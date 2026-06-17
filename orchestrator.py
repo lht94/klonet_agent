@@ -7,15 +7,17 @@
 from __future__ import annotations
 
 import json
+from time import perf_counter
 
 from klonet_agent.agents import AgentProfile, get_profile
-from klonet_agent.config import MAX_TOKEN
+from klonet_agent.config import MAX_TOKEN, TRACE_FILE
 from klonet_agent.knowledge import SKILL_LOADER
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MEMORY_STORE
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
 from klonet_agent.tools import TOOLS, ToolExecutor
+from klonet_agent.tracing.logger import TraceLogger
 
 
 class AgentOrchestrator:
@@ -31,14 +33,17 @@ class AgentOrchestrator:
         session: AgentSession | None = None,
         llm: LLMClient | None = None,
         tool_executor: ToolExecutor | None = None,
+        trace_logger: TraceLogger | None = None,
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
         self.llm = llm or LLMClient()
+        self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
             allowed_tools=self.profile.allowed_tools,
+            trace_logger=self.trace_logger,
         )
 
     def init_history(self) -> list[dict]:
@@ -83,7 +88,17 @@ class AgentOrchestrator:
         现在统一通过 LLMClient.complete() 发送请求。
         """
 
-        return self.llm.complete(messages=history, tools=self._visible_tools())
+        start = perf_counter()
+        response = self.llm.complete(messages=history, tools=self._visible_tools())
+        duration_ms = int((perf_counter() - start) * 1000)
+        self.trace_logger.record_llm_call(
+            user_id=self.session.user_id,
+            project_id=self.session.project_id,
+            mode=self.session.mode,
+            total_tokens=getattr(response.usage, "total_tokens", 0),
+            duration_ms=duration_ms,
+        )
+        return response
 
     def use_tool(self, tool_name: str, tool_args: dict) -> str:
         """调用工具执行器。"""

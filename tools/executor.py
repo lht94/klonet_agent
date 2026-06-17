@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+from time import perf_counter
 
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge import KNOWLEDGE_BASE, SKILL_LOADER
@@ -15,6 +16,7 @@ from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
 from klonet_agent.tools.web import web_fetch
+from klonet_agent.tracing.logger import TraceLogger
 from klonet_agent.workspace.git_ops import show_diff
 from klonet_agent.workspace.manager import WORKSPACE_MANAGER
 
@@ -25,15 +27,38 @@ class ToolExecutor:
     大模型只会输出工具名和参数；真正调用 Python 函数、读写记忆、执行命令的逻辑都在这里。
     """
 
-    def __init__(self, session: AgentSession | None = None, allowed_tools: set[str] | None = None):
+    def __init__(
+        self,
+        session: AgentSession | None = None,
+        allowed_tools: set[str] | None = None,
+        trace_logger: TraceLogger | None = None,
+    ):
         self.session = session or AgentSession()
         self.allowed_tools = allowed_tools
+        self.trace_logger = trace_logger
 
     def run(self, tool_name: str, tool_args: dict) -> str:
         """执行一个工具调用，并返回给大模型看的文本结果。"""
 
+        start = perf_counter()
         if self.allowed_tools is not None and tool_name not in self.allowed_tools:
-            return f"Error: 当前 Agent 模式不允许调用工具 {tool_name}"
+            result = f"Error: 当前 Agent 模式不允许调用工具 {tool_name}"
+            self._record_trace(tool_name, tool_args, "denied", start, result)
+            return result
+
+        try:
+            result = self._run_allowed_tool(tool_name, tool_args)
+        except Exception as exc:
+            result = f"Error: {exc}"
+            self._record_trace(tool_name, tool_args, "error", start, result)
+            return result
+
+        status = "error" if result.startswith("Error:") else "success"
+        self._record_trace(tool_name, tool_args, status, start, result)
+        return result
+
+    def _run_allowed_tool(self, tool_name: str, tool_args: dict) -> str:
+        """执行已经通过权限检查的工具。"""
 
         if tool_name == "run_command":
             sandbox = WORKSPACE_MANAGER.sandbox_for(self.session)
@@ -126,3 +151,27 @@ class ToolExecutor:
             return journal.record_acceptance_gap(tool_args["content"])
 
         return f"Error:Unknown tool {tool_name}"
+
+    def _record_trace(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        status: str,
+        start: float,
+        result: str,
+    ):
+        """如果配置了 trace logger，就记录本次工具调用。"""
+
+        if self.trace_logger is None:
+            return
+        duration_ms = int((perf_counter() - start) * 1000)
+        self.trace_logger.record_tool_call(
+            user_id=self.session.user_id,
+            project_id=self.session.project_id,
+            mode=self.session.mode,
+            tool_name=tool_name,
+            status=status,
+            duration_ms=duration_ms,
+            args=tool_args,
+            result=result,
+        )

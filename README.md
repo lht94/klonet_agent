@@ -85,9 +85,16 @@
    - 新增 `evals/mentor_cases.jsonl`
    - 新增 `evals/coding_cases.jsonl`
    - 新增 `evals/error_cases.jsonl`
+   - 新增 `evals/runner.py`，可以离线汇总 eval case，生成 `evals/summary.md`
    - 后续可以用这些 case 做对比实验，例如：通用 Claude Code / 无 RAG 版本 / 有 RAG + 项目日志版本
 
-10. 新增测试
+10. 新增 trace 与 token 统计
+    - 新增 `tracing/logger.py`
+    - 记录 LLM 调用 token、耗时
+    - 记录工具调用、执行状态、耗时和结果摘要
+    - trace 写入 `tracing/trace.jsonl`，作为后续评估和审计数据
+
+11. 新增测试
     - 新增 `tests/test_imports.py`
     - 新增 `tests/test_cli_entry.py`
     - 新增 `tests/test_prompt_style.py`
@@ -95,10 +102,12 @@
     - 新增 `tests/test_journal.py`
     - 新增 `tests/test_knowledge.py`
     - 新增 `tests/test_workspace_tools.py`
+    - 新增 `tests/test_tracing.py`
+    - 新增 `tests/test_eval_runner.py`
     - 当前验证结果：
       ```bash
       python -m pytest -q
-      # 17 passed
+      # 23 passed
       ```
 
 ### 现在的运行方式
@@ -119,7 +128,7 @@ python agent.py --help
 - RAG 目前只是本地关键词检索，还不是向量数据库
 - ReviewAgent 目前只是 prompt 层面的轻量 review，还没有独立子 agent
 - Web/API 服务还没有做，当前目标仍然是本地 CLI 可用
-- token/速度优化目前只搭了基础结构，后续需要通过 evals 做对比实验
+- token/速度优化目前已有 trace 和 eval runner 基础，后续需要接入真实 Klonet 任务做对比实验
 
 ## 更新：项目架构
 把项目封装成了一个个类

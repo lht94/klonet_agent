@@ -19,6 +19,7 @@ MEMORY_DIR = PROJECT_ROOT / "memory"
 JOURNAL_DIR = PROJECT_ROOT / "journals"
 WORKSPACE_DIR = PROJECT_ROOT / "workspaces"
 KNOWLEDGE_INDEX_FILE = PROJECT_ROOT / "knowledge" / "index.jsonl"
+TRACE_FILE = PROJECT_ROOT / "tracing" / "trace.jsonl"
 
 DEFAULT_USER_ID = "default"
 DEFAULT_PROJECT_ID = "default"

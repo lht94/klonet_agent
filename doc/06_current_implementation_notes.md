@@ -190,19 +190,37 @@ workspace/git_ops.py
 evals/mentor_cases.jsonl
 evals/coding_cases.jsonl
 evals/error_cases.jsonl
+evals/runner.py
 ```
 
-这些文件用于后续做对比实验。
+这些文件用于后续做对比实验。当前 `EvalRunner` 可以离线读取 jsonl case、
+校验最小字段，并生成 `evals/summary.md` 汇总。
 
-### 11. Tests
+### 11. Trace 与 Token 统计
+
+新增：
+
+```text
+tracing/logger.py
+```
+
+当前支持：
+
+- 记录 LLM 调用 token 和耗时。
+- 记录工具调用状态、耗时和结果摘要。
+- trace 写入 `tracing/trace.jsonl`，作为后续评估和安全审计依据。
+
+### 12. Tests
 
 新增：
 
 ```text
 tests/test_cli_entry.py
+tests/test_eval_runner.py
 tests/test_imports.py
 tests/test_prompt_style.py
 tests/test_session.py
+tests/test_tracing.py
 tests/test_journal.py
 tests/test_knowledge.py
 tests/test_workspace_tools.py
@@ -212,7 +230,7 @@ tests/test_workspace_tools.py
 
 ```bash
 python -m pytest -q
-# 17 passed
+# 23 passed
 ```
 
 ## 当前 .gitignore 策略
@@ -223,6 +241,8 @@ python -m pytest -q
 - Python 缓存
 - `.pytest_cache`
 - `knowledge/index.jsonl`
+- `evals/summary.md`
+- `tracing/trace.jsonl`
 - `memory/history.jsonl`
 - `memory/20*.md`
 - `memory/MEMORY.md`
@@ -243,9 +263,6 @@ python -m pytest -q
 - SQLite 多用户元数据。
 - 独立 ReviewAgent。
 - Web/API 服务。
-- trace logger。
-- token 统计。
-- eval runner。
 - LangGraph 状态图。
 
 ## 下一步建议
@@ -255,5 +272,4 @@ python -m pytest -q
 1. 接入真实 Klonet 源码到 workspace。
 2. 为 Klonet 补充规范文档和常见报错文档。
 3. 扩展 `search_knowledge` 的索引范围。
-4. 实现 trace logger。
-5. 实现 eval runner，开始做 token/速度/质量对比实验。
+4. 接入真实 Klonet 任务，开始用 eval runner 做 token/速度/质量对比实验。
