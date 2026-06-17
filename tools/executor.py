@@ -40,16 +40,16 @@ class ToolExecutor:
             reason = sandbox.reject_dangerous_command(tool_args["command"])
             if reason:
                 return f"Error: {reason}"
-            print(f"小鸡毛：小白，我在执行命令\n{tool_args['command']}")
+            print(f"Klonet Agent：正在执行命令\n{tool_args['command']}")
             if os.name == "nt":
                 result = run_command_win(tool_args["command"])
             else:
                 result = run_command_linux(tool_args["command"])
-            print(f"小鸡毛：执行完啦，命令结果为：\n{result}")
+            print(f"Klonet Agent：命令执行完成，结果为：\n{result}")
             return result
 
         if tool_name == "load_skill":
-            print(f"小鸡毛：小白，我在认真学习技能{tool_args['skill_name']}!!")
+            print(f"Klonet Agent：正在加载技能 {tool_args['skill_name']}。")
             return SKILL_LOADER.load_skill(tool_args["skill_name"])
 
         if tool_name == "search_knowledge":
@@ -79,17 +79,17 @@ class ToolExecutor:
             return show_diff(self.session.workspace_path)
 
         if tool_name == "append_episode":
-            print("小鸡毛：小白，我在记录我们今天发生的事情哦~")
+            print("Klonet Agent：正在记录本次有价值的进展。")
             MEMORY_STORE.append_episode(tool_args["content"])
             return "已成功追加到今天的情景记忆日志中。"
 
         if tool_name == "write_memory":
-            print("小鸡毛：小白，我好像更了解你啦！")
+            print("Klonet Agent：正在更新长期记忆。")
             MEMORY_STORE.write_memory(tool_args["content"])
             return "长期记忆 MEMORY.md 已被成功覆盖更新。"
 
         if tool_name == "write_user":
-            print("小鸡毛：小白，我记住你喜欢什么啦！")
+            print("Klonet Agent：正在更新用户画像。")
             MEMORY_STORE.write_user(tool_args["content"])
             return "用户偏好 USER.md 已被成功覆盖更新。"
 
@@ -101,7 +101,7 @@ class ToolExecutor:
             )
 
         if tool_name == "update_todos":
-            print("小鸡毛：小白，计划在稳步推进哦！")
+            print("Klonet Agent：正在更新任务计划。")
             return self.session.update_todos(tool_args["todos"])
 
         journal = ProjectJournal.from_session(self.session)

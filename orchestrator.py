@@ -93,16 +93,16 @@ class AgentOrchestrator:
     def compress_memory(self, history: list[dict], token: int):
         """触发记忆复盘与压缩。"""
 
-        print("💡 小鸡毛进行记忆复盘与折叠...")
+        print("Klonet Agent：正在进行记忆复盘与折叠...")
         compress_instruction = """【系统强制指令 - 记忆反思折叠】
         我们当前的对话历史即将达到容量上限并被截断。为了防止你失忆，请立刻全面回顾我们刚才的新对话：
         1. 提炼出核心的技术进展、Bug 解决过程或实验结论，调用 `append_episode` 追加到今天的日记。
         2. 检查是否有项目的全局核心目标、网络架构事实改变，若有，将其与当前提示词中的长期记忆融合，调用 `write_memory` 全量更新。
-        3. 评估小白的个人偏好、工作流、环境是否有变，若有，调用 `write_user` 全量更新。
+        3. 评估用户的个人偏好、工作流、环境是否有变，若有，调用 `write_user` 全量更新。
 
         **执行规范**：
         - 请根据实际对话进展，主动、合理地触发上述工具。
-        - 执行完工具后（或发现无硬核信息可记时），请用小鸡毛可爱温柔的口吻对小白说一句话，告诉她你已经把前面的重点都理清楚、记在小本本上了，随时可以继续轻装上阵聊新话题。
+        - 执行完工具后（或发现没有需要记录的新信息时），请简要说明记忆复盘已经完成，可以继续新的任务。
         """
         # 这是条静默指令。虽然 role 为 user，但它不是用户主动输入的，而是系统触发压缩用的内部指令。
         history.append({"role": "user", "content": compress_instruction})
@@ -152,7 +152,7 @@ class AgentOrchestrator:
                 history.append(comp_assistant)
                 MEMORY_STORE.append_history(comp_assistant)
 
-                print(f"小鸡毛：(揉了揉小脑袋) {compress_reply}")
+                print(f"Klonet Agent：{compress_reply}")
                 # 打入压缩标记，表示前面的内容已经被压缩归档。
                 MEMORY_STORE.append_compact_marker()
                 # 重新初始化记忆，并将压缩总结加入数组，保持上下文连贯。
@@ -256,7 +256,7 @@ class AgentOrchestrator:
         # 条件触发对话压缩。这里沿用旧版逻辑，用本轮 context token 判断。
         current_context_size = response.usage.total_tokens
         if current_context_size >= MAX_TOKEN:
-            print(f"\n小鸡毛：我已经吃了 {current_context_size} 根骨头啦，小白等我消化一下...")
+            print(f"\nKlonet Agent：当前上下文约 {current_context_size} token，开始整理记忆。")
             history, token = self.compress_memory(history, token)
 
         return reply, history, token

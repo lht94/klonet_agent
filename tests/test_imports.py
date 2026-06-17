@@ -42,3 +42,21 @@ def test_profile_tool_permissions():
     assert "run_tests" in coding.allowed_tools
     assert "show_diff" in coding.allowed_tools
     assert coding.requires_review is True
+
+
+def test_session_can_update_todos():
+    """确认 session 自身可以维护任务列表。"""
+
+    from klonet_agent.session import AgentSession
+
+    session = AgentSession(user_id="u1", project_id="p1")
+    result = session.update_todos(
+        [
+            {"id": 1, "content": "检索知识库", "status": "completed"},
+            {"id": 2, "content": "整理回答", "status": "in_progress"},
+        ]
+    )
+
+    assert "total=2" in result
+    assert session.todos[0]["status"] == "completed"
+    assert session.todos[1]["status"] == "in_progress"

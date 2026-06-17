@@ -71,6 +71,9 @@ Profile 决定：
 - `STYLE_PROMPT`
 - `TASK_PROMPT`
 
+当前已经清理旧个人 Agent 口吻，运行时提示、记忆提示和工具输出统一使用
+Klonet 教学协作 Agent 的表达。
+
 ### 5. Session 隔离
 
 `AgentSession` 当前包含：
@@ -194,6 +197,7 @@ evals/error_cases.jsonl
 ```text
 tests/test_cli_entry.py
 tests/test_imports.py
+tests/test_prompt_style.py
 tests/test_journal.py
 tests/test_knowledge.py
 tests/test_workspace_tools.py
@@ -203,7 +207,7 @@ tests/test_workspace_tools.py
 
 ```bash
 python -m pytest -q
-# 8 passed
+# 12 passed
 ```
 
 ## 当前 .gitignore 策略

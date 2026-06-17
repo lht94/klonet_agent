@@ -23,7 +23,7 @@ def run_chat(mode: str = "mentor", user_id: str = DEFAULT_USER_ID, project_id: s
 
     try:
         while True:
-            user_input = input("小白：").strip()
+            user_input = input("用户：").strip()
 
             # 处理空输入。
             if not user_input:

@@ -23,6 +23,7 @@
 
 3. 重构系统提示词
    - 把原来单一的 `SYSTEM_PROMPT` 拆成多层 prompt
+   - 清理旧个人 Agent 口吻，统一为 Klonet 教学协作 Agent 表达
    - 现在包含：
      - `CORE_SYSTEM_PROMPT`：核心身份与通用规则
      - `SAFETY_PROMPT`：安全与权限规则
@@ -89,13 +90,14 @@
 10. 新增测试
     - 新增 `tests/test_imports.py`
     - 新增 `tests/test_cli_entry.py`
+    - 新增 `tests/test_prompt_style.py`
     - 新增 `tests/test_journal.py`
     - 新增 `tests/test_knowledge.py`
     - 新增 `tests/test_workspace_tools.py`
     - 当前验证结果：
       ```bash
       python -m pytest -q
-      # 8 passed
+      # 12 passed
       ```
 
 ### 现在的运行方式

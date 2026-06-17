@@ -44,6 +44,11 @@ class AgentSession:
         self.workspace_path = workspace_path or WORKSPACE_DIR / user_id / project_id
         self.journal_path = journal_path or JOURNAL_DIR / user_id / f"{project_id}.md"
 
+    def update_todos(self, todos: list[dict]) -> str:
+        """更新当前会话的任务进度。"""
+
+        return update_todos(self.todos, todos)
+
 
 def render_todos(todos: list[dict]) -> str:
     """把 todo 列表渲染成命令行可读文本。"""
@@ -58,12 +63,6 @@ def render_todos(todos: list[dict]) -> str:
         lines.append(f"{icon} {todo.get('id')}. {todo.get('content', '')}")
     # 用换行符把每一行拼接起来。
     return "\n".join(lines)
-
-
-    def update_todos(self, todos: list[dict]) -> str:
-        """更新当前会话的任务进度。"""
-
-        return update_todos(self.todos, todos)
 
 
 def update_todos(target: list[dict], todos: list[dict]) -> str:
@@ -94,7 +93,7 @@ def update_todos(target: list[dict], todos: list[dict]) -> str:
     # 注意这里用 clear + extend 原地更新，保持外部持有的列表对象引用不变。
     target.clear()
     target.extend(cleaned)
-    print("\n小白，计划更新啦！")
+    print("\nKlonet Agent：计划已更新。")
     print(render_todos(target))
     print()
 

@@ -160,17 +160,17 @@ class MemoryStore:
         current_memory = self.read_memory()
         current_user = self.read_user()
         return f"""
-            【当前你的大脑长期记忆 (MEMORY.md)】
+            【当前长期记忆 (MEMORY.md)】
             {current_memory}
 
-            【小白的个人画像与偏好 (USER.md)】
+            【用户画像与偏好 (USER.md)】
             {current_user}
 
-            【你的核心任务：自动维护记忆】
-            除了回答小白的问题，你还拥有三个记忆工具。你必须在对话中主动调用它们：
+            【核心任务：自动维护记忆】
+            除了回答用户的问题，你还拥有三个记忆工具。你必须在对话中主动调用它们：
             1. 若完成了具体任务、解决了 Bug，调用 append_episode 记录。
             2. 若当前长期记忆 (MEMORY.md) 中的信息过时，或者有新的全局重大事实，调用 write_memory 覆盖更新。你需要把上面的旧记忆和新事实融合，写出完整的全新内容。
-            3. 若小白展现了新的个人喜好或习惯，调用 write_user 覆盖更新。同样，必须把上面的旧画像和新喜好融合完整后写入！
+            3. 若用户展现了新的个人喜好或习惯，调用 write_user 覆盖更新。同样，必须把上面的旧画像和新喜好融合完整后写入！
             """
 
 
