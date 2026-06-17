@@ -90,6 +90,8 @@ Klonet 教学协作 Agent 的表达。
 
 原来的全局 `TODOS` 已经迁移到 session 内。
 
+当前已经补充会话隔离测试，确认不同用户/项目有独立的 workspace、journal 和 todo。
+
 ### 6. Project Journal
 
 新增项目日志模块：
@@ -200,6 +202,7 @@ evals/error_cases.jsonl
 tests/test_cli_entry.py
 tests/test_imports.py
 tests/test_prompt_style.py
+tests/test_session.py
 tests/test_journal.py
 tests/test_knowledge.py
 tests/test_workspace_tools.py
@@ -209,7 +212,7 @@ tests/test_workspace_tools.py
 
 ```bash
 python -m pytest -q
-# 12 passed
+# 17 passed
 ```
 
 ## 当前 .gitignore 策略

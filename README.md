@@ -91,13 +91,14 @@
     - 新增 `tests/test_imports.py`
     - 新增 `tests/test_cli_entry.py`
     - 新增 `tests/test_prompt_style.py`
+    - 新增 `tests/test_session.py`
     - 新增 `tests/test_journal.py`
     - 新增 `tests/test_knowledge.py`
     - 新增 `tests/test_workspace_tools.py`
     - 当前验证结果：
       ```bash
       python -m pytest -q
-      # 12 passed
+      # 17 passed
       ```
 
 ### 现在的运行方式

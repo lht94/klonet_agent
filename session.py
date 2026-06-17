@@ -28,19 +28,19 @@ class AgentSession:
 
     def __init__(
         self,
-        user_id: str = DEFAULT_USER_ID,
-        project_id: str = DEFAULT_PROJECT_ID,
-        mode: str = DEFAULT_MODE,
-        workspace_path: Path | None = None,
-        journal_path: Path | None = None,
+        user_id: str = DEFAULT_USER_ID,             # 当前用户标识
+        project_id: str = DEFAULT_PROJECT_ID,       # 当前项目标识
+        mode: str = DEFAULT_MODE,                   # 当前 Agent 模式
+        workspace_path: Path | None = None,         # 当前会话 workspace
+        journal_path: Path | None = None,           # 当前项目日志路径
     ):
-        self.user_id = user_id
-        self.project_id = project_id
-        self.mode = mode
-        self.history: list[dict] = []
-        self.token_total = 0
-        self.loaded_skills: list[str] = []
-        self.todos: list[dict] = []
+        self.user_id = user_id                                      # 用户隔离维度
+        self.project_id = project_id                                # 项目隔离维度
+        self.mode = mode                                            # mentor / coding
+        self.history: list[dict] = []                               # 当前会话内存历史
+        self.token_total = 0                                        # 当前会话累计 token
+        self.loaded_skills: list[str] = []                          # 已加载技能名
+        self.todos: list[dict] = []                                 # 当前会话任务列表
         self.workspace_path = workspace_path or WORKSPACE_DIR / user_id / project_id
         self.journal_path = journal_path or JOURNAL_DIR / user_id / f"{project_id}.md"
 
