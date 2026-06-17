@@ -37,6 +37,7 @@ class AgentOrchestrator:
         self.llm = llm or LLMClient()
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
+            # 执行层再次检查工具权限，避免模型绕过可见工具列表。
             allowed_tools=self.profile.allowed_tools,
         )
 

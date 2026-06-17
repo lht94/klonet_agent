@@ -1,5 +1,5 @@
-# agent_v7
-**把功能模块封装成类**
+# Klonet Agent
+**Klonet 专用教学协作 Agent**
 
 ## 更新：Klonet 专用教学协作 Agent 第一版
 这一版开始从通用的 `agent_v7` 迁移成 `klonet_agent`，目标也从“个人对话 agent”变成“面向 Klonet 的教学协作 agent”。
@@ -88,21 +88,27 @@
 
 10. 新增测试
     - 新增 `tests/test_imports.py`
+    - 新增 `tests/test_cli_entry.py`
     - 新增 `tests/test_journal.py`
     - 新增 `tests/test_knowledge.py`
     - 新增 `tests/test_workspace_tools.py`
     - 当前验证结果：
       ```bash
-      python3 -m pytest -q
-      # 5 passed
+      python -m pytest -q
+      # 8 passed
       ```
 
 ### 现在的运行方式
-现在需要在项目父目录下，用模块方式运行：
+现在可以直接在项目根目录下运行：
 ```bash
-cd /Users/lht/Library/CloudStorage/OneDrive-个人/课设/agent开发
-python3 -m klonet_agent.agent --mode mentor --user-id default --project-id default
-python3 -m klonet_agent.agent --mode coding --user-id default --project-id demo
+cd C:\Users\LHT\OneDrive\课设\agent开发\klonet_agent
+python -m klonet_agent.agent --mode mentor --user-id default --project-id default
+python -m klonet_agent.agent --mode coding --user-id default --project-id demo
+```
+
+也可以用脚本方式查看帮助或启动：
+```bash
+python agent.py --help
 ```
 
 ### 这一版还没有做的事情
@@ -119,7 +125,7 @@ python3 -m klonet_agent.agent --mode coding --user-id default --project-id demo
 ```
 agent.py                         # CLI 启动入口，尽量很薄
 
-agent_v7/
+klonet_agent/
 ├── __init__.py
 ├── config.py                    # 配置：模型名、路径、token限制、开关
 ├── prompts.py                   # 系统提示词、角色提示词、任务提示词
@@ -241,7 +247,7 @@ run.py ->
 
 总结完毕后，手动打上标签
 
-## 项目架构
+## 旧版架构记录
 把项目拆成了三层
 1. 基础设施层：client，history，tools，skills
 2. 编排层：runner （即把各个模块拼接在一起）
@@ -267,9 +273,9 @@ agent_v5/
 3. 目前以面向过程编程为原则，主要是比较简单。后续做大后，为了维护方便可以改成面向对象编程
    
 ## 运行方法
-一般按照模块的方式运行，而不是简单的按py文件执行
+当前项目建议在仓库根目录运行：
 ``` bash
-cd C:\Users\LHT\OneDrive\课设\agent开发\demo
-python -m agent_v7.agent
-# 而非直接运行 python agent_v5\agent.py
+cd C:\Users\LHT\OneDrive\课设\agent开发\klonet_agent
+python -m klonet_agent.agent --help
+python agent.py --help
 ```

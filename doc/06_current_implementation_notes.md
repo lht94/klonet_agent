@@ -31,9 +31,10 @@ main
 运行方式改为：
 
 ```bash
-cd /Users/lht/Library/CloudStorage/OneDrive-个人/课设/agent开发
-python3 -m klonet_agent.agent --mode mentor --user-id default --project-id default
-python3 -m klonet_agent.agent --mode coding --user-id default --project-id demo
+cd C:\Users\LHT\OneDrive\课设\agent开发\klonet_agent
+python -m klonet_agent.agent --mode mentor --user-id default --project-id default
+python -m klonet_agent.agent --mode coding --user-id default --project-id demo
+python agent.py --help
 ```
 
 ### 3. Agent Profile
@@ -191,6 +192,7 @@ evals/error_cases.jsonl
 新增：
 
 ```text
+tests/test_cli_entry.py
 tests/test_imports.py
 tests/test_journal.py
 tests/test_knowledge.py
@@ -200,8 +202,8 @@ tests/test_workspace_tools.py
 当前测试结果：
 
 ```bash
-python3 -m pytest -q
-# 5 passed
+python -m pytest -q
+# 8 passed
 ```
 
 ## 当前 .gitignore 策略

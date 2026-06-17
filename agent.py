@@ -1,6 +1,15 @@
 """命令行启动脚本。"""
 
 import argparse
+import sys
+from pathlib import Path
+
+
+# 当用户在仓库根目录直接运行 `python agent.py` 时，当前目录就是包目录本身。
+# 这时需要把父目录加入 sys.path，绝对导入 `klonet_agent.app` 才能成立。
+PACKAGE_PARENT = Path(__file__).resolve().parent.parent
+if str(PACKAGE_PARENT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_PARENT))
 
 from klonet_agent.app import run_chat
 

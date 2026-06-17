@@ -12,12 +12,12 @@ from klonet_agent.prompts import CODING_PROMPT, MENTOR_PROMPT
 class AgentProfile:
     """描述某一种 Agent 模式。"""
 
-    name: str
-    mode_prompt: str
-    allowed_tools: set[str] = field(default_factory=set)
-    default_workflow: str = ""
-    requires_rag: bool = False
-    requires_review: bool = False
+    name: str                                             # 模式名
+    mode_prompt: str                                      # 该模式专用提示词
+    allowed_tools: set[str] = field(default_factory=set)  # 允许调用哪些工具
+    default_workflow: str = ""                            # 默认工作流
+    requires_rag: bool = False                            # 是否需要知识检索
+    requires_review: bool = False                         # 是否需要 review
 
 
 MENTOR_TOOLS = {

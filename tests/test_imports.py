@@ -22,3 +22,23 @@ def test_core_imports():
     assert get_profile("mentor").name == "mentor"
     assert get_profile("coding").name == "coding"
     assert AgentSession(user_id="u1", project_id="p1").user_id == "u1"
+
+
+def test_profile_tool_permissions():
+    """确认 Mentor 和 Coding 的工具权限边界。"""
+
+    from klonet_agent.agents import get_profile
+
+    mentor = get_profile("mentor")
+    coding = get_profile("coding")
+
+    assert "search_knowledge" in mentor.allowed_tools
+    assert "read_project_journal" in mentor.allowed_tools
+    assert "write_file" not in mentor.allowed_tools
+    assert "run_tests" not in mentor.allowed_tools
+    assert "show_diff" not in mentor.allowed_tools
+
+    assert "write_file" in coding.allowed_tools
+    assert "run_tests" in coding.allowed_tools
+    assert "show_diff" in coding.allowed_tools
+    assert coding.requires_review is True
