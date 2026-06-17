@@ -15,6 +15,7 @@ from klonet_agent.config import JOURNAL_DIR, KNOWLEDGE_INDEX_FILE, PROJECT_ROOT
 
 TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml"}
 SKIP_PARTS = {"__pycache__", ".git", ".DS_Store"}
+RUNTIME_MEMORY_FILES = {"MEMORY.md", "USER.md", "history.jsonl", "tokens.jsonl"}
 
 
 @dataclass
@@ -74,6 +75,8 @@ class KnowledgeIndexer:
             for path in root.rglob("*"):
                 if any(part in SKIP_PARTS for part in path.parts):
                     continue
+                if _is_runtime_memory_file(path, self.root):
+                    continue
                 if path.is_file() and path.suffix in TEXT_SUFFIXES:
                     yield path
 
@@ -85,18 +88,39 @@ class KnowledgeIndexer:
         except UnicodeDecodeError:
             text = path.read_text(encoding="utf-8", errors="ignore")
         rel = path.relative_to(self.root) if path.is_relative_to(self.root) else path
-        title = str(rel)
+        # 索引里统一使用 /，避免 Windows 反斜杠影响检索结果展示和测试。
+        rel_text = rel.as_posix() if isinstance(rel, Path) else str(rel)
+        title = rel_text
         chunks = []
         for index, content in enumerate(_split_text(text), start=1):
             chunks.append(
                 KnowledgeChunk(
                     source="local",
-                    path=str(rel),
+                    path=rel_text,
                     title=f"{title}#{index}",
                     content=content,
                 )
             )
         return chunks
+
+
+def _is_runtime_memory_file(path: Path, root: Path) -> bool:
+    """判断是否为运行时记忆文件。
+
+    `memory/store.py` 这类源码可以进知识库，但 MEMORY.md、USER.md 和按日期生成
+    的情景记忆属于用户运行状态，不应该沉淀进 Klonet 公共知识索引。
+    """
+
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    parts = rel.parts
+    if len(parts) < 2 or parts[0] != "memory":
+        return False
+    if path.name in RUNTIME_MEMORY_FILES:
+        return True
+    return path.suffix == ".md" and path.stem[:4].isdigit()
 
 
 def _split_text(text: str, chunk_size: int = 1200, overlap: int = 120) -> list[str]:

@@ -132,6 +132,8 @@ knowledge/style_guide.md
 - 写入 JSONL 索引。
 - 关键词检索。
 - 返回适合注入模型上下文的证据文本。
+- 跳过 `memory/MEMORY.md`、`memory/USER.md` 和日期情景记忆等运行时状态文件，
+  避免把个人历史记忆混入 Klonet 公共知识库。
 
 当前生成索引：
 
