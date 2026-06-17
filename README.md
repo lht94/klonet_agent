@@ -55,6 +55,7 @@
      - 功能差异与验收建议
      - 下一步
    - 这就是后续做“项目管理、老师验收、进度对齐”的核心文件
+   - 支持生成项目日志摘要，避免每次把完整日志注入上下文
 
 6. 实现 Klonet 知识库第一版
    - 新增 `knowledge/indexer.py`
@@ -62,6 +63,7 @@
    - 新增 `knowledge/rag.py`
    - 当前先使用本地 JSONL 索引，不上复杂向量数据库
    - 检索对象包括 README、prompt、knowledge、journal、workspace、tools、memory 等文本资料
+   - 新增 `knowledge/task_templates.md`，沉淀 Mentor 问答、Coding 开发、报错排查、修复测试失败等常见任务模板
    - 后续可以逐步替换成 BM25 + 向量检索的混合 RAG
 
 7. 新增代码风格指南
@@ -93,6 +95,7 @@
     - 记录 LLM 调用 token、耗时
     - 记录工具调用、执行状态、耗时和结果摘要
     - trace 写入 `tracing/trace.jsonl`，作为后续评估和审计数据
+    - 工具结果过长时会统一截断，保护上下文窗口
 
 11. 新增测试
     - 新增 `tests/test_imports.py`
@@ -107,7 +110,7 @@
     - 当前验证结果：
       ```bash
       python -m pytest -q
-      # 23 passed
+      # 27 passed
       ```
 
 ### 现在的运行方式

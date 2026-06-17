@@ -21,6 +21,9 @@ from klonet_agent.workspace.git_ops import show_diff
 from klonet_agent.workspace.manager import WORKSPACE_MANAGER
 
 
+TOOL_RESULT_MAX_CHARS = 12000
+
+
 class ToolExecutor:
     """统一的工具执行入口。
 
@@ -53,6 +56,7 @@ class ToolExecutor:
             self._record_trace(tool_name, tool_args, "error", start, result)
             return result
 
+        result = _truncate_tool_result(result)
         status = "error" if result.startswith("Error:") else "success"
         self._record_trace(tool_name, tool_args, status, start, result)
         return result
@@ -136,6 +140,9 @@ class ToolExecutor:
             return f"项目日志已创建或确认存在：{path}"
 
         if tool_name == "read_project_journal":
+            max_chars = tool_args.get("max_chars", 3000)
+            if max_chars:
+                return journal.summary(max_chars=max_chars)
             return journal.read()
 
         if tool_name == "append_journal_event":
@@ -175,3 +182,12 @@ class ToolExecutor:
             args=tool_args,
             result=result,
         )
+
+
+def _truncate_tool_result(result: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -> str:
+    """统一截断过长工具结果，保护上下文窗口。"""
+
+    if len(result) <= max_chars:
+        return result
+    suffix = "\n\n...（工具结果过长，已截断）"
+    return result[: max_chars - len(suffix)].rstrip() + suffix

@@ -102,8 +102,8 @@ TOOLS = [
     ),
     _tool(
         "read_project_journal",
-        "读取当前 user_id/project_id 对应的项目 Markdown 日志。",
-        {},
+        "读取当前 user_id/project_id 对应的项目 Markdown 日志。默认返回摘要，避免上下文过长。",
+        {"max_chars": {"type": "integer", "description": "摘要最大字符数，默认 3000；传 0 表示读取全文"}},
         [],
     ),
     _tool(

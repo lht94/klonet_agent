@@ -78,6 +78,23 @@ def test_tool_executor_writes_trace_for_denied_tool():
     assert row["status"] == "denied"
 
 
+def test_tool_executor_truncates_long_result():
+    """工具结果过长时，执行器应该统一截断，避免塞爆上下文。"""
+
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+
+    class LongResultExecutor(ToolExecutor):
+        def _run_allowed_tool(self, tool_name, tool_args):
+            return "A" * 13000
+
+    executor = LongResultExecutor(session=AgentSession(), allowed_tools={"demo"})
+    result = executor.run("demo", {})
+
+    assert len(result) < 13000
+    assert "工具结果过长，已截断" in result
+
+
 def test_trace_logger_records_llm_usage():
     """LLM token 和耗时也应该进入 trace。"""
 

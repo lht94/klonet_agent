@@ -111,6 +111,7 @@ journals/{user_id}/{project_id}.md
 
 - 创建日志。
 - 读取日志。
+- 生成适合注入上下文的项目日志摘要。
 - 追加事件。
 - 更新状态。
 - 记录测试结果。
@@ -125,6 +126,7 @@ knowledge/indexer.py
 knowledge/retriever.py
 knowledge/rag.py
 knowledge/style_guide.md
+knowledge/task_templates.md
 ```
 
 当前能力：
@@ -136,6 +138,7 @@ knowledge/style_guide.md
 - 返回适合注入模型上下文的证据文本。
 - 跳过 `memory/MEMORY.md`、`memory/USER.md` 和日期情景记忆等运行时状态文件，
   避免把个人历史记忆混入 Klonet 公共知识库。
+- 提供常见任务模板，覆盖 Mentor 问答、Coding 开发、报错排查和修复测试失败。
 
 当前生成索引：
 
@@ -208,6 +211,7 @@ tracing/logger.py
 
 - 记录 LLM 调用 token 和耗时。
 - 记录工具调用状态、耗时和结果摘要。
+- 统一截断过长工具结果，避免上下文膨胀。
 - trace 写入 `tracing/trace.jsonl`，作为后续评估和安全审计依据。
 
 ### 12. Tests
@@ -230,7 +234,7 @@ tests/test_workspace_tools.py
 
 ```bash
 python -m pytest -q
-# 23 passed
+# 27 passed
 ```
 
 ## 当前 .gitignore 策略

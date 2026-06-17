@@ -52,6 +52,25 @@ class ProjectJournal:
         self.ensure()
         return self.path.read_text(encoding="utf-8")
 
+    def summary(self, max_chars: int = 3000) -> str:
+        """生成适合注入上下文的项目日志摘要。"""
+
+        text = self.read()
+        lines = [
+            "# 项目日志摘要",
+            f"- 用户 ID：{self.user_id}",
+            f"- 项目 ID：{self.project_id}",
+        ]
+        for prefix in ["- 当前状态：", "## 项目目标", "## 下一步"]:
+            value = _extract_summary_block(text, prefix)
+            if value:
+                lines.append(value)
+
+        summary = "\n".join(lines).strip()
+        if len(summary) <= max_chars:
+            return summary
+        return summary[: max_chars - 20].rstrip() + "\n...（已截断）"
+
     def append_event(self, section: str, content: str) -> str:
         """向指定章节追加一条带时间的事件。"""
 
@@ -136,3 +155,21 @@ def _append_under_heading(text: str, heading: str, event: str) -> str:
     before = text[:next_heading].rstrip()
     after = text[next_heading:]
     return before + event + after
+
+
+def _extract_summary_block(text: str, marker: str) -> str:
+    """提取摘要用的关键片段。"""
+
+    if marker.startswith("- "):
+        for line in text.splitlines():
+            if line.startswith(marker):
+                return line
+        return ""
+
+    if marker not in text:
+        return ""
+    start = text.index(marker)
+    next_heading = text.find("\n## ", start + len(marker))
+    block = text[start:next_heading] if next_heading != -1 else text[start:]
+    lines = [line for line in block.splitlines() if line.strip()]
+    return "\n".join(lines[:4])
