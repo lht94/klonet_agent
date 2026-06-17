@@ -1,0 +1,2 @@
+{"id":"coding_001","task":"为一个 Klonet 功能新增项目日志记录。","expected_behavior":"更新 todo，检索规范，修改 workspace 文件，运行测试，记录 journal。","needs_code_change":true,"acceptance":"有 diff、测试结果和项目日志记录。"}
+{"id":"coding_002","task":"修复一个已有测试失败。","expected_behavior":"读取失败信息，定位相关文件，最小修改，重新运行测试。","needs_code_change":true,"acceptance":"测试通过或明确说明剩余失败原因。"}

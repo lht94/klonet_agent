@@ -1,0 +1,1 @@
+{"id":"error_001","error":"ModuleNotFoundError: No module named 'klonet_agent'","expected_behavior":"检查包名、运行目录和 PYTHONPATH，给出可复现修复建议。","acceptance":"包含迁移包名和运行方式检查。"}

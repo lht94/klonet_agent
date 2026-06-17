@@ -1,0 +1,11 @@
+# Core LLM client
+openai>=1.0.0
+
+# Local environment variables such as DEEPSEEK_API_KEY
+python-dotenv>=1.0.0
+
+# SKILL.md frontmatter parsing
+PyYAML>=6.0.0
+
+# Tests
+pytest>=8.0.0

@@ -1,0 +1,29 @@
+# macOS / editor
+.DS_Store
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment
+.env
+.venv/
+venv/
+
+# Runtime memory and generated state
+memory/history.jsonl
+memory/tokens.jsonl
+memory/20*.md
+memory/MEMORY.md
+memory/USER.md
+journals/
+workspaces/
+
+# Generated knowledge index
+knowledge/index.jsonl
+
+# Local Codex skill/plugin cache copied during experiments
+skills/.system/

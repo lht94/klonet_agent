@@ -1,0 +1,2 @@
+{"id":"mentor_001","question":"Klonet Agent 的项目日志应该记录什么？","expected_behavior":"先检索知识库，再解释项目目标、进度、问题、测试和验收差异。","needs_code_change":false,"acceptance":"回答包含项目日志用途和至少 3 个固定章节。"}
+{"id":"mentor_002","question":"同学遇到 Klonet 报错时 Mentor Agent 应该怎么做？","expected_behavior":"先判断报错类型，检索知识库和项目日志，说明证据不足时继续定位。","needs_code_change":false,"acceptance":"回答不直接猜测原因，包含排查步骤。"}
