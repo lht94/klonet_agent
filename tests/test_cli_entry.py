@@ -11,6 +11,18 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+class FakeStream:
+    """模拟 Windows GBK stdout/stderr。"""
+
+    encoding = "cp936"
+
+    def __init__(self):
+        self.config = {}
+
+    def reconfigure(self, **kwargs):
+        self.config.update(kwargs)
+
+
 def test_module_cli_can_run_from_project_root():
     """用户在仓库根目录下也应该可以用模块方式查看帮助。"""
 
@@ -43,3 +55,19 @@ def test_script_cli_can_run_from_project_root():
     assert "--mode" in result.stdout
     assert "--user-id" in result.stdout
     assert "--project-id" in result.stdout
+
+
+def test_cli_configures_utf8_output_streams():
+    """CLI 启动时应该把输出流配置成 UTF-8，避免 Windows GBK 崩溃。"""
+
+    from klonet_agent.app.cli import configure_console_encoding
+
+    stdout = FakeStream()
+    stderr = FakeStream()
+
+    configure_console_encoding(stdout=stdout, stderr=stderr)
+
+    assert stdout.config["encoding"] == "utf-8"
+    assert stdout.config["errors"] == "replace"
+    assert stderr.config["encoding"] == "utf-8"
+    assert stderr.config["errors"] == "replace"

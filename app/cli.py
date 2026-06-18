@@ -4,15 +4,28 @@
 CLI 只处理输入输出，不承载 agent 的核心业务逻辑。
 """
 
+import sys
+
 from klonet_agent.agents import get_profile
 from klonet_agent.config import DEFAULT_PROJECT_ID, DEFAULT_USER_ID
 from klonet_agent.orchestrator import AgentOrchestrator
 from klonet_agent.session import AgentSession
 
 
+def configure_console_encoding(stdout=None, stderr=None):
+    """把 CLI 输出配置为 UTF-8，避免 Windows GBK 遇到特殊字符崩溃。"""
+
+    stdout = stdout or sys.stdout
+    stderr = stderr or sys.stderr
+    for stream in (stdout, stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def run_chat(mode: str = "mentor", user_id: str = DEFAULT_USER_ID, project_id: str = DEFAULT_PROJECT_ID):
     """进入命令行对话流程，即旧版 main.py 中的外层 while 循环。"""
 
+    configure_console_encoding()
     print("正在启动 Klonet 专用教学协作 Agent...")
     profile = get_profile(mode)
     session = AgentSession(user_id=user_id, project_id=project_id, mode=profile.name)

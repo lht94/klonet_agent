@@ -82,6 +82,7 @@
      - `run_tests`
      - `show_diff`
    - 旧的 `run_command` 只保留兼容能力，并增加危险命令拦截
+   - `show_diff` 在无 Git 仓库时会降级返回文件摘要，在 Git 仓库中会显示未跟踪文件
 
 9. 新增评估集雏形
    - 新增 `evals/mentor_cases.jsonl`
@@ -97,7 +98,11 @@
     - trace 写入 `tracing/trace.jsonl`，作为后续评估和审计数据
     - 工具结果过长时会统一截断，保护上下文窗口
 
-11. 新增测试
+11. 增强本地 CLI 稳定性
+    - CLI 启动时把 stdout/stderr 配置为 UTF-8，避免 Windows GBK 输出特殊字符时崩溃
+    - 新增 `pytest.ini`，排除 `workspaces/`、`journals/`、`memory/` 等运行时目录，避免测试污染
+
+12. 新增测试
     - 新增 `tests/test_imports.py`
     - 新增 `tests/test_cli_entry.py`
     - 新增 `tests/test_prompt_style.py`
@@ -107,10 +112,11 @@
     - 新增 `tests/test_workspace_tools.py`
     - 新增 `tests/test_tracing.py`
     - 新增 `tests/test_eval_runner.py`
+    - 新增 `tests/test_pytest_config.py`
     - 当前验证结果：
       ```bash
       python -m pytest -q
-      # 27 passed
+      # 31 passed
       ```
 
 ### 现在的运行方式

@@ -165,6 +165,7 @@ workspace/git_ops.py
 - 拦截危险命令。
 - 限制测试命令白名单。
 - 查看 git diff。
+- `show_diff` 在无 Git 仓库时返回文件摘要，在 Git 仓库中补充未跟踪文件列表。
 
 ### 9. 结构化工具
 
@@ -223,6 +224,7 @@ tests/test_cli_entry.py
 tests/test_eval_runner.py
 tests/test_imports.py
 tests/test_prompt_style.py
+tests/test_pytest_config.py
 tests/test_session.py
 tests/test_tracing.py
 tests/test_journal.py
@@ -234,7 +236,7 @@ tests/test_workspace_tools.py
 
 ```bash
 python -m pytest -q
-# 27 passed
+# 31 passed
 ```
 
 ## 当前 .gitignore 策略
@@ -244,6 +246,9 @@ python -m pytest -q
 - `.env`
 - Python 缓存
 - `.pytest_cache`
+- `workspaces/`
+- `journals/`
+- `memory/`
 - `knowledge/index.jsonl`
 - `evals/summary.md`
 - `tracing/trace.jsonl`
@@ -259,6 +264,9 @@ python -m pytest -q
 
 - 这些是运行时状态、隐私文件、缓存或生成产物。
 - 不应该进入版本管理。
+
+同时新增 `pytest.ini`，让根目录测试跳过 `workspaces/`、`journals/`、`memory/`
+等运行时目录，避免真实使用生成的测试污染项目自身测试结果。
 
 ## 当前还没做的事情
 

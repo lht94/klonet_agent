@@ -47,3 +47,46 @@ def test_workspace_blocks_escape():
             assert "workspace" in str(exc)
         else:
             raise AssertionError("应该拒绝读取 workspace 外部路径")
+
+
+def test_show_diff_reports_files_when_workspace_has_no_git():
+    """无 Git 仓库时，show_diff 应该降级返回文件变更摘要。"""
+
+    from klonet_agent.workspace.git_ops import show_diff
+
+    with local_temp_dir() as temp_dir:
+        workspace = temp_dir / "workspace"
+        workspace.mkdir()
+        (workspace / "demo.py").write_text("print('hello')\n", encoding="utf-8")
+
+        result = show_diff(workspace)
+
+    assert "当前 workspace 不是 Git 仓库" in result
+    assert "demo.py" in result
+
+
+def test_show_diff_reports_untracked_files_in_git_workspace():
+    """Git 仓库中新增但未暂存的文件，也应该在 show_diff 中可见。"""
+
+    import subprocess
+
+    from klonet_agent.workspace.git_ops import show_diff
+
+    with local_temp_dir() as temp_dir:
+        workspace = temp_dir / "workspace"
+        workspace.mkdir()
+        subprocess.run(
+            ["git", "init"],
+            cwd=workspace,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        (workspace / "new_file.py").write_text("print('new')\n", encoding="utf-8")
+
+        result = show_diff(workspace)
+
+    assert "未跟踪文件" in result
+    assert "new_file.py" in result
