@@ -132,6 +132,19 @@ python -m klonet_agent.agent --mode coding --user-id default --project-id demo
 python agent.py --help
 ```
 
+PowerShell 使用管道传入多行中文时，需要同时统一 PowerShell 和 Python 的编码：
+
+```powershell
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+@'
+不需要 Klonet，只做 Docker Compose 实验。
+这里可以继续输入多行需求。
+'@ | python -X utf8 -m klonet_agent.agent --mode mentor
+```
+
+CLI 会把非交互 stdin 的全部内容作为一个用户回合，并使用 UTF-8 严格解码。
+如果生产端已经把中文替换成 `?`，程序会得到损坏文本，无法在接收后恢复。
+
 ### 这一版还没有做的事情
 - Klonet 真正源码仓库还没有接入 workspace
 - RAG 目前只是本地关键词检索，还不是向量数据库

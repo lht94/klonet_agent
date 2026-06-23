@@ -285,6 +285,13 @@ python -m klonet_agent.evals.retrieval_runner
 - 预算在 Orchestrator 中执行，因此同一模型响应中的并行工具调用也不能绕过限制。
 - 本轮 scope 约束使用临时 system 消息注入，回答结束后移除，不污染下一轮历史。
 
+### 11.4 CLI UTF-8 输入边界
+
+- 交互式终端继续使用系统控制台输入编码。
+- 非交互 stdin 统一使用 UTF-8 严格解码，编码错误不再静默替换。
+- 管道中的多行文本一次读取为一个用户回合，避免否定条件与需求列表被拆开。
+- PowerShell 管道需要设置 `$OutputEncoding`，Python 建议使用 `-X utf8`。
+
 ### 12. Tests
 
 新增：
@@ -310,7 +317,7 @@ tests/test_retrieval_eval.py
 
 ```bash
 python -m pytest -q
-# 58 passed
+# 61 passed
 ```
 
 ## 当前 .gitignore 策略
