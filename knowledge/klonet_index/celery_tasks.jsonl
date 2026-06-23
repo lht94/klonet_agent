@@ -1,0 +1,10 @@
+{"domain": "monitor", "line": 32, "path": "vemu_uestc/Service_layer/ExprMonitor.py", "summary": "", "symbol": "save_raw_data_to_db", "task_name": "save_raw_data_to_db", "track_started": true}
+{"domain": "monitor", "line": 39, "path": "vemu_uestc/Service_layer/ExprMonitor.py", "summary": "", "symbol": "raw_data_calculate", "task_name": "raw_data_calculate", "track_started": true}
+{"domain": "satellite", "line": 46, "path": "vemu_uestc/satellite/master_evt_generate.py", "summary": "master 主进程创建的进程，进行星座事件产生与发布", "symbol": "sat_evt_generate", "task_name": "sat_evt_generate", "track_started": true}
+{"domain": "satellite", "line": 510, "path": "vemu_uestc/satellite/worker_eventset.py", "summary": "注册上述函数为异步函数，可异步执行", "symbol": "celery_asy_func", "task_name": "celery_asy_func", "track_started": true}
+{"domain": "monitor", "line": 36, "path": "vemu_uestc/webserver/tasks/monitor/tasks.py", "summary": "", "symbol": "raw_data_calc", "task_name": "raw_data_calc", "track_started": true}
+{"domain": "monitor", "line": 42, "path": "vemu_uestc/webserver/tasks/monitor/tasks.py", "summary": "", "symbol": "save_raw_data_to_db", "task_name": "save_raw_data_to_db", "track_started": true}
+{"domain": "satellite", "line": 13, "path": "vemu_uestc/webserver/tasks/satellite/tasks.py", "summary": "通过用户 + 拓扑定位到星座，对星座实时更新的死循环", "symbol": "master_sat_calculate", "task_name": "master_sat_calculate", "track_started": false}
+{"domain": "topology", "line": 94, "path": "vemu_uestc/webserver/tasks/topo/tasks.py", "summary": "拓扑创建函数", "symbol": "master_deploy_topo", "task_name": "master_deploy_topo", "track_started": true}
+{"domain": "topology", "line": 373, "path": "vemu_uestc/webserver/tasks/topo/tasks.py", "summary": "拓扑删除函数", "symbol": "master_delete_topo", "task_name": "master_delete_topo", "track_started": true}
+{"domain": "topology", "line": 514, "path": "vemu_uestc/webserver/tasks/topo/tasks.py", "summary": "删除redis中进度条表", "symbol": "master_delete_process_table", "task_name": "master_delete_process_table", "track_started": true}

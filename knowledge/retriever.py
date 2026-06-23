@@ -41,12 +41,13 @@ class KnowledgeRetriever:
         for row in self._iter_rows():
             content = row.get("content", "")
             path = row.get("path", "")
-            score = _score(terms, content, path)
+            source = row.get("source", "local")
+            score = _score(terms, content, path, query=query, source=source)
             if score <= 0:
                 continue
             results.append(
                 RetrievedChunk(
-                    source=row.get("source", "local"),
+                    source=source,
                     path=path,
                     title=row.get("title", path),
                     snippet=_make_snippet(content, terms),
@@ -75,7 +76,14 @@ def _tokenize(text: str) -> list[str]:
     return list(dict.fromkeys(words))
 
 
-def _score(terms: list[str], content: str, path: str) -> float:
+def _score(
+    terms: list[str],
+    content: str,
+    path: str,
+    *,
+    query: str = "",
+    source: str = "local",
+) -> float:
     """简单关键词打分，路径命中权重更高。"""
 
     haystack = content.lower()
@@ -85,6 +93,13 @@ def _score(terms: list[str], content: str, path: str) -> float:
         score += haystack.count(term)
         if term in path_text:
             score += 3
+
+    if source == "machine_index":
+        routes = re.findall(
+            r"/[a-zA-Z0-9_<>.-]+(?:/[a-zA-Z0-9_<>.-]+)+/?",
+            query,
+        )
+        score += 20 * sum(route.lower() in haystack for route in routes)
     return score
 
 

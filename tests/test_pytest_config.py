@@ -16,3 +16,4 @@ def test_pytest_ignores_runtime_directories():
     assert "workspaces" in text
     assert "journals" in text
     assert "memory" in text
+    assert "klonet_knowledge" in text

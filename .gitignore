@@ -28,5 +28,11 @@ workspaces/
 knowledge/index.jsonl
 evals/summary.md
 
+# Local raw Klonet materials
+klonet_knowledge/
+knowledge/extracted_docs/
+knowledge/extracted_images/
+knowledge/staging/
+
 # Local Codex skill/plugin cache copied during experiments
 skills/.system/

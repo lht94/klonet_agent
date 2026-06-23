@@ -13,9 +13,10 @@ from pathlib import Path
 from klonet_agent.config import JOURNAL_DIR, KNOWLEDGE_INDEX_FILE, PROJECT_ROOT
 
 
-TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".yaml", ".yml", ".toml"}
+TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".jsonl", ".yaml", ".yml", ".toml"}
 SKIP_PARTS = {"__pycache__", ".git", ".DS_Store"}
 RUNTIME_MEMORY_FILES = {"MEMORY.md", "USER.md", "history.jsonl", "tokens.jsonl"}
+SKIP_KNOWLEDGE_DIRS = {"extracted_docs", "extracted_images", "staging"}
 
 
 @dataclass
@@ -61,24 +62,36 @@ class KnowledgeIndexer:
             self.root / "doc",
             JOURNAL_DIR,
         ]
-        style = self.root / "knowledge" / "style_guide.md"
-        if style.exists():
-            roots.append(style)
-
-        for root in roots:
-            if not root.exists():
+        seen: set[Path] = set()
+        knowledge_root = self.root / "knowledge"
+        for source_root in roots:
+            if not source_root.exists():
                 continue
-            if root.is_file():
-                if root.suffix in TEXT_SUFFIXES:
-                    yield root
-                continue
-            for path in root.rglob("*"):
+            candidates = [source_root] if source_root.is_file() else source_root.rglob("*")
+            for path in candidates:
+                if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
+                    continue
                 if any(part in SKIP_PARTS for part in path.parts):
                     continue
                 if _is_runtime_memory_file(path, self.root):
                     continue
-                if path.is_file() and path.suffix in TEXT_SUFFIXES:
-                    yield path
+                if path.resolve() == self.index_file.resolve():
+                    continue
+                if path.is_relative_to(knowledge_root):
+                    rel_knowledge = path.relative_to(knowledge_root)
+                    if rel_knowledge.parts and rel_knowledge.parts[0] in SKIP_KNOWLEDGE_DIRS:
+                        continue
+                    if path.suffix == ".jsonl" and (
+                        not rel_knowledge.parts or rel_knowledge.parts[0] != "klonet_index"
+                    ):
+                        continue
+                elif path.suffix == ".jsonl":
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                yield path
 
     def _chunk_file(self, path: Path) -> list[KnowledgeChunk]:
         """按固定长度切分文件。"""
@@ -90,19 +103,60 @@ class KnowledgeIndexer:
         rel = path.relative_to(self.root) if path.is_relative_to(self.root) else path
         # 索引里统一使用 /，避免 Windows 反斜杠影响检索结果展示和测试。
         rel_text = rel.as_posix() if isinstance(rel, Path) else str(rel)
-        title = rel_text
+        source = _knowledge_source(rel_text)
+        if path.suffix == ".jsonl":
+            return _chunk_jsonl(text, rel_text, source)
         chunks = []
         for index, content in enumerate(_split_text(text), start=1):
             chunks.append(
                 KnowledgeChunk(
-                    source="local",
+                    source=source,
                     path=rel_text,
-                    title=f"{title}#{index}",
+                    title=f"{rel_text}#{index}",
                     content=content,
                 )
             )
         return chunks
 
+
+def _knowledge_source(path: str) -> str:
+    """按知识资产层标记检索来源。"""
+
+    if path.startswith("knowledge/klonet/"):
+        return "curated"
+    if path.startswith("knowledge/klonet_experience/"):
+        return "experience"
+    if path.startswith("knowledge/klonet_index/"):
+        return "machine_index"
+    return "local"
+
+
+def _chunk_jsonl(text: str, path: str, source: str) -> list[KnowledgeChunk]:
+    """机器索引按 JSONL 记录切分，避免跨记录窗口污染。"""
+
+    chunks = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        identifier = (
+            row.get("route")
+            or row.get("symbol")
+            or row.get("domain")
+            or row.get("name")
+            or row.get("path")
+            or str(index)
+        )
+        chunks.append(
+            KnowledgeChunk(
+                source=source,
+                path=path,
+                title=f"{path}#{identifier}",
+                content=json.dumps(row, ensure_ascii=False, sort_keys=True),
+            )
+        )
+    return chunks
 
 def _is_runtime_memory_file(path: Path, root: Path) -> bool:
     """判断是否为运行时记忆文件。
