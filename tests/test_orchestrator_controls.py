@@ -78,3 +78,21 @@ def test_coding_todo_auto_continue_has_limit():
 
     assert len(llm.calls) == 2
     assert session.todos[0]["status"] == "waiting_user"
+
+def test_soft_general_query_keeps_search_tool_visible():
+    """非明确否定的通用分类只能软路由，不能控制工具硬权限。"""
+
+    with local_temp_dir() as temp_dir:
+        orchestrator, _, llm = _orchestrator(temp_dir)
+        history = orchestrator.init_history()
+        orchestrator.single_chat(
+            "如何配置 Docker Compose 自定义网络",
+            history,
+            0,
+        )
+
+    visible_names = {
+        tool["function"]["name"]
+        for tool in llm.calls[0]["tools"]
+    }
+    assert "search_knowledge" in visible_names

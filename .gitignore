@@ -29,6 +29,7 @@ workspaces/
 # Generated knowledge index
 knowledge/index.jsonl
 evals/summary.md
+evals/retrieval_summary.md
 
 # Local raw Klonet materials
 klonet_knowledge/

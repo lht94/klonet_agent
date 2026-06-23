@@ -1,128 +1,346 @@
-"""知识检索流程。"""
+"""BM25、精确匹配和 metadata 分层检索。"""
 
 from __future__ import annotations
 
 import json
 import math
 import re
-from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from rank_bm25 import BM25Okapi
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K, KNOWLEDGE_INDEX_FILE
 from klonet_agent.knowledge.indexer import KnowledgeIndexer
+from klonet_agent.knowledge.models import (
+    RetrievedChunk,
+    SearchOutcome,
+    SearchRequest,
+)
+from klonet_agent.knowledge.tokenizer import DEFAULT_TOKENIZER, MixedTokenizer
 
 
-@dataclass
-class RetrievedChunk:
-    """检索返回的一条证据。"""
-
-    source: str
-    path: str
-    title: str
-    snippet: str
-    score: float
+_TASK_LAYER_WEIGHTS = {
+    "concept": {
+        "curated": 1.5,
+        "experience": 1.1,
+        "machine_index": 0.8,
+        "local": 1.0,
+    },
+    "troubleshooting": {
+        "experience": 1.8,
+        "curated": 1.1,
+        "machine_index": 1.0,
+        "local": 0.9,
+    },
+    "code_lookup": {
+        "machine_index": 2.0,
+        "curated": 1.0,
+        "experience": 0.8,
+        "local": 0.8,
+    },
+    "development": {
+        "machine_index": 1.4,
+        "curated": 1.3,
+        "experience": 1.0,
+        "local": 0.9,
+    },
+    "project_progress": {
+        "local": 1.5,
+        "experience": 1.0,
+        "curated": 1.0,
+        "machine_index": 0.7,
+    },
+    "general": {
+        "curated": 1.0,
+        "experience": 1.0,
+        "machine_index": 1.0,
+        "local": 1.0,
+    },
+}
+_PRIORITY_WEIGHTS = {"P0": 1.25, "P1": 1.1, "P2": 1.0, "P3": 0.85}
+_PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+_QUALITY_WEIGHTS = {
+    "verified": 1.2,
+    "reviewed": 1.1,
+    "generated": 0.95,
+    "unknown": 0.9,
+}
+_DOMAIN_ALIASES = {
+    "runtime": {"runtime", "operations", "deployment", "dependencies", "environment"},
+}
+_ROUTE_RE = re.compile(r"/[A-Za-z0-9_<>.-]+(?:/[A-Za-z0-9_<>.-]+)+/?")
+_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:API|Manager|Worker|Config)\b")
 
 
 class KnowledgeRetriever:
-    """第一版关键词检索器。"""
+    """缓存 JSONL 索引，并执行结构化 BM25 检索。"""
 
-    def __init__(self, index_file: Path = KNOWLEDGE_INDEX_FILE):
+    def __init__(
+        self,
+        index_file: Path = KNOWLEDGE_INDEX_FILE,
+        tokenizer: MixedTokenizer | None = None,
+    ):
         self.index_file = index_file
+        self.tokenizer = tokenizer or DEFAULT_TOKENIZER
+        self._mtime_ns: int | None = None
+        self._rows: list[dict[str, Any]] = []
+        self._corpus_tokens: list[list[str]] = []
+        self._bm25: BM25Okapi | None = None
 
-    def search(self, query: str, top_k: int = DEFAULT_RAG_TOP_K) -> list[RetrievedChunk]:
-        """检索相关知识片段。"""
+    def search(
+        self,
+        query: str,
+        top_k: int = DEFAULT_RAG_TOP_K,
+        *,
+        task_type: str = "auto",
+        layers: tuple[str, ...] | None = None,
+        domains: tuple[str, ...] | None = None,
+    ) -> list[RetrievedChunk]:
+        """兼容旧调用，返回检索结果列表。"""
+
+        return self.search_request(
+            SearchRequest(
+                query=query,
+                task_type=task_type,
+                layers=layers,
+                domains=domains,
+                top_k=top_k,
+            )
+        ).results
+
+    def search_request(self, request: SearchRequest) -> SearchOutcome:
+        """执行 BM25 召回、精确加权、metadata 过滤和置信度判断。"""
+
+        self._ensure_loaded()
+        query_tokens = self.tokenizer.tokenize(request.query)
+        if not query_tokens or not self._rows or self._bm25 is None:
+            return SearchOutcome(status="none", reason="empty_query_or_index")
+
+        task_type = "concept" if request.task_type == "auto" else request.task_type
+        bm25_scores = self._bm25.get_scores(query_tokens)
+        candidates: list[RetrievedChunk] = []
+
+        for index, row in enumerate(self._rows):
+            metadata = _row_metadata(row)
+            if not _allowed_by_request(metadata, request):
+                continue
+
+            document_tokens = set(self._corpus_tokens[index])
+            matched_terms = tuple(
+                token for token in query_tokens if token in document_tokens
+            )
+            exact_score = _exact_score(request.query, query_tokens, row)
+            bm25_score = max(0.0, float(bm25_scores[index]))
+            if not _has_enough_evidence(query_tokens, matched_terms, exact_score, bm25_score):
+                continue
+
+            metadata_score = _metadata_weight(metadata, task_type)
+            lexical_score = min(len(matched_terms), 8) * 1.5
+            final_score = (bm25_score + exact_score + lexical_score) * metadata_score
+            if final_score < 2.0:
+                continue
+
+            candidates.append(
+                RetrievedChunk(
+                    chunk_id=str(row.get("chunk_id") or f"legacy-{index}"),
+                    layer=metadata["layer"],
+                    source=str(row.get("source") or metadata["layer"]),
+                    path=str(row.get("path") or ""),
+                    title=str(row.get("title") or row.get("path") or ""),
+                    snippet=_make_snippet(str(row.get("content") or ""), query_tokens),
+                    domain=metadata["domain"],
+                    priority=metadata["priority"],
+                    status=metadata["status"],
+                    quality=metadata["quality"],
+                    sensitivity=metadata["sensitivity"],
+                    last_verified=metadata["last_verified"],
+                    score=round(final_score, 4),
+                    bm25_score=round(bm25_score, 4),
+                    exact_score=round(exact_score, 4),
+                    metadata_score=round(metadata_score, 4),
+                    matched_terms=matched_terms,
+                )
+            )
+
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        selected = candidates[: max(1, request.top_k)]
+        return _classify_outcome(selected)
+
+    def _ensure_loaded(self):
+        """索引文件变化时重建内存 BM25，未变化时复用缓存。"""
 
         if not self.index_file.exists():
             KnowledgeIndexer(index_file=self.index_file).build()
-        terms = _tokenize(query)
-        if not terms:
-            return []
+        if not self.index_file.exists():
+            return
 
-        results = []
-        for row in self._iter_rows():
-            content = row.get("content", "")
-            path = row.get("path", "")
-            source = row.get("source", "local")
-            score = _score(terms, content, path, query=query, source=source)
-            matched_terms = _matched_term_count(terms, content, path)
-            required_matches = min(3, max(1, math.ceil(len(terms) * 0.25)))
-            if score < 2 or matched_terms < required_matches:
-                continue
-            results.append(
-                RetrievedChunk(
-                    source=source,
-                    path=path,
-                    title=row.get("title", path),
-                    snippet=_make_snippet(content, terms),
-                    score=score,
-                )
-            )
-        results.sort(key=lambda item: item.score, reverse=True)
-        return results[:top_k]
+        mtime_ns = self.index_file.stat().st_mtime_ns
+        if self._mtime_ns == mtime_ns:
+            return
 
-    def _iter_rows(self):
-        """逐行读取 JSONL 索引。"""
-
-        with self.index_file.open("r", encoding="utf-8") as f:
-            for line in f:
+        rows = []
+        with self.index_file.open("r", encoding="utf-8") as file:
+            for line in file:
                 try:
-                    yield json.loads(line)
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(row, dict):
+                    rows.append(row)
+
+        corpus = []
+        for row in rows:
+            title_tokens = self.tokenizer.tokenize(str(row.get("title") or ""))
+            path_tokens = self.tokenizer.tokenize(str(row.get("path") or ""))
+            content_tokens = self.tokenizer.tokenize(str(row.get("content") or ""))
+            corpus.append(title_tokens * 2 + path_tokens * 2 + content_tokens)
+
+        self._rows = rows
+        self._corpus_tokens = corpus
+        self._bm25 = BM25Okapi(corpus) if corpus else None
+        self._mtime_ns = mtime_ns
 
 
-def _tokenize(text: str) -> list[str]:
-    """中英文混合的轻量分词。"""
+def _row_metadata(row: dict[str, Any]) -> dict[str, str]:
+    """兼容旧索引行，为缺失 metadata 提供稳定默认值。"""
 
-    lowered = text.lower()
-    words = re.findall(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]{2,}", lowered)
-    return list(dict.fromkeys(words))
+    layer = str(row.get("layer") or row.get("source") or "local")
+    return {
+        "layer": layer,
+        "domain": str(row.get("domain") or "general"),
+        "priority": str(row.get("priority") or "P2").upper(),
+        "status": str(row.get("status") or "current").lower(),
+        "quality": str(row.get("quality") or "unknown").lower(),
+        "sensitivity": str(row.get("sensitivity") or "public").lower(),
+        "last_verified": str(row.get("last_verified") or ""),
+    }
 
 
-def _score(
-    terms: list[str],
-    content: str,
-    path: str,
-    *,
-    query: str = "",
-    source: str = "local",
-) -> float:
-    """简单关键词打分，路径命中权重更高。"""
+def _allowed_by_request(metadata: dict[str, str], request: SearchRequest) -> bool:
+    """执行 layer、domain、priority、状态和敏感度过滤。"""
 
-    haystack = content.lower()
-    path_text = path.lower()
+    if metadata["status"] == "deprecated":
+        return False
+    if metadata["sensitivity"] in request.exclude_sensitivity:
+        return False
+    if request.layers and metadata["layer"] not in request.layers:
+        return False
+    if request.domains and not _domains_match(metadata["domain"], request.domains):
+        return False
+    if request.min_priority:
+        row_rank = _PRIORITY_RANK.get(metadata["priority"], 99)
+        limit_rank = _PRIORITY_RANK.get(request.min_priority.upper(), 99)
+        if row_rank > limit_rank:
+            return False
+    return True
+
+
+def _domains_match(row_domain: str, request_domains: tuple[str, ...]) -> bool:
+    """兼容路由领域名与知识 frontmatter 领域名。"""
+
+    for request_domain in request_domains:
+        aliases = _DOMAIN_ALIASES.get(request_domain, {request_domain})
+        if row_domain in aliases:
+            return True
+    return False
+
+
+def _metadata_weight(metadata: dict[str, str], task_type: str) -> float:
+    """按任务类型、优先级和质量计算可解释权重。"""
+
+    layer_weights = _TASK_LAYER_WEIGHTS.get(
+        task_type,
+        _TASK_LAYER_WEIGHTS["concept"],
+    )
+    return (
+        layer_weights.get(metadata["layer"], 1.0)
+        * _PRIORITY_WEIGHTS.get(metadata["priority"], 0.9)
+        * _QUALITY_WEIGHTS.get(metadata["quality"], 0.9)
+    )
+
+
+def _exact_score(query: str, query_tokens: list[str], row: dict[str, Any]) -> float:
+    """API 路由、源码标识符、标题和路径精确命中优先。"""
+
+    content = str(row.get("content") or "").lower()
+    title = str(row.get("title") or "").lower()
+    path = str(row.get("path") or "").lower()
+    layer = str(row.get("layer") or row.get("source") or "local")
     score = 0.0
-    for term in terms:
-        score += haystack.count(term)
-        if term in path_text:
+
+    routes = [match.group(0).lower() for match in _ROUTE_RE.finditer(query)]
+    for route in routes:
+        if route in content or route in title:
+            score += 120 if layer == "machine_index" else 30
+
+    identifiers = [match.group(0).lower() for match in _IDENTIFIER_RE.finditer(query)]
+    for identifier in identifiers:
+        if identifier in content or identifier in title or identifier in path:
+            score += 50 if layer == "machine_index" else 20
+
+    for token in query_tokens:
+        if len(token) < 2:
+            continue
+        if token == title:
+            score += 12
+        elif token in title:
+            score += 4
+        if token in path:
             score += 3
-
-    normalized_query = query.strip().lower()
-    if normalized_query and (
-        normalized_query in haystack or normalized_query in path_text
-    ):
-        score += 5
-
-    if source == "machine_index":
-        routes = [
-            token.strip("，。；;")
-            for token in query.split()
-            if token.startswith("/") and token.count("/") >= 2
-        ]
-        score += 100 * sum(route.lower() in haystack for route in routes)
     return score
 
 
-def _matched_term_count(terms: list[str], content: str, path: str) -> int:
-    """统计实际命中的查询词数量，用于过滤偶然命中。"""
+def _has_enough_evidence(
+    query_tokens: list[str],
+    matched_terms: tuple[str, ...],
+    exact_score: float,
+    bm25_score: float,
+) -> bool:
+    """过滤只碰巧命中一个通用词的结果。"""
 
-    haystack = content.lower()
-    path_text = path.lower()
-    return sum(term in haystack or term in path_text for term in terms)
+    if exact_score >= 20:
+        return True
+    required = 1 if len(query_tokens) == 1 else min(
+        3,
+        max(2, math.ceil(len(query_tokens) * 0.2)),
+    )
+    return len(matched_terms) >= required and (
+        bm25_score > 0 or len(matched_terms) >= 2
+    )
+
+
+def _classify_outcome(results: list[RetrievedChunk]) -> SearchOutcome:
+    """根据最高分、精确命中和分差判断整体可靠性。"""
+
+    if not results:
+        return SearchOutcome(status="none", reason="no_relevant_evidence")
+
+    top = results[0]
+    second_score = results[1].score if len(results) > 1 else 0.0
+    margin = top.score - second_score
+    reliable = (
+        top.exact_score >= 20
+        or (
+            len(top.matched_terms) >= 2
+            and top.score >= 6
+            and (margin >= 0.5 or top.bm25_score >= 1.0)
+        )
+    )
+    status = "reliable" if reliable else "weak"
+    confidence = min(1.0, top.score / 20)
+    for result in results:
+        result.relevance = status if result is top else "candidate"
+    return SearchOutcome(
+        status=status,
+        results=results,
+        confidence=round(confidence, 4),
+        reason="high_confidence_match" if reliable else "weak_match",
+    )
 
 
 def _make_snippet(content: str, terms: list[str], width: int = 500) -> str:
-    """围绕第一个命中词生成摘要。"""
+    """围绕最早命中词生成摘要。"""
 
     lowered = content.lower()
     positions = [lowered.find(term) for term in terms if lowered.find(term) >= 0]
@@ -130,4 +348,9 @@ def _make_snippet(content: str, terms: list[str], width: int = 500) -> str:
         return content[:width]
     center = min(positions)
     start = max(center - width // 3, 0)
-    return content[start : start + width].strip()
+    return content[start:start + width].strip()
+
+
+# 保留旧模块级函数，避免已有教学代码导入失败。
+def _tokenize(text: str) -> list[str]:
+    return DEFAULT_TOKENIZER.tokenize(text)

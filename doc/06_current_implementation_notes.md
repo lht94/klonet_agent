@@ -238,6 +238,42 @@ tracing/logger.py
 - Prompt 要求保留否定条件，不能把通用问题强行拉回 Klonet。
 
 
+### 11.2 BM25 分层检索架构
+
+当前新增：
+
+- 使用 `jieba` 做中文领域分词，保留 API 路由、类名、函数名和文件路径等结构化 token。
+- 使用 `rank-bm25` 替换简单词频统计，索引未变化时复用内存 BM25。
+- `KnowledgeChunk` 增加 `chunk_id/layer/domain/priority/status/quality/sensitivity/last_verified`。
+- Markdown 优先按标题切分，超长章节再使用重叠窗口。
+- 兼容现有知识文档的复数 `domains` 以及 `current_verified`、`diagnostic_playbook` 状态，并统一转换为检索 metadata。
+- 对路由领域名和知识 frontmatter 领域名做显式别名匹配，例如 `runtime` 可匹配 `operations/deployment/environment`。
+- 公共索引在构建阶段排除 `review_required/restricted` 内容。
+- Query Router 返回 `scope/confidence/task_type/domains/reasons/hard_disable_rag`。
+- 只有明确排除 Klonet 时才硬隐藏 RAG；普通 general 分类只做软路由。
+- 概念、故障排查、源码定位、开发和项目进度使用不同知识层权重。
+- 检索输出分为 `reliable/weak/none`，无可靠证据时允许拒答。
+- `search_knowledge` 兼容原有参数，并新增 `task_type/layers/domains/min_priority`。
+
+检索评估：
+
+```text
+cases: 11
+scope_accuracy: 1.0
+task_type_accuracy: 1.0
+recall_at_3: 1.0
+recall_at_10: 1.0
+mrr: 1.0
+abstention_accuracy: 1.0
+general_rag_false_positive_rate: 0.0
+```
+
+评估入口：
+
+```bash
+python -m klonet_agent.evals.retrieval_runner
+```
+
 ### 12. Tests
 
 新增：
@@ -255,13 +291,15 @@ tests/test_knowledge.py
 tests/test_workspace_tools.py
 tests/test_knowledge_pipeline.py
 tests/test_orchestrator_controls.py
+tests/test_retrieval_architecture.py
+tests/test_retrieval_eval.py
 ```
 
 当前测试结果：
 
 ```bash
 python -m pytest -q
-# 42 passed
+# 54 passed
 ```
 
 ## 当前 .gitignore 策略
@@ -276,6 +314,7 @@ python -m pytest -q
 - `memory/`
 - `knowledge/index.jsonl`
 - `evals/summary.md`
+- `evals/retrieval_summary.md`
 - `tracing/trace.jsonl`
 - `memory/sessions/`
 - `memory/users/`

@@ -18,7 +18,7 @@ from klonet_agent.config import (
     MEMORY_DIR,
     TRACE_FILE,
 )
-from klonet_agent.knowledge import SKILL_LOADER, classify_query_scope
+from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
 from klonet_agent.prompts import build_system_prompts
@@ -52,7 +52,7 @@ class AgentOrchestrator:
             self.session.user_id,
             self.session.project_id,
         )
-        self._query_scope = "klonet"
+        self._query_route = route_query("Klonet")
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
@@ -209,7 +209,7 @@ class AgentOrchestrator:
         reply = ""
         tool_rounds = 0
         todo_continuations = 0
-        self._query_scope = classify_query_scope(user_input)
+        self._query_route = route_query(user_input)
 
         # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
         while tool_rounds < MAX_TOOL_ROUNDS:
@@ -335,7 +335,7 @@ class AgentOrchestrator:
             for tool in TOOLS
             if tool["function"]["name"] in self.profile.allowed_tools
         ]
-        if self._query_scope == "general":
+        if self._query_route.hard_disable_rag:
             tools = [
                 tool
                 for tool in tools

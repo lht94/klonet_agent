@@ -1,16 +1,17 @@
-"""知识索引构建流程。
-
-第一版先使用 JSONL 本地索引，不引入向量数据库。这样实现简单，也方便后续做对比实验：
-无 RAG、关键词 RAG、向量 RAG 可以逐步替换。
-"""
+"""知识资产扫描、metadata 归一化和 JSONL 索引构建。"""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
-from klonet_agent.config import JOURNAL_DIR, KNOWLEDGE_INDEX_FILE, PROJECT_ROOT
+import yaml
+
+from klonet_agent.config import KNOWLEDGE_INDEX_FILE, PROJECT_ROOT
 
 
 TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".jsonl", ".yaml", ".yml", ".toml"}
@@ -18,34 +19,77 @@ SKIP_PARTS = {"__pycache__", ".git", ".DS_Store"}
 RUNTIME_MEMORY_FILES = {"MEMORY.md", "USER.md", "history.jsonl", "tokens.jsonl"}
 SKIP_KNOWLEDGE_DIRS = {"extracted_docs", "extracted_images", "staging"}
 
+_LAYER_DEFAULTS = {
+    "curated": {
+        "priority": "P1",
+        "status": "current",
+        "quality": "reviewed",
+        "sensitivity": "public",
+    },
+    "experience": {
+        "priority": "P1",
+        "status": "current",
+        "quality": "reviewed",
+        "sensitivity": "public",
+    },
+    "machine_index": {
+        "priority": "P1",
+        "status": "current",
+        "quality": "generated",
+        "sensitivity": "public",
+    },
+    "local": {
+        "priority": "P2",
+        "status": "current",
+        "quality": "unknown",
+        "sensitivity": "public",
+    },
+}
+
 
 @dataclass
 class KnowledgeChunk:
-    """一段可检索的知识片段。"""
+    """一段带来源和质量信息的可检索知识。"""
 
+    chunk_id: str
+    layer: str
     source: str
     path: str
     title: str
     content: str
+    domain: str = "general"
+    priority: str = "P2"
+    status: str = "current"
+    quality: str = "unknown"
+    sensitivity: str = "public"
+    last_verified: str = ""
 
 
 class KnowledgeIndexer:
-    """扫描项目资料并构建简单 JSONL 索引。"""
+    """扫描正式知识资产并构建本地 JSONL 索引。"""
 
-    def __init__(self, root: Path = PROJECT_ROOT, index_file: Path = KNOWLEDGE_INDEX_FILE):
+    def __init__(
+        self,
+        root: Path = PROJECT_ROOT,
+        index_file: Path = KNOWLEDGE_INDEX_FILE,
+    ):
         self.root = root
         self.index_file = index_file
 
     def build(self) -> int:
-        """重建索引，返回写入的 chunk 数量。"""
+        """重建索引，敏感 chunk 不进入公共索引。"""
 
         chunks: list[KnowledgeChunk] = []
         for path in self._iter_source_files():
-            chunks.extend(self._chunk_file(path))
+            chunks.extend(
+                chunk
+                for chunk in self._chunk_file(path)
+                if chunk.sensitivity == "public"
+            )
         self.index_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.index_file.open("w", encoding="utf-8") as f:
+        with self.index_file.open("w", encoding="utf-8") as file:
             for chunk in chunks:
-                f.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
+                file.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
         return len(chunks)
 
     def _iter_source_files(self):
@@ -60,7 +104,7 @@ class KnowledgeIndexer:
             self.root / "tools",
             self.root / "memory",
             self.root / "doc",
-            JOURNAL_DIR,
+            self.root / "journals",
         ]
         seen: set[Path] = set()
         knowledge_root = self.root / "knowledge"
@@ -69,7 +113,7 @@ class KnowledgeIndexer:
                 continue
             candidates = [source_root] if source_root.is_file() else source_root.rglob("*")
             for path in candidates:
-                if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
+                if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
                     continue
                 if any(part in SKIP_PARTS for part in path.parts):
                     continue
@@ -78,11 +122,11 @@ class KnowledgeIndexer:
                 if path.resolve() == self.index_file.resolve():
                     continue
                 if path.is_relative_to(knowledge_root):
-                    rel_knowledge = path.relative_to(knowledge_root)
-                    if rel_knowledge.parts and rel_knowledge.parts[0] in SKIP_KNOWLEDGE_DIRS:
+                    relative = path.relative_to(knowledge_root)
+                    if relative.parts and relative.parts[0] in SKIP_KNOWLEDGE_DIRS:
                         continue
                     if path.suffix == ".jsonl" and (
-                        not rel_knowledge.parts or rel_knowledge.parts[0] != "klonet_index"
+                        not relative.parts or relative.parts[0] != "klonet_index"
                     ):
                         continue
                 elif path.suffix == ".jsonl":
@@ -94,91 +138,130 @@ class KnowledgeIndexer:
                 yield path
 
     def _chunk_file(self, path: Path) -> list[KnowledgeChunk]:
-        """按固定长度切分文件。"""
+        """根据文件类型生成带 metadata 的 chunk。"""
 
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             text = path.read_text(encoding="utf-8", errors="ignore")
-        rel = path.relative_to(self.root) if path.is_relative_to(self.root) else path
-        # 索引里统一使用 /，避免 Windows 反斜杠影响检索结果展示和测试。
-        rel_text = rel.as_posix() if isinstance(rel, Path) else str(rel)
-        source = _knowledge_source(rel_text)
-        if path.suffix == ".jsonl":
-            return _chunk_jsonl(text, rel_text, source)
+
+        relative = path.relative_to(self.root) if path.is_relative_to(self.root) else path
+        relative_text = relative.as_posix()
+        layer = _knowledge_layer(relative_text)
+        defaults = dict(_LAYER_DEFAULTS[layer])
+
+        if path.suffix.lower() == ".jsonl":
+            return _chunk_jsonl(text, relative_text, layer, defaults)
+
+        metadata: dict[str, Any] = {}
+        if path.suffix.lower() == ".md":
+            metadata, text = _parse_frontmatter(text)
+        normalized = _normalize_metadata(
+            metadata,
+            defaults,
+            domain=_infer_domain(relative_text),
+        )
+
+        sections = (
+            _split_markdown_sections(text)
+            if path.suffix.lower() == ".md"
+            else [(relative_text, part) for part in _split_windows(text)]
+        )
         chunks = []
-        for index, content in enumerate(_split_text(text), start=1):
-            chunks.append(
-                KnowledgeChunk(
-                    source=source,
-                    path=rel_text,
-                    title=f"{rel_text}#{index}",
-                    content=content,
+        for index, (section_title, content) in enumerate(sections, start=1):
+            parts = _split_windows(content)
+            for part_index, part in enumerate(parts, start=1):
+                title = section_title or relative_text
+                if len(parts) > 1:
+                    title = f"{title} ({part_index})"
+                chunks.append(
+                    _make_chunk(
+                        path=relative_text,
+                        layer=layer,
+                        title=title,
+                        content=part,
+                        index=f"{index}-{part_index}",
+                        metadata=normalized,
+                    )
                 )
-            )
         return chunks
 
 
-def _knowledge_source(path: str) -> str:
-    """按知识资产层标记检索来源。"""
+def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """读取 Markdown YAML frontmatter。"""
 
-    if path.startswith("knowledge/klonet/"):
-        return "curated"
-    if path.startswith("knowledge/klonet_experience/"):
-        return "experience"
-    if path.startswith("knowledge/klonet_index/"):
-        return "machine_index"
-    return "local"
-
-
-def _chunk_jsonl(text: str, path: str, source: str) -> list[KnowledgeChunk]:
-    """机器索引按 JSONL 记录切分，避免跨记录窗口污染。"""
-
-    chunks = []
-    for index, line in enumerate(text.splitlines(), start=1):
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        identifier = (
-            row.get("route")
-            or row.get("symbol")
-            or row.get("domain")
-            or row.get("name")
-            or row.get("path")
-            or str(index)
-        )
-        chunks.append(
-            KnowledgeChunk(
-                source=source,
-                path=path,
-                title=f"{path}#{identifier}",
-                content=json.dumps(row, ensure_ascii=False, sort_keys=True),
-            )
-        )
-    return chunks
-
-def _is_runtime_memory_file(path: Path, root: Path) -> bool:
-    """判断是否为运行时记忆文件。
-
-    `memory/store.py` 这类源码可以进知识库，但 MEMORY.md、USER.md 和按日期生成
-    的情景记忆属于用户运行状态，不应该沉淀进 Klonet 公共知识索引。
-    """
-
-    try:
-        rel = path.relative_to(root)
-    except ValueError:
-        return False
-    parts = rel.parts
-    if len(parts) < 2 or parts[0] != "memory":
-        return False
-    if path.name in RUNTIME_MEMORY_FILES:
-        return True
-    return path.suffix == ".md" and path.stem[:4].isdigit()
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    raw = text[4:end]
+    metadata = yaml.safe_load(raw) or {}
+    return metadata if isinstance(metadata, dict) else {}, text[end + 5:]
 
 
-def _split_text(text: str, chunk_size: int = 1200, overlap: int = 120) -> list[str]:
-    """用简单窗口切分文本，保留少量重叠。"""
+def _normalize_metadata(
+    metadata: dict[str, Any],
+    defaults: dict[str, str],
+    *,
+    domain: str,
+) -> dict[str, str]:
+    """补齐统一 metadata，并把日期等对象转换成字符串。"""
+
+    raw_domains = metadata.get("domain") or metadata.get("domains")
+    if isinstance(raw_domains, list):
+        normalized_domain = str(raw_domains[0]) if raw_domains else domain
+    else:
+        normalized_domain = str(raw_domains or domain).split(",", maxsplit=1)[0].strip()
+
+    raw_status = str(metadata.get("status") or defaults["status"]).lower()
+    if raw_status in {"deprecated", "archived"}:
+        status = "deprecated"
+    elif raw_status == "draft":
+        status = "draft"
+    else:
+        status = "current"
+
+    quality = metadata.get("quality")
+    if not quality and raw_status == "current_verified":
+        quality = "verified"
+    elif not quality and raw_status == "diagnostic_playbook":
+        quality = "reviewed"
+
+    return {
+        "domain": normalized_domain,
+        "priority": str(metadata.get("priority") or defaults["priority"]).upper(),
+        "status": status,
+        "quality": str(quality or defaults["quality"]).lower(),
+        "sensitivity": str(
+            metadata.get("sensitivity") or defaults["sensitivity"]
+        ).lower(),
+        "last_verified": str(metadata.get("last_verified") or ""),
+    }
+
+
+def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
+    """按 Markdown 标题切分，避免固定窗口跨越不同主题。"""
+
+    cleaned = text.strip()
+    if not cleaned:
+        return []
+    matches = list(re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", cleaned))
+    if not matches:
+        return [("", cleaned)]
+
+    sections = []
+    preamble = cleaned[:matches[0].start()].strip()
+    if preamble:
+        sections.append(("前言", preamble))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
+        sections.append((match.group(1).strip(), cleaned[match.start():end].strip()))
+    return sections
+
+
+def _split_windows(text: str, chunk_size: int = 1200, overlap: int = 120) -> list[str]:
+    """超长章节再按固定窗口切分，并保留少量重叠。"""
 
     cleaned = text.strip()
     if not cleaned:
@@ -192,3 +275,121 @@ def _split_text(text: str, chunk_size: int = 1200, overlap: int = 120) -> list[s
             break
         start = max(end - overlap, start + 1)
     return result
+
+
+def _chunk_jsonl(
+    text: str,
+    path: str,
+    layer: str,
+    defaults: dict[str, str],
+) -> list[KnowledgeChunk]:
+    """机器索引按记录切分并继承原记录 metadata。"""
+
+    chunks = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+
+        identifier = (
+            row.get("route")
+            or row.get("symbol")
+            or row.get("name")
+            or row.get("path")
+            or row.get("domain")
+            or str(index)
+        )
+        metadata = dict(row)
+        if row.get("sensitive") is True and row.get("default") != "<redacted>":
+            metadata["sensitivity"] = "restricted"
+        normalized = _normalize_metadata(
+            metadata,
+            defaults,
+            domain=str(row.get("domain") or _infer_domain(str(row.get("path") or path))),
+        )
+        chunks.append(
+            _make_chunk(
+                path=path,
+                layer=layer,
+                title=f"{path}#{identifier}",
+                content=json.dumps(row, ensure_ascii=False, sort_keys=True),
+                index=str(index),
+                metadata=normalized,
+            )
+        )
+    return chunks
+
+
+def _make_chunk(
+    *,
+    path: str,
+    layer: str,
+    title: str,
+    content: str,
+    index: str,
+    metadata: dict[str, str],
+) -> KnowledgeChunk:
+    """创建稳定 chunk id，便于 eval 和后续增量索引。"""
+
+    digest = hashlib.sha256(f"{path}:{index}:{title}".encode("utf-8")).hexdigest()[:16]
+    return KnowledgeChunk(
+        chunk_id=digest,
+        layer=layer,
+        source=layer,
+        path=path,
+        title=title,
+        content=content,
+        **metadata,
+    )
+
+
+def _knowledge_layer(path: str) -> str:
+    if path.startswith("knowledge/klonet/"):
+        return "curated"
+    if path.startswith("knowledge/klonet_experience/"):
+        return "experience"
+    if path.startswith("knowledge/klonet_index/"):
+        return "machine_index"
+    return "local"
+
+
+def _infer_domain(path: str) -> str:
+    lowered = path.lower()
+    rules = {
+        "topology": ("topo", "topology"),
+        "vm": ("kvm", "virtual", "terminal", "ssh"),
+        "traffic": ("traffic", "pkt"),
+        "link": ("link", "delay", "vxlan"),
+        "monitor": ("monitor", "prometheus", "grafana"),
+        "auth": ("user", "auth", "login"),
+        "runtime": ("environment", "startup", "deploy", "config"),
+    }
+    for domain, terms in rules.items():
+        if any(term in lowered for term in terms):
+            return domain
+    return "general"
+
+
+def _is_runtime_memory_file(path: Path, root: Path) -> bool:
+    """运行时记忆不进入 Klonet 公共知识索引。"""
+
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    if len(parts) < 2 or parts[0] != "memory":
+        return False
+    if path.name in RUNTIME_MEMORY_FILES:
+        return True
+    if "sessions" in parts or "users" in parts:
+        return True
+    return path.suffix == ".md" and path.stem[:4].isdigit()
+
+
+# 兼容已有测试和调用。
+_split_text = _split_windows
+_knowledge_source = _knowledge_layer

@@ -88,6 +88,10 @@ class ToolExecutor:
             return KNOWLEDGE_BASE.search_knowledge(
                 tool_args["query"],
                 tool_args.get("top_k", DEFAULT_RAG_TOP_K),
+                task_type=tool_args.get("task_type"),
+                layers=tuple(tool_args["layers"]) if tool_args.get("layers") else None,
+                domains=tuple(tool_args["domains"]) if tool_args.get("domains") else None,
+                min_priority=tool_args.get("min_priority"),
             )
 
         if tool_name == "list_files":

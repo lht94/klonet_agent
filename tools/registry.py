@@ -55,6 +55,36 @@ TOOLS = [
         {
             "query": {"type": "string", "description": "检索问题或关键词"},
             "top_k": {"type": "integer", "description": "返回条数，默认 3"},
+            "task_type": {
+                "type": "string",
+                "enum": [
+                    "concept",
+                    "troubleshooting",
+                    "code_lookup",
+                    "development",
+                    "project_progress",
+                    "general",
+                ],
+                "description": "可选任务类型，用于选择知识层权重",
+            },
+            "layers": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["curated", "experience", "machine_index", "local"],
+                },
+                "description": "可选知识层过滤",
+            },
+            "domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选业务域过滤，例如 topology、vm、traffic",
+            },
+            "min_priority": {
+                "type": "string",
+                "enum": ["P0", "P1", "P2", "P3"],
+                "description": "可选最低知识优先级",
+            },
         },
         ["query"],
     ),

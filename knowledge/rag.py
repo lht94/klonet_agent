@@ -1,61 +1,23 @@
-"""Klonet RAG 知识库。"""
+"""Klonet RAG 路由、结构化检索和证据格式化。"""
 
 from __future__ import annotations
 
-import re
-from typing import Literal
-
 from klonet_agent.config import DEFAULT_RAG_TOP_K
+from klonet_agent.knowledge.models import QueryRoute, QueryScope, SearchRequest
 from klonet_agent.knowledge.retriever import KnowledgeRetriever
+from klonet_agent.knowledge.router import DEFAULT_QUERY_ROUTER
 
 
-QueryScope = Literal["klonet", "general", "mixed"]
+def route_query(query: str) -> QueryRoute:
+    """返回完整软路由结果。"""
 
-_KLONET_TERMS = {
-    "klonet",
-    "vemu",
-    "拓扑部署",
-    "拓扑删除",
-    "worker注册",
-    "worker 注册",
-    "进度条卡住",
-    "项目验收",
-    "klonet源码",
-    "klonet 源码",
-    "代码风格指南",
-}
-_GENERAL_TERMS = {
-    "docker compose",
-    "docker-compose",
-    "dind",
-    "rust",
-    "ubuntu",
-    "linux vm",
-    "通用技术",
-}
-_KLONET_NEGATION = re.compile(
-    r"(?:不需要|无需|不使用|不要|独立于|排除)\s*(?:klonet|vemu)",
-    re.IGNORECASE,
-)
+    return DEFAULT_QUERY_ROUTER.route(query)
 
 
 def classify_query_scope(query: str) -> QueryScope:
-    """判断问题是否应该使用 Klonet 专属知识。"""
+    """兼容旧接口，只返回范围字符串。"""
 
-    normalized = " ".join((query or "").lower().split())
-    if _KLONET_NEGATION.search(normalized):
-        return "general"
-
-    has_klonet = any(term in normalized for term in _KLONET_TERMS)
-    has_general = any(term in normalized for term in _GENERAL_TERMS)
-    if has_klonet and has_general:
-        return "mixed"
-    if has_klonet:
-        return "klonet"
-    if has_general:
-        return "general"
-    # 专用 Agent 中的模糊项目问题默认视为 Klonet，避免阶段、模块等问题漏检索。
-    return "klonet"
+    return route_query(query).scope
 
 
 class KnowledgeBase:
@@ -64,28 +26,65 @@ class KnowledgeBase:
     def __init__(self, retriever: KnowledgeRetriever | None = None):
         self.retriever = retriever or KnowledgeRetriever()
 
-    def search_knowledge(self, query: str, top_k: int = DEFAULT_RAG_TOP_K) -> str:
-        """检索知识库，并返回适合塞回模型上下文的文本。"""
+    def search_knowledge(
+        self,
+        query: str,
+        top_k: int = DEFAULT_RAG_TOP_K,
+        *,
+        task_type: str | None = None,
+        layers: tuple[str, ...] | None = None,
+        domains: tuple[str, ...] | None = None,
+        min_priority: str | None = None,
+    ) -> str:
+        """按软路由检索，并返回带来源和可靠度的证据。"""
 
-        scope = classify_query_scope(query)
-        if scope == "general":
+        route = route_query(query)
+        if route.hard_disable_rag:
             return (
-                "该问题不属于 Klonet 知识库范围，未执行 Klonet RAG。"
-                "请保留用户的否定条件，使用通用技术知识回答；"
-                "需要实时资料时再使用联网工具。"
+                "该问题明确不属于 Klonet 知识库范围，未执行 Klonet RAG。"
+                "请保留用户的否定条件，使用通用技术知识回答。"
+            )
+        if route.scope == "general" and route.confidence >= 0.8:
+            return (
+                "该问题高概率属于通用技术范围，未主动注入 Klonet 证据。"
+                "如用户后续明确关联 Klonet，再执行专属知识检索。"
             )
 
-        results = self.retriever.search(query, top_k=top_k)
-        if not results:
-            return "未检索到相关 Klonet 知识。请说明证据不足，并建议下一步读取源码或补充文档。"
+        request = SearchRequest(
+            query=query,
+            task_type=task_type or route.task_type,
+            layers=layers,
+            domains=domains or route.domains or None,
+            min_priority=min_priority,
+            top_k=top_k,
+        )
+        outcome = self.retriever.search_request(request)
+        if outcome.status == "none":
+            return (
+                "未检索到可靠 Klonet 证据。"
+                "请明确说明证据不足，并建议读取源码、补充问题信息或完善知识文档。"
+            )
 
-        lines = ["检索到以下 Klonet 相关证据："]
-        for index, item in enumerate(results, start=1):
+        prefix = (
+            "检索到以下可靠 Klonet 证据："
+            if outcome.status == "reliable"
+            else "只检索到相关度较弱的 Klonet 候选证据，请谨慎引用："
+        )
+        lines = [
+            prefix,
+            f"- retrieval_status: {outcome.status}",
+            f"- confidence: {outcome.confidence}",
+            f"- route_scope: {route.scope}",
+            f"- task_type: {request.task_type}",
+        ]
+        for index, item in enumerate(outcome.results, start=1):
             lines.append(
                 f"\n[{index}] {item.title}\n"
-                f"- source: {item.source}\n"
+                f"- layer: {item.layer}\n"
+                f"- domain: {item.domain}\n"
+                f"- quality: {item.quality}\n"
                 f"- path: {item.path}\n"
-                f"- score: {item.score}\n"
+                f"- relevance: {item.relevance}\n"
                 f"- snippet:\n{item.snippet}"
             )
         return "\n".join(lines)
