@@ -18,6 +18,11 @@ HISTORY_MAX_MESSAGES = 20
 MAX_TOOL_ROUNDS = 8
 MAX_TODO_CONTINUATIONS = 1
 DEFAULT_RAG_TOP_K = 3
+RAG_SEARCH_BUDGETS = {
+    "general": 1,
+    "klonet": 2,
+    "mixed": 2,
+}
 
 MEMORY_DIR = PROJECT_ROOT / "memory"
 JOURNAL_DIR = PROJECT_ROOT / "journals"

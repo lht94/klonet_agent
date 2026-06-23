@@ -230,7 +230,7 @@ tracing/logger.py
 当前新增：
 
 - 区分 Klonet 域内、通用技术和混合问题。
-- 明确“不需要 Klonet”时不暴露 `search_knowledge`。
+- 原始输入确定整轮 `scope`，后续检索词改写不能改变本轮问题范围。
 - RAG 默认 `top_k=3`，并过滤低分、低关键词覆盖结果。
 - Mentor 不暴露 `update_todos`。
 - Coding todo 最多自动续跑一次，工具循环最多 8 轮。
@@ -250,7 +250,7 @@ tracing/logger.py
 - 对路由领域名和知识 frontmatter 领域名做显式别名匹配，例如 `runtime` 可匹配 `operations/deployment/environment`。
 - 公共索引在构建阶段排除 `review_required/restricted` 内容。
 - Query Router 返回 `scope/confidence/task_type/domains/reasons/hard_disable_rag`。
-- 只有明确排除 Klonet 时才硬隐藏 RAG；普通 general 分类只做软路由。
+- Query Router 负责判断范围；Orchestrator 负责锁定整轮范围并控制检索证据等级。
 - 概念、故障排查、源码定位、开发和项目进度使用不同知识层权重。
 - 检索输出分为 `reliable/weak/none`，无可靠证据时允许拒答。
 - `search_knowledge` 兼容原有参数，并新增 `task_type/layers/domains/min_priority`。
@@ -273,6 +273,17 @@ general_rag_false_positive_rate: 0.0
 ```bash
 python -m klonet_agent.evals.retrieval_runner
 ```
+
+### 11.3 整轮作用域与检索预算
+
+当前运行时策略：
+
+- `generic`：通用知识是主要依据，Klonet RAG 可选且只能作为 secondary，每轮最多检索 1 次；禁用项目日志。
+- `klonet`：Klonet RAG 是主要事实依据，每轮最多检索 2 次。
+- `mixed`：通用知识与 Klonet 证据分区回答，每轮最多检索 2 次。
+- 检索预算按实际 `search_knowledge` 调用次数计算，不限制一次检索覆盖的知识层。
+- 预算在 Orchestrator 中执行，因此同一模型响应中的并行工具调用也不能绕过限制。
+- 本轮 scope 约束使用临时 system 消息注入，回答结束后移除，不污染下一轮历史。
 
 ### 12. Tests
 
@@ -299,7 +310,7 @@ tests/test_retrieval_eval.py
 
 ```bash
 python -m pytest -q
-# 54 passed
+# 58 passed
 ```
 
 ## 当前 .gitignore 策略

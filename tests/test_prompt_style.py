@@ -28,6 +28,17 @@ def test_system_prompts_use_klonet_agent_identity():
         assert word not in text
 
 
+def test_mentor_prompt_keeps_generic_rag_secondary():
+    """Mentor Prompt 应与 generic 的执行层策略保持一致。"""
+
+    from klonet_agent.prompts import MENTOR_PROMPT
+
+    assert "通用知识作为主要依据" in MENTOR_PROMPT
+    assert "Klonet RAG 只能作为辅助证据" in MENTOR_PROMPT
+    assert "最多检索 1 次" in MENTOR_PROMPT
+    assert "明确排除 Klonet 的问题禁止检索" not in MENTOR_PROMPT
+
+
 def test_memory_prompt_uses_teaching_agent_language():
     """记忆提示词不应该残留旧个人 Agent 称呼。"""
 

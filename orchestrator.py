@@ -16,6 +16,7 @@ from klonet_agent.config import (
     MAX_TOKEN,
     MAX_TOOL_ROUNDS,
     MEMORY_DIR,
+    RAG_SEARCH_BUDGETS,
     TRACE_FILE,
 )
 from klonet_agent.knowledge import SKILL_LOADER, route_query
@@ -53,6 +54,7 @@ class AgentOrchestrator:
             self.session.project_id,
         )
         self._query_route = route_query("Klonet")
+        self._knowledge_search_count = 0
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
@@ -118,9 +120,31 @@ class AgentOrchestrator:
         return response
 
     def use_tool(self, tool_name: str, tool_args: dict) -> str:
-        """调用工具执行器。"""
+        """按本轮作用域和检索预算调用工具执行器。"""
 
-        return self.tool_executor.run(tool_name, tool_args)
+        scope = self._query_route.scope
+        if scope == "general" and tool_name == "read_project_journal":
+            return "本轮属于 generic 问题，禁止读取 Klonet 项目日志。"
+
+        if tool_name != "search_knowledge":
+            return self.tool_executor.run(tool_name, tool_args)
+
+        budget = RAG_SEARCH_BUDGETS[scope]
+        if self._knowledge_search_count >= budget:
+            return (
+                f"本轮 {scope} 检索预算已用完（最多 {budget} 次）。"
+                "请根据已有证据完成回答，不要继续改写查询。"
+            )
+
+        self._knowledge_search_count += 1
+        result = self.tool_executor.run(tool_name, tool_args)
+        if scope == "general":
+            return (
+                "【secondary Klonet evidence】\n"
+                "以下内容只能用于辅助对比，不能改变通用技术问题的主要方向：\n"
+                f"{result}"
+            )
+        return result
 
     def compress_memory(self, history: list[dict], token: int):
         """触发记忆复盘与压缩。"""
@@ -210,6 +234,9 @@ class AgentOrchestrator:
         tool_rounds = 0
         todo_continuations = 0
         self._query_route = route_query(user_input)
+        self._knowledge_search_count = 0
+        turn_scope_message = self._build_turn_scope_message(user_input)
+        history.append(turn_scope_message)
 
         # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
         while tool_rounds < MAX_TOOL_ROUNDS:
@@ -312,6 +339,13 @@ class AgentOrchestrator:
             self.memory_store.append_history(assistant_msg)
             print(f"Klonet Agent：{reply}")
 
+        # 本轮作用域只约束当前用户输入，不写入长期历史，避免影响下一轮。
+        history = [
+            message
+            for message in history
+            if message is not turn_scope_message
+        ]
+
         # 条件触发对话压缩。这里沿用旧版逻辑，用本轮 context token 判断。
         current_context_size = response.usage.total_tokens
         if current_context_size >= MAX_TOKEN:
@@ -335,13 +369,49 @@ class AgentOrchestrator:
             for tool in TOOLS
             if tool["function"]["name"] in self.profile.allowed_tools
         ]
-        if self._query_route.hard_disable_rag:
+        if self._query_route.scope == "general":
             tools = [
                 tool
                 for tool in tools
-                if tool["function"]["name"] != "search_knowledge"
+                if tool["function"]["name"] != "read_project_journal"
             ]
         return tools
+
+    def _build_turn_scope_message(self, user_input: str) -> dict:
+        """构建只在当前工具循环中生效的问题范围约束。"""
+
+        route = self._query_route
+        rules = [
+            "【本轮问题范围】",
+            f"- scope: {route.scope}",
+            f"- confidence: {route.confidence}",
+            f"- original_user_input: {user_input}",
+            "- 本轮范围由原始用户输入确定，后续查询改写不得改变。",
+        ]
+        if route.scope == "general":
+            rules.extend(
+                [
+                    "- 通用知识是主要依据，必须先完整回答原始技术需求。",
+                    "- Klonet RAG 只能作为 secondary 辅助证据，最多检索 1 次。",
+                    "- 禁止读取 Klonet 项目日志。",
+                    "- 不得让 Klonet 资料取代或带偏最终回答的主要方向。",
+                ]
+            )
+        elif route.scope == "mixed":
+            rules.extend(
+                [
+                    "- 通用知识与 Klonet 证据需要分区回答。",
+                    "- 本轮 Klonet 知识检索最多 2 次。",
+                ]
+            )
+        else:
+            rules.extend(
+                [
+                    "- Klonet RAG 是主要事实依据。",
+                    "- 本轮 Klonet 知识检索最多 2 次。",
+                ]
+            )
+        return {"role": "system", "content": "\n".join(rules)}
 
     def _refresh_memory_prompt(self, history: list[dict]):
         """刷新上下文里的记忆系统提示词。"""
