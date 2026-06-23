@@ -12,11 +12,17 @@ from klonet_agent.config import (
     WORKSPACE_DIR,
 )
 
-# 任务状态集合：未做、正在做、已完成。
-VALID_STATUS = {"pending", "in_progress", "completed"}
+# 任务状态集合：未做、正在做、等待、阻塞、已完成。
+VALID_STATUS = {"pending", "in_progress", "completed", "waiting_user", "blocked"}
 
-# 状态符号转换表，把任务的三种状态映射成命令行里更直观的文本符号。
-STATUS_ICON = {"pending": "[]", "in_progress": "[~]", "completed": "[x]"}
+# 状态符号转换表，把任务状态映射成命令行里更直观的文本符号。
+STATUS_ICON = {
+    "pending": "[]",
+    "in_progress": "[~]",
+    "completed": "[x]",
+    "waiting_user": "[?]",
+    "blocked": "[!]",
+}
 
 
 class AgentSession:

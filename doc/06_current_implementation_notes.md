@@ -90,7 +90,17 @@ Klonet 教学协作 Agent 的表达。
 
 原来的全局 `TODOS` 已经迁移到 session 内。
 
-当前已经补充会话隔离测试，确认不同用户/项目有独立的 workspace、journal 和 todo。
+当前已经补充会话隔离测试，确认不同用户/项目有独立的 workspace、journal、todo 和工作历史。
+
+记忆路径：
+
+```text
+memory/sessions/{user_id}/{project_id}/history.jsonl
+memory/sessions/{user_id}/{project_id}/MEMORY.md
+memory/users/{user_id}/USER.md
+```
+
+初始化上下文最多加载最近 20 条历史，避免旧对话污染和 token 膨胀。
 
 ### 6. Project Journal
 
@@ -215,6 +225,19 @@ tracing/logger.py
 - 统一截断过长工具结果，避免上下文膨胀。
 - trace 写入 `tracing/trace.jsonl`，作为后续评估和安全审计依据。
 
+### 11.1 运行时路由与编排保护
+
+当前新增：
+
+- 区分 Klonet 域内、通用技术和混合问题。
+- 明确“不需要 Klonet”时不暴露 `search_knowledge`。
+- RAG 默认 `top_k=3`，并过滤低分、低关键词覆盖结果。
+- Mentor 不暴露 `update_todos`。
+- Coding todo 最多自动续跑一次，工具循环最多 8 轮。
+- todo 支持 `waiting_user` 和 `blocked`，暂停状态不会自动续跑。
+- Prompt 要求保留否定条件，不能把通用问题强行拉回 Klonet。
+
+
 ### 12. Tests
 
 新增：
@@ -230,13 +253,15 @@ tests/test_tracing.py
 tests/test_journal.py
 tests/test_knowledge.py
 tests/test_workspace_tools.py
+tests/test_knowledge_pipeline.py
+tests/test_orchestrator_controls.py
 ```
 
 当前测试结果：
 
 ```bash
 python -m pytest -q
-# 31 passed
+# 42 passed
 ```
 
 ## 当前 .gitignore 策略
@@ -252,7 +277,8 @@ python -m pytest -q
 - `knowledge/index.jsonl`
 - `evals/summary.md`
 - `tracing/trace.jsonl`
-- `memory/history.jsonl`
+- `memory/sessions/`
+- `memory/users/`
 - `memory/20*.md`
 - `memory/MEMORY.md`
 - `memory/USER.md`

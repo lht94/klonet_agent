@@ -51,10 +51,10 @@ TOOLS = [
     },
     _tool(
         "search_knowledge",
-        "检索 Klonet 知识库。Mentor 回答 Klonet 问题前必须优先调用；Coding 写代码前用于查规范和相似实现。",
+        "仅检索 Klonet 专属知识。明确不需要 Klonet 的通用技术问题不要调用；Klonet 域内问题和 Coding 规范查询再使用。",
         {
             "query": {"type": "string", "description": "检索问题或关键词"},
-            "top_k": {"type": "integer", "description": "返回条数，默认 5"},
+            "top_k": {"type": "integer", "description": "返回条数，默认 3"},
         },
         ["query"],
     ),
@@ -231,7 +231,7 @@ TOOLS = [
                 "创建或更新当前任务的 todolist。"
                 "传入完整的 todos 数组（每次都是全量覆盖，而非增量）。"
                 "用于：拆解多步骤任务、推进任务状态（pending → in_progress → completed）。"
-                "约束：同一时间至多一个任务为 in_progress。"
+                "约束：同一时间至多一个任务为 in_progress；等待用户输入时使用 waiting_user，当前模式无法执行时使用 blocked。"
             ),
             "parameters": {
                 "type": "object",
@@ -246,7 +246,7 @@ TOOLS = [
                                 "content": {"type": "string", "description": "这一步要做什么"},
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed"],
+                                    "enum": ["pending", "in_progress", "completed", "waiting_user", "blocked"],
                                     "description": "状态",
                                 },
                             },

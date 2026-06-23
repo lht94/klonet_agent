@@ -32,6 +32,21 @@ class MemoryStore:
         self.user_file = user_file  # 用户画像文件
         self._ensure()  # 如果没有记忆文件，则初始化
 
+    @classmethod
+    def for_session(
+        cls,
+        memory_root: Path,
+        user_id: str,
+        project_id: str,
+    ) -> "MemoryStore":
+        """按用户和项目创建隔离的记忆存储器。"""
+
+        user_name = _safe_path_component(user_id)
+        project_name = _safe_path_component(project_id)
+        project_dir = memory_root / "sessions" / user_name / project_name
+        user_file = memory_root / "users" / user_name / "USER.md"
+        return cls(project_dir, user_file)
+
     """-------------下面是记忆文件读取的实现----------------"""
 
     def _ensure(self):
@@ -126,7 +141,7 @@ class MemoryStore:
         with self.history_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def load_unarchived_history(self) -> list[dict[str, Any]]:
+    def load_unarchived_history(self, max_messages: int = 20) -> list[dict[str, Any]]:
         """返回最新的工作记忆。
 
         只加载最后一个 compact_event 之后的对话，避免每次启动都把完整历史塞进上下文。
@@ -150,9 +165,15 @@ class MemoryStore:
                 # 绝不硬编码 role 和 content！直接提取除了时间戳 ts 以外的所有完整字段。
                 msg = {key: value for key, value in row.items() if key != "ts"}
                 unarchived_reversed.append(msg)
+                if max_messages > 0 and len(unarchived_reversed) >= max_messages:
+                    break
 
         # 倒序收集后再翻转回时间正序。
-        return list(reversed(unarchived_reversed))
+        messages = list(reversed(unarchived_reversed))
+        # 被截断的历史不能从孤立 tool 消息开始，否则模型 API 会拒绝上下文。
+        while messages and messages[0].get("role") == "tool":
+            messages.pop(0)
+        return messages
 
     def memory_prompt(self) -> str:
         """生成记忆系统提示词，让大模型知道如何主动维护记忆。"""
@@ -166,12 +187,23 @@ class MemoryStore:
             【用户画像与偏好 (USER.md)】
             {current_user}
 
-            【核心任务：自动维护记忆】
-            除了回答用户的问题，你还拥有三个记忆工具。你必须在对话中主动调用它们：
-            1. 若完成了具体任务、解决了 Bug，调用 append_episode 记录。
-            2. 若当前长期记忆 (MEMORY.md) 中的信息过时，或者有新的全局重大事实，调用 write_memory 覆盖更新。你需要把上面的旧记忆和新事实融合，写出完整的全新内容。
-            3. 若用户展现了新的个人喜好或习惯，调用 write_user 覆盖更新。同样，必须把上面的旧画像和新喜好融合完整后写入！
+            【记忆维护规则】
+            只有出现可复用的重要进展时才使用记忆工具，普通问答不要写记忆：
+            1. 完成具体任务或解决 Bug 后，可以调用 append_episode 记录。
+            2. 项目长期目标或关键事实确实变化时，才调用 write_memory。
+            3. 用户明确表达稳定偏好时，才调用 write_user。
+            4. 不要把临时问题、工具报错或其他项目的内容写入当前会话记忆。
             """
+
+
+def _safe_path_component(value: str) -> str:
+    """把用户输入转换成安全、稳定的目录名。"""
+
+    cleaned = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in (value or "default").strip()
+    )
+    return cleaned or "default"
 
 
 def _iter_jsonl_lines_reverse(path: Path, chunk_size: int = 8192):
@@ -232,6 +264,5 @@ def _json_safe(obj: Any):
     return str(obj)
 
 
-# 初始化默认记忆存储器。后续服务端可以按 user_id 创建多个实例。
-USER_FILE = MEMORY_DIR / "USER.md"
-MEMORY_STORE = MemoryStore(MEMORY_DIR, USER_FILE)
+# 保留默认实例兼容旧调用；正式会话由 Orchestrator 按用户和项目创建实例。
+MEMORY_STORE = MemoryStore.for_session(MEMORY_DIR, "default", "default")

@@ -10,10 +10,17 @@ import json
 from time import perf_counter
 
 from klonet_agent.agents import AgentProfile, get_profile
-from klonet_agent.config import MAX_TOKEN, TRACE_FILE
-from klonet_agent.knowledge import SKILL_LOADER
+from klonet_agent.config import (
+    HISTORY_MAX_MESSAGES,
+    MAX_TODO_CONTINUATIONS,
+    MAX_TOKEN,
+    MAX_TOOL_ROUNDS,
+    MEMORY_DIR,
+    TRACE_FILE,
+)
+from klonet_agent.knowledge import SKILL_LOADER, classify_query_scope
 from klonet_agent.llm import LLMClient
-from klonet_agent.memory import MEMORY_STORE
+from klonet_agent.memory import MemoryStore
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
 from klonet_agent.tools import TOOLS, ToolExecutor
@@ -34,16 +41,24 @@ class AgentOrchestrator:
         llm: LLMClient | None = None,
         tool_executor: ToolExecutor | None = None,
         trace_logger: TraceLogger | None = None,
+        memory_store: MemoryStore | None = None,
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
         self.llm = llm or LLMClient()
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
+        self.memory_store = memory_store or MemoryStore.for_session(
+            MEMORY_DIR,
+            self.session.user_id,
+            self.session.project_id,
+        )
+        self._query_scope = "klonet"
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
             allowed_tools=self.profile.allowed_tools,
             trace_logger=self.trace_logger,
+            memory_store=self.memory_store,
         )
 
     def init_history(self) -> list[dict]:
@@ -55,7 +70,7 @@ class AgentOrchestrator:
             history.append({"role": "system", "content": prompt})
 
         # 把记忆设定加入到系统提示词中。
-        memory_prompt = MEMORY_STORE.memory_prompt()
+        memory_prompt = self.memory_store.memory_prompt()
         history.append({"role": "system", "content": memory_prompt})
 
         # 把目前已有的 skill 加入到系统提示词中。
@@ -76,7 +91,9 @@ class AgentOrchestrator:
         history.append({"role": "system", "content": session_prompt})
 
         # 载入上一次对话，即把未归档压缩的工作记忆加入上下文。
-        last_history = MEMORY_STORE.load_unarchived_history()
+        last_history = self.memory_store.load_unarchived_history(
+            max_messages=HISTORY_MAX_MESSAGES,
+        )
         history.extend(last_history)
 
         return history
@@ -132,7 +149,7 @@ class AgentOrchestrator:
                     compress_response.choices[0].message
                 )
                 history.append(comp_assistant)
-                MEMORY_STORE.append_history(comp_assistant)
+                self.memory_store.append_history(comp_assistant)
 
                 # 执行归档压缩中的工具调用。
                 for tool_call in compress_response.choices[0].message.tool_calls:
@@ -147,7 +164,7 @@ class AgentOrchestrator:
                         "content": tool_result,
                     }
                     history.append(comp_tool_msg)
-                    MEMORY_STORE.append_history(comp_tool_msg)
+                    self.memory_store.append_history(comp_tool_msg)
 
                     if tool_name in ["write_memory", "write_user"]:
                         self._refresh_memory_prompt(history)
@@ -165,11 +182,11 @@ class AgentOrchestrator:
                     )
 
                 history.append(comp_assistant)
-                MEMORY_STORE.append_history(comp_assistant)
+                self.memory_store.append_history(comp_assistant)
 
                 print(f"Klonet Agent：{compress_reply}")
                 # 打入压缩标记，表示前面的内容已经被压缩归档。
-                MEMORY_STORE.append_compact_marker()
+                self.memory_store.append_compact_marker()
                 # 重新初始化记忆，并将压缩总结加入数组，保持上下文连贯。
                 history = self.init_history()
                 history.append({"role": "assistant", "content": compress_reply})
@@ -187,12 +204,16 @@ class AgentOrchestrator:
         # 设定对话消息。消息列表中的每个消息都包含 role 和 content。
         # role 可以是 system、user、assistant、tool。
         history.append({"role": "user", "content": user_input})
-        MEMORY_STORE.append_history({"role": "user", "content": user_input})
+        self.memory_store.append_history({"role": "user", "content": user_input})
 
         reply = ""
+        tool_rounds = 0
+        todo_continuations = 0
+        self._query_scope = classify_query_scope(user_input)
 
-        # 再套一层 while 循环，使得 LLM 可以一直循环调用工具，直到停止工作并输出自然语言。
-        while True:
+        # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
+        while tool_rounds < MAX_TOOL_ROUNDS:
+            tool_rounds += 1
             response = self.chat_with_llm(history)
             # 记录 token 要放在外层，避免只有调用工具时才计数。
             token += response.usage.total_tokens
@@ -204,7 +225,7 @@ class AgentOrchestrator:
                 # 注意不能直接把复杂 SDK 对象 append 到 history，要转换成普通字典。
                 assistant_msg = self._assistant_tool_message(response.choices[0].message)
                 history.append(assistant_msg)
-                MEMORY_STORE.append_history(assistant_msg)
+                self.memory_store.append_history(assistant_msg)
 
                 for tool_call in response.choices[0].message.tool_calls:
                     # 工具名，即 schema 中 function.name。
@@ -220,7 +241,7 @@ class AgentOrchestrator:
                         "content": result,
                     }
                     history.append(tool_msg)
-                    MEMORY_STORE.append_history(tool_msg)
+                    self.memory_store.append_history(tool_msg)
 
                     # 核心补丁：记忆同步刷新机制。
                     # 如果刚才执行的工具修改了长期记忆文件，要立刻刷新系统提示词中的记忆内容。
@@ -232,31 +253,46 @@ class AgentOrchestrator:
                 reply = response.choices[0].message.content
                 print(f"Klonet Agent：{reply}")
 
-                # 对于有计划的任务，做一次检查，避免模型声称完成但 todo 状态仍未完成。
+                # 只有 Coding 模式中的可执行任务允许有限自动续跑。
                 if self.session.todos:
-                    unfinished = [
-                        todo for todo in self.session.todos if todo["status"] != "completed"
+                    actionable = [
+                        todo
+                        for todo in self.session.todos
+                        if todo["status"] in {"pending", "in_progress"}
                     ]
-                    if unfinished:
-                        print("Klonet Agent：任务列表里还有未完成项，继续推进。")
+                    if actionable and self.profile.name != "coding":
+                        self._set_unfinished_todo_status("blocked")
+                        print("Klonet Agent：当前模式无法执行这些任务，已停止自动续跑。")
+                    elif actionable and todo_continuations < MAX_TODO_CONTINUATIONS:
+                        todo_continuations += 1
+                        print("Klonet Agent：任务列表里还有未完成项，再自动推进一次。")
                         print(render_todos(self.session.todos))
                         print()
                         continue_prompt = (
-                            "以下任务仍未完成，请按计划继续执行，"
-                            "并按规矩更新 todolist 状态：\n"
+                            "以下任务仍未完成。只再推进一次；"
+                            "如果仍无法完成，请将状态改为 waiting_user 或 blocked：\n"
                             + render_todos(self.session.todos)
                         )
                         history.append({"role": "user", "content": continue_prompt})
-                        MEMORY_STORE.append_history(
+                        self.memory_store.append_history(
                             {"role": "user", "content": continue_prompt}
                         )
-                        # continue 会跳过本次循环剩余逻辑，重新回到 chat_with_llm。
                         continue
+                    elif actionable:
+                        self._set_unfinished_todo_status("waiting_user")
+                        print("Klonet Agent：已达到自动续跑上限，等待用户确认后继续。")
 
-                    print("Klonet Agent：任务全部完成。")
-                    print(render_todos(self.session.todos))
-                    print()
-                    self.session.todos.clear()
+                    if all(
+                        todo["status"] == "completed"
+                        for todo in self.session.todos
+                    ):
+                        print("Klonet Agent：任务全部完成。")
+                        print(render_todos(self.session.todos))
+                        print()
+                        self.session.todos.clear()
+                    else:
+                        print(render_todos(self.session.todos))
+                        print()
 
                 assistant_msg = {"role": "assistant", "content": reply}
                 if self._has_reasoning(response.choices[0].message):
@@ -265,8 +301,16 @@ class AgentOrchestrator:
                     )
 
                 history.append(assistant_msg)
-                MEMORY_STORE.append_history(assistant_msg)
+                self.memory_store.append_history(assistant_msg)
                 break
+
+        else:
+            reply = "本轮工具调用已达到上限，任务已暂停，等待用户确认后继续。"
+            self._set_unfinished_todo_status("waiting_user")
+            assistant_msg = {"role": "assistant", "content": reply}
+            history.append(assistant_msg)
+            self.memory_store.append_history(assistant_msg)
+            print(f"Klonet Agent：{reply}")
 
         # 条件触发对话压缩。这里沿用旧版逻辑，用本轮 context token 判断。
         current_context_size = response.usage.total_tokens
@@ -276,21 +320,35 @@ class AgentOrchestrator:
 
         return reply, history, token
 
-    def _visible_tools(self) -> list[dict]:
-        """根据 profile 过滤模型可见工具。"""
+    def _set_unfinished_todo_status(self, status: str):
+        """暂停未完成任务，防止编排器继续自动循环。"""
 
-        return [
+        for todo in self.session.todos:
+            if todo["status"] in {"pending", "in_progress"}:
+                todo["status"] = status
+
+    def _visible_tools(self) -> list[dict]:
+        """根据 profile 和当前问题范围过滤模型可见工具。"""
+
+        tools = [
             tool
             for tool in TOOLS
             if tool["function"]["name"] in self.profile.allowed_tools
         ]
+        if self._query_scope == "general":
+            tools = [
+                tool
+                for tool in tools
+                if tool["function"]["name"] != "search_knowledge"
+            ]
+        return tools
 
     def _refresh_memory_prompt(self, history: list[dict]):
         """刷新上下文里的记忆系统提示词。"""
 
         for msg in history:
             if msg.get("role") == "system" and "MEMORY.md" in msg.get("content", ""):
-                msg["content"] = MEMORY_STORE.memory_prompt()
+                msg["content"] = self.memory_store.memory_prompt()
                 return
 
     def _assistant_tool_message(self, message) -> dict:

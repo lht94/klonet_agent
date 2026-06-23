@@ -60,3 +60,11 @@ def test_session_can_update_todos():
     assert "total=2" in result
     assert session.todos[0]["status"] == "completed"
     assert session.todos[1]["status"] == "in_progress"
+
+def test_mentor_does_not_expose_todo_planning_tool():
+    """Mentor 只提供指导，不应该创建需要自动执行的 todo。"""
+
+    from klonet_agent.agents import get_profile
+
+    assert "update_todos" not in get_profile("mentor").allowed_tools
+    assert "update_todos" in get_profile("coding").allowed_tools

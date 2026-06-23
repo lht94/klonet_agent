@@ -28,10 +28,10 @@ MENTOR_TOOLS = {
     "write_memory",
     "write_user",
     "web_fetch",
-    "update_todos",
 }
 
 CODING_TOOLS = MENTOR_TOOLS | {
+    "update_todos",
     "list_files",
     "read_file",
     "write_file",

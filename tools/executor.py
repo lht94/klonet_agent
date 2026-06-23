@@ -9,9 +9,10 @@ from __future__ import annotations
 import os
 from time import perf_counter
 
+from klonet_agent.config import DEFAULT_RAG_TOP_K
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge import KNOWLEDGE_BASE, SKILL_LOADER
-from klonet_agent.memory import MEMORY_STORE
+from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
@@ -35,10 +36,12 @@ class ToolExecutor:
         session: AgentSession | None = None,
         allowed_tools: set[str] | None = None,
         trace_logger: TraceLogger | None = None,
+        memory_store: MemoryStore | None = None,
     ):
         self.session = session or AgentSession()
         self.allowed_tools = allowed_tools
         self.trace_logger = trace_logger
+        self.memory_store = memory_store or MEMORY_STORE
 
     def run(self, tool_name: str, tool_args: dict) -> str:
         """执行一个工具调用，并返回给大模型看的文本结果。"""
@@ -84,7 +87,7 @@ class ToolExecutor:
         if tool_name == "search_knowledge":
             return KNOWLEDGE_BASE.search_knowledge(
                 tool_args["query"],
-                tool_args.get("top_k", 5),
+                tool_args.get("top_k", DEFAULT_RAG_TOP_K),
             )
 
         if tool_name == "list_files":
@@ -109,17 +112,17 @@ class ToolExecutor:
 
         if tool_name == "append_episode":
             print("Klonet Agent：正在记录本次有价值的进展。")
-            MEMORY_STORE.append_episode(tool_args["content"])
+            self.memory_store.append_episode(tool_args["content"])
             return "已成功追加到今天的情景记忆日志中。"
 
         if tool_name == "write_memory":
             print("Klonet Agent：正在更新长期记忆。")
-            MEMORY_STORE.write_memory(tool_args["content"])
+            self.memory_store.write_memory(tool_args["content"])
             return "长期记忆 MEMORY.md 已被成功覆盖更新。"
 
         if tool_name == "write_user":
             print("Klonet Agent：正在更新用户画像。")
-            MEMORY_STORE.write_user(tool_args["content"])
+            self.memory_store.write_user(tool_args["content"])
             return "用户偏好 USER.md 已被成功覆盖更新。"
 
         if tool_name == "web_fetch":

@@ -21,6 +21,8 @@ memory/tokens.jsonl
 memory/20*.md
 memory/MEMORY.md
 memory/USER.md
+memory/sessions/
+memory/users/
 journals/
 workspaces/
 

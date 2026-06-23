@@ -80,3 +80,50 @@ def test_task_templates_are_available_to_knowledge_index():
 
     assert results
     assert results[0].path == "knowledge/task_templates.md"
+
+def test_general_query_does_not_force_klonet_results():
+    """明确排除 Klonet 的通用问题不应该返回 Klonet 证据。"""
+
+    import json
+
+    from klonet_agent.knowledge.rag import KnowledgeBase
+    from klonet_agent.knowledge.retriever import KnowledgeRetriever
+
+    with local_temp_dir() as temp_dir:
+        index_file = temp_dir / "index.jsonl"
+        row = {
+            "source": "curated",
+            "path": "knowledge/klonet/ops/startup.md",
+            "title": "Klonet 启动",
+            "content": "Klonet 使用 Docker 和 screen 启动服务",
+        }
+        index_file.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+        knowledge = KnowledgeBase(KnowledgeRetriever(index_file=index_file))
+        result = knowledge.search_knowledge(
+            "不需要 Klonet，只需要 Linux VM Docker Compose DinD Rust",
+        )
+
+    assert "不属于 Klonet 知识库" in result
+
+
+def test_retriever_rejects_low_coverage_match():
+    """长查询只碰巧命中一个通用词时不应返回证据。"""
+
+    import json
+
+    from klonet_agent.knowledge.retriever import KnowledgeRetriever
+
+    with local_temp_dir() as temp_dir:
+        index_file = temp_dir / "index.jsonl"
+        row = {
+            "source": "curated",
+            "path": "knowledge/klonet/ops/startup.md",
+            "title": "Klonet 启动",
+            "content": "Klonet 的 Docker 资源执行层。",
+        }
+        index_file.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+        results = KnowledgeRetriever(index_file=index_file).search(
+            "Linux VM Docker Compose DinD Rust 自定义网络",
+        )
+
+    assert results == []
