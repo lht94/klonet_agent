@@ -62,7 +62,7 @@ def get_profile(name: str) -> AgentProfile:
         name="mentor",
         mode_prompt=MENTOR_PROMPT,
         allowed_tools=MENTOR_TOOLS,
-        default_workflow="retrieve -> explain -> suggest next step",
+        default_workflow="route -> retrieve if needed -> answer directly",
         requires_rag=True,
         requires_review=False,
     )

@@ -12,6 +12,7 @@ from time import perf_counter
 from klonet_agent.config import DEFAULT_RAG_TOP_K
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge import KNOWLEDGE_BASE, SKILL_LOADER
+from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
@@ -85,6 +86,7 @@ class ToolExecutor:
             return SKILL_LOADER.load_skill(tool_args["skill_name"])
 
         if tool_name == "search_knowledge":
+            intent = QueryIntent.from_mapping(tool_args.get("intent"))
             return KNOWLEDGE_BASE.search_knowledge(
                 tool_args["query"],
                 tool_args.get("top_k", DEFAULT_RAG_TOP_K),
@@ -92,6 +94,7 @@ class ToolExecutor:
                 layers=tuple(tool_args["layers"]) if tool_args.get("layers") else None,
                 domains=tuple(tool_args["domains"]) if tool_args.get("domains") else None,
                 min_priority=tool_args.get("min_priority"),
+                intent=intent,
             )
 
         if tool_name == "list_files":

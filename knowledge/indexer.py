@@ -18,6 +18,7 @@ TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".jsonl", ".yaml", ".yml", ".tom
 SKIP_PARTS = {"__pycache__", ".git", ".DS_Store"}
 RUNTIME_MEMORY_FILES = {"MEMORY.md", "USER.md", "history.jsonl", "tokens.jsonl"}
 SKIP_KNOWLEDGE_DIRS = {"extracted_docs", "extracted_images", "staging"}
+INDEX_SCHEMA_VERSION = 3
 
 _LAYER_DEFAULTS = {
     "curated": {
@@ -63,6 +64,8 @@ class KnowledgeChunk:
     quality: str = "unknown"
     sensitivity: str = "public"
     last_verified: str = ""
+    intent_tags: tuple[str, ...] = ()
+    index_schema_version: int = INDEX_SCHEMA_VERSION
 
 
 class KnowledgeIndexer:
@@ -205,7 +208,7 @@ def _normalize_metadata(
     defaults: dict[str, str],
     *,
     domain: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """补齐统一 metadata，并把日期等对象转换成字符串。"""
 
     raw_domains = metadata.get("domain") or metadata.get("domains")
@@ -237,16 +240,32 @@ def _normalize_metadata(
             metadata.get("sensitivity") or defaults["sensitivity"]
         ).lower(),
         "last_verified": str(metadata.get("last_verified") or ""),
+        "intent_tags": _normalize_string_list(metadata.get("intent_tags")),
     }
 
 
+def _normalize_string_list(value: Any) -> tuple[str, ...]:
+    """把 YAML 数组或逗号分隔字符串归一化为去重 tuple。"""
+
+    raw_items = value if isinstance(value, list) else str(value or "").split(",")
+    result = []
+    for item in raw_items:
+        normalized = str(item or "").strip().lower()
+        if normalized and normalized not in result:
+            result.append(normalized)
+    return tuple(result)
+
+
 def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
-    """按 Markdown 标题切分，避免固定窗口跨越不同主题。"""
+    """按 Markdown 标题切分，并把父级标题保留在子章节名称中。"""
 
     cleaned = text.strip()
     if not cleaned:
         return []
-    matches = list(re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", cleaned))
+    heading_source = _mask_markdown_fences(cleaned)
+    matches = list(
+        re.finditer(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$", heading_source)
+    )
     if not matches:
         return [("", cleaned)]
 
@@ -254,10 +273,34 @@ def _split_markdown_sections(text: str) -> list[tuple[str, str]]:
     preamble = cleaned[:matches[0].start()].strip()
     if preamble:
         sections.append(("前言", preamble))
+    heading_stack: list[str] = []
     for index, match in enumerate(matches):
+        level = len(match.group(1))
+        heading = match.group(2).strip()
+        heading_stack = heading_stack[: level - 1]
+        heading_stack.append(heading)
         end = matches[index + 1].start() if index + 1 < len(matches) else len(cleaned)
-        sections.append((match.group(1).strip(), cleaned[match.start():end].strip()))
+        body = cleaned[match.end():end].strip()
+        if not body:
+            continue
+        title = " / ".join(heading_stack)
+        content = f"{match.group(0).strip()}\n\n{body}"
+        sections.append((title, content))
     return sections
+
+
+def _mask_markdown_fences(text: str) -> str:
+    """屏蔽 fenced code，保持字符位置不变以便继续切原始正文。"""
+
+    pattern = re.compile(
+        r"(?ms)^(?P<fence>`{3,}|~{3,})[^\r\n]*\r?\n.*?^(?P=fence)[ \t]*$"
+    )
+    masked = list(text)
+    for match in pattern.finditer(text):
+        for index in range(match.start(), match.end()):
+            if masked[index] not in "\r\n":
+                masked[index] = " "
+    return "".join(masked)
 
 
 def _split_windows(text: str, chunk_size: int = 1200, overlap: int = 120) -> list[str]:
@@ -330,7 +373,7 @@ def _make_chunk(
     title: str,
     content: str,
     index: str,
-    metadata: dict[str, str],
+    metadata: dict[str, Any],
 ) -> KnowledgeChunk:
     """创建稳定 chunk id，便于 eval 和后续增量索引。"""
 

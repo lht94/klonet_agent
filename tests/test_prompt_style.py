@@ -38,6 +38,31 @@ def test_mentor_prompt_keeps_generic_rag_secondary():
     assert "最多检索 1 次" in MENTOR_PROMPT
     assert "明确排除 Klonet 的问题禁止检索" not in MENTOR_PROMPT
 
+def test_mentor_prompt_requires_direct_concise_evidence_based_answers():
+    """Mentor 应直接、简洁地回答，并避免无证据推测和机械收尾。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.prompts import MENTOR_PROMPT
+
+    assert "第一段直接给出结论" in MENTOR_PROMPT
+    assert "只解释理解结论所必需的原因" in MENTOR_PROMPT
+    assert "不重复用户问题，不汇报内部检索过程" in MENTOR_PROMPT
+    assert "不机械追加学习建议、源码路径或下一步" in MENTOR_PROMPT
+    assert "不生成 Klonet 架构推测" in MENTOR_PROMPT
+    assert "suggest next step" not in get_profile("mentor").default_workflow
+
+
+def test_mentor_prompt_requires_structured_intent_before_retrieval():
+    """Mentor 检索前必须保存否定、前提和多轮纠正信息。"""
+
+    from klonet_agent.prompts import MENTOR_PROMPT
+
+    assert "search_knowledge" in MENTOR_PROMPT
+    assert "intent 参数" in MENTOR_PROMPT
+    assert "不得把被否定的方向作为主要检索目标" in MENTOR_PROMPT
+    assert "先向用户澄清" in MENTOR_PROMPT
+
+
 
 def test_memory_prompt_uses_teaching_agent_language():
     """记忆提示词不应该残留旧个人 Agent 称呼。"""

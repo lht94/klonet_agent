@@ -11,7 +11,7 @@ from typing import Any
 from rank_bm25 import BM25Okapi
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K, KNOWLEDGE_INDEX_FILE
-from klonet_agent.knowledge.indexer import KnowledgeIndexer
+from klonet_agent.knowledge.indexer import INDEX_SCHEMA_VERSION, KnowledgeIndexer
 from klonet_agent.knowledge.models import (
     RetrievedChunk,
     SearchOutcome,
@@ -44,6 +44,12 @@ _TASK_LAYER_WEIGHTS = {
         "curated": 1.3,
         "experience": 1.0,
         "local": 0.9,
+    },
+    "operation_guide": {
+        "curated": 1.7,
+        "experience": 1.0,
+        "machine_index": 0.7,
+        "local": 0.8,
     },
     "project_progress": {
         "local": 1.5,
@@ -125,6 +131,8 @@ class KnowledgeRetriever:
             metadata = _row_metadata(row)
             if not _allowed_by_request(metadata, request):
                 continue
+            if not _allowed_section_by_intent(row, request):
+                continue
 
             document_tokens = set(self._corpus_tokens[index])
             matched_terms = tuple(
@@ -156,6 +164,7 @@ class KnowledgeRetriever:
                     sensitivity=metadata["sensitivity"],
                     last_verified=metadata["last_verified"],
                     score=round(final_score, 4),
+                    intent_tags=metadata["intent_tags"],
                     bm25_score=round(bm25_score, 4),
                     exact_score=round(exact_score, 4),
                     metadata_score=round(metadata_score, 4),
@@ -164,7 +173,7 @@ class KnowledgeRetriever:
             )
 
         candidates.sort(key=lambda item: item.score, reverse=True)
-        selected = candidates[: max(1, request.top_k)]
+        selected = _select_candidates(candidates, request)
         return _classify_outcome(selected)
 
     def _ensure_loaded(self):
@@ -179,15 +188,14 @@ class KnowledgeRetriever:
         if self._mtime_ns == mtime_ns:
             return
 
-        rows = []
-        with self.index_file.open("r", encoding="utf-8") as file:
-            for line in file:
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(row, dict):
-                    rows.append(row)
+        rows = _read_index_rows(self.index_file)
+        if (
+            self.index_file.resolve() == KNOWLEDGE_INDEX_FILE.resolve()
+            and _needs_intent_metadata_migration(rows)
+        ):
+            KnowledgeIndexer(index_file=self.index_file).build()
+            rows = _read_index_rows(self.index_file)
+            mtime_ns = self.index_file.stat().st_mtime_ns
 
         corpus = []
         for row in rows:
@@ -202,7 +210,30 @@ class KnowledgeRetriever:
         self._mtime_ns = mtime_ns
 
 
-def _row_metadata(row: dict[str, Any]) -> dict[str, str]:
+def _read_index_rows(index_file: Path) -> list[dict[str, Any]]:
+    rows = []
+    with index_file.open("r", encoding="utf-8") as file:
+        for line in file:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _needs_intent_metadata_migration(rows: list[dict[str, Any]]) -> bool:
+    """缺少意图字段或仍使用旧切块结构时重建默认索引。"""
+
+    return bool(rows) and any(
+        "intent_tags" not in row
+        or row.get("index_schema_version") != INDEX_SCHEMA_VERSION
+        for row in rows
+    )
+
+
+def _row_metadata(row: dict[str, Any]) -> dict[str, Any]:
     """兼容旧索引行，为缺失 metadata 提供稳定默认值。"""
 
     layer = str(row.get("layer") or row.get("source") or "local")
@@ -214,10 +245,22 @@ def _row_metadata(row: dict[str, Any]) -> dict[str, str]:
         "quality": str(row.get("quality") or "unknown").lower(),
         "sensitivity": str(row.get("sensitivity") or "public").lower(),
         "last_verified": str(row.get("last_verified") or ""),
+        "intent_tags": _intent_tags(row.get("intent_tags")),
     }
 
 
-def _allowed_by_request(metadata: dict[str, str], request: SearchRequest) -> bool:
+def _intent_tags(value: Any) -> tuple[str, ...]:
+    raw_items = value if isinstance(value, list) else str(value or "").split(",")
+    return tuple(
+        dict.fromkeys(
+            normalized
+            for item in raw_items
+            if (normalized := str(item or "").strip().lower())
+        )
+    )
+
+
+def _allowed_by_request(metadata: dict[str, Any], request: SearchRequest) -> bool:
     """执行 layer、domain、priority、状态和敏感度过滤。"""
 
     if metadata["status"] == "deprecated":
@@ -228,12 +271,33 @@ def _allowed_by_request(metadata: dict[str, str], request: SearchRequest) -> boo
         return False
     if request.domains and not _domains_match(metadata["domain"], request.domains):
         return False
+    if request.intent != "unknown" and request.intent not in metadata["intent_tags"]:
+        return False
+    if set(request.excluded_intents).intersection(metadata["intent_tags"]):
+        return False
     if request.min_priority:
         row_rank = _PRIORITY_RANK.get(metadata["priority"], 99)
         limit_rank = _PRIORITY_RANK.get(request.min_priority.upper(), 99)
         if row_rank > limit_rank:
             return False
     return True
+
+
+def _allowed_section_by_intent(row: dict[str, Any], request: SearchRequest) -> bool:
+    """同一 Runbook 内按操作意图排除明显相反或故障型章节。"""
+
+    if request.intent != "platform_start":
+        return True
+    segments = [
+        segment.strip()
+        for segment in str(row.get("title") or "").split("/")
+        if segment.strip()
+    ]
+    if segments and "启动、停止与重启" in segments[0]:
+        segments = segments[1:]
+    section_title = " / ".join(segments)
+    forbidden = ("常见问题", "正常停止", "正常重启", "失败", "无法")
+    return not any(term in section_title for term in forbidden)
 
 
 def _domains_match(row_domain: str, request_domains: tuple[str, ...]) -> bool:
@@ -349,6 +413,51 @@ def _make_snippet(content: str, terms: list[str], width: int = 500) -> str:
     center = min(positions)
     start = max(center - width // 3, 0)
     return content[start:start + width].strip()
+
+
+def _select_candidates(
+    candidates: list[RetrievedChunk],
+    request: SearchRequest,
+) -> list[RetrievedChunk]:
+    limit = max(1, request.top_k)
+    if request.intent != "platform_start":
+        return candidates[:limit]
+
+    stage_terms = (
+        "服务器角色与启动顺序",
+        "检查并启动 Redis",
+        "启动 Master",
+        "启动 Celery",
+        "启动 Web Terminal",
+        "启动 Worker",
+        "配置并重载 Nginx",
+        "启动后验证",
+    )
+    selected: list[RetrievedChunk] = []
+    for stage_term in stage_terms:
+        matches = [
+            item
+            for item in candidates
+            if stage_term in item.title and item not in selected
+        ]
+        if not matches:
+            continue
+        matches.sort(key=_operation_variant_rank)
+        selected.append(matches[0])
+        if len(selected) >= limit:
+            return selected
+
+    for item in candidates:
+        if item not in selected:
+            selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _operation_variant_rank(item: RetrievedChunk) -> tuple[int, float]:
+    preferred = item.title.endswith("/ 服务器路径") or "nginx -t" in item.snippet
+    return (0 if preferred else 1, -item.score)
 
 
 # 保留旧模块级函数，避免已有教学代码导入失败。

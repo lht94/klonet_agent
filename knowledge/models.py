@@ -10,6 +10,7 @@ QueryScope = Literal["klonet", "general", "mixed"]
 TaskType = Literal[
     "auto",
     "concept",
+    "operation_guide",
     "troubleshooting",
     "code_lookup",
     "development",
@@ -39,6 +40,8 @@ class SearchRequest:
     task_type: TaskType = "auto"
     layers: tuple[str, ...] | None = None
     domains: tuple[str, ...] | None = None
+    intent: str = "unknown"
+    excluded_intents: tuple[str, ...] = ()
     min_priority: str | None = None
     exclude_sensitivity: tuple[str, ...] = ("review_required", "restricted")
     top_k: int = 3
@@ -61,6 +64,7 @@ class RetrievedChunk:
     sensitivity: str
     last_verified: str
     score: float
+    intent_tags: tuple[str, ...] = ()
     bm25_score: float = 0.0
     exact_score: float = 0.0
     metadata_score: float = 1.0

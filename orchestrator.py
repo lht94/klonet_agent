@@ -10,6 +10,7 @@ import json
 from time import perf_counter
 
 from klonet_agent.agents import AgentProfile, get_profile
+from klonet_agent.answer_policy import build_answer_policy
 from klonet_agent.config import (
     HISTORY_MAX_MESSAGES,
     MAX_TODO_CONTINUATIONS,
@@ -19,6 +20,7 @@ from klonet_agent.config import (
     RAG_SEARCH_BUDGETS,
     TRACE_FILE,
 )
+from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
@@ -54,6 +56,7 @@ class AgentOrchestrator:
             self.session.project_id,
         )
         self._query_route = route_query("Klonet")
+        self._query_intent: QueryIntent | None = None
         self._knowledge_search_count = 0
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
@@ -122,7 +125,16 @@ class AgentOrchestrator:
     def use_tool(self, tool_name: str, tool_args: dict) -> str:
         """按本轮作用域和检索预算调用工具执行器。"""
 
-        scope = self._query_route.scope
+        if tool_name == "search_knowledge" and self._query_route.hard_disable_rag:
+            return (
+                "原始用户输入已明确排除 Klonet，未执行 Klonet RAG。"
+                "查询改写和模型意图不能覆盖该否定条件。"
+            )
+        scope = (
+            self._query_intent.scope
+            if self._query_intent is not None
+            else self._query_route.scope
+        )
         if scope == "general" and tool_name == "read_project_journal":
             return "本轮属于 generic 问题，禁止读取 Klonet 项目日志。"
 
@@ -234,9 +246,17 @@ class AgentOrchestrator:
         tool_rounds = 0
         todo_continuations = 0
         self._query_route = route_query(user_input)
+        self._query_intent = None
         self._knowledge_search_count = 0
         turn_scope_message = self._build_turn_scope_message(user_input)
         history.append(turn_scope_message)
+        turn_answer_policy_message = None
+        if self.profile.name == "mentor":
+            turn_answer_policy_message = {
+                "role": "system",
+                "content": build_answer_policy(self._query_route.task_type, user_input),
+            }
+            history.append(turn_answer_policy_message)
 
         # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
         while tool_rounds < MAX_TOOL_ROUNDS:
@@ -259,6 +279,20 @@ class AgentOrchestrator:
                     tool_name = tool_call.function.name
                     # 工具参数，即 schema 中 function.parameters 约束出的标准 JSON。
                     tool_args = json.loads(tool_call.function.arguments)
+                    if tool_name == "search_knowledge":
+                        candidate_intent = QueryIntent.from_mapping(
+                            tool_args.get("intent")
+                        )
+                        if candidate_intent.confidence >= 0.6:
+                            self._query_intent = candidate_intent
+                            if turn_answer_policy_message is not None:
+                                turn_answer_policy_message["content"] = (
+                                    build_answer_policy(
+                                        candidate_intent.task_type,
+                                        user_input,
+                                        intent=candidate_intent,
+                                    )
+                                )
                     # 调用工具函数，开始执行命令或其他动作。
                     result = self.use_tool(tool_name, tool_args)
 
@@ -343,7 +377,10 @@ class AgentOrchestrator:
         history = [
             message
             for message in history
-            if message is not turn_scope_message
+            if (
+                message is not turn_scope_message
+                and message is not turn_answer_policy_message
+            )
         ]
 
         # 条件触发对话压缩。这里沿用旧版逻辑，用本轮 context token 判断。
@@ -375,6 +412,12 @@ class AgentOrchestrator:
                 for tool in tools
                 if tool["function"]["name"] != "read_project_journal"
             ]
+        if self._query_route.hard_disable_rag:
+            tools = [
+                tool
+                for tool in tools
+                if tool["function"]["name"] != "search_knowledge"
+            ]
         return tools
 
     def _build_turn_scope_message(self, user_input: str) -> dict:
@@ -388,7 +431,15 @@ class AgentOrchestrator:
             f"- original_user_input: {user_input}",
             "- 本轮范围由原始用户输入确定，后续查询改写不得改变。",
         ]
-        if route.scope == "general":
+        if route.hard_disable_rag:
+            rules.extend(
+                [
+                    "- 用户明确排除了 Klonet；禁止执行 Klonet RAG。",
+                    "- 查询改写、后续工具参数和模型意图都不能覆盖该否定条件。",
+                    "- 只使用通用技术知识回答原始需求。",
+                ]
+            )
+        elif route.scope == "general":
             rules.extend(
                 [
                     "- 通用知识是主要依据，必须先完整回答原始技术需求。",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K
+from klonet_agent.knowledge.intent import QueryIntent, build_retrieval_plan
 from klonet_agent.knowledge.models import QueryRoute, QueryScope, SearchRequest
 from klonet_agent.knowledge.retriever import KnowledgeRetriever
 from klonet_agent.knowledge.router import DEFAULT_QUERY_ROUTER
@@ -35,28 +36,39 @@ class KnowledgeBase:
         layers: tuple[str, ...] | None = None,
         domains: tuple[str, ...] | None = None,
         min_priority: str | None = None,
+        intent: QueryIntent | None = None,
     ) -> str:
         """按软路由检索，并返回带来源和可靠度的证据。"""
 
         route = route_query(query)
+        if intent is not None and intent.confidence < 0.6:
+            intent = None
         if route.hard_disable_rag:
             return (
                 "该问题明确不属于 Klonet 知识库范围，未执行 Klonet RAG。"
                 "请保留用户的否定条件，使用通用技术知识回答。"
             )
-        if route.scope == "general" and route.confidence >= 0.8:
+        if intent is not None and intent.scope == "general":
+            return (
+                "结构化意图表明该问题属于通用技术范围，未执行 Klonet RAG。"
+                "请使用通用技术知识回答，并保留用户的原始约束。"
+            )
+        if intent is None and route.scope == "general" and route.confidence >= 0.8:
             return (
                 "该问题高概率属于通用技术范围，未主动注入 Klonet 证据。"
                 "如用户后续明确关联 Klonet，再执行专属知识检索。"
             )
 
+        retrieval_query, retrieval_top_k = build_retrieval_plan(query, intent, top_k)
         request = SearchRequest(
-            query=query,
-            task_type=task_type or route.task_type,
+            query=retrieval_query,
+            task_type=(intent.task_type if intent is not None else task_type or route.task_type),
             layers=layers,
             domains=domains or route.domains or None,
+            intent=(intent.operation if intent is not None else "unknown"),
+            excluded_intents=(intent.excluded_intents if intent is not None else ()),
             min_priority=min_priority,
-            top_k=top_k,
+            top_k=retrieval_top_k,
         )
         outcome = self.retriever.search_request(request)
         if outcome.status == "none":
@@ -76,6 +88,7 @@ class KnowledgeBase:
             f"- confidence: {outcome.confidence}",
             f"- route_scope: {route.scope}",
             f"- task_type: {request.task_type}",
+            f"- operation: {request.intent}",
         ]
         for index, item in enumerate(outcome.results, start=1):
             lines.append(

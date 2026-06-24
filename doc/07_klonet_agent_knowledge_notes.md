@@ -1307,3 +1307,194 @@ web terminal 连不上通常是什么原因？
 稳定结论需要上升到人工知识层。
 代码定位需要交给机器索引层。
 ```
+
+## 意图路由与知识检索的职责边界
+
+### 路由和检索不是同一件事
+
+可以把知识库理解成一座图书馆：
+
+```text
+路由：判断应该去哪个书架，以及这次要解决什么任务。
+检索：在选定书架中找到最相关的具体页面和证据片段。
+```
+
+例如用户问：
+
+```text
+不是配置环境，我要启动 Klonet。
+```
+
+正确的路由结果应该表达：
+
+```text
+问题范围：Klonet
+任务类型：操作指导
+操作意图：启动已有平台
+排除意图：首次安装环境
+前置状态：环境已经准备完成
+本轮是对上一轮理解的纠正
+```
+
+路由完成后，检索器才去启动 Runbook 中查找 Master、Celery、Web Terminal、Worker 和 Nginx 的具体启动命令。
+
+### 当前实现为什么容易跑偏
+
+当前系统采用：
+
+```text
+关键词路由 + BM25 关键词检索
+```
+
+关键词路由主要输出 `scope`、`task_type` 和 `domains`。当前 `runtime` 领域同时包含部署、启动、关闭和环境等词，`concept` 任务也无法区分“安装环境”和“启动平台”。因此下面两个问题可能得到相同路由：
+
+```text
+我怎么部署 Klonet？
+环境已经装好了，我怎么启动 Klonet？
+```
+
+第二个问题中的“不是环境配置”还可能让 BM25 同时命中“环境”和“启动”。如果路由没有保存否定条件，环境部署文档反而可能得到更高分。
+
+所以当前问题首先是走错知识范围，而不代表 BM25 完全不可用。
+
+### 目标架构
+
+建议逐步升级为：
+
+```text
+原始用户输入
+  -> 少量确定性边界检查
+  -> 大模型结构化意图解析
+  -> Schema 与置信度校验
+  -> 根据意图生成检索计划
+  -> BM25 在候选知识范围内检索具体章节
+  -> 证据组织
+  -> 按任务结构生成回答
+```
+
+这里优先替换的是“关键词主路由”，不是立即替换 BM25。BM25 仍然负责在已经选定的文档范围内找到具体内容。后续只有真实 Eval 证明存在明显语义漏检时，才需要增加向量召回。
+
+### 结构化意图
+
+意图解析模型不应该输出一段自由文本，而应该返回受 Schema 约束的数据，例如：
+
+```json
+{
+  "scope": "klonet",
+  "task_type": "operation_guide",
+  "operation": "platform_start",
+  "target": "klonet_platform",
+  "excluded_intents": ["environment_setup"],
+  "prerequisites": ["environment_ready"],
+  "is_correction": true,
+  "confidence": 0.96
+}
+```
+
+字段职责如下：
+
+```text
+scope：Klonet、通用技术或 mixed。
+task_type：概念解释、操作指导、故障排查、源码定位或项目进度。
+operation：环境安装、平台启动、停止、重启等具体动作。
+target：动作针对的平台、服务或模块。
+excluded_intents：用户明确否定的方向。
+prerequisites：用户已经说明的前置状态。
+is_correction：是否在纠正上一轮理解。
+confidence：意图解析置信度。
+```
+
+这种结构把开放的自然语言收敛为有限、可校验的系统状态。不同说法，例如“把平台跑起来”“环境装好了接下来呢”和“不是安装，我要启动”，都可以归一化为 `platform_start`。
+
+### 意图模块如何知道需要哪些文档
+
+意图模型不应该在每个问题到来时读取全部 README，也不应该记住仓库中的物理路径。更稳定的方式是维护一个紧凑的知识目录，由文档 frontmatter 或构建索引自动生成。
+
+知识目录可以包含：
+
+```json
+{
+  "document_id": "ops.startup_shutdown",
+  "path": "knowledge/klonet/ops/startup_shutdown.md",
+  "domains": ["operations", "runtime"],
+  "intent_tags": ["platform_start", "platform_stop", "platform_restart"],
+  "task_types": ["operation_guide", "troubleshooting"],
+  "priority": "P0",
+  "status": "current_runbook"
+}
+```
+
+环境部署文档则可以注册为：
+
+```json
+{
+  "document_id": "ops.environment_setup",
+  "path": "knowledge/klonet/ops/environment_setup.md",
+  "domains": ["operations", "environment"],
+  "intent_tags": ["environment_setup", "dependency_install"],
+  "task_types": ["operation_guide"],
+  "priority": "P0",
+  "status": "current_runbook"
+}
+```
+
+模型主要负责把用户语言解析为 `operation=platform_start`。系统再使用知识目录把意图映射到候选文档：
+
+```text
+platform_start
+  -> ops.startup_shutdown
+  -> 在该文档内检索 Master、Celery、Terminal、Worker 的启动命令
+
+environment_setup
+  -> ops.environment_setup
+  -> 在该文档内检索依赖、基础容器、镜像仓库和环境验收
+```
+
+因此，文档定位依据不是一个总 README，而是统一、可生成、可校验的知识目录。新增知识文档时主要维护 frontmatter 或索引 metadata，不需要把所有文档名称硬编码进 Prompt。
+
+当前知识文档已有 `domains`、`priority`、`status` 等 metadata，但还不足以稳定区分“环境安装”和“平台启动”。目标状态需要补充更细的 `intent_tags` 或等价字段。
+
+### 为什么不会再次变成无限规则库
+
+大模型负责理解开放的用户表达，代码只维护有限的业务意图和安全边界：
+
+```text
+大模型：理解用户究竟想做什么。
+Schema：限制模型可以输出哪些结构化状态。
+知识目录：声明每份文档适用于哪些意图。
+检索器：在候选文档中找到具体证据。
+硬规则：保护明确否定、安全权限和精确路径等确定性边界。
+```
+
+需要维护的是相对稳定的业务动作，例如环境安装、启动、停止和重启，而不是穷举“怎么开平台”“如何跑起来”等所有自然语言说法。
+
+### 是否需要额外增加一次模型调用
+
+不一定。当前 RAG 工具循环本来通常包含：
+
+```text
+第一次模型调用：判断是否调用知识检索工具。
+第二次模型调用：读取工具证据并生成回答。
+```
+
+可以让第一次模型调用同时完成意图解析，并把结构化意图放入检索工具参数：
+
+```text
+第一次调用：理解意图 + 生成结构化检索请求。
+工具执行：校验意图 + 选择候选文档 + BM25 检索章节。
+第二次调用：根据可靠证据回答。
+```
+
+只有当模型输出不符合 Schema、置信度过低或用户问题本身存在关键歧义时，系统才应该降级或请求用户澄清。
+
+### 设计结论
+
+目标方案可以概括为：
+
+```text
+从“关键词决定去哪里找”升级为“大模型理解意图，系统决定可检索范围”。
+从“在整个知识库碰关键词”升级为“先选对文档，再在文档内找具体证据”。
+从“丢失否定和纠正条件”升级为“把约束保存为结构化状态”。
+```
+
+路由解决的是“找哪类知识”，检索解决的是“找到哪些具体内容”。意图解析提高前者的准确性，BM25 继续承担后者；两者职责清晰后，回答才不容易因为走错知识范围而跑偏。

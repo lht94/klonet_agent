@@ -54,11 +54,61 @@ TOOLS = [
         "仅检索 Klonet 专属知识。明确不需要 Klonet 的通用技术问题不要调用；Klonet 域内问题和 Coding 规范查询再使用。",
         {
             "query": {"type": "string", "description": "检索问题或关键词"},
+            "intent": {
+                "type": "object",
+                "description": "对原始用户需求的结构化理解；必须保留否定、前置条件和纠正信息",
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["klonet", "general", "mixed"],
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "enum": [
+                            "concept",
+                            "operation_guide",
+                            "troubleshooting",
+                            "code_lookup",
+                            "development",
+                            "project_progress",
+                            "general",
+                        ],
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": [
+                            "unknown",
+                            "environment_setup",
+                            "dependency_install",
+                            "platform_start",
+                            "platform_stop",
+                            "platform_restart",
+                        ],
+                    },
+                    "target": {"type": "string"},
+                    "excluded_intents": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "prerequisites": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "is_correction": {"type": "boolean"},
+                    "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                    },
+                },
+                "required": ["scope", "task_type", "operation", "confidence"],
+            },
             "top_k": {"type": "integer", "description": "返回条数，默认 3"},
             "task_type": {
                 "type": "string",
                 "enum": [
                     "concept",
+                    "operation_guide",
                     "troubleshooting",
                     "code_lookup",
                     "development",
@@ -86,7 +136,7 @@ TOOLS = [
                 "description": "可选最低知识优先级",
             },
         },
-        ["query"],
+        ["query", "intent"],
     ),
     _tool(
         "list_files",
