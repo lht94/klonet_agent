@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K
+from klonet_agent.knowledge.collection_router import collection_ids, collection_paths, route_collections
 from klonet_agent.knowledge.intent import QueryIntent, build_retrieval_plan
 from klonet_agent.knowledge.models import QueryRoute, QueryScope, SearchRequest
 from klonet_agent.knowledge.retriever import KnowledgeRetriever
@@ -60,6 +61,7 @@ class KnowledgeBase:
             )
 
         retrieval_query, retrieval_top_k = build_retrieval_plan(query, intent, top_k)
+        collections = route_collections(intent)
         request = SearchRequest(
             query=retrieval_query,
             task_type=(intent.task_type if intent is not None else task_type or route.task_type),
@@ -68,6 +70,8 @@ class KnowledgeBase:
             intent=(intent.operation if intent is not None else "unknown"),
             excluded_intents=(intent.excluded_intents if intent is not None else ()),
             min_priority=min_priority,
+            collections=collection_ids(collections),
+            allowed_paths=collection_paths(collections),
             top_k=retrieval_top_k,
         )
         outcome = self.retriever.search_request(request)

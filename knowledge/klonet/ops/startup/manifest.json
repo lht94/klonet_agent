@@ -1,0 +1,9 @@
+﻿{
+  "collection_id": "klonet_runtime_startup",
+  "title": "Klonet platform startup, stop and restart runbook",
+  "paths": ["knowledge/klonet/ops/startup_shutdown.md"],
+  "task_types": ["deployment_guidance", "operation_guide", "troubleshooting"],
+  "operations": ["platform_start", "platform_stop", "platform_restart"],
+  "targets": ["klonet_platform", "redis", "gunicorn", "celery", "web_terminal", "nginx", "worker", "master"],
+  "excluded_operations": ["environment_setup", "dependency_install"]
+}

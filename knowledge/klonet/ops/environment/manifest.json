@@ -1,0 +1,9 @@
+﻿{
+  "collection_id": "klonet_environment_setup",
+  "title": "Klonet base environment and dependency installation runbook",
+  "paths": ["knowledge/klonet/ops/environment_setup.md"],
+  "task_types": ["deployment_preparation", "operation_guide", "troubleshooting"],
+  "operations": ["environment_setup", "dependency_install", "acceptance_check"],
+  "targets": ["klonet_environment", "docker", "docker_service", "base_requ_setup", "registry"],
+  "excluded_operations": ["platform_start"]
+}

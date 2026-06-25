@@ -58,6 +58,12 @@ def _select_policy(
     normalized_type = (task_type or "").strip().lower()
     query = (user_input or "").strip()
 
+    if normalized_type == "credential_boundary":
+        return (
+            "安全边界、可替代做法",
+            "100 至 300 字",
+            "不得复述、猜测或保存明文账号、密码、token、真实 IP",
+        )
     if intent is not None and intent.operation == "platform_start":
         return (
             "启动前提、标准启动命令、验证方式",

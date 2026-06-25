@@ -66,6 +66,9 @@ TOOLS = [
                         "type": "string",
                         "enum": [
                             "concept",
+                            "deployment_preparation",
+                            "deployment_guidance",
+                            "credential_boundary",
                             "operation_guide",
                             "troubleshooting",
                             "code_lookup",
@@ -83,9 +86,11 @@ TOOLS = [
                             "platform_start",
                             "platform_stop",
                             "platform_restart",
+                            "acceptance_check",
                         ],
                     },
                     "target": {"type": "string"},
+                    "symptom": {"type": "string"},
                     "excluded_intents": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -94,6 +99,9 @@ TOOLS = [
                         "type": "array",
                         "items": {"type": "string"},
                     },
+                    "requires_retrieval": {"type": "boolean"},
+                    "clarification_required": {"type": "boolean"},
+                    "clarification_question": {"type": "string"},
                     "is_correction": {"type": "boolean"},
                     "confidence": {
                         "type": "number",
@@ -108,6 +116,9 @@ TOOLS = [
                 "type": "string",
                 "enum": [
                     "concept",
+                    "deployment_preparation",
+                    "deployment_guidance",
+                    "credential_boundary",
                     "operation_guide",
                     "troubleshooting",
                     "code_lookup",

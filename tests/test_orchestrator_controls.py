@@ -14,6 +14,8 @@ class FakeLLM:
 
     def complete(self, messages, tools):
         self.calls.append({"messages": messages, "tools": tools})
+        if tools is None:
+            return _intent_response()
         message = SimpleNamespace(content="已给出当前建议。", tool_calls=None)
         choice = SimpleNamespace(message=message)
         usage = SimpleNamespace(total_tokens=10)
@@ -25,10 +27,14 @@ class RewrittenQueryLLM:
 
     def __init__(self):
         self.calls = []
+        self.answer_calls = 0
 
     def complete(self, messages, tools):
         self.calls.append({"messages": list(messages), "tools": tools})
-        if len(self.calls) == 1:
+        if tools is None:
+            return _intent_response()
+        self.answer_calls += 1
+        if self.answer_calls == 1:
             tool_calls = [
                 SimpleNamespace(
                     id="search-1",
@@ -83,10 +89,14 @@ class BatchSearchLLM:
 
     def __init__(self):
         self.calls = []
+        self.answer_calls = 0
 
     def complete(self, messages, tools):
         self.calls.append({"messages": list(messages), "tools": tools})
-        if len(self.calls) == 1:
+        if tools is None:
+            return _intent_response()
+        self.answer_calls += 1
+        if self.answer_calls == 1:
             tool_calls = [
                 SimpleNamespace(
                     id=f"search-{index}",
@@ -114,10 +124,14 @@ class StructuredIntentSearchLLM:
 
     def __init__(self):
         self.calls = []
+        self.answer_calls = 0
 
     def complete(self, messages, tools):
         self.calls.append({"messages": list(messages), "tools": tools})
-        if len(self.calls) == 1:
+        if tools is None:
+            return _intent_response()
+        self.answer_calls += 1
+        if self.answer_calls == 1:
             tool_calls = [
                 SimpleNamespace(
                     id="intent-search-1",
@@ -148,6 +162,129 @@ class StructuredIntentSearchLLM:
         return SimpleNamespace(
             choices=[SimpleNamespace(message=message)],
             usage=SimpleNamespace(total_tokens=10),
+        )
+
+
+def _stream_chunk(
+    *,
+    content=None,
+    tool_calls=None,
+    finish_reason=None,
+    usage=None,
+):
+    delta = SimpleNamespace(content=content, tool_calls=tool_calls)
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _intent_response(content="{}"):
+    message = SimpleNamespace(content=content, tool_calls=None)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message)],
+        usage=SimpleNamespace(total_tokens=0),
+    )
+
+
+def _answer_calls(llm):
+    return [call for call in llm.calls if call.get("tools") is not None]
+
+
+class StreamingAnswerLLM:
+    """模拟模型用流式分片返回普通自然语言回答。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages, tools, stream=False):
+        self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+        if tools is None:
+            return _intent_response()
+        if stream:
+            return iter(
+                [
+                    _stream_chunk(content="第一段"),
+                    _stream_chunk(content="，第二段"),
+                    _stream_chunk(finish_reason="stop", usage=SimpleNamespace(total_tokens=12)),
+                ]
+            )
+        message = SimpleNamespace(content="不应走非流式回答", tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=SimpleNamespace(total_tokens=12),
+        )
+
+
+class StreamingToolThenAnswerLLM:
+    """模拟模型先用流式 tool call 请求工具，再流式返回最终回答。"""
+
+    def __init__(self):
+        self.calls = []
+        self.answer_calls = 0
+
+    def complete(self, messages, tools, stream=False):
+        self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+        if tools is None:
+            return _intent_response()
+        self.answer_calls += 1
+        if self.answer_calls == 1:
+            return iter(
+                [
+                    _stream_chunk(
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="search-stream-1",
+                                function=SimpleNamespace(
+                                    name="search_knowledge",
+                                    arguments='{"query": "Klonet ',
+                                ),
+                            )
+                        ]
+                    ),
+                    _stream_chunk(
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                function=SimpleNamespace(
+                                    name=None,
+                                    arguments='启动", "intent": {"scope": "klonet", "task_type": "operation_guide", "operation": "platform_start", "confidence": 0.95}}',
+                                ),
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                        usage=SimpleNamespace(total_tokens=8),
+                    ),
+                ]
+            )
+        return iter(
+            [
+                _stream_chunk(content="启动命令如下"),
+                _stream_chunk(finish_reason="stop", usage=SimpleNamespace(total_tokens=9)),
+            ]
+        )
+
+
+class StreamTimeoutError(Exception):
+    pass
+
+
+class StreamingTimeoutThenNonStreamLLM:
+    """Simulate stream handshake timeout, then successful non-stream retry."""
+
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages, tools, stream=False):
+        self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+        if tools is None:
+            return _intent_response()
+        if stream:
+            raise StreamTimeoutError("Request timed out.")
+        message = SimpleNamespace(content="fallback answer", tool_calls=None)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message)],
+            usage=SimpleNamespace(total_tokens=11),
         )
 
 
@@ -192,7 +329,7 @@ def test_general_query_allows_secondary_search_but_hides_project_journal():
 
     visible_names = {
         tool["function"]["name"]
-        for tool in llm.calls[0]["tools"]
+        for tool in _answer_calls(llm)[0]["tools"]
     }
     assert "search_knowledge" in visible_names
     assert "read_project_journal" not in visible_names
@@ -233,7 +370,7 @@ def test_explicit_klonet_negation_blocks_rewritten_search():
         )
 
     assert executor.calls == []
-    for call in llm.calls:
+    for call in _answer_calls(llm):
         visible_names = {
             tool["function"]["name"]
             for tool in call["tools"]
@@ -249,7 +386,7 @@ def test_explicit_klonet_negation_blocks_rewritten_search():
     assert any("明确排除 Klonet" in result for result in tool_results)
     assert any("禁止读取" in result for result in tool_results)
 
-    first_messages = llm.calls[0]["messages"]
+    first_messages = _answer_calls(llm)[0]["messages"]
     scope_prompts = [
         message["content"]
         for message in first_messages
@@ -355,7 +492,7 @@ def test_mixed_search_budget_is_two_and_requires_split_answer():
     assert len(search_calls) == 2
     scope_prompts = [
         message["content"]
-        for message in llm.calls[0]["messages"]
+        for message in _answer_calls(llm)[0]["messages"]
         if message["role"] == "system" and "本轮问题范围" in message["content"]
     ]
     assert "分区回答" in scope_prompts[0]
@@ -389,7 +526,7 @@ def test_soft_general_query_keeps_search_tool_visible():
 
     visible_names = {
         tool["function"]["name"]
-        for tool in llm.calls[0]["tools"]
+        for tool in _answer_calls(llm)[0]["tools"]
     }
     assert "search_knowledge" in visible_names
 
@@ -408,7 +545,7 @@ def test_turn_answer_policy_is_injected_and_removed_after_reply():
 
     policy_prompts = [
         message["content"]
-        for message in llm.calls[0]["messages"]
+        for message in _answer_calls(llm)[0]["messages"]
         if message["role"] == "system" and "本轮回答策略" in message["content"]
     ]
     assert policy_prompts
@@ -431,7 +568,7 @@ def test_coding_mode_does_not_receive_mentor_answer_policy():
     assert not any(
         message["role"] == "system"
         and "本轮回答策略" in message.get("content", "")
-        for message in llm.calls[0]["messages"]
+        for message in _answer_calls(llm)[0]["messages"]
     )
 
 
@@ -472,8 +609,121 @@ def test_model_intent_refreshes_mentor_policy_before_final_answer():
     assert executor.calls[0][1]["intent"]["operation"] == "platform_start"
     policy_prompts = [
         message["content"]
-        for message in llm.calls[1]["messages"]
+        for message in _answer_calls(llm)[1]["messages"]
         if message["role"] == "system" and "本轮回答策略" in message["content"]
     ]
     assert "启动前提、标准启动命令、验证方式" in policy_prompts[0]
     assert "不得包含环境安装步骤" in policy_prompts[0]
+
+
+def test_single_chat_streams_plain_answer_without_duplicate_print(capsys):
+    """最终自然语言回答应边到达边输出，不能等完整响应后再重复打印。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingAnswerLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        _, history, token = orchestrator.single_chat("解释 Klonet", history, 0)
+
+    output = capsys.readouterr().out
+    assert "Klonet Agent：第一段，第二段" in output
+    assert output.count("第一段，第二段") == 1
+    assert history[-1]["content"] == "第一段，第二段"
+    assert "\u6b63\u5728\u601d\u8003" in output
+    assert output.index("\u6b63\u5728\u601d\u8003") < output.index(history[-1]["content"])
+    assert token == 12
+    assert _answer_calls(llm)[0]["stream"] is True
+
+
+def test_single_chat_streams_tool_call_then_final_answer(capsys):
+    """流式模式下仍能聚合 tool call 参数、执行工具，再流式输出最终回答。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingToolThenAnswerLLM()
+        executor = RecordingToolExecutor()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            tool_executor=executor,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        _, history, token = orchestrator.single_chat("我要启动 Klonet", history, 0)
+
+    output = capsys.readouterr().out
+    assert executor.calls[0][0] == "search_knowledge"
+    assert executor.calls[0][1]["query"] == "Klonet 启动"
+    assert executor.calls[0][1]["intent"]["operation"] == "platform_start"
+    assert "Klonet Agent：启动命令如下" in output
+    assert history[-1]["content"] == "启动命令如下"
+    assert token == 17
+    assert [call["stream"] for call in _answer_calls(llm)] == [True, True]
+
+
+def test_stream_timeout_falls_back_to_non_stream_answer(capsys):
+    """If stream connection times out, retry once without stream instead of crashing."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingTimeoutThenNonStreamLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        _, history, token = orchestrator.single_chat("hello", history, 0)
+
+    output = capsys.readouterr().out
+    assert "Klonet Agent：fallback answer" in output
+    assert history[-1]["content"] == "fallback answer"
+    assert token == 11
+    assert [call["stream"] for call in _answer_calls(llm)] == [True, False]

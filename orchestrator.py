@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from time import perf_counter
+from types import SimpleNamespace
 
 from klonet_agent.agents import AgentProfile, get_profile
 from klonet_agent.answer_policy import build_answer_policy
@@ -20,7 +21,12 @@ from klonet_agent.config import (
     RAG_SEARCH_BUDGETS,
     TRACE_FILE,
 )
+from klonet_agent.knowledge.clarification import (
+    decide_model_intent_clarification,
+    decide_pre_llm_clarification,
+)
 from klonet_agent.knowledge.intent import QueryIntent
+from klonet_agent.knowledge.intent_analyzer import IntentAnalyzer, route_from_intent
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
@@ -45,10 +51,12 @@ class AgentOrchestrator:
         tool_executor: ToolExecutor | None = None,
         trace_logger: TraceLogger | None = None,
         memory_store: MemoryStore | None = None,
+        intent_analyzer: IntentAnalyzer | None = None,
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
         self.llm = llm or LLMClient()
+        self.intent_analyzer = intent_analyzer or IntentAnalyzer(self.llm)
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
             MEMORY_DIR,
@@ -103,7 +111,13 @@ class AgentOrchestrator:
 
         return history
 
-    def chat_with_llm(self, history: list[dict]):
+    def chat_with_llm(
+        self,
+        history: list[dict],
+        *,
+        stream: bool = False,
+        on_delta=None,
+    ):
         """调用 LLM 并返回响应。
 
         旧版是在 runner.py 中直接调用底层 SDK 的 chat.completions.create(...)，
@@ -111,7 +125,9 @@ class AgentOrchestrator:
         """
 
         start = perf_counter()
-        response = self.llm.complete(messages=history, tools=self._visible_tools())
+        response = self._complete_llm(history, stream=stream)
+        if stream and not self._is_complete_response(response):
+            response = self._collect_stream_response(response, on_delta=on_delta)
         duration_ms = int((perf_counter() - start) * 1000)
         self.trace_logger.record_llm_call(
             user_id=self.session.user_id,
@@ -121,6 +137,105 @@ class AgentOrchestrator:
             duration_ms=duration_ms,
         )
         return response
+
+    def _complete_llm(self, history: list[dict], *, stream: bool):
+        tools = self._visible_tools()
+        if not stream:
+            return self.llm.complete(messages=history, tools=tools)
+        try:
+            return self.llm.complete(messages=history, tools=tools, stream=True)
+        except TypeError as exc:
+            if "stream" not in str(exc):
+                raise
+            return self.llm.complete(messages=history, tools=tools)
+        except Exception as exc:
+            if not self._is_timeout_error(exc):
+                raise
+            return self.llm.complete(messages=history, tools=tools)
+
+    def _is_complete_response(self, response) -> bool:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return False
+        return hasattr(choices[0], "message")
+
+    def _is_timeout_error(self, exc: Exception) -> bool:
+        error_type = exc.__class__.__name__.lower()
+        error_module = exc.__class__.__module__.lower()
+        message = str(exc).lower()
+        return (
+            "timeout" in error_type
+            or "timeout" in message
+            or error_type == "apitimeouterror"
+            or ("openai" in error_module and "timeout" in error_type)
+        )
+
+    def _collect_stream_response(self, stream, *, on_delta=None):
+        content_parts: list[str] = []
+        tool_call_parts: dict[int, dict] = {}
+        total_tokens = 0
+        finish_reason = None
+
+        for chunk in stream:
+            usage = getattr(chunk, "usage", None)
+            chunk_tokens = getattr(usage, "total_tokens", 0) if usage is not None else 0
+            if chunk_tokens:
+                total_tokens = chunk_tokens
+
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+            delta = getattr(choice, "delta", None)
+            if delta is None:
+                continue
+
+            content = getattr(delta, "content", None)
+            if content:
+                content_parts.append(content)
+                if on_delta is not None:
+                    on_delta(content)
+
+            for tool_call in getattr(delta, "tool_calls", None) or []:
+                index = getattr(tool_call, "index", 0) or 0
+                current = tool_call_parts.setdefault(
+                    index,
+                    {"id": "", "name": "", "arguments": ""},
+                )
+                tool_id = getattr(tool_call, "id", None)
+                if tool_id:
+                    current["id"] = tool_id
+
+                function = getattr(tool_call, "function", None)
+                if function is None:
+                    continue
+                name = getattr(function, "name", None)
+                if name:
+                    current["name"] += name
+                arguments = getattr(function, "arguments", None)
+                if arguments:
+                    current["arguments"] += arguments
+
+        tool_calls = [
+            SimpleNamespace(
+                id=part["id"],
+                function=SimpleNamespace(
+                    name=part["name"],
+                    arguments=part["arguments"],
+                ),
+            )
+            for _, part in sorted(tool_call_parts.items())
+        ]
+        message = SimpleNamespace(
+            content="".join(content_parts),
+            tool_calls=tool_calls or None,
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+            usage=SimpleNamespace(total_tokens=total_tokens),
+        )
 
     def use_tool(self, tool_name: str, tool_args: dict) -> str:
         """按本轮作用域和检索预算调用工具执行器。"""
@@ -239,35 +354,109 @@ class AgentOrchestrator:
 
         # 设定对话消息。消息列表中的每个消息都包含 role 和 content。
         # role 可以是 system、user、assistant、tool。
+        recent_history_for_intent = self._recent_dialogue_history(history)
         history.append({"role": "user", "content": user_input})
         self.memory_store.append_history({"role": "user", "content": user_input})
 
         reply = ""
         tool_rounds = 0
         todo_continuations = 0
-        self._query_route = route_query(user_input)
         self._query_intent = None
         self._knowledge_search_count = 0
+
+        pre_decision = (
+            decide_pre_llm_clarification(user_input)
+            if self.profile.name == "mentor"
+            else None
+        )
+        if pre_decision is not None and pre_decision.should_stop:
+            reply = pre_decision.reply
+            assistant_msg = {"role": "assistant", "content": reply}
+            history.append(assistant_msg)
+            self.memory_store.append_history(assistant_msg)
+            print(f"Klonet Agent\uff1a{reply}")
+            return reply, history, token
+
+        if self.profile.name == "mentor":
+            try:
+                analysis = self.intent_analyzer.analyze(
+                    user_input,
+                    recent_history=recent_history_for_intent,
+                )
+                token += analysis.token_usage
+                self._query_intent = analysis.intent
+                self._query_route = route_from_intent(user_input, analysis.intent)
+            except Exception:
+                self._query_route = route_query(user_input)
+                self._query_intent = None
+        else:
+            self._query_route = route_query(user_input)
+
+        if self._query_intent is not None:
+            clarification = decide_model_intent_clarification(
+                self._query_intent,
+                user_input=user_input,
+                recent_history=recent_history_for_intent,
+            )
+            if clarification.should_stop:
+                reply = clarification.reply
+                assistant_msg = {"role": "assistant", "content": reply}
+                history.append(assistant_msg)
+                self.memory_store.append_history(assistant_msg)
+                print(f"Klonet Agent\uff1a{reply}")
+                return reply, history, token
+
         turn_scope_message = self._build_turn_scope_message(user_input)
         history.append(turn_scope_message)
         turn_answer_policy_message = None
         if self.profile.name == "mentor":
             turn_answer_policy_message = {
                 "role": "system",
-                "content": build_answer_policy(self._query_route.task_type, user_input),
+                "content": build_answer_policy(
+                    self._query_route.task_type,
+                    user_input,
+                    intent=self._query_intent,
+                ),
             }
             history.append(turn_answer_policy_message)
 
         # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
         while tool_rounds < MAX_TOOL_ROUNDS:
             tool_rounds += 1
-            response = self.chat_with_llm(history)
+            printed_stream_reply = False
+            thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."
+            thinking_visible = True
+            print(thinking_prompt, end="", flush=True)
+
+            def clear_thinking_prompt():
+                nonlocal thinking_visible
+                if not thinking_visible:
+                    return
+                print("\r" + (" " * len(thinking_prompt)) + "\r", end="", flush=True)
+                thinking_visible = False
+
+            def print_reply_delta(delta: str):
+                nonlocal printed_stream_reply
+                if not printed_stream_reply:
+                    clear_thinking_prompt()
+                    print("Klonet Agent\uff1a", end="", flush=True)
+                    printed_stream_reply = True
+                print(delta, end="", flush=True)
+
+            response = self.chat_with_llm(
+                history,
+                stream=True,
+                on_delta=print_reply_delta,
+            )
             # 记录 token 要放在外层，避免只有调用工具时才计数。
             token += response.usage.total_tokens
 
             # tool_calls 是本次模型决定要调用的工具集合。
             # 处理流程：模型输出标准工具参数 -> Python 执行工具 -> 工具结果输入模型 -> 模型继续判断。
             if response.choices[0].message.tool_calls:
+                clear_thinking_prompt()
+                if printed_stream_reply:
+                    print()
                 # 总共要记录两次记忆：模型发起了哪些工具调用、工具返回了什么。
                 # 注意不能直接把复杂 SDK 对象 append 到 history，要转换成普通字典。
                 assistant_msg = self._assistant_tool_message(response.choices[0].message)
@@ -279,6 +468,8 @@ class AgentOrchestrator:
                     tool_name = tool_call.function.name
                     # 工具参数，即 schema 中 function.parameters 约束出的标准 JSON。
                     tool_args = json.loads(tool_call.function.arguments)
+                    if tool_name == "search_knowledge" and self._query_intent is not None and self._query_intent.confidence >= 0.6:
+                        tool_args["intent"] = self._query_intent_tool_args()
                     if tool_name == "search_knowledge":
                         candidate_intent = QueryIntent.from_mapping(
                             tool_args.get("intent")
@@ -312,7 +503,11 @@ class AgentOrchestrator:
             else:
                 # 没有调用工具，说明本次对话进入最终自然语言回答。
                 reply = response.choices[0].message.content
-                print(f"Klonet Agent：{reply}")
+                if printed_stream_reply:
+                    print()
+                else:
+                    clear_thinking_prompt()
+                    print(f"Klonet Agent\uff1a{reply}")
 
                 # 只有 Coding 模式中的可执行任务允许有限自动续跑。
                 if self.session.todos:
@@ -371,7 +566,7 @@ class AgentOrchestrator:
             assistant_msg = {"role": "assistant", "content": reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
-            print(f"Klonet Agent：{reply}")
+            print(f"Klonet Agent\uff1a{reply}")
 
         # 本轮作用域只约束当前用户输入，不写入长期历史，避免影响下一轮。
         history = [
@@ -419,6 +614,16 @@ class AgentOrchestrator:
                 if tool["function"]["name"] != "search_knowledge"
             ]
         return tools
+
+    def _recent_dialogue_history(self, history: list[dict], limit: int = 6) -> list[dict]:
+        """Return recent user/assistant turns for front-loaded intent analysis."""
+
+        dialogue = [
+            {"role": message.get("role"), "content": message.get("content", "")}
+            for message in history
+            if message.get("role") in {"user", "assistant"}
+        ]
+        return dialogue[-limit:]
 
     def _build_turn_scope_message(self, user_input: str) -> dict:
         """构建只在当前工具循环中生效的问题范围约束。"""
@@ -471,6 +676,27 @@ class AgentOrchestrator:
             if msg.get("role") == "system" and "MEMORY.md" in msg.get("content", ""):
                 msg["content"] = self.memory_store.memory_prompt()
                 return
+
+    def _query_intent_tool_args(self) -> dict:
+        """Return the front-loaded intent as safe tool arguments."""
+
+        intent = self._query_intent
+        if intent is None:
+            return {}
+        return {
+            "scope": intent.scope,
+            "task_type": intent.task_type,
+            "operation": intent.operation,
+            "target": intent.target,
+            "symptom": intent.symptom,
+            "excluded_intents": list(intent.excluded_intents),
+            "prerequisites": list(intent.prerequisites),
+            "requires_retrieval": intent.requires_retrieval,
+            "clarification_required": intent.clarification_required,
+            "clarification_question": intent.clarification_question,
+            "is_correction": intent.is_correction,
+            "confidence": intent.confidence,
+        }
 
     def _assistant_tool_message(self, message) -> dict:
         """把 SDK 返回的 assistant message 转成普通字典，方便写入 history。"""

@@ -2,6 +2,7 @@
 
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 
 SKIP_DIFF_PARTS = {".git", "__pycache__", ".pytest_cache"}
@@ -60,7 +61,7 @@ def show_diff(workspace_path: Path) -> str:
     return output or "当前没有检测到 diff。"
 
 
-def _git_root(workspace_path: Path) -> Path | None:
+def _git_root(workspace_path: Path) -> Optional[Path]:
     """返回 workspace 所属 Git 根目录。"""
 
     result = subprocess.run(

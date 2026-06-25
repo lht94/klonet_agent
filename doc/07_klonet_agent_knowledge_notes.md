@@ -1498,3 +1498,759 @@ Schema：限制模型可以输出哪些结构化状态。
 ```
 
 路由解决的是“找哪类知识”，检索解决的是“找到哪些具体内容”。意图解析提高前者的准确性，BM25 继续承担后者；两者职责清晰后，回答才不容易因为走错知识范围而跑偏。
+
+## Mentor 回答质量提升的三道约束
+
+这一版 Mentor 回答质量明显提升，不是因为单纯把 prompt 写长了，而是把“不确定的模型行为”拆成了三道可控制的系统约束：
+
+```text
+1. 意图约束：先约束模型要查什么。
+2. 检索约束：再约束系统拿哪些证据。
+3. 回答约束：最后约束模型怎么组织答案。
+```
+
+完整链路可以理解为：
+
+```text
+用户问题
+  ↓
+orchestrator 路由与预算控制
+  ↓
+Mentor 临时回答策略
+  ↓
+search_knowledge 工具调用，必须提交 intent
+  ↓
+knowledge/intent.py 校验、降级和保留否定条件
+  ↓
+query expansion + intent filter + BM25 排序
+  ↓
+RAG 证据文本
+  ↓
+按回答策略生成最终回答
+```
+
+### 第一道：意图约束
+
+意图约束解决的是：
+
+```text
+这次到底应该查什么？
+```
+
+过去如果只把用户问题原文丢给检索器，系统容易被关键词带偏。例如用户说：
+
+```text
+不是配置环境，我要启动 Klonet。
+```
+
+如果系统只看关键词，可能同时命中“环境”“配置”“启动”，最后误查环境安装文档。
+
+现在更合理的做法是让 `search_knowledge` 工具参数携带结构化 `intent`，例如：
+
+```json
+{
+  "scope": "klonet",
+  "task_type": "operation_guide",
+  "operation": "platform_start",
+  "excluded_intents": ["environment_setup"],
+  "prerequisites": ["environment_ready"],
+  "confidence": 0.96
+}
+```
+
+这一步的核心不是让模型自由解释，而是让模型把自然语言压缩进有限字段。随后由 Python 代码校验这些字段：
+
+```text
+unknown enum 拒绝或降级。
+confidence 过低时不盲信。
+用户明确否定的方向进入 excluded_intents。
+改写后的 query 不能覆盖原始问题中的否定条件。
+```
+
+所以第一道约束把“模型觉得用户想问什么”变成了“系统可检查的结构化状态”。
+
+### 第二道：检索约束
+
+检索约束解决的是：
+
+```text
+应该把哪些证据交给模型？
+```
+
+BM25 仍然负责关键词相关性排序，但它不应该独自决定答案质量。更稳的检索流程是：
+
+```text
+先根据 intent 限定候选范围。
+再用 query expansion 扩展同义表达。
+再用 excluded_intents 排除明确错误方向。
+最后让 BM25 在正确范围内排序具体片段。
+```
+
+例如 `platform_start` 场景下，系统应该优先找启动 Runbook 中的阶段性步骤：
+
+```text
+Redis
+Master
+Gunicorn
+Celery
+Web Terminal
+Worker
+Nginx
+启动后验证
+```
+
+同时过滤掉：
+
+```text
+环境安装
+首次部署
+停止平台
+故障排查中不相关的失败分支
+```
+
+这说明检索质量不是只靠“分数最高的 chunk”，而是靠：
+
+```text
+意图标签
+任务类型
+操作类型
+排除意图
+层级权重
+BM25 分数
+```
+
+共同决定候选证据。
+
+### 第三道：回答约束
+
+回答约束解决的是：
+
+```text
+模型拿到证据后，应该怎样回答？
+```
+
+同样的检索结果，如果没有回答策略，模型可能会：
+
+```text
+复述用户问题。
+展示内部检索过程。
+机械列出一堆来源路径。
+把概念解释写成排查步骤。
+把操作指导写成空泛建议。
+证据不足时继续编造。
+```
+
+因此系统需要根据任务类型注入临时回答策略。例如：
+
+```text
+troubleshooting：先给排查顺序，再给验证点。
+code_lookup：先给位置，再解释为什么是这些位置。
+deployment/platform_start：按执行阶段组织命令和检查项。
+concept：先给定义，再解释机制和边界。
+```
+
+这个策略最好由 `answer_policy.py` 生成，并由 `orchestrator.py` 在本轮 Mentor 回答中临时注入。临时注入的好处是：
+
+```text
+只影响当前回答。
+不会污染长期 history。
+可以在 search_knowledge 返回高置信 intent 后刷新策略。
+```
+
+回答策略的重点不是替模型写答案，而是限制答案形态：
+
+```text
+结论先行。
+不要重复用户问题。
+不要暴露内部检索报告。
+不要无意义地建议“去看源码路径”。
+证据不足时说明不确定，而不是编造 Klonet 架构。
+```
+
+### 三道约束的分工
+
+可以把三道约束对应到三个风险点：
+
+| 风险点 | 对应约束 | 作用 |
+| :--- | :--- | :--- |
+| 查错方向 | 意图约束 | 把用户问题结构化，保留否定条件和任务类型 |
+| 拿错证据 | 检索约束 | 用 intent、metadata、BM25 共同筛选证据 |
+| 答错形态 | 回答约束 | 按任务类型控制最终答案结构 |
+
+一句话总结：
+
+```text
+意图约束决定“查什么”。
+检索约束决定“拿什么证据”。
+回答约束决定“怎么讲给用户”。
+```
+
+### 和 prompt 工程的区别
+
+这三道约束不是普通 prompt 工程。
+
+它们分别落在不同层级：
+
+```text
+工具 schema
+  要求模型提交结构化 intent。
+
+Python 校验
+  检查 intent 是否可信，是否需要降级。
+
+检索算法
+  根据 intent 做 query expansion、过滤、加权和 BM25 排序。
+
+临时 system message
+  按任务类型控制本轮回答结构。
+```
+
+所以它不是“告诉模型你要回答好一点”，而是把回答质量拆成几个可验证、可调试、可替换的工程环节。
+
+### 设计结论
+
+Mentor 回答质量提升的核心原因是：
+
+```text
+系统不再只依赖模型自己理解问题、自己找证据、自己组织答案。
+而是把理解、检索、表达分别加上结构化约束。
+```
+
+这和前面 Mentor/Coding 工具权限设计是一致的：
+
+```text
+Prompt 负责引导。
+工具 schema 负责收敛动作。
+Python 代码负责校验和执行。
+检索层负责证据边界。
+回答策略负责输出形态。
+```
+
+因此，好的 Agent 设计不是把所有规则塞进 prompt，而是把关键边界放到系统链路里。
+
+## 有限意图 Schema 与规则兜底
+
+这一节记录“问题理解”应该如何优化。它属于意图解析优化，但目标不是无限增加关键词规则，而是把用户问题解析成一张固定格式的意图表。
+
+### 1. 什么是有限意图 Schema
+
+有限意图 Schema 可以理解为：系统预先定义好一组字段和候选值，模型或解析器只能在这些字段里填写结果，不能随意发明新的分类。
+
+例如用户问：
+
+```text
+启动 web-terminal 的时候报错 address already in use，为什么？
+```
+
+系统不应该只得到一句自然语言判断：
+
+```text
+用户大概是在问 Web Terminal 启动失败。
+```
+
+而应该得到结构化意图：
+
+```json
+{
+  "scope": "klonet",
+  "task_type": "troubleshooting",
+  "operation": "platform_start",
+  "target": "web_terminal",
+  "symptom": "address_already_in_use",
+  "excluded_intents": [],
+  "prerequisites": [],
+  "requires_retrieval": true,
+  "confidence": 0.92
+}
+```
+
+这里的“有限”很重要。因为如果不限制候选值，模型可能输出很多近义词：
+
+```text
+start_platform
+startup
+launch_klonet
+run_klonet
+boot_platform
+```
+
+这些词对人来说差不多，但对代码来说会变成很多兼容分支。因此系统应该统一成固定值，例如：
+
+```json
+"operation": "platform_start"
+```
+
+有限 Schema 的作用是把自然语言问题转成稳定、可验证、可路由的数据结构。
+
+### 2. Schema 里可以有哪些字段
+
+第一版不需要设计得很复杂，但至少应该覆盖以下信息：
+
+```text
+scope
+  用户问题属于 Klonet、通用技术，还是 mixed。
+
+task_type
+  用户是在问概念、排障、源码定位、部署指导、凭据边界，还是项目进度。
+
+operation
+  如果是操作类问题，具体是环境安装、依赖安装、平台启动、停止、重启，还是验收检查。
+
+target
+  用户关注的对象，例如 master、worker、redis、web_terminal、nginx、frontend、topology、container。
+
+symptom
+  如果是故障排查，记录关键症状，例如 address_already_in_use、connection_refused、worker_unreachable。
+
+excluded_intents
+  用户明确排除的方向，例如“不是配置环境”“不需要 Klonet”。
+
+prerequisites
+  用户已经说明的前提，例如“已经跑完 docker_service.sh”“环境已经装好了”。
+
+requires_retrieval
+  是否需要查 Klonet 知识库。
+
+confidence
+  意图解析结果的置信度。
+```
+
+这些字段不是为了让模型“看起来更聪明”，而是为了让后面的路由、检索和回答结构都能有明确输入。
+
+### 3. 为什么这不是无限加规则
+
+无限加规则的写法是：
+
+```python
+if "启动" in query:
+    operation = "platform_start"
+if "部署" in query:
+    operation = "environment_setup"
+if "密码" in query:
+    task_type = "credential_boundary"
+if "web-terminal" in query and "address already in use" in query:
+    symptom = "address_already_in_use"
+```
+
+这种方式的问题是：真实用户表达会不断变化，规则会越堆越多，最后很难维护。
+
+有限 Schema 的思路不同：
+
+```text
+先定义系统能理解哪些字段和候选值。
+再让模型或解析器把用户问题填成这张表。
+规则只负责安全边界、低置信度兜底和检索增强。
+```
+
+也就是说，主路径是结构化意图解析，不是关键词 if/else。
+
+### 4. 什么是规则兜底
+
+规则兜底不是主路径，而是保险丝。它只在模型不可靠、问题有硬边界，或者检索需要增强时介入。
+
+#### 4.1 安全兜底
+
+如果用户问：
+
+```text
+虚拟机用户名和密码是什么？
+```
+
+即使模型没有正确识别，只要规则检测到“用户名、密码、凭据、token、真实 IP”等敏感方向，就应该强制进入：
+
+```json
+{
+  "task_type": "credential_boundary",
+  "requires_retrieval": false
+}
+```
+
+这类问题不能交给模型自由发挥，因为一旦输出真实凭据就是安全事故。
+
+#### 4.2 否定兜底
+
+如果用户说：
+
+```text
+不需要 Klonet，我只是想问 Docker Compose。
+```
+
+即使模型因为看到“Klonet”这个词想查知识库，规则也应该拦住：
+
+```json
+{
+  "scope": "general",
+  "excluded_intents": ["klonet_rag"]
+}
+```
+
+用户明确否定的方向不能被查询改写或后续工具调用覆盖。
+
+#### 4.3 低置信度兜底
+
+如果模型输出：
+
+```json
+{
+  "task_type": "concept",
+  "confidence": 0.42
+}
+```
+
+说明系统并不确定用户到底要什么。此时可以采取保守策略：
+
+```text
+降低检索范围。
+不要强行套某个专门回答结构。
+必要时先问澄清问题。
+```
+
+例如“怎么部署 Klonet？”可能同时指：
+
+```text
+安装环境
+启动已经安装好的平台
+部署前端或后端服务
+```
+
+如果上下文不足，系统可以先问用户是在问哪一种，而不是直接生成一长串安装步骤。
+
+#### 4.4 检索增强兜底
+
+如果结构化意图是：
+
+```json
+{
+  "task_type": "troubleshooting",
+  "target": "web_terminal",
+  "symptom": "address_already_in_use"
+}
+```
+
+检索层可以把查询扩展成：
+
+```text
+web_terminal address already in use 端口占用 screen lsof ss
+```
+
+这不是在判断用户意图，而是在帮助检索找到更稳定的证据。
+
+### 5. 推荐链路
+
+整体流程应该是：
+
+```text
+用户问题
+  ↓
+LLM / 解析器填写有限意图 Schema
+  ↓
+规则兜底校验
+  - 安全边界
+  - 否定条件
+  - 低置信度
+  - 检索增强
+  ↓
+根据 Schema 路由到相关知识文档
+  ↓
+在文档内检索具体证据
+  ↓
+按回答结构输出
+```
+
+### 6. 设计结论
+
+有限意图 Schema 的核心价值是让“问题理解”变成稳定的数据结构，而不是依赖模型在回答时临场发挥。
+
+规则兜底的核心价值是保护系统边界，而不是替代意图解析。
+
+一句话总结：
+
+```text
+有限意图 Schema 负责让模型填一张固定格式的意图表。
+规则兜底负责在安全、否定、低置信度和检索增强场景下保护系统。
+两者配合，才能避免无限堆关键词规则。
+```
+
+## 当前 Mentor 前置意图链路
+
+### 1. 用户输入如何变成结构化 QueryIntent
+
+当前优化后的 Mentor 链路里，`IntentAnalyzer` 会在正式回答和工具调用之前先调用一次 LLM。这个 LLM 调用不负责回答用户，而是只负责把自然语言问题解析成稳定 JSON，也就是 `QueryIntent`。
+
+例如用户问：
+
+```text
+启动 web-terminal 的时候报 address already in use，为什么？
+```
+
+前置意图解析器应该输出类似：
+
+```json
+{
+  "scope": "klonet",
+  "task_type": "troubleshooting",
+  "operation": "platform_start",
+  "target": "web_terminal",
+  "symptom": "address_already_in_use",
+  "excluded_intents": [],
+  "prerequisites": [],
+  "requires_retrieval": true,
+  "clarification_required": false,
+  "clarification_question": "",
+  "is_correction": false,
+  "confidence": 0.92
+}
+```
+
+如果用户问：
+
+```text
+我已经安装完环境了，怎么启动 Klonet？
+```
+
+解析结果应该更接近：
+
+```json
+{
+  "scope": "klonet",
+  "task_type": "deployment_guidance",
+  "operation": "platform_start",
+  "target": "klonet_platform",
+  "symptom": "",
+  "excluded_intents": ["environment_setup"],
+  "prerequisites": ["environment_ready"],
+  "requires_retrieval": true,
+  "clarification_required": false,
+  "clarification_question": "",
+  "is_correction": false,
+  "confidence": 0.9
+}
+```
+
+如果用户明确排除 Klonet：
+
+```text
+不要 Klonet，我只想知道 Docker Compose 网络怎么配置
+```
+
+解析结果应该是：
+
+```json
+{
+  "scope": "general",
+  "task_type": "general",
+  "operation": "unknown",
+  "target": "docker_compose_network",
+  "symptom": "",
+  "excluded_intents": ["klonet"],
+  "prerequisites": [],
+  "requires_retrieval": false,
+  "clarification_required": false,
+  "clarification_question": "",
+  "is_correction": false,
+  "confidence": 0.95
+}
+```
+
+因此，`QueryIntent` 不是“关键词命中结果”，而是把用户自然语言问题转成系统可消费的结构化意图表。
+
+### 2. 为什么还有 LLM 前的确定性澄清
+
+当前链路里有两层澄清：
+
+```text
+第一层：确定性安全 / 澄清边界，发生在 LLM 前。
+第二层：LLM 意图解析后的 clarification_required 判断，发生在 LLM 后。
+```
+
+LLM 前的确定性澄清只处理很少数“系统已经能确定不能直接回答”的情况。它不是替代意图解析，而是作为安全边界和高精度歧义保护。
+
+例如：
+
+```text
+怎么部署 Klonet？
+```
+
+在当前 Klonet 语境下，“部署”可能至少表示：
+
+- 安装基础环境；
+- 启动已经安装好的 Klonet 平台服务；
+- 启动某个前端、后端或 Worker 组件。
+
+如果系统直接进入检索和回答，很容易又把“启动平台”答成“安装环境”。所以这类问题会先追问：
+
+```text
+你说的“部署 Klonet”是指安装基础环境，还是启动已经安装好的 Klonet 平台服务？
+```
+
+这类问题称为“明显需要追问的问题”：不补充信息就会导致系统选择错误路径，而且系统不应该自行猜测。
+
+但不是所有模糊问题都靠规则处理。比如：
+
+```text
+Klonet 起不来怎么办？
+```
+
+这个问题可能涉及 Redis、Gunicorn、Celery、端口、依赖、目录、权限等多种原因。它不适合靠固定规则判断，而应该交给前置 LLM 输出：
+
+```json
+{
+  "task_type": "troubleshooting",
+  "operation": "platform_start",
+  "target": "klonet_platform",
+  "symptom": "",
+  "clarification_required": true,
+  "clarification_question": "启动失败时的具体报错或失败服务是什么？",
+  "confidence": 0.55
+}
+```
+
+也就是说，规则只拦“高确定性、低覆盖面”的边界；普通意图理解仍然由 LLM 完成。
+
+### 3. 当前 Mentor 链路
+
+当前 Mentor 主链路可以理解为：
+
+```text
+user_input
+  ↓
+确定性安全 / 澄清边界
+  ↓
+IntentAnalyzer 前置解析 QueryIntent
+  ↓
+clarification_required 判断
+  ↓
+根据 intent 生成 route / answer_policy / tool visibility
+  ↓
+知识检索与最终回答
+```
+
+各层含义如下：
+
+- 确定性安全 / 澄清边界：不用 LLM 也能确定必须先停下的问题，例如账号、密码、token、真实 IP，或者“部署 Klonet”这种高风险歧义。
+- `IntentAnalyzer` 前置解析 `QueryIntent`：就是 LLM 意图解析。它把自然语言问题转成固定字段。
+- `clarification_required` 判断：判断是否需要先问用户补充信息。这个判断既可以来自确定性规则，也可以来自 LLM 输出的结构化字段。
+- 根据 `intent` 生成 `route / answer_policy / tool visibility`：
+  - `route` 决定当前问题是 Klonet、general 还是 mixed，以及检索预算和工具边界；
+  - `answer_policy` 决定回答结构，例如故障排查用“最可能原因、排查顺序、判断依据”；
+  - `tool visibility` 决定本轮是否能看到 `search_knowledge`、`read_project_journal` 等工具。
+
+### 4. 当前还没做到什么
+
+当前已经从“关键词路由”升级成“结构化意图驱动检索”，但还没有做到非常完整的：
+
+```text
+intent → 文档目录 / README → 指定文档集合
+```
+
+现在更准确的链路是：
+
+```text
+intent
+  → route / domains / operation
+  → 检索查询增强 + 检索过滤 + 检索预算控制
+  → 在统一知识索引里找具体 chunk
+```
+
+也就是说，当前系统会根据 `scope`、`task_type`、`operation`、`target`、`symptom` 等字段影响检索方向，但还没有一个显式的“文档目录路由表”告诉系统：
+
+```text
+platform_start → 只去 deployment/startup README 和 runbook 文档集合
+web_terminal 故障 → 只去 web-terminal 故障文档集合
+topology deploy → 只去 topology deployment 文档集合
+```
+
+下一步如果继续升级，可以为每组文档建立 README / manifest，描述该文档集合适合哪些 `task_type`、`operation`、`target` 和 `symptom`。这样系统就能先选文档集合，再在集合内部做 BM25 或向量检索，检索命中会更稳定。
+
+## 前置意图解析的上下文与追问权限优化
+
+### 1. 问题现象
+
+在多轮对话中，用户可能使用“第一种”“上面那个”“你刚说的场景一”等指代词。如果前置意图解析器只看当前用户输入，就会把本来能由上下文消解的问题误判为不明确。
+
+典型例子：
+
+```text
+Assistant: 场景一：你在浏览器里用 Klonet（普通用户）。
+Assistant: 场景二：你要部署运行 Klonet（管理员/开发者）。
+User: 是第一种，我怎么使用？
+```
+
+如果只看最后一句，“第一种”确实不完整；但结合上一轮回答，它明确指向“浏览器普通用户使用 Klonet”。因此不应该追问“第一种是什么”。
+
+### 2. 根因
+
+之前链路中，`IntentAnalyzer` 只接收当前 `user_input`：
+
+```text
+IntentAnalyzer.analyze(user_input)
+```
+
+同时，模型只要输出：
+
+```json
+{
+  "clarification_required": true
+}
+```
+
+系统就会直接中断主回答并追问。也就是说，前置意图解析器上下文不足，但拥有过大的追问权限。
+
+### 3. 优化方式
+
+现在分两层修复：
+
+```text
+recent_history
+  → IntentAnalyzer.analyze(user_input, recent_history=...)
+  → QueryIntent
+  → ClarificationPolicy 二次校验
+  → 决定是否真的追问
+```
+
+#### 3.1 IntentAnalyzer 接收短上下文
+
+只传最近几轮 `user/assistant` 消息，不传完整历史，避免 token 膨胀和旧上下文污染。
+
+构造给意图解析器的输入类似：
+
+```text
+最近对话上下文：
+assistant: 场景一：你在浏览器里用 Klonet（普通用户）。
+assistant: 场景二：你要部署运行 Klonet（管理员/开发者）。
+
+当前用户输入：
+是第一种，我怎么使用？
+
+如果当前输入包含“第一种/第二种/场景一/场景二/上面那个/你刚说的/继续”等指代，必须结合最近对话解析，不得直接追问这些指代是什么意思。
+```
+
+#### 3.2 clarification_required 不再一票否决
+
+模型仍然可以建议追问，但系统会先检查最近上下文是否能消解指代。
+
+如果用户输入包含：
+
+```text
+第一种 / 第二种 / 场景一 / 场景二 / 上面那个 / 你说的 / 刚说的 / 继续
+```
+
+并且最近 assistant 消息中存在对应选项或场景定义，则忽略失忆式追问，继续进入主回答。
+
+### 4. 设计边界
+
+这次优化不是取消追问，而是把追问权限收回到策略层：
+
+- 安全边界问题仍然可以直接拦截，例如账号、密码、token、真实 IP。
+- 真正上下文不足的问题仍然可以追问。
+- 能由最近上下文消解的指代问题，不应该追问“你说的是什么”。
+
+### 5. 结论
+
+前置意图解析器可以站在主链路前面，但不能只看当前一句，也不能单独决定是否中断回答。更稳的结构是：
+
+```text
+短上下文意图解析 + 代码层 ClarificationPolicy 二次校验
+```
+
+这样既保留前置意图解析的收益，又避免多轮对话中的“失忆式追问”。

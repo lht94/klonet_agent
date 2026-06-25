@@ -342,6 +342,53 @@ def test_low_confidence_intent_does_not_filter_retrieval():
     assert recorder.request.query == "Klonet 是什么"
 
 
+
+
+def test_intent_routes_to_document_collection_before_bm25():
+    """前置意图应先收敛到文档集合，再在集合内做具体检索。"""
+
+    from klonet_agent.knowledge.intent import QueryIntent
+    from klonet_agent.knowledge.rag import KnowledgeBase
+
+    recorder = _RecordingRetriever()
+    startup_intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "deployment_guidance",
+            "operation": "platform_start",
+            "target": "klonet_platform",
+            "confidence": 0.95,
+        }
+    )
+
+    KnowledgeBase(retriever=recorder).search_knowledge(
+        "怎么启动 Klonet",
+        top_k=3,
+        intent=startup_intent,
+    )
+
+    assert recorder.request.collections == ("klonet_runtime_startup",)
+    assert recorder.request.allowed_paths == ("knowledge/klonet/ops/startup_shutdown.md",)
+
+    environment_intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "deployment_preparation",
+            "operation": "environment_setup",
+            "target": "klonet_environment",
+            "confidence": 0.95,
+        }
+    )
+
+    KnowledgeBase(retriever=recorder).search_knowledge(
+        "怎么安装 Klonet 环境",
+        top_k=3,
+        intent=environment_intent,
+    )
+
+    assert recorder.request.collections == ("klonet_environment_setup",)
+    assert recorder.request.allowed_paths == ("knowledge/klonet/ops/environment_setup.md",)
+
 def test_platform_start_filters_stop_restart_and_failure_sections():
     """启动指南不应被同一 Runbook 中的停止和故障章节占据。"""
 

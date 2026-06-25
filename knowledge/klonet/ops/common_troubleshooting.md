@@ -3,7 +3,7 @@ title: Klonet 常见排障
 status: current_experience_with_source_validation
 priority: P0
 domains: operations, troubleshooting, topology, vm
-last_verified: 2026-06-22
+last_verified: 2026-06-24
 ---
 
 # Klonet 常见排障
@@ -41,6 +41,26 @@ last_verified: 2026-06-22
 
 敏感数据在记录中脱敏。
 
+第一轮先执行只读命令，形成同一时间点的状态快照：
+
+~~~bash
+date
+screen -ls
+ps aux | grep '[g]unicorn'
+ps aux | grep '[c]elery'
+ps aux | grep '[r]edis'
+sudo ss -lntp
+sudo docker ps -a
+sudo ovs-vsctl show
+sudo virsh list --all
+df -h
+free -h
+~~~
+
+不使用 KVM 的服务器可以跳过 `virsh`；不使用 OVS 的场景可以跳过 `ovs-vsctl`。命令失败本身也是证据，应连同完整错误输出保留。
+
+服务启动、停止和 screen 操作的完整命令见 [Klonet 启动、停止与重启](startup_shutdown.md)。
+
 ## 前端可访问但无法登录
 
 1. 浏览器 Network 查看实际请求。
@@ -64,7 +84,15 @@ last_verified: 2026-06-22
 - bootstrap 初始化异常。
 - 磁盘空间不足。
 
-先阅读完整 traceback，不使用“缺什么就全局安装什么”替代根因分析。
+先阅读完整 traceback，不使用“缺什么就全局安装什么”替代根因分析。用以下命令确认运行目录、解释器和端口，再对照 [启动 Runbook](startup_shutdown.md) 中的两套 Python 路径：
+
+~~~bash
+pwd
+command -v python3
+command -v gunicorn
+sudo ss -lntp
+~~~
+
 
 ## Worker 注册失败
 

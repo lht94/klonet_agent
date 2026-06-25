@@ -9,6 +9,9 @@ from typing import Any, Mapping
 ALLOWED_SCOPES = {"klonet", "general", "mixed"}
 ALLOWED_TASK_TYPES = {
     "concept",
+    "deployment_preparation",
+    "deployment_guidance",
+    "credential_boundary",
     "operation_guide",
     "troubleshooting",
     "code_lookup",
@@ -23,6 +26,7 @@ ALLOWED_OPERATIONS = {
     "platform_start",
     "platform_stop",
     "platform_restart",
+    "acceptance_check",
 }
 _OPERATION_QUERY_TERMS = {
     "platform_start": "启动顺序 Redis Master Gunicorn Celery Web Terminal Worker Nginx 标准命令",
@@ -48,8 +52,12 @@ class QueryIntent:
     task_type: str = "concept"
     operation: str = "unknown"
     target: str = ""
+    symptom: str = ""
     excluded_intents: tuple[str, ...] = ()
     prerequisites: tuple[str, ...] = ()
+    requires_retrieval: bool = True
+    clarification_required: bool = False
+    clarification_question: str = ""
     is_correction: bool = False
     confidence: float = 0.0
 
@@ -74,11 +82,15 @@ class QueryIntent:
             task_type=task_type,
             operation=operation,
             target=str(raw.get("target") or "").strip(),
+            symptom=str(raw.get("symptom") or "").strip(),
             excluded_intents=_string_tuple(
                 raw.get("excluded_intents"),
                 allowed=ALLOWED_OPERATIONS - {"unknown"},
             ),
             prerequisites=_string_tuple(raw.get("prerequisites")),
+            requires_retrieval=raw.get("requires_retrieval") is not False,
+            clarification_required=raw.get("clarification_required") is True,
+            clarification_question=str(raw.get("clarification_question") or "").strip(),
             is_correction=raw.get("is_correction") is True,
             confidence=_confidence(raw.get("confidence")),
         )

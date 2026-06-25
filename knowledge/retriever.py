@@ -239,6 +239,7 @@ def _row_metadata(row: dict[str, Any]) -> dict[str, Any]:
     layer = str(row.get("layer") or row.get("source") or "local")
     return {
         "layer": layer,
+        "path": str(row.get("path") or ""),
         "domain": str(row.get("domain") or "general"),
         "priority": str(row.get("priority") or "P2").upper(),
         "status": str(row.get("status") or "current").lower(),
@@ -261,8 +262,10 @@ def _intent_tags(value: Any) -> tuple[str, ...]:
 
 
 def _allowed_by_request(metadata: dict[str, Any], request: SearchRequest) -> bool:
-    """执行 layer、domain、priority、状态和敏感度过滤。"""
+    """执行 path collection、layer、domain、priority、状态和敏感度过滤。"""
 
+    if request.allowed_paths and metadata.get("path") not in request.allowed_paths:
+        return False
     if metadata["status"] == "deprecated":
         return False
     if metadata["sensitivity"] in request.exclude_sensitivity:

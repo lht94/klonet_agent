@@ -3,7 +3,7 @@ title: Klonet KVM 与虚机组网
 status: current_verified_with_environment_validation
 priority: P0
 domains: kvm, vm, networking, terminal, images
-last_verified: 2026-06-22
+last_verified: 2026-06-24
 ---
 
 # Klonet KVM 与虚机组网
@@ -19,13 +19,25 @@ last_verified: 2026-06-22
 ## 前置条件
 
 - 宿主机支持 KVM。
-- libvirtd 正常。
+- libvirt 服务处于 active 状态。
 - virsh、virt-install、qemu-img 可用。
 - 镜像目录、权限和磁盘空间满足要求。
 - Worker 有执行虚拟化和网络命令的权限。
 - libvirt 网络或平台网桥已准备。
 - Web Terminal/SSH 相关服务和端口映射可用。
 - Master 与 Worker 的 KVM 镜像元数据一致。
+
+先用只读命令验证，不要因为一次 Worker 重启就重复执行初始化脚本：
+
+~~~bash
+systemctl is-active libvirtd || systemctl is-active virtqemud
+virsh list --all
+virsh net-list --all
+ip link show
+ovs-vsctl show
+~~~
+
+`libvirt_config.sh` 仅在服务器首次启用 Klonet KVM、libvirt/tap/bridge 初始化丢失，或当前部署说明明确要求时按需执行。执行前必须阅读脚本，确认它不会覆盖现有虚机或网络。普通 Worker 代码重启不需要运行该脚本；完整启停步骤见 [启动、停止与重启](../ops/startup_shutdown.md)。
 
 ## KVM 节点定义
 

@@ -10,6 +10,9 @@ QueryScope = Literal["klonet", "general", "mixed"]
 TaskType = Literal[
     "auto",
     "concept",
+    "deployment_preparation",
+    "deployment_guidance",
+    "credential_boundary",
     "operation_guide",
     "troubleshooting",
     "code_lookup",
@@ -43,6 +46,8 @@ class SearchRequest:
     intent: str = "unknown"
     excluded_intents: tuple[str, ...] = ()
     min_priority: str | None = None
+    collections: tuple[str, ...] = ()
+    allowed_paths: tuple[str, ...] = ()
     exclude_sensitivity: tuple[str, ...] = ("review_required", "restricted")
     top_k: int = 3
 
