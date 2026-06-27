@@ -72,6 +72,7 @@ class RetrievedChunk:
     intent_tags: tuple[str, ...] = ()
     bm25_score: float = 0.0
     exact_score: float = 0.0
+    semantic_score: float = 0.0
     metadata_score: float = 1.0
     matched_terms: tuple[str, ...] = ()
     relevance: str = "weak"

@@ -7,9 +7,21 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from klonet_agent.knowledge.intent_cases import (
+    IntentCase,
+    IntentCaseRetriever,
+    build_default_intent_case_retriever,
+    build_intent_case_query,
+)
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.models import QueryRoute
 from klonet_agent.knowledge.rag import route_query
+from klonet_agent.knowledge.semantic_understanding import (
+    IntentDecision,
+    SemanticDecisionPlanner,
+    SemanticFrame,
+    SemanticState,
+)
 
 
 INTENT_ANALYSIS_PROMPT = """
@@ -41,19 +53,49 @@ INTENT_ANALYSIS_PROMPT = """
 """
 
 
+INTENT_ANALYSIS_PROMPT += """
+
+语义理解字段（优先输出这些字段，再由代码决定路由和是否追问）：
+- user_role: learner | operator | developer | admin | unknown
+- perspective: asking_about_own_pc | operating_target_machine | using_platform | debugging_runtime | unknown
+- machine_role: operator_local_pc | target_server | target_vm | host_machine | klonet_master | klonet_worker | unspecified
+- deployment_phase: local_tool_preparation | environment_setup | platform_startup | platform_shutdown | platform_restart | topology_deploy | platform_usage | troubleshooting | unknown
+- action_goal: prepare_tools | install_dependencies | start_services | stop_services | restart_services | deploy_topology | inspect_error | use_feature | explain_concept | unknown
+- target_component: 用户正在操作或询问的对象
+- excluded_meanings: 用户明确否定的方向
+- context_refs: 第一种、上面那个、继续等上下文指代
+- evidence_spans: 支撑字段判断的原文片段
+- ambiguity: {"level":"low|medium|high","candidates":[],"defaultable":true|false}
+
+判断原则：
+1. “电脑”默认先判断是不是操作者自己的电脑；只有出现服务器、虚拟机、部署机等证据时才当作目标机器。
+2. “部署平台/怎么部署 Klonet”没有首次安装证据时，可默认理解为启动已安装平台，歧义标为 medium 且 defaultable=true。
+3. “部署环境/安装依赖/首次部署/base_requ_setup/Docker Redis MySQL”属于 environment_setup。
+4. “部署拓扑/创建拓扑/进度条/TopoDeployAPI”属于 topology_deploy，不要混成平台启动。
+5. 如果上文给出 A/B 或场景一/场景二选项，当前输入只有 “A”“B”“第一种”“第二种” 时，必须解析 context_refs 并结合上文，不要当作全新问题。
+6. 如果当前输入只是“klonet平台/这个平台/平台”等短补充，而上文正在确认“使用哪个平台/普通用户使用/浏览器使用”，应理解为补充上一轮对象，优先解析为 platform_usage，不要重新追问首次安装还是启动平台。
+7. 只输出 JSON，不要输出 Markdown，不要解释。
+"""
+
+
 @dataclass(frozen=True)
 class IntentAnalysis:
     intent: QueryIntent
     token_usage: int = 0
     used_model: bool = False
     raw_content: str = ""
+    semantic_frame: SemanticFrame | None = None
+    decision: IntentDecision | None = None
 
 
 class IntentAnalyzer:
     """Use an LLM to parse the user's request before retrieval/tool routing."""
 
-    def __init__(self, llm):
+    def __init__(self, llm, intent_case_retriever: IntentCaseRetriever | None = None):
         self.llm = llm
+        self.intent_case_retriever = (
+            intent_case_retriever or build_default_intent_case_retriever()
+        )
 
     def analyze(
         self,
@@ -61,7 +103,14 @@ class IntentAnalyzer:
         *,
         recent_history: list[dict] | None = None,
     ) -> IntentAnalysis:
-        user_message = _build_analysis_user_message(user_input, recent_history or [])
+        history = recent_history or []
+        user_message = _build_analysis_user_message(user_input, history)
+        intent_cases = self.intent_case_retriever.search_for_prompt(
+            build_intent_case_query(user_input, history),
+            top_k=4,
+            min_score=0.1,
+        )
+        user_message = _append_intent_cases(user_message, intent_cases)
         response = self.llm.complete(
             messages=[
                 {"role": "system", "content": INTENT_ANALYSIS_PROMPT},
@@ -72,8 +121,24 @@ class IntentAnalyzer:
         )
         content = response.choices[0].message.content or ""
         token_usage = getattr(getattr(response, "usage", None), "total_tokens", 0)
+        raw = _parse_json_object(content)
+        frame = _semantic_frame_from_mapping(raw)
+        if frame is not None:
+            decision = SemanticDecisionPlanner().plan(
+                user_input,
+                frame,
+                SemanticState.from_history(recent_history or []),
+            )
+            return IntentAnalysis(
+                intent=decision.intent,
+                token_usage=token_usage,
+                used_model=True,
+                raw_content=content,
+                semantic_frame=frame,
+                decision=decision,
+            )
         return IntentAnalysis(
-            intent=QueryIntent.from_mapping(_parse_json_object(content)),
+            intent=QueryIntent.from_mapping(raw),
             token_usage=token_usage,
             used_model=True,
             raw_content=content,
@@ -112,6 +177,58 @@ def _parse_json_object(content: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return value if isinstance(value, dict) else {}
+
+
+def _semantic_frame_from_mapping(raw: dict[str, Any]) -> SemanticFrame | None:
+    semantic = raw.get("semantic_frame")
+    if isinstance(semantic, dict):
+        return SemanticFrame.from_mapping(semantic)
+    semantic_keys = {
+        "user_role",
+        "perspective",
+        "machine_role",
+        "deployment_phase",
+        "action_goal",
+        "target_component",
+        "excluded_meanings",
+        "context_refs",
+        "evidence_spans",
+        "ambiguity",
+    }
+    if semantic_keys.intersection(raw):
+        return SemanticFrame.from_mapping(raw)
+    return None
+
+
+def _append_intent_cases(user_message: str, cases: tuple[IntentCase, ...]) -> str:
+    if not cases:
+        return user_message
+    blocks = [
+        "下面是与当前输入相似的历史意图样例。样例只用于理解意图和槽位；如果样例与当前用户明确条件冲突，以当前用户输入为准。"
+    ]
+    for index, case in enumerate(cases, start=1):
+        blocks.append(
+            "\n".join(
+                [
+                    f"[Intent Case {index}]",
+                    f"case_id: {case.case_id}",
+                    f"tag: {case.tag}",
+                    f"retrieval_mode: {case.retrieval_mode}",
+                    f"score: {case.score}",
+                    f"keyword_score: {case.keyword_score}",
+                    f"semantic_score: {case.semantic_score}",
+                    f"history_pattern: {case.history_pattern}",
+                    f"latest_query: {case.latest_query}",
+                    f"handling_rule: {case.handling_rule}",
+                    "semantic_frame: "
+                    + json.dumps(case.semantic_frame or {}, ensure_ascii=False),
+                    "intent: " + json.dumps(case.intent or {}, ensure_ascii=False),
+                    "slots: " + json.dumps(case.slots or {}, ensure_ascii=False),
+                    "safety: " + json.dumps(case.safety or {}, ensure_ascii=False),
+                ]
+            )
+        )
+    return user_message + "\n\n" + "\n\n".join(blocks)
 
 
 def _domains_from_intent(intent: QueryIntent) -> tuple[str, ...]:

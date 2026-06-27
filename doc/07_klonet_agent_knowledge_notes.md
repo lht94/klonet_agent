@@ -2254,3 +2254,406 @@ assistant: 场景二：你要部署运行 Klonet（管理员/开发者）。
 ```
 
 这样既保留前置意图解析的收益，又避免多轮对话中的“失忆式追问”。
+
+## Intent Case RAG 的定位、收益与风险
+
+### 1. 它确实是在意图解析前增加一层 RAG
+
+方案 4 里的“前置意图 RAG 召回”可以理解为：
+
+```text
+用户最新输入 + 短历史上下文
+  ↓
+检索相似的意图样例 Case
+  ↓
+把命中的 Case 作为动态 few-shot 注入 IntentAnalyzer Prompt
+  ↓
+LLM 输出 intent + slots + decision
+  ↓
+进入 ClarificationPolicy / SemanticDecisionPlanner / 后续业务逻辑
+```
+
+所以它本质上是在意图解析模块之前加了一层 RAG，但这个 RAG 不是用来回答业务事实的，而是用来给意图解析器提供“相似对话如何理解”的参考样例。
+
+它和普通知识 RAG 的区别是：
+
+- 普通知识 RAG 检索的是事实、步骤、文档证据，用于最终回答。
+- Intent Case RAG 检索的是对话样例、语义角色、意图、槽位和处理方式，用于帮助模型理解当前用户到底在问什么。
+
+因此，Intent Case RAG 的输出不应该直接变成最终答案，而应该只影响意图理解、槽位抽取、上下文指代消解和是否追问。
+
+### 2. 为什么它有用
+
+Klonet Agent 的很多误判不是“缺少文档”，而是“用户话术太口语化、多轮上下文太省略、角色和机器边界不清”。例如：
+
+```text
+用户: 我电脑里需要下什么软件吗？
+```
+
+如果没有相似样例，模型可能把“电脑”理解成目标服务器，于是回答 Docker、Redis、MySQL、RabbitMQ。
+
+如果 Intent Case RAG 命中类似样例：
+
+```text
+历史提问: 我想在自己笔记本上操作服务器
+最新提问: 我电脑里需要下什么软件吗？
+意图: local_tool_preparation
+槽位: machine_role=operator_pc
+处理方式: 回答 SSH、浏览器、VS Code、SFTP、数据库客户端等操作者电脑工具
+```
+
+模型就更容易把当前问题理解为“操作者个人电脑准备工具”，而不是“目标服务器安装依赖”。
+
+它的预期收益主要有三类：
+
+- 提升口语化表达、反问、情绪化说法、上下文省略场景下的意图识别稳定性。
+- 在一次 LLM 调用中同时完成 intent、slots、semantic_frame、clarification decision，减少多次调用。
+- 让多轮对话中的“B”“第一种”“上面那个”“这台电脑”更容易结合历史语境被正确消解。
+
+### 3. 最大风险是 Case 锚定偏差
+
+这个方案最大的风险确实是：如果召回的 case 不好，或者相似度只是表面相似，LLM 会被 few-shot 样例强行带偏，把当前用户问题往错误意图上靠。
+
+典型风险包括：
+
+- 用户问“部署平台”，命中了“首次环境部署”样例，模型忽略上下文里用户其实选了 B，错误进入环境安装流程。
+- 用户说“电脑”，命中了“目标服务器依赖安装”样例，模型把个人电脑误判成服务器。
+- 用户已经切换新话题，但历史拼接召回了旧意图样例，导致意图残留。
+- Case 里带了过细的命令路径，模型把样例路径当成当前机器事实，生成错误命令。
+
+所以 Intent Case RAG 不能被设计成“召回到哪个 case 就判成哪个 intent”。它只能提供参考，不应该拥有最终决策权。
+
+### 4. 必须加的防护边界
+
+为了避免样例锚定，Intent Case RAG 需要几条硬约束：
+
+- Case 只作为 few-shot 参考，不作为事实证据；最终回答仍然必须从正式知识库、工具结果或当前上下文取证。
+- 检索分数低、top case 互相冲突、或 case 与用户显式条件冲突时，不注入或降级为弱参考。
+- Prompt 中明确要求：不得因为 case 相似就覆盖用户当前明确表达；当前用户输入和最近上下文优先级高于样例。
+- Case 中的命令、路径、IP、用户名、机器名只能作为样例字段，不得直接迁移到当前答案。
+- 最终 intent 仍需经过 `SemanticDecisionPlanner` 和 `ClarificationPolicy` 二次校验。
+- `direct_answer` 类型 case 只能用于低风险、高确定性、短答案场景；部署、启动、故障排查等高风险流程不应直接绕过 LLM。
+- 样例入库前要有人工审核和回归测试，避免错误 case 被批量放大。
+
+### 5. 更稳的工程定位
+
+Intent Case RAG 在系统里的合理定位是“意图解析增强器”，不是“意图分类器本体”：
+
+```text
+Intent Case RAG 负责提供相似理解范式。
+IntentAnalyzer 负责结构化抽取。
+SemanticDecisionPlanner 负责语义决策。
+ClarificationPolicy 负责是否追问。
+业务知识 RAG 负责最终回答证据。
+```
+
+这样做的好处是：样例能帮助模型理解复杂口语和多轮语境，但不会让某个命中 case 单独决定用户意图，更不会把样例里的历史命令、路径和机器环境误当成当前事实。
+
+### 6. 当前落地结构
+
+Intent Case RAG 先落地为一个“可向量化、可门控、可观测”的模块，而不是直接批量灌入大量 case：
+
+```text
+knowledge/intent_cases.py
+  IntentCase
+  IntentCaseRetriever
+  build_intent_case_query
+
+llm/embeddings.py
+  EmbeddingClient
+
+IntentAnalyzer
+  build_intent_case_query(user_input, recent_history)
+  → IntentCaseRetriever.search_for_prompt(...)
+  → _append_intent_cases(...)
+  → LLM structured intent parsing
+```
+
+`IntentCaseRetriever` 支持两种模式：
+
+- `keyword`：没有 embedding provider 时的本地兜底，保证测试和开发环境不断链。
+- `hybrid`：注入 `EmbeddingClient.embed_text` 后，使用 `semantic_score + keyword_score` 混合打分。
+
+这里保留 keyword fallback 不是说生产上继续依赖关键词，而是为了让系统在没有 embedding 服务时仍然可运行。生产环境应注入真实 embedding provider，并通过 prompt 中的 `retrieval_mode: hybrid`、`keyword_score`、`semantic_score` 观测是否真的走了语义召回。
+
+Prompt 注入前增加了 `search_for_prompt` 门控：
+
+- 低分 case 不注入。
+- 非 `intent_parse` 或显式 `block_prompt_injection` 的 case 不注入。
+- top case 分数接近但 intent / semantic_frame 冲突时，不注入任何 case，避免把模型锚定到错误样例。
+
+所以现在的设计不是：
+
+```text
+召回 case → 直接判定 intent
+```
+
+而是：
+
+```text
+召回 case 候选
+  → 质量门控 / 冲突检测
+  → 仅作为 few-shot 参考注入
+  → LLM 结构化解析
+  → SemanticDecisionPlanner / ClarificationPolicy 再决策
+```
+
+这个结构为后续生成高质量 case 做准备：case 库质量会影响意图解析质量，但单个 case 不应该拥有最终裁决权。
+
+## 结构化意图不能替代原始输入和会话状态
+
+### 1. intent 不是原始 prompt 的替代品
+
+前置意图解析的目标是把用户输入转换成结构化字段，例如：
+
+```json
+{
+  "task_type": "troubleshooting",
+  "operation": "platform_start",
+  "target": "web_terminal",
+  "symptom": "address_already_in_use"
+}
+```
+
+但结构化 intent 本质上是对原始问题的压缩。如果后续检索只使用这些字段，而不再携带用户原始问题，就会丢失用户原文里的细节、语气、限定条件和错误描述。
+
+错误链路是：
+
+```text
+用户原始问题
+  → intent 结构化输出
+  → 只拿 intent 去检索
+```
+
+更稳的链路应该是：
+
+```text
+用户原始问题
+  + intent
+  + semantic_frame
+  + slots
+  + 必要的会话状态
+  → QueryBuilder 构造检索 query
+```
+
+也就是说，结构化 intent 是检索增强信号，不是原始 query 的替代品。
+
+例如用户问：
+
+```text
+我启动 web-terminal 的时候报 address already in use，怎么处理？
+```
+
+检索 query 不应该只剩：
+
+```text
+platform_start web_terminal address_already_in_use
+```
+
+而应该包含：
+
+```text
+原始问题：我启动 web-terminal 的时候报 address already in use，怎么处理？
+任务类型：troubleshooting
+操作阶段：platform_start
+目标组件：web_terminal
+故障现象：address_already_in_use
+排除方向：environment_setup
+```
+
+这样既保留原始表达，又利用结构化字段收敛检索范围。
+
+### 2. 短历史不是完整记忆
+
+IntentAnalyzer 接收最近几轮对话，是为了处理“B”“第一种”“上面那个”“继续”等近距离指代。它不应该被理解为 Agent 只有两轮记忆。
+
+如果系统只依赖最近一两轮原文，会出现明显失忆：
+
+- 用户早前已经确认“服务器已安装好，只需要启动”，后面系统又追问首次安装还是启动。
+- 用户早前说明自己是学习者、在个人电脑上操作，后面系统又把“电脑”理解成目标服务器。
+- 用户切换过任务后，旧任务残留又污染新任务。
+
+更稳的多轮上下文应拆成三层：
+
+```text
+短上下文：最近 N 轮原文，用于指代消解。
+会话状态：当前任务的结构化状态，例如用户角色、机器角色、部署阶段、已确认槽位。
+长期摘要：更早但仍有价值的信息压缩，例如用户环境、已完成步骤、明确排除项。
+```
+
+意图解析时输入的不是完整历史原文，也不是只有最近两轮，而应该是：
+
+```text
+latest_query
+  + recent_history
+  + session_state
+  + long_term_summary
+```
+
+其中：
+
+- `recent_history` 解决近距离指代。
+- `session_state` 保存当前任务状态和已确认槽位。
+- `long_term_summary` 保存更早但仍有用的信息。
+
+### 3. 推荐的后续架构
+
+后续更完整的链路应该是：
+
+```text
+用户输入
+  ↓
+ConversationStateManager
+  - recent_history
+  - session_state
+  - long_term_summary
+  - confirmed_slots
+  ↓
+Intent Case RAG
+  - 用 latest_query + state + recent_history 召回相似 case
+  ↓
+IntentAnalyzer
+  - 输出 intent / slots / semantic_frame / decision
+  ↓
+QueryBuilder
+  - 原始 prompt
+  - intent
+  - semantic_frame
+  - slots
+  - session_state
+  一起构造检索 query
+  ↓
+业务知识 RAG
+  ↓
+回答
+  ↓
+更新 ConversationStateManager
+```
+
+这里有两个核心原则：
+
+```text
+结构化 intent 不替代原始问题。
+短历史不替代会话状态。
+```
+
+因此，下一步需要补两个模块：
+
+- `QueryBuilder`：把原始 prompt、intent、semantic_frame、slots、session_state 合成检索 query，避免原文信息丢失。
+- `ConversationStateManager`：维护跨多轮的结构化状态，避免 Agent 只依赖最近几轮原文。
+
+## 三段链路里不是每一段都必须调用 LLM
+
+当前前置意图架构容易被误解成“三个 LLM 调用”：
+
+```text
+1. 意图识别部分：喂短上下文，生成结构化意图。
+2. 检索增强部分：喂短上下文 + 结构化意图，找到对应知识。
+3. 回答问题部分：喂长上下文 + 检索增强后的 prompt，生成最终回答。
+```
+
+这个理解大方向对，但第 2 步需要修正：检索增强部分不一定是一次 LLM 调用。
+
+更准确的链路是：
+
+```text
+1. IntentAnalyzer
+   输入：当前用户输入 + 短上下文 + 少量 intent case
+   输出：intent / slots / semantic_frame / clarification decision
+
+2. QueryBuilder + KnowledgeRetriever
+   输入：原始用户输入 + intent + semantic_frame + slots + 必要短上下文/session_state
+   输出：检索 query + 知识证据
+
+3. Answer LLM
+   输入：当前工作上下文 + 当前用户问题 + 本轮 intent/scope 约束 + 检索证据
+   输出：最终自然语言回答
+```
+
+其中第 2 步优先设计成确定性模块，而不是额外 LLM 调用：
+
+- `QueryBuilder` 用代码把原始问题、结构化意图、语义角色、槽位和会话状态拼成聚焦检索 query。
+- `KnowledgeRetriever` 或 `search_knowledge` 根据 query 和 intent metadata 检索业务知识。
+- 只有未来需要复杂 query rewrite、rerank 或语义重排时，才考虑给第 2 步加 LLM。
+
+这样可以避免系统变成：
+
+```text
+意图解析 LLM
+  → 检索改写 LLM
+  → 回答 LLM
+```
+
+导致成本、延迟和不确定性同时上升。
+
+推荐理解是：
+
+```text
+IntentAnalyzer 负责“理解用户要什么”。
+QueryBuilder + RAG 负责“找到该用什么证据”。
+Answer LLM 负责“组织成用户能看懂的回答”。
+```
+
+也就是说，当前系统里明确需要的 LLM 调用主要是第 1 步和第 3 步；第 2 步应先做成可测试、可解释的确定性检索准备层。
+
+### 1. LLM 和 embedding 能力的分工
+
+如果按最终理想版来设计，三段链路可以理解为：
+
+```text
+1. IntentAnalyzer：理解用户要什么
+   - LLM：把当前输入 + 短上下文解析成 intent / slots / semantic_frame。
+   - embedding：从 intent case 库召回相似对话样例，辅助 LLM 理解。
+
+2. QueryBuilder + RAG：找到该用什么证据
+   - QueryBuilder：通常不用 LLM，用代码把原始问题 + intent + slots + state 拼成检索 query。
+   - embedding：用于知识库向量召回。
+   - keyword / BM25 / exact match：用于脚本名、接口名、报错、路径等精确匹配。
+   - 输出：知识证据。
+
+3. Answer LLM：组织成用户能看懂的回答
+   - LLM：读取用户问题、当前上下文、intent 约束、检索证据，生成最终回答。
+```
+
+简化后是：
+
+```text
+IntentAnalyzer = LLM + intent case embedding retrieval
+QueryBuilder + RAG = deterministic query builder + knowledge hybrid retrieval
+Answer = LLM
+```
+
+也就是：
+
+```text
+第一段：LLM + 向量召回
+第二段：向量 / 关键词 / BM25 / 精确匹配的混合检索，不一定需要 LLM
+第三段：LLM
+```
+
+这里要区分两个概念：
+
+```text
+LLM：负责理解、推理、生成文本。
+Embedding model：负责把文本变成向量，用于相似度检索。
+```
+
+两者都属于模型能力，但职责不同。Intent Case RAG 和 Knowledge RAG 可以共用同一个 embedding provider，但应该分开建索引、分开设阈值、分开做门控：
+
+```text
+同一个 embedding provider
+  → intent_case_index：检索“相似问法应该如何理解”
+  → knowledge_index：检索“回答依据在哪里”
+```
+
+因此，系统最终需要的是：
+
+```text
+两个 LLM 使用点：
+  1. IntentAnalyzer
+  2. Answer LLM
+
+一个可复用 embedding 能力：
+  1. 给 intent case retrieval 用
+  2. 给 knowledge retrieval 用
+```

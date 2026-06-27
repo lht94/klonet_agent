@@ -45,6 +45,13 @@ def build_answer_policy(
     ]
     if extra_rule:
         rules.append(f"- {extra_rule}")
+    if intent is not None and intent.operation == "platform_start":
+        rules.append(
+            "- 启动命令里的 gunicorn、celery、python 路径必须先用 command -v gunicorn、"
+            "command -v celery、command -v python3.8 或 ls 在当前目标机器验证；"
+            "只执行当前机器实际存在的一套命令；"
+            "不得仅凭“服务器路径”或“虚拟机路径”标签选择 /usr/local/bin 或 /usr/local/python3/bin。"
+        )
     return "\n".join(rules)
 
 

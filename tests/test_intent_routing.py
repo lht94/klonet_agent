@@ -389,6 +389,62 @@ def test_intent_routes_to_document_collection_before_bm25():
     assert recorder.request.collections == ("klonet_environment_setup",)
     assert recorder.request.allowed_paths == ("knowledge/klonet/ops/environment_setup.md",)
 
+
+def test_platform_usage_routes_to_user_operation_collection():
+    """普通用户平台使用问题应先路由到用户操作手册，而不是启动 runbook。"""
+
+    from klonet_agent.knowledge.intent import QueryIntent
+    from klonet_agent.knowledge.rag import KnowledgeBase
+
+    recorder = _RecordingRetriever()
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "operation_guide",
+            "operation": "unknown",
+            "target": "klonet_platform platform_usage normal_user browser",
+            "excluded_intents": ["platform_start", "environment_setup"],
+            "confidence": 0.92,
+        }
+    )
+
+    KnowledgeBase(retriever=recorder).search_knowledge(
+        "是第一种，我怎么使用",
+        top_k=3,
+        intent=intent,
+    )
+
+    assert recorder.request.collections == ("klonet_platform_usage",)
+    assert "klonet_runtime_startup" not in recorder.request.collections
+    assert recorder.request.allowed_paths == (
+        "knowledge/klonet/usage/platform_usage.md",
+    )
+
+
+def test_platform_usage_query_retrieves_indexed_user_guide_evidence():
+    """Platform usage collections must point at indexed curated documents."""
+
+    from klonet_agent.knowledge.intent import QueryIntent
+    from klonet_agent.knowledge.rag import KNOWLEDGE_BASE
+
+    intent = QueryIntent(
+        scope="klonet",
+        task_type="operation_guide",
+        operation="unknown",
+        target="klonet platform_usage normal_user browser experiment topology",
+        excluded_intents=("platform_start", "environment_setup"),
+        confidence=0.92,
+    )
+
+    evidence = KNOWLEDGE_BASE.search_knowledge(
+        "我想使用klonet去做实验",
+        top_k=3,
+        intent=intent,
+    )
+
+    assert "未检索到可靠 Klonet 证据" not in evidence
+    assert "platform_usage.md" in evidence
+
 def test_platform_start_filters_stop_restart_and_failure_sections():
     """启动指南不应被同一 Runbook 中的停止和故障章节占据。"""
 

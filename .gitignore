@@ -9,6 +9,7 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 tracing/trace.jsonl
+tracing/trace-*.jsonl
 
 # Local environment
 .env
@@ -28,6 +29,7 @@ workspaces/
 
 # Generated knowledge index
 knowledge/index.jsonl
+knowledge/vectors.jsonl
 evals/summary.md
 evals/retrieval_summary.md
 
@@ -39,3 +41,4 @@ knowledge/staging/
 
 # Local Codex skill/plugin cache copied during experiments
 skills/.system/
+.claude/

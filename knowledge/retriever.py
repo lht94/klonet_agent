@@ -10,7 +10,13 @@ from typing import Any
 
 from rank_bm25 import BM25Okapi
 
-from klonet_agent.config import DEFAULT_RAG_TOP_K, KNOWLEDGE_INDEX_FILE
+from klonet_agent.config import (
+    DEFAULT_RAG_TOP_K,
+    KNOWLEDGE_INDEX_FILE,
+    KNOWLEDGE_VECTOR_INDEX_FILE,
+    PROJECT_ROOT,
+)
+from klonet_agent.llm.embeddings import build_default_embedding_provider
 from klonet_agent.knowledge.indexer import INDEX_SCHEMA_VERSION, KnowledgeIndexer
 from klonet_agent.knowledge.models import (
     RetrievedChunk,
@@ -18,6 +24,11 @@ from klonet_agent.knowledge.models import (
     SearchRequest,
 )
 from klonet_agent.knowledge.tokenizer import DEFAULT_TOKENIZER, MixedTokenizer
+from klonet_agent.knowledge.vector_index import (
+    EmbeddingProvider,
+    KnowledgeVectorIndex,
+    cosine_similarity,
+)
 
 
 _TASK_LAYER_WEIGHTS = {
@@ -86,13 +97,20 @@ class KnowledgeRetriever:
         self,
         index_file: Path = KNOWLEDGE_INDEX_FILE,
         tokenizer: MixedTokenizer | None = None,
+        vector_index_file: Path | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
     ):
         self.index_file = index_file
         self.tokenizer = tokenizer or DEFAULT_TOKENIZER
+        self.vector_index_file = vector_index_file or KNOWLEDGE_VECTOR_INDEX_FILE
+        self.embedding_provider = embedding_provider
+        self._default_embedding_provider_loaded = embedding_provider is not None
         self._mtime_ns: int | None = None
         self._rows: list[dict[str, Any]] = []
         self._corpus_tokens: list[list[str]] = []
         self._bm25: BM25Okapi | None = None
+        self._vector_mtime_ns: int | None = None
+        self._vectors: dict[str, tuple[float, ...]] = {}
 
     def search(
         self,
@@ -119,8 +137,15 @@ class KnowledgeRetriever:
         """执行 BM25 召回、精确加权、metadata 过滤和置信度判断。"""
 
         self._ensure_loaded()
+        self._ensure_allowed_paths_indexed(request)
         query_tokens = self.tokenizer.tokenize(request.query)
-        if not query_tokens or not self._rows or self._bm25 is None:
+        query_embedding = self._embed_query(request.query)
+        if (
+            not query_tokens
+            and query_embedding is None
+            or not self._rows
+            or self._bm25 is None
+        ):
             return SearchOutcome(status="none", reason="empty_query_or_index")
 
         task_type = "concept" if request.task_type == "auto" else request.task_type
@@ -140,12 +165,23 @@ class KnowledgeRetriever:
             )
             exact_score = _exact_score(request.query, query_tokens, row)
             bm25_score = max(0.0, float(bm25_scores[index]))
-            if not _has_enough_evidence(query_tokens, matched_terms, exact_score, bm25_score):
+            semantic_score = self._semantic_score(row, query_embedding)
+            has_lexical_evidence = _has_enough_evidence(
+                query_tokens,
+                matched_terms,
+                exact_score,
+                bm25_score,
+            )
+            has_semantic_evidence = semantic_score >= 0.75
+            if not has_lexical_evidence and not has_semantic_evidence:
                 continue
 
             metadata_score = _metadata_weight(metadata, task_type)
             lexical_score = min(len(matched_terms), 8) * 1.5
-            final_score = (bm25_score + exact_score + lexical_score) * metadata_score
+            vector_score = semantic_score * 10
+            final_score = (
+                bm25_score + exact_score + lexical_score + vector_score
+            ) * metadata_score
             if final_score < 2.0:
                 continue
 
@@ -167,6 +203,7 @@ class KnowledgeRetriever:
                     intent_tags=metadata["intent_tags"],
                     bm25_score=round(bm25_score, 4),
                     exact_score=round(exact_score, 4),
+                    semantic_score=round(semantic_score, 4),
                     metadata_score=round(metadata_score, 4),
                     matched_terms=matched_terms,
                 )
@@ -208,6 +245,84 @@ class KnowledgeRetriever:
         self._corpus_tokens = corpus
         self._bm25 = BM25Okapi(corpus) if corpus else None
         self._mtime_ns = mtime_ns
+        self._load_vectors()
+
+    def _ensure_allowed_paths_indexed(self, request: SearchRequest):
+        """Rebuild the default index if a routed collection references new curated docs."""
+
+        if not request.allowed_paths:
+            return
+        if self.index_file.resolve() != KNOWLEDGE_INDEX_FILE.resolve():
+            return
+
+        indexed_paths = {str(row.get("path") or "") for row in self._rows}
+        missing_paths = [
+            path
+            for path in request.allowed_paths
+            if path not in indexed_paths and _indexable_project_path_exists(path)
+        ]
+        if not missing_paths:
+            return
+
+        KnowledgeIndexer(index_file=self.index_file).build()
+        self._mtime_ns = None
+        self._ensure_loaded()
+
+    def build_vector_index(self) -> int:
+        """Build the semantic vector sidecar for the loaded knowledge rows."""
+
+        self._ensure_loaded()
+        embedding_provider = self._embedding_provider()
+        if embedding_provider is None:
+            return 0
+        count = KnowledgeVectorIndex(
+            vector_file=self.vector_index_file,
+            embedding_provider=embedding_provider,
+        ).build(self._rows)
+        self._vector_mtime_ns = None
+        self._load_vectors()
+        return count
+
+    def _load_vectors(self):
+        if not self.vector_index_file.exists():
+            self._vectors = {}
+            self._vector_mtime_ns = None
+            return
+        mtime_ns = self.vector_index_file.stat().st_mtime_ns
+        if self._vector_mtime_ns == mtime_ns:
+            return
+        self._vectors = KnowledgeVectorIndex(
+            vector_file=self.vector_index_file,
+        ).load()
+        self._vector_mtime_ns = mtime_ns
+
+    def _embed_query(self, query: str) -> tuple[float, ...] | None:
+        if not self._vectors:
+            return None
+        embedding_provider = self._embedding_provider()
+        if embedding_provider is None:
+            return None
+        try:
+            values = embedding_provider(query)
+        except Exception:
+            return None
+        return tuple(float(value) for value in values)
+
+    def _embedding_provider(self) -> EmbeddingProvider | None:
+        if not self._default_embedding_provider_loaded:
+            self.embedding_provider = build_default_embedding_provider()
+            self._default_embedding_provider_loaded = True
+        return self.embedding_provider
+
+    def _semantic_score(
+        self,
+        row: dict[str, Any],
+        query_embedding: tuple[float, ...] | None,
+    ) -> float:
+        if query_embedding is None:
+            return 0.0
+        chunk_id = str(row.get("chunk_id") or "")
+        return cosine_similarity(query_embedding, self._vectors.get(chunk_id))
 
 
 def _read_index_rows(index_file: Path) -> list[dict[str, Any]]:
@@ -221,6 +336,16 @@ def _read_index_rows(index_file: Path) -> list[dict[str, Any]]:
             if isinstance(row, dict):
                 rows.append(row)
     return rows
+
+
+def _indexable_project_path_exists(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    if any(
+        part in normalized.split("/")
+        for part in ("extracted_docs", "extracted_images", "staging")
+    ):
+        return False
+    return (PROJECT_ROOT / normalized).exists()
 
 
 def _needs_intent_metadata_migration(rows: list[dict[str, Any]]) -> bool:

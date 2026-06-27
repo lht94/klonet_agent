@@ -48,6 +48,19 @@ def test_startup_runbook_contains_concrete_runtime_commands():
     assert "<python_env>" not in text
 
 
+def test_startup_runbook_requires_current_machine_path_verification():
+    text = _read(STARTUP_RUNBOOK)
+
+    for expected in (
+        "command -v gunicorn",
+        "command -v celery",
+        "command -v python3.8",
+        "只执行当前机器实际存在",
+        "不要混用 `/usr/local/bin/` 和 `/usr/local/python3/bin/`",
+    ):
+        assert expected in text
+
+
 def test_startup_runbook_contains_complete_nginx_template():
     text = _read(STARTUP_RUNBOOK)
 

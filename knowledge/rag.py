@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K
 from klonet_agent.knowledge.collection_router import collection_ids, collection_paths, route_collections
-from klonet_agent.knowledge.intent import QueryIntent, build_retrieval_plan
+from klonet_agent.knowledge.conversation_state import ConversationState
+from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.models import QueryRoute, QueryScope, SearchRequest
+from klonet_agent.knowledge.query_builder import QueryBuilder
 from klonet_agent.knowledge.retriever import KnowledgeRetriever
 from klonet_agent.knowledge.router import DEFAULT_QUERY_ROUTER
+from klonet_agent.knowledge.semantic_understanding import SemanticFrame
 
 
 def route_query(query: str) -> QueryRoute:
@@ -38,6 +41,8 @@ class KnowledgeBase:
         domains: tuple[str, ...] | None = None,
         min_priority: str | None = None,
         intent: QueryIntent | None = None,
+        semantic_frame: SemanticFrame | None = None,
+        conversation_state: ConversationState | None = None,
     ) -> str:
         """按软路由检索，并返回带来源和可靠度的证据。"""
 
@@ -60,19 +65,28 @@ class KnowledgeBase:
                 "如用户后续明确关联 Klonet，再执行专属知识检索。"
             )
 
-        retrieval_query, retrieval_top_k = build_retrieval_plan(query, intent, top_k)
+        plan = QueryBuilder().build(
+            query,
+            intent=intent,
+            semantic_frame=semantic_frame,
+            conversation_state=conversation_state,
+            top_k=top_k,
+            task_type=task_type,
+            domains=domains,
+            layers=layers,
+        )
         collections = route_collections(intent)
         request = SearchRequest(
-            query=retrieval_query,
-            task_type=(intent.task_type if intent is not None else task_type or route.task_type),
-            layers=layers,
-            domains=domains or route.domains or None,
-            intent=(intent.operation if intent is not None else "unknown"),
-            excluded_intents=(intent.excluded_intents if intent is not None else ()),
+            query=plan.query,
+            task_type=(plan.task_type if plan.task_type != "auto" else route.task_type),
+            layers=plan.layers,
+            domains=plan.domains or route.domains or None,
+            intent=plan.intent_operation,
+            excluded_intents=plan.excluded_intents,
             min_priority=min_priority,
             collections=collection_ids(collections),
             allowed_paths=collection_paths(collections),
-            top_k=retrieval_top_k,
+            top_k=plan.top_k,
         )
         outcome = self.retriever.search_request(request)
         if outcome.status == "none":

@@ -3,6 +3,7 @@ title: 拓扑部署进度卡住
 status: diagnostic_playbook
 priority: P0
 domains: topology, celery, redis, worker
+intent_tags: topology_deploy
 last_verified: 2026-06-23
 ---
 

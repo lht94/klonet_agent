@@ -12,6 +12,8 @@ PROJECT_ROOT = PACKAGE_ROOT
 
 DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
+DEFAULT_EMBEDDING_BASE_URL = "https://ws-o108vxrjw8kdvbrm.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 DEFAULT_REASONING_EFFORT = "medium"
 MAX_TOKEN = 500000
 HISTORY_MAX_MESSAGES = 20
@@ -28,6 +30,7 @@ MEMORY_DIR = PROJECT_ROOT / "memory"
 JOURNAL_DIR = PROJECT_ROOT / "journals"
 WORKSPACE_DIR = PROJECT_ROOT / "workspaces"
 KNOWLEDGE_INDEX_FILE = PROJECT_ROOT / "knowledge" / "index.jsonl"
+KNOWLEDGE_VECTOR_INDEX_FILE = PROJECT_ROOT / "knowledge" / "vectors.jsonl"
 TRACE_FILE = PROJECT_ROOT / "tracing" / "trace.jsonl"
 
 DEFAULT_USER_ID = "default"

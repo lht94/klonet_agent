@@ -23,6 +23,7 @@ class KnowledgeCollection:
     operations: tuple[str, ...] = ()
     targets: tuple[str, ...] = ()
     excluded_operations: tuple[str, ...] = ()
+    excluded_targets: tuple[str, ...] = ()
 
 
 def load_collections(root: Path | None = None) -> tuple[KnowledgeCollection, ...]:
@@ -57,6 +58,8 @@ def route_collections(
         if intent.operation in collection.excluded_operations:
             continue
         if excluded.intersection(collection.operations):
+            continue
+        if _target_excluded(intent, collection):
             continue
         if intent.operation in collection.operations:
             matches.append(collection)
@@ -108,6 +111,7 @@ def _collection_from_manifest(manifest_path: Path) -> KnowledgeCollection | None
         operations=_string_tuple(raw.get("operations")),
         targets=_string_tuple(raw.get("targets")),
         excluded_operations=_string_tuple(raw.get("excluded_operations")),
+        excluded_targets=_string_tuple(raw.get("excluded_targets")),
     )
 
 
@@ -120,4 +124,11 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
         if normalized and normalized not in result:
             result.append(normalized)
     return tuple(result)
+
+
+def _target_excluded(intent: QueryIntent, collection: KnowledgeCollection) -> bool:
+    if not collection.excluded_targets:
+        return False
+    haystack = f"{intent.target} {intent.symptom}".lower()
+    return any(term.lower() in haystack for term in collection.excluded_targets)
 

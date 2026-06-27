@@ -110,3 +110,24 @@ def test_platform_start_intent_uses_command_focused_structure():
     assert "启动前提、标准启动命令、验证方式" in text
     assert "不得包含环境安装步骤" in text
     assert "不得推测 start.sh" in text
+def test_platform_start_policy_requires_runtime_path_verification():
+    """启动命令的绝对路径必须按当前目标机器验证，不能靠服务器/虚拟机标签硬选。"""
+
+    from klonet_agent.answer_policy import build_answer_policy
+    from klonet_agent.knowledge.intent import QueryIntent
+
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "deployment_guidance",
+            "operation": "platform_start",
+            "target": "klonet_platform",
+            "confidence": 0.95,
+        }
+    )
+
+    text = build_answer_policy("deployment_guidance", "B", intent=intent)
+
+    assert "command -v gunicorn" in text
+    assert "只执行当前机器实际存在的一套命令" in text
+    assert "不得仅凭“服务器路径”或“虚拟机路径”标签选择 /usr/local/bin 或 /usr/local/python3/bin" in text

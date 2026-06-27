@@ -1,0 +1,11 @@
+{
+  "collection_id": "klonet_platform_usage",
+  "title": "Klonet browser user and platform operation guides",
+  "paths": [
+    "knowledge/klonet/usage/platform_usage.md"
+  ],
+  "task_types": ["operation_guide"],
+  "operations": [],
+  "targets": ["platform_usage", "normal_user", "browser", "普通用户", "浏览器", "使用平台", "klonet_platform"],
+  "excluded_operations": ["environment_setup", "dependency_install", "platform_start", "platform_stop", "platform_restart"]
+}

@@ -25,8 +25,13 @@ from klonet_agent.knowledge.clarification import (
     decide_model_intent_clarification,
     decide_pre_llm_clarification,
 )
+from klonet_agent.knowledge.conversation_state import (
+    ConversationState,
+    ConversationStateManager,
+)
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.intent_analyzer import IntentAnalyzer, route_from_intent
+from klonet_agent.knowledge.semantic_understanding import IntentDecision
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
@@ -65,6 +70,9 @@ class AgentOrchestrator:
         )
         self._query_route = route_query("Klonet")
         self._query_intent: QueryIntent | None = None
+        self._intent_decision: IntentDecision | None = None
+        self._conversation_state = ConversationState()
+        self._conversation_state_manager = ConversationStateManager()
         self._knowledge_search_count = 0
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
@@ -362,6 +370,7 @@ class AgentOrchestrator:
         tool_rounds = 0
         todo_continuations = 0
         self._query_intent = None
+        self._intent_decision = None
         self._knowledge_search_count = 0
 
         pre_decision = (
@@ -385,10 +394,20 @@ class AgentOrchestrator:
                 )
                 token += analysis.token_usage
                 self._query_intent = analysis.intent
+                self._intent_decision = analysis.decision
+                self._conversation_state = self._conversation_state_manager.from_turn(
+                    user_input,
+                    recent_history=recent_history_for_intent,
+                    semantic_frame=analysis.semantic_frame,
+                    intent=analysis.intent,
+                    decision=analysis.decision,
+                    previous_state=self._conversation_state,
+                )
                 self._query_route = route_from_intent(user_input, analysis.intent)
             except Exception:
                 self._query_route = route_query(user_input)
                 self._query_intent = None
+                self._intent_decision = None
         else:
             self._query_route = route_query(user_input)
 
@@ -470,12 +489,26 @@ class AgentOrchestrator:
                     tool_args = json.loads(tool_call.function.arguments)
                     if tool_name == "search_knowledge" and self._query_intent is not None and self._query_intent.confidence >= 0.6:
                         tool_args["intent"] = self._query_intent_tool_args()
+                        tool_args["conversation_state"] = (
+                            self._conversation_state.to_tool_args()
+                        )
                     if tool_name == "search_knowledge":
                         candidate_intent = QueryIntent.from_mapping(
                             tool_args.get("intent")
                         )
                         if candidate_intent.confidence >= 0.6:
                             self._query_intent = candidate_intent
+                            self._conversation_state = (
+                                self._conversation_state_manager.from_turn(
+                                    user_input,
+                                    recent_history=recent_history_for_intent,
+                                    intent=candidate_intent,
+                                    previous_state=self._conversation_state,
+                                )
+                            )
+                            tool_args["conversation_state"] = (
+                                self._conversation_state.to_tool_args()
+                            )
                             if turn_answer_policy_message is not None:
                                 turn_answer_policy_message["content"] = (
                                     build_answer_policy(
@@ -636,6 +669,13 @@ class AgentOrchestrator:
             f"- original_user_input: {user_input}",
             "- 本轮范围由原始用户输入确定，后续查询改写不得改变。",
         ]
+        if self._intent_decision is not None and self._intent_decision.soft_note:
+            rules.extend(
+                [
+                    f"- 默认解释：{self._intent_decision.soft_note}",
+                    "- 回答时先按默认解释直接给方案，再用一句低打扰提示说明另一种解释的流程不同。",
+                ]
+            )
         if route.hard_disable_rag:
             rules.extend(
                 [

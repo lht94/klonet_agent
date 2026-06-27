@@ -93,22 +93,40 @@ def test_query_intent_keeps_clarification_fields():
     assert intent.clarification_question == "安装环境还是启动平台？"
 
 
-def test_ambiguous_klonet_deploy_asks_clarification_without_llm_or_tools(capsys):
+def test_bare_klonet_deploy_no_longer_stops_before_semantic_analysis(capsys):
     with local_temp_dir() as temp_dir:
-        llm = ShouldNotCallLLM()
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"klonet","deployment_phase":"unknown",'
+                    '"action_goal":"start_services",'
+                    '"target_component":"klonet_platform",'
+                    '"ambiguity":{"level":"medium","defaultable":true},'
+                    '"confidence":0.74}',
+                    tokens=5,
+                ),
+                _response(
+                    "先按启动已安装好的 Klonet 平台服务理解；如果你指首次安装环境，流程不同。",
+                    tokens=7,
+                ),
+            ]
+        )
         executor = RecordingToolExecutor()
         orchestrator = _mentor_orchestrator(temp_dir, llm=llm, executor=executor)
         history = orchestrator.init_history()
         reply, history, token = orchestrator.single_chat("怎么部署 Klonet？", history, 0)
 
     output = capsys.readouterr().out
-    assert "安装基础环境" in reply
-    assert "启动已经安装好的 Klonet 平台服务" in reply
+    assert "先按启动" in reply
+    assert "首次安装环境" in reply
     assert reply in output
     assert history[-1]["role"] == "assistant"
     assert history[-1]["content"] == reply
-    assert token == 0
-    assert llm.calls == []
+    assert token == 12
+    assert len(llm.calls) == 2
+    assert "这里先按启动已安装好的 Klonet 平台服务理解" in "\n".join(
+        message["content"] for message in llm.calls[1]["messages"]
+    )
     assert executor.calls == []
 
 
@@ -247,6 +265,156 @@ def test_context_reference_does_not_trigger_memoryless_clarification(capsys):
     assert len(llm.calls) == 2
     assert "场景一" in llm.calls[0]["messages"][1]["content"]
     assert token == 12
+
+
+def test_late_platform_name_supplement_continues_previous_usage_question(capsys):
+    """短补充说明应补全上一轮问题，而不是开启新的部署澄清分支。"""
+
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"mixed","user_role":"learner",'
+                    '"perspective":"asking_about_own_pc",'
+                    '"machine_role":"operator_local_pc",'
+                    '"deployment_phase":"local_tool_preparation",'
+                    '"action_goal":"prepare_tools",'
+                    '"target_component":"operator_computer",'
+                    '"excluded_meanings":["environment_setup","platform_startup"],'
+                    '"ambiguity":{"level":"low"},'
+                    '"confidence":0.9}',
+                    tokens=5,
+                ),
+                _response(
+                    "你如果只是作为普通用户使用 Klonet 平台，电脑上有浏览器即可。\n"
+                    "场景一：你在浏览器里用 Klonet（普通用户）。\n"
+                    "场景二：你要部署运行 Klonet（管理员/开发者）。",
+                    tokens=7,
+                ),
+                _response(
+                    '{"scope":"klonet","user_role":"learner",'
+                    '"perspective":"using_platform",'
+                    '"machine_role":"unspecified",'
+                    '"deployment_phase":"platform_usage",'
+                    '"action_goal":"use_feature",'
+                    '"target_component":"klonet_platform",'
+                    '"excluded_meanings":["environment_setup","platform_startup"],'
+                    '"ambiguity":{"level":"low","resolved_by_context":true},'
+                    '"confidence":0.86}',
+                    tokens=5,
+                ),
+                _response("继续按普通用户浏览器使用 Klonet 平台回答。", tokens=7),
+            ]
+        )
+        orchestrator = _mentor_orchestrator(
+            temp_dir,
+            llm=llm,
+            executor=RecordingToolExecutor(),
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat("我在使用平台之前，电脑里需要下载什么软件吗？", history, 0)
+        reply, history, token = orchestrator.single_chat("klonet平台", history, 12)
+
+    assert "首次安装" not in reply
+    assert "启动已经安装" not in reply
+    assert "普通用户" in reply or "浏览器" in reply
+    assert len(llm.calls) == 4
+    second_intent_prompt = llm.calls[2]["messages"][1]["content"]
+    assert "电脑里需要下载什么软件" in second_intent_prompt
+
+
+def test_late_platform_name_supplement_ignores_model_deploy_clarification(capsys):
+    """模型把短补充误判为部署歧义时，策略层应按上下文继续。"""
+
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"klonet","task_type":"deployment_guidance",'
+                    '"operation":"unknown","target":"klonet_platform",'
+                    '"clarification_required":true,'
+                    '"clarification_question":"你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？",'
+                    '"confidence":0.7}',
+                    tokens=5,
+                ),
+                _response("继续回答普通用户浏览器使用 Klonet 平台。", tokens=7),
+            ]
+        )
+        orchestrator = _mentor_orchestrator(
+            temp_dir,
+            llm=llm,
+            executor=RecordingToolExecutor(),
+        )
+        history = orchestrator.init_history()
+        history.extend(
+            [
+                {
+                    "role": "user",
+                    "content": "我在使用平台之前，电脑里需要下载什么软件吗？",
+                },
+                {
+                    "role": "assistant",
+                    "content": (
+                        "你如果只是作为普通用户使用，电脑上有浏览器即可。\n"
+                        "场景一：你在浏览器里用平台（普通用户）。\n"
+                        "场景二：你要部署运行平台（管理员/开发者）。"
+                    ),
+                },
+            ]
+        )
+
+        reply, history, token = orchestrator.single_chat("klonet平台", history, 0)
+
+    assert "首次安装" not in reply
+    assert "启动已经安装" not in reply
+    assert "浏览器使用" in reply
+    assert len(llm.calls) == 2
+    assert token == 12
+
+
+def test_b_option_inherits_platform_start_and_runtime_path_guard(capsys):
+    """用户只回答 B 时，应继承上文平台启动路线，并保留运行路径验证约束。"""
+
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"klonet","context_refs":["B"],'
+                    '"deployment_phase":"unknown",'
+                    '"action_goal":"unknown",'
+                    '"target_component":"klonet_platform",'
+                    '"ambiguity":{"level":"medium"},'
+                    '"confidence":0.55}',
+                    tokens=5,
+                ),
+                _response("按平台启动路线回答，并先验证 gunicorn 路径。", tokens=7),
+            ]
+        )
+        orchestrator = _mentor_orchestrator(
+            temp_dir,
+            llm=llm,
+            executor=RecordingToolExecutor(),
+        )
+        history = orchestrator.init_history()
+        history.append(
+            {
+                "role": "assistant",
+                "content": (
+                    "A：服务器是全新的，从来没装过 Klonet，需要首次环境部署。\n"
+                    "B：服务器上已经有 Klonet，只是没启动，需要重新拉起 Redis、Master、Celery、Worker、Nginx。"
+                ),
+            }
+        )
+
+        reply, history, token = orchestrator.single_chat("B", history, 0)
+
+    assert "平台启动路线" in reply
+    assert token == 12
+    second_call_messages = "\n".join(
+        message["content"] for message in llm.calls[1]["messages"]
+    )
+    assert "command -v gunicorn" in second_call_messages
+    assert "只执行当前机器实际存在的一套命令" in second_call_messages
 
 
 def test_credential_question_uses_safety_boundary_without_llm_or_retrieval(capsys):

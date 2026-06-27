@@ -3,6 +3,7 @@ title: Klonet 拓扑部署流程
 status: current_verified
 priority: P0
 domains: topology, celery, redis, worker
+intent_tags: topology_deploy
 last_verified: 2026-06-22
 ---
 

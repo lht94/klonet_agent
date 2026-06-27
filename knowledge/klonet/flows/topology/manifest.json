@@ -1,0 +1,14 @@
+{
+  "collection_id": "klonet_topology_deploy",
+  "title": "Klonet topology deployment flow",
+  "paths": [
+    "knowledge/klonet/flows/topology_deploy.md",
+    "knowledge/klonet/ops/common_troubleshooting.md",
+    "knowledge/klonet_experience/cases/topology_progress_stuck.md",
+    "knowledge/klonet_experience/cases/frontend_backend_api_trace.md"
+  ],
+  "task_types": ["operation_guide", "troubleshooting", "code_lookup"],
+  "operations": ["topology_deploy"],
+  "targets": ["topology", "topo", "frontend", "process_bar"],
+  "excluded_operations": ["environment_setup", "platform_start"]
+}

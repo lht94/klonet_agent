@@ -71,17 +71,6 @@ def decide_pre_llm_clarification(
             ),
         )
 
-    if _looks_like_ambiguous_klonet_deploy(normalized, route):
-        return ClarificationDecision(
-            should_stop=True,
-            reason="ambiguous_klonet_deploy",
-            reply=(
-                "\u4f60\u8bf4\u7684\u201c\u90e8\u7f72 Klonet\u201d\u662f\u6307"
-                "\u5b89\u88c5\u57fa\u7840\u73af\u5883\uff0c\u8fd8\u662f\u542f\u52a8"
-                "\u5df2\u7ecf\u5b89\u88c5\u597d\u7684 Klonet \u5e73\u53f0\u670d\u52a1\uff1f"
-            ),
-        )
-
     if route is not None and route.confidence < 0.45 and route.scope != "general":
         return ClarificationDecision(
             should_stop=True,
@@ -101,6 +90,9 @@ def decide_model_intent_clarification(
     """Honor high-signal clarification fields from the structured model intent."""
 
     if _context_resolves_reference(user_input, recent_history or []):
+        return ClarificationDecision()
+
+    if _context_resolves_late_supplement(user_input, recent_history or []):
         return ClarificationDecision()
 
     if intent.clarification_required:
@@ -170,3 +162,23 @@ def _context_resolves_reference(user_input: str, recent_history: list[dict]) -> 
         "\u4e8c\uff1a",
     )
     return any(marker in recent_assistant_text for marker in option_markers)
+
+
+def _context_resolves_late_supplement(user_input: str, recent_history: list[dict]) -> bool:
+    text = user_input.strip().lower().replace(" ", "")
+    if text not in {"klonet", "klonet平台", "平台", "这个平台", "那个平台"}:
+        return False
+
+    recent_text = "\n".join(
+        str(message.get("content") or "")
+        for message in recent_history[-6:]
+        if message.get("role") in {"user", "assistant"}
+    ).lower()
+    if not recent_text:
+        return False
+
+    usage_signals = ("使用平台", "浏览器", "普通用户", "场景一", "电脑里需要下载")
+    contrast_signals = ("场景二", "部署运行", "管理员", "开发者")
+    return any(term in recent_text for term in usage_signals) and any(
+        term in recent_text for term in contrast_signals
+    )

@@ -688,6 +688,8 @@ def test_single_chat_streams_tool_call_then_final_answer(capsys):
     assert executor.calls[0][0] == "search_knowledge"
     assert executor.calls[0][1]["query"] == "Klonet 启动"
     assert executor.calls[0][1]["intent"]["operation"] == "platform_start"
+    assert executor.calls[0][1]["conversation_state"]["deployment_phase"] == "platform_startup"
+    assert executor.calls[0][1]["conversation_state"]["current_topic"] == "klonet_platform_start"
     assert "Klonet Agent：启动命令如下" in output
     assert history[-1]["content"] == "启动命令如下"
     assert token == 17

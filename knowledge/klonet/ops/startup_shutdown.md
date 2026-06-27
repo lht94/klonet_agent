@@ -123,7 +123,7 @@ ls -l /usr/local/bin/gunicorn /usr/local/bin/celery
 ls -l /usr/local/python3/bin/gunicorn /usr/local/python3/bin/celery
 ~~~
 
-只执行符合当前机器的一套命令。
+这些“服务器路径/服务器内虚拟机路径”标签只是历史环境中的常见变体，不是判断当前机器类型的依据。不同批次服务器、宿主机或虚拟机可能互换路径；最终以当前目标机器上 `command -v gunicorn`、`command -v celery`、`command -v python3.8` 或 `ls -l` 的结果为准。只执行当前机器实际存在且属于同一套 Python 环境的一套命令，不要混用 `/usr/local/bin/` 和 `/usr/local/python3/bin/`。
 
 ## 第四步：启动 Master
 

@@ -5,5 +5,6 @@
   "task_types": ["deployment_guidance", "operation_guide", "troubleshooting"],
   "operations": ["platform_start", "platform_stop", "platform_restart"],
   "targets": ["klonet_platform", "redis", "gunicorn", "celery", "web_terminal", "nginx", "worker", "master"],
-  "excluded_operations": ["environment_setup", "dependency_install"]
+  "excluded_operations": ["environment_setup", "dependency_install"],
+  "excluded_targets": ["platform_usage", "normal_user", "browser", "普通用户", "浏览器", "使用平台"]
 }

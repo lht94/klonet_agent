@@ -11,7 +11,7 @@ from time import perf_counter
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K
 from klonet_agent.journal import ProjectJournal
-from klonet_agent.knowledge import KNOWLEDGE_BASE, SKILL_LOADER
+from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.session import AgentSession
@@ -24,6 +24,8 @@ from klonet_agent.workspace.manager import WORKSPACE_MANAGER
 
 
 TOOL_RESULT_MAX_CHARS = 12000
+KNOWLEDGE_BASE = None
+SKILL_LOADER = None
 
 
 class ToolExecutor:
@@ -83,11 +85,14 @@ class ToolExecutor:
 
         if tool_name == "load_skill":
             print(f"Klonet Agent：正在加载技能 {tool_args['skill_name']}。")
-            return SKILL_LOADER.load_skill(tool_args["skill_name"])
+            return _skill_loader().load_skill(tool_args["skill_name"])
 
         if tool_name == "search_knowledge":
             intent = QueryIntent.from_mapping(tool_args.get("intent"))
-            return KNOWLEDGE_BASE.search_knowledge(
+            conversation_state = ConversationState.from_mapping(
+                tool_args.get("conversation_state")
+            )
+            return _knowledge_base().search_knowledge(
                 tool_args["query"],
                 tool_args.get("top_k", DEFAULT_RAG_TOP_K),
                 task_type=tool_args.get("task_type"),
@@ -95,6 +100,7 @@ class ToolExecutor:
                 domains=tuple(tool_args["domains"]) if tool_args.get("domains") else None,
                 min_priority=tool_args.get("min_priority"),
                 intent=intent,
+                conversation_state=conversation_state,
             )
 
         if tool_name == "list_files":
@@ -201,3 +207,25 @@ def _truncate_tool_result(result: str, max_chars: int = TOOL_RESULT_MAX_CHARS) -
         return result
     suffix = "\n\n...（工具结果过长，已截断）"
     return result[: max_chars - len(suffix)].rstrip() + suffix
+
+
+def _knowledge_base():
+    """Delay heavy RAG initialization until a knowledge search is actually needed."""
+
+    global KNOWLEDGE_BASE
+    if KNOWLEDGE_BASE is None:
+        from klonet_agent.knowledge import KNOWLEDGE_BASE as DEFAULT_KNOWLEDGE_BASE
+
+        KNOWLEDGE_BASE = DEFAULT_KNOWLEDGE_BASE
+    return KNOWLEDGE_BASE
+
+
+def _skill_loader():
+    """Delay skill loader construction for CLI/help paths that never load skills."""
+
+    global SKILL_LOADER
+    if SKILL_LOADER is None:
+        from klonet_agent.knowledge import SKILL_LOADER as DEFAULT_SKILL_LOADER
+
+        SKILL_LOADER = DEFAULT_SKILL_LOADER
+    return SKILL_LOADER
