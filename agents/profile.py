@@ -24,6 +24,8 @@ MENTOR_TOOLS = {
     "load_skill",
     "search_knowledge",
     "read_project_journal",
+    "list_files",
+    "read_file",
     "append_episode",
     "write_memory",
     "write_user",

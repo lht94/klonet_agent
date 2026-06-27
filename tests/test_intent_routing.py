@@ -445,6 +445,34 @@ def test_platform_usage_query_retrieves_indexed_user_guide_evidence():
     assert "未检索到可靠 Klonet 证据" not in evidence
     assert "platform_usage.md" in evidence
 
+
+def test_topology_node_type_query_retrieves_curated_node_guide():
+    """Node palette questions should not rely only on partial symbol hits."""
+
+    from klonet_agent.knowledge.intent import QueryIntent
+    from klonet_agent.knowledge.rag import KNOWLEDGE_BASE
+
+    intent = QueryIntent(
+        scope="klonet",
+        task_type="operation_guide",
+        operation="unknown",
+        target="topology node_types host switch router controller kvm",
+        excluded_intents=("environment_setup", "dependency_install", "platform_start"),
+        confidence=0.92,
+    )
+
+    evidence = KNOWLEDGE_BASE.search_knowledge(
+        "拓扑里能放置哪些节点呢？",
+        top_k=4,
+        intent=intent,
+    )
+
+    assert "未检索到可靠 Klonet 证据" not in evidence
+    assert "topology_node_types.md" in evidence
+    for term in ("Host", "Switch", "Router", "Controller", "KVM"):
+        assert term in evidence
+
+
 def test_platform_start_filters_stop_restart_and_failure_sections():
     """启动指南不应被同一 Runbook 中的停止和故障章节占据。"""
 

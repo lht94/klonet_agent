@@ -2,6 +2,7 @@
   "collection_id": "klonet_topology_deploy",
   "title": "Klonet topology deployment flow",
   "paths": [
+    "knowledge/klonet/flows/topology_node_types.md",
     "knowledge/klonet/flows/topology_deploy.md",
     "knowledge/klonet/ops/common_troubleshooting.md",
     "knowledge/klonet_experience/cases/topology_progress_stuck.md",

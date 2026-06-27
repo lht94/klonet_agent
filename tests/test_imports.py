@@ -34,6 +34,8 @@ def test_profile_tool_permissions():
 
     assert "search_knowledge" in mentor.allowed_tools
     assert "read_project_journal" in mentor.allowed_tools
+    assert "list_files" in mentor.allowed_tools
+    assert "read_file" in mentor.allowed_tools
     assert "write_file" not in mentor.allowed_tools
     assert "run_tests" not in mentor.allowed_tools
     assert "show_diff" not in mentor.allowed_tools
