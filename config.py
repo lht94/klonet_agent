@@ -32,6 +32,7 @@ WORKSPACE_DIR = PROJECT_ROOT / "workspaces"
 KNOWLEDGE_INDEX_FILE = PROJECT_ROOT / "knowledge" / "index.jsonl"
 KNOWLEDGE_VECTOR_INDEX_FILE = PROJECT_ROOT / "knowledge" / "vectors.jsonl"
 TRACE_FILE = PROJECT_ROOT / "tracing" / "trace.jsonl"
+KLONET_SOURCE_ROOT = PROJECT_ROOT / "klonet_knowledge" / "02_vemu_uestc_code"
 
 DEFAULT_USER_ID = "default"
 DEFAULT_PROJECT_ID = "default"

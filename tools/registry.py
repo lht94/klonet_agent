@@ -157,6 +157,39 @@ TOOLS = [
         [],
     ),
     _tool(
+        "search_code",
+        "在 Klonet 规范源码树中按字面量 grep 搜索源码。代码、接口、配置、启动脚本和报错类问题应优先用它定位真实源码证据。",
+        {
+            "query": {"type": "string", "description": "要搜索的函数名、路由、报错文本、配置项或关键词"},
+            "path": {"type": "string", "description": "源码树内相对目录，默认搜索整个源码树"},
+            "file_glob": {"type": "string", "description": "可选文件通配符，例如 *.py 或 mains/*.py"},
+            "max_results": {"type": "integer", "description": "最多返回命中条数，默认 50"},
+            "case_sensitive": {"type": "boolean", "description": "是否区分大小写，默认 false"},
+        },
+        ["query"],
+    ),
+    _tool(
+        "read_source_file",
+        "读取 Klonet 规范源码树中的真实源码文件。只能读取 klonet_knowledge/02_vemu_uestc_code 内文件，可指定行范围。",
+        {
+            "path": {"type": "string", "description": "源码树内相对文件路径，例如 mains/web_terminal_main.py"},
+            "start_line": {"type": "integer", "description": "可选起始行号"},
+            "end_line": {"type": "integer", "description": "可选结束行号"},
+            "max_chars": {"type": "integer", "description": "最大返回字符数，默认 12000"},
+        },
+        ["path"],
+    ),
+    _tool(
+        "list_source_files",
+        "列出 Klonet 规范源码树中的源码文件相对路径，用于不知道入口文件时先缩小范围。",
+        {
+            "path": {"type": "string", "description": "源码树内相对目录，默认根目录"},
+            "pattern": {"type": "string", "description": "可选相对路径通配符，例如 mains/*.py"},
+            "max_results": {"type": "integer", "description": "最多返回文件数，默认 200"},
+        },
+        [],
+    ),
+    _tool(
         "read_file",
         "读取当前 workspace 内的文本文件。",
         {

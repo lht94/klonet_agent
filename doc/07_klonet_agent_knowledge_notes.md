@@ -2657,3 +2657,549 @@ Embedding model：负责把文本变成向量，用于相似度检索。
   1. 给 intent case retrieval 用
   2. 给 knowledge retrieval 用
 ```
+
+## 源码机器索引与真实源码读取
+
+源码机器索引可以理解为“源码地图”，而不是真实源码本身。
+
+它通常记录：
+
+- 哪些源码文件存在；
+- 文件路径在哪里；
+- 文件大概属于哪个业务领域；
+- 有哪些函数、类、路由、配置项、Celery 任务；
+- 它们位于第几行；
+- 有时还会包含简短 summary；
+- 路由对应哪个实现文件；
+- 配置项来自哪个配置文件。
+
+例如 `knowledge/klonet_index/symbols.jsonl` 中的一条记录可能表示：
+
+```json
+{
+  "kind": "function",
+  "symbol": "post_worker_init",
+  "module": "mains.gun",
+  "path": "mains/gun.py",
+  "line": 46,
+  "end_line": 57,
+  "summary": "gunicorn master 初始化时的回调函数"
+}
+```
+
+这表示源码中存在一个叫 `post_worker_init` 的函数，它在 `mains/gun.py` 的第 46 到 57 行。
+
+但是这条索引并没有保存完整函数源码。它只是告诉 Agent：
+
+```text
+如果你要理解 post_worker_init，应该去 mains/gun.py 这个文件附近找。
+```
+
+所以，机器索引负责“定位”，真实源码负责“确认”。
+
+### 如果 workspace 里没有真实源码
+
+如果只有机器索引，而没有真实源码，Agent 仍然可以知道：
+
+- 可能有哪些文件；
+- 函数叫什么；
+- 路由在哪个文件；
+- 配置项可能在哪；
+- 调用入口大概在哪里。
+
+但它不能可靠回答源码细节，例如：
+
+- 函数内部具体做了什么；
+- 参数如何校验；
+- 异常分支如何处理；
+- 返回值结构是什么；
+- 某个报错到底由哪一行触发；
+- 当前代码与文档是否不一致。
+
+因此，如果 workspace 或可访问源码目录中没有真实源码，Agent 最多只能“根据源码索引推断”，不能做到源码级确认。
+
+### 如果同时有机器索引和真实源码
+
+这是最理想的状态。
+
+推荐链路是：
+
+```text
+用户问题
+  ↓
+机器索引定位候选文件 / 函数 / 路由 / 配置项
+  ↓
+按需读取真实源码
+  ↓
+用源码内容确认答案
+  ↓
+最终回答用户
+```
+
+例如用户问：
+
+```text
+/file/dload/ 这个接口是干什么的？
+```
+
+系统可以先查 `routes.jsonl`，找到：
+
+```json
+{
+  "route": "/file/dload/",
+  "implementation": "vemu_uestc/webserver/api/file_load/master_download.py",
+  "methods": ["POST"]
+}
+```
+
+然后再读取真实源码：
+
+```text
+klonet_knowledge/02_vemu_uestc_code/vemu_uestc/webserver/api/file_load/master_download.py
+```
+
+最终回答时，应该以真实源码为准，而不是只根据索引中的 route 或 summary 推断。
+
+### 机器索引如何影响源码读取
+
+机器索引不是直接“让 Agent 理解源码”，而是影响 Agent 的搜索方向。
+
+没有机器索引时，Agent 可能只能在大量源码中盲目搜索关键词。
+
+有机器索引后，Agent 可以先缩小范围：
+
+```text
+用户问 web-terminal address already in use
+  ↓
+机器索引定位 web_terminal_main.py、启动脚本、端口配置项
+  ↓
+读取相关源码和配置
+  ↓
+判断到底是端口占用、screen 旧进程未退出，还是配置端口重复
+```
+
+所以正确理解是：
+
+```text
+机器索引 = 找到应该读哪里
+真实源码 = 证明答案是否正确
+```
+
+后续 Mentor 的源码理解能力应该采用混合方案：
+
+```text
+代码类问题
+  → 查机器索引定位候选文件
+  → search_code / read_source_file 读取真实源码
+  → 结合知识库文档组织回答
+```
+
+不能只依赖机器索引，也不应该把机器索引当成源码本身。
+
+### 知识库优先还是源码优先
+
+源码理解链路不应该固定成“永远先读源码”或“永远先查知识库”，而应该由问题意图决定证据优先级。
+
+如果用户问的是流程类、概念类、部署指导类问题，通常应该先查知识库，再用源码校验关键事实。
+
+例如：
+
+```text
+Klonet 怎么启动？
+部署环境和启动平台有什么区别？
+为什么 Worker 不需要启动 Celery？
+```
+
+这类问题的推荐链路是：
+
+```text
+用户问题
+  ↓
+意图解析
+  ↓
+知识库检索，找到流程文档、部署文档或经验总结
+  ↓
+如果涉及具体命令、脚本、端口、源码路径
+  ↓
+读取源码或脚本确认关键事实
+  ↓
+最终回答
+```
+
+这样回答会更完整，因为知识库通常已经整理了背景、流程、前提和注意事项。源码在这里主要负责校验命令、脚本、路径、配置项等事实。
+
+如果用户问的是代码类、接口类、配置类、报错类问题，最终标准通常应该是源码。
+
+例如：
+
+```text
+web_terminal_main.py 是怎么启动的？
+/file/dload/ 这个接口在哪里？
+为什么启动时报 address already in use？
+Celery 任务是在哪注册的？
+```
+
+这类问题的推荐链路是：
+
+```text
+用户问题
+  ↓
+意图解析
+  ↓
+源码机器索引定位候选文件 / 函数 / 路由 / 配置项
+  ↓
+按需 grep / read_source_file 读取真实源码
+  ↓
+必要时补充知识库背景
+  ↓
+最终回答
+```
+
+原因是代码问题的事实标准是当前源码，而不是文档。文档可能过期、漏写或简化，源码才代表系统真实行为。
+
+因此更准确的原则是：
+
+```text
+流程类问题：知识库优先，源码校验。
+代码类问题：源码优先，知识库补充。
+混合类问题：知识库定位流程，源码确认关键事实。
+```
+
+这里的重点不是谁一定先于谁，而是不同问题需要不同的证据优先级。意图解析模块应该输出任务类型和证据需求，后续检索层再根据 evidence priority 决定先查知识库还是先读源码。
+
+### 按需 grep 源码与源码全文数据库 / 向量库的区别
+
+按需 grep 源码和把源码全文存入数据库或向量库，解决的是不同层次的问题。
+
+按需 grep 源码的本质是：
+
+```text
+直接在真实源码文件里搜索关键词、函数名、路由、报错文本或配置项。
+```
+
+例如用户问：
+
+```text
+address already in use 是哪里来的？
+```
+
+系统可以搜索：
+
+```text
+address already in use
+web_terminal
+port
+socket
+```
+
+然后读取命中的真实源码文件。
+
+按需 grep 的优点是：
+
+- 读的是当前真实源码；
+- 不容易因为索引过期而答错；
+- 对函数名、接口路由、报错文本、配置项、脚本名非常准确；
+- 实现简单；
+- 适合作为代码事实校验手段。
+
+它的缺点是：
+
+- 对自然语言问题不够强；
+- 用户描述的是现象时，源码里可能没有完全相同的词；
+- 大代码库中多轮 grep 可能较慢；
+- 需要 Agent 能把用户问题转成合适的搜索词。
+
+源码全文数据库或向量库的本质是：
+
+```text
+提前把源码切成 chunk，建立全文索引或向量索引，然后用关键词或语义相似度召回相关代码片段。
+```
+
+例如用户问：
+
+```text
+网页终端连接失败是哪里处理的？
+```
+
+即使源码中没有“连接失败”这个原词，向量检索也可能召回：
+
+- websocket handler；
+- terminal session；
+- web_terminal_main.py；
+- socket 连接逻辑；
+- terminal 端口配置。
+
+源码全文数据库 / 向量库的优点是：
+
+- 对自然语言问题更友好；
+- 可以做语义搜索；
+- 大规模代码库检索更快；
+- 适合用户不知道准确关键词、只描述现象的场景。
+
+它的缺点是：
+
+- 索引可能过期；
+- 需要定期重建；
+- 向量召回可能找出“相似但不正确”的代码；
+- 最终仍然需要回到真实源码确认；
+- 实现和维护成本更高。
+
+因此，两者不应该简单二选一。更合理的架构是：
+
+```text
+第一层：源码机器索引
+用途：快速知道有哪些文件、函数、路由、配置项。
+
+第二层：按需 grep / read_source_file
+用途：读取真实源码，确认事实。
+
+第三层：源码全文数据库 / 向量库，可选
+用途：自然语言语义召回，解决用户不知道关键词的问题。
+```
+
+最终原则是：
+
+```text
+源码索引告诉 Agent 去哪里找。
+grep / read_source_file 让 Agent 看真实代码。
+向量库帮助 Agent 在不知道关键词时也能找到候选代码。
+最终答案，尤其是代码问题，仍然应该以真实源码为准。
+```
+
+### 当前读代码工具的实现原理与调用链路
+
+当前第一版源码理解能力采用的是“LLM 生成搜索词 + grep 定位 + 读取真实源码”的两层工具链。
+
+它不是向量检索，也不是让大模型直接扫描硬盘。大模型本身不能直接读取本地文件，它只能根据问题决定是否调用工具、调用哪个工具、传什么参数。真正访问源码目录的是工具层。
+
+当前源码工具固定面向规范源码树：
+
+```text
+klonet_knowledge/02_vemu_uestc_code
+```
+
+也就是说，源码工具不是读取任意 workspace 文件，而是专门读取 Klonet 源码证据目录。
+
+#### 1. LLM 先判断是否需要源码证据
+
+例如用户问：
+
+```text
+web_terminal 是怎么启动的？
+```
+
+Mentor 会先判断：
+
+```text
+这是 Klonet 域内问题
+这是启动 / 源码解释问题
+需要真实源码证据
+```
+
+因此它应该优先调用源码工具，而不是只根据知识库文档回答。
+
+#### 2. LLM 生成 search_code 调用
+
+模型会把用户问题转换成更适合源码检索的关键词。
+
+例如用户原话可能是：
+
+```text
+网页终端为什么启动失败？
+```
+
+但源码里未必有“网页终端”这个词。模型需要推导出更可能命中的源码关键词，例如：
+
+```text
+web_terminal
+terminal
+create_web_terminal_app
+web_terminal_port
+```
+
+然后生成工具调用：
+
+```json
+{
+  "name": "search_code",
+  "arguments": {
+    "query": "web_terminal",
+    "max_results": 5
+  }
+}
+```
+
+所以当前第一层仍然是关键词 grep，但关键词不一定等于用户原话，而是由 LLM 根据意图生成。
+
+#### 3. ToolExecutor 检查权限并分发工具
+
+模型生成 tool call 后，不会直接执行。
+
+系统会先经过 `ToolExecutor`：
+
+```text
+tool_name = search_code
+tool_args = {"query": "web_terminal", "max_results": 5}
+```
+
+执行前会检查当前 Agent 是否允许调用这个工具。
+
+Mentor 现在允许调用：
+
+```text
+search_code
+read_source_file
+list_source_files
+```
+
+如果工具不在白名单里，会被拒绝。
+
+#### 4. search_code 在源码目录中 grep
+
+`search_code` 的核心行为是：
+
+```text
+在 klonet_knowledge/02_vemu_uestc_code 下搜索 query
+返回 文件路径:行号:命中行
+```
+
+优先使用 `rg`，也就是 ripgrep。
+
+如果当前运行环境没有 `rg`，则降级为 Python 逐文件扫描。
+
+简化理解：
+
+```text
+有 rg：
+  用 rg 做快速关键词搜索
+
+没有 rg：
+  用 Python 遍历源码文件并逐行匹配
+```
+
+工具会跳过明显不适合检索的目录，例如：
+
+```text
+.git
+.history
+__pycache__
+node_modules
+logs
+tmp
+test-results
+output
+```
+
+并限制返回条数，避免一次把大量源码塞进上下文。
+
+#### 5. search_code 返回候选位置
+
+例如搜索：
+
+```json
+{
+  "query": "web_terminal",
+  "max_results": 5
+}
+```
+
+可能返回：
+
+```text
+mains/web_terminal_main.py:1: from vemu_uestc.webserver.app_factory import create_web_terminal_app
+mains/web_terminal_main.py:6: app = create_web_terminal_app()
+vemu_config/config.py:479: web_terminal_port = 5005
+```
+
+这一步只说明：
+
+```text
+这些文件和 web_terminal 相关。
+```
+
+它还不能完整解释源码逻辑，因为 grep 只返回命中行。
+
+#### 6. LLM 再调用 read_source_file 读取真实源码
+
+拿到候选文件后，Mentor 应该继续读取关键文件。
+
+例如：
+
+```json
+{
+  "name": "read_source_file",
+  "arguments": {
+    "path": "mains/web_terminal_main.py",
+    "start_line": 1,
+    "end_line": 30
+  }
+}
+```
+
+`read_source_file` 会读取真实源码片段，并带上文件路径和行号：
+
+```text
+源码文件：mains/web_terminal_main.py（第 1-30 行）
+mains/web_terminal_main.py:1: ...
+mains/web_terminal_main.py:3: if __name__ == "__main__":
+mains/web_terminal_main.py:4: ...
+```
+
+这一步才是“看代码具体写了什么”。
+
+#### 7. LLM 根据源码证据组织回答
+
+工具结果会进入模型上下文。
+
+之后模型根据真实源码回答：
+
+```text
+web_terminal 的入口在 mains/web_terminal_main.py。
+它通过 create_web_terminal_app() 创建 app。
+运行主程序时引入 gevent.pywsgi 和 WebSocketHandler。
+端口配置需要继续查看 vemu_config/config.py 中的 web_terminal_port。
+```
+
+如果还需要端口、配置或调用链，就继续搜索并读取：
+
+```text
+search_code("web_terminal_port")
+read_source_file("vemu_config/config.py", start_line=470, end_line=520)
+```
+
+#### 8. 当前完整调用链路
+
+```text
+用户提出代码 / 接口 / 配置 / 启动脚本 / 报错问题
+  ↓
+Mentor 判断需要源码证据
+  ↓
+LLM 生成 search_code 工具调用
+  ↓
+ToolExecutor 检查工具权限
+  ↓
+search_code 在 klonet_knowledge/02_vemu_uestc_code 中 grep
+  ↓
+返回 文件路径:行号:命中行
+  ↓
+LLM 选择关键候选文件
+  ↓
+LLM 生成 read_source_file 工具调用
+  ↓
+read_source_file 读取真实源码片段
+  ↓
+必要时再结合 search_knowledge 查知识库背景
+  ↓
+最终回答以源码事实为准，知识库用于解释背景
+```
+
+核心分工是：
+
+```text
+LLM：理解问题、生成搜索词、选择候选文件、解释源码。
+search_code：用关键词 grep 找到源码位置。
+read_source_file：读取真实源码内容。
+search_knowledge：补充流程、背景、经验和文档证据。
+```
+
+因此，当前第一版源码理解能力的优势是简单、准确、可验证；短板是第一层仍依赖关键词命中。如果用户只描述现象、不知道源码关键词，效果取决于 LLM 能否生成合适的搜索词。后续向量库或语义源码索引可以补足这一点。

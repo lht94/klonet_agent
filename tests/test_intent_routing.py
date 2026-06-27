@@ -186,6 +186,18 @@ def test_search_tool_requires_structured_intent_schema():
     )
 
 
+def test_source_code_tools_are_registered_for_llm():
+    """Mentor 需要能看到源码 grep/read 工具 schema。"""
+
+    from klonet_agent.tools.registry import TOOLS
+
+    tool_names = {item["function"]["name"] for item in TOOLS}
+
+    assert "search_code" in tool_names
+    assert "read_source_file" in tool_names
+    assert "list_source_files" in tool_names
+
+
 def test_executor_validates_intent_before_calling_knowledge_base():
     """不可信工具参数必须在执行层转换为 QueryIntent。"""
 

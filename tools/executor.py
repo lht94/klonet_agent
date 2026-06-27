@@ -17,6 +17,11 @@ from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
+from klonet_agent.tools.source_code import (
+    list_source_files,
+    read_source_file,
+    search_code,
+)
 from klonet_agent.tools.web import web_fetch
 from klonet_agent.tracing.logger import TraceLogger
 from klonet_agent.workspace.git_ops import show_diff
@@ -111,6 +116,30 @@ class ToolExecutor:
                 self.session,
                 tool_args["path"],
                 tool_args.get("max_chars", 12000),
+            )
+
+        if tool_name == "search_code":
+            return search_code(
+                tool_args["query"],
+                path=tool_args.get("path", ""),
+                file_glob=tool_args.get("file_glob"),
+                max_results=tool_args.get("max_results", 50),
+                case_sensitive=tool_args.get("case_sensitive", False),
+            )
+
+        if tool_name == "read_source_file":
+            return read_source_file(
+                tool_args["path"],
+                start_line=tool_args.get("start_line"),
+                end_line=tool_args.get("end_line"),
+                max_chars=tool_args.get("max_chars", 12000),
+            )
+
+        if tool_name == "list_source_files":
+            return list_source_files(
+                path=tool_args.get("path", ""),
+                pattern=tool_args.get("pattern"),
+                max_results=tool_args.get("max_results", 200),
             )
 
         if tool_name == "write_file":

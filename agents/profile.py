@@ -23,6 +23,9 @@ class AgentProfile:
 MENTOR_TOOLS = {
     "load_skill",
     "search_knowledge",
+    "search_code",
+    "read_source_file",
+    "list_source_files",
     "read_project_journal",
     "list_files",
     "read_file",

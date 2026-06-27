@@ -33,6 +33,9 @@ def test_profile_tool_permissions():
     coding = get_profile("coding")
 
     assert "search_knowledge" in mentor.allowed_tools
+    assert "search_code" in mentor.allowed_tools
+    assert "read_source_file" in mentor.allowed_tools
+    assert "list_source_files" in mentor.allowed_tools
     assert "read_project_journal" in mentor.allowed_tools
     assert "list_files" in mentor.allowed_tools
     assert "read_file" in mentor.allowed_tools
