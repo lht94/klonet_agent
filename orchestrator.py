@@ -57,10 +57,12 @@ class AgentOrchestrator:
         trace_logger: TraceLogger | None = None,
         memory_store: MemoryStore | None = None,
         intent_analyzer: IntentAnalyzer | None = None,
+        answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
         self.llm = llm or LLMClient()
+        self.answer_style = answer_style
         self.intent_analyzer = intent_analyzer or IntentAnalyzer(self.llm)
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
@@ -74,6 +76,8 @@ class AgentOrchestrator:
         self._conversation_state = ConversationState()
         self._conversation_state_manager = ConversationStateManager()
         self._knowledge_search_count = 0
+        self._paused_turn_state: dict | None = None
+        self._last_turn_state: dict | None = None
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
@@ -369,24 +373,75 @@ class AgentOrchestrator:
         reply = ""
         tool_rounds = 0
         todo_continuations = 0
+        tool_events: list[dict] = []
+        reasoning_trace_printed = False
         self._query_intent = None
         self._intent_decision = None
         self._knowledge_search_count = 0
-
-        pre_decision = (
-            decide_pre_llm_clarification(user_input)
-            if self.profile.name == "mentor"
-            else None
+        resume_state = self._resume_state_for(user_input)
+        resume_paused_turn = (
+            resume_state is not None
+            and resume_state is self._paused_turn_state
         )
-        if pre_decision is not None and pre_decision.should_stop:
-            reply = pre_decision.reply
-            assistant_msg = {"role": "assistant", "content": reply}
-            history.append(assistant_msg)
-            self.memory_store.append_history(assistant_msg)
-            print(f"Klonet Agent\uff1a{reply}")
-            return reply, history, token
+        resume_previous_turn = resume_state is not None
+        effective_user_input = user_input
+        turn_resume_message = None
 
-        if self.profile.name == "mentor":
+        thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."
+        thinking_visible = False
+        if self._show_visible_reasoning_trace():
+            thinking_visible = True
+            print(thinking_prompt, end="", flush=True)
+
+        def clear_thinking_prompt():
+            nonlocal thinking_visible
+            if not thinking_visible:
+                return
+            print("\r" + (" " * len(thinking_prompt)) + "\r", end="", flush=True)
+            thinking_visible = False
+
+        def print_reasoning_trace_once():
+            nonlocal reasoning_trace_printed
+            if reasoning_trace_printed or not self._show_visible_reasoning_trace():
+                return
+            clear_thinking_prompt()
+            print(self._render_visible_reasoning_trace(tool_events))
+            reasoning_trace_printed = True
+
+        if resume_previous_turn:
+            state = resume_state or {}
+            effective_user_input = str(state.get("original_user_input") or user_input)
+            self._query_intent = state.get("intent")
+            self._intent_decision = state.get("decision")
+            self._query_route = state.get("route") or route_query(effective_user_input)
+            self._conversation_state = state.get("conversation_state") or ConversationState()
+            turn_resume_message = {
+                "role": "system",
+                "content": (
+                    "【恢复上一轮暂停任务】\n"
+                    f"- original_user_input: {effective_user_input}\n"
+                    "- 当前用户输入是继续上一轮，不是新的部署/安装问题。\n"
+                    "- 禁止重新追问“首次安装环境还是启动平台服务”。\n"
+                    "- 请基于已有工具结果继续回答；如果证据已经足够，直接给阶段性结论。"
+                ),
+            }
+            history.append(turn_resume_message)
+        else:
+            pre_decision = (
+                decide_pre_llm_clarification(user_input)
+                if self.profile.name == "mentor"
+                else None
+            )
+            if pre_decision is not None and pre_decision.should_stop:
+                reply = pre_decision.reply
+                assistant_msg = {"role": "assistant", "content": reply}
+                history.append(assistant_msg)
+                self.memory_store.append_history(assistant_msg)
+                clear_thinking_prompt()
+                print(f"Klonet Agent\uff1a{reply}")
+                return reply, history, token
+
+        if self.profile.name == "mentor" and not resume_previous_turn:
             try:
                 analysis = self.intent_analyzer.analyze(
                     user_input,
@@ -408,10 +463,10 @@ class AgentOrchestrator:
                 self._query_route = route_query(user_input)
                 self._query_intent = None
                 self._intent_decision = None
-        else:
+        elif not resume_previous_turn:
             self._query_route = route_query(user_input)
 
-        if self._query_intent is not None:
+        if self._query_intent is not None and not resume_previous_turn:
             clarification = decide_model_intent_clarification(
                 self._query_intent,
                 user_input=user_input,
@@ -422,10 +477,11 @@ class AgentOrchestrator:
                 assistant_msg = {"role": "assistant", "content": reply}
                 history.append(assistant_msg)
                 self.memory_store.append_history(assistant_msg)
+                clear_thinking_prompt()
                 print(f"Klonet Agent\uff1a{reply}")
                 return reply, history, token
 
-        turn_scope_message = self._build_turn_scope_message(user_input)
+        turn_scope_message = self._build_turn_scope_message(effective_user_input)
         history.append(turn_scope_message)
         turn_answer_policy_message = None
         if self.profile.name == "mentor":
@@ -433,7 +489,7 @@ class AgentOrchestrator:
                 "role": "system",
                 "content": build_answer_policy(
                     self._query_route.task_type,
-                    user_input,
+                    effective_user_input,
                     intent=self._query_intent,
                 ),
             }
@@ -443,21 +499,12 @@ class AgentOrchestrator:
         while tool_rounds < MAX_TOOL_ROUNDS:
             tool_rounds += 1
             printed_stream_reply = False
-            thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."
-            thinking_visible = True
-            print(thinking_prompt, end="", flush=True)
-
-            def clear_thinking_prompt():
-                nonlocal thinking_visible
-                if not thinking_visible:
-                    return
-                print("\r" + (" " * len(thinking_prompt)) + "\r", end="", flush=True)
-                thinking_visible = False
 
             def print_reply_delta(delta: str):
                 nonlocal printed_stream_reply
                 if not printed_stream_reply:
                     clear_thinking_prompt()
+                    print_reasoning_trace_once()
                     print("Klonet Agent\uff1a", end="", flush=True)
                     printed_stream_reply = True
                 print(delta, end="", flush=True)
@@ -519,6 +566,13 @@ class AgentOrchestrator:
                                 )
                     # 调用工具函数，开始执行命令或其他动作。
                     result = self.use_tool(tool_name, tool_args)
+                    tool_events.append(
+                        {
+                            "name": tool_name,
+                            "args": dict(tool_args),
+                            "result": result,
+                        }
+                    )
 
                     tool_msg = {
                         "role": "tool",
@@ -540,6 +594,7 @@ class AgentOrchestrator:
                     print()
                 else:
                     clear_thinking_prompt()
+                    print_reasoning_trace_once()
                     print(f"Klonet Agent\uff1a{reply}")
 
                 # 只有 Coding 模式中的可执行任务允许有限自动续跑。
@@ -591,11 +646,15 @@ class AgentOrchestrator:
 
                 history.append(assistant_msg)
                 self.memory_store.append_history(assistant_msg)
+                self._last_turn_state = self._snapshot_turn_state(effective_user_input)
+                self._paused_turn_state = None
                 break
 
         else:
             reply = "本轮工具调用已达到上限，任务已暂停，等待用户确认后继续。"
             self._set_unfinished_todo_status("waiting_user")
+            self._paused_turn_state = self._snapshot_turn_state(effective_user_input)
+            self._last_turn_state = self._paused_turn_state
             assistant_msg = {"role": "assistant", "content": reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
@@ -608,6 +667,7 @@ class AgentOrchestrator:
             if (
                 message is not turn_scope_message
                 and message is not turn_answer_policy_message
+                and message is not turn_resume_message
             )
         ]
 
@@ -618,6 +678,122 @@ class AgentOrchestrator:
             history, token = self.compress_memory(history, token)
 
         return reply, history, token
+
+    def _show_visible_reasoning_trace(self) -> bool:
+        """默认输出用户可见思考摘要；brief 模式只输出最终答案。"""
+
+        return self.answer_style != "brief"
+
+    def _is_resume_request(self, user_input: str) -> bool:
+        """判断当前输入是否是在请求继续上一轮暂停任务。"""
+
+        text = (user_input or "").strip().lower().replace(" ", "")
+        return text in {
+            "继续",
+            "接着",
+            "继续说",
+            "接着说",
+            "往下讲",
+            "往下说",
+            "继续讲",
+            "继续回答",
+            "继续上面",
+            "接着上面",
+            "goon",
+            "continue",
+        }
+
+    def _resume_state_for(self, user_input: str) -> dict | None:
+        """返回可用于“继续”语义的上一轮状态。"""
+
+        if not self._is_resume_request(user_input):
+            return None
+        if self._paused_turn_state is not None:
+            return self._paused_turn_state
+        return self._last_turn_state
+
+    def _snapshot_turn_state(self, original_user_input: str) -> dict:
+        """保存可恢复的轻量回合状态。"""
+
+        return {
+            "original_user_input": original_user_input,
+            "intent": self._query_intent,
+            "decision": self._intent_decision,
+            "route": self._query_route,
+            "conversation_state": self._conversation_state,
+        }
+
+    def _render_visible_reasoning_trace(self, tool_events: list[dict]) -> str:
+        """把本轮已发生的路由、意图和工具动作整理成可见摘要。
+
+        这里输出的是可验证的执行轨迹，不是模型完整内部思维链。
+        """
+
+        task_type = self._query_route.task_type
+        operation = getattr(self._query_intent, "operation", "unknown") or "unknown"
+        scope = (
+            self._query_intent.scope
+            if self._query_intent is not None
+            else self._query_route.scope
+        )
+        return "\n".join(
+            [
+                "Klonet Agent：思考摘要：",
+                f"1. 问题类型：scope={scope}，task_type={task_type}，operation={operation}。",
+                f"2. 证据计划：{self._evidence_plan_for_trace(scope, task_type)}",
+                f"3. 工具动作：{self._tool_summary_for_trace(tool_events)}",
+                f"4. 依据摘要：{self._evidence_summary_for_trace(tool_events)}",
+            ]
+        )
+
+    def _evidence_plan_for_trace(self, scope: str, task_type: str) -> str:
+        if scope == "general":
+            return "以通用知识为主；Klonet 资料最多作为辅助对比。"
+        if task_type in {"code_lookup", "troubleshooting", "development"}:
+            return "优先核对源码或知识库证据，再组织回答。"
+        if task_type in {"deployment_guidance", "operation_guide"}:
+            return "优先检索 Klonet 操作知识，必要时用源码确认命令和配置。"
+        return "优先使用 Klonet 知识库证据；证据不足时说明不确定。"
+
+    def _tool_summary_for_trace(self, tool_events: list[dict]) -> str:
+        if not tool_events:
+            return "本轮未调用外部工具，直接根据当前上下文回答。"
+        return "已调用 " + " → ".join(event["name"] for event in tool_events) + "。"
+
+    def _evidence_summary_for_trace(self, tool_events: list[dict]) -> str:
+        if not tool_events:
+            return "暂无新增工具证据。"
+
+        hints: list[str] = []
+        for event in tool_events:
+            name = event["name"]
+            args = event.get("args", {})
+            result = event.get("result", "")
+            if name == "search_knowledge":
+                hints.append(f"search_knowledge query={args.get('query', '')!r}")
+            elif name == "search_code":
+                hints.append(f"search_code query={args.get('query', '')!r}")
+            elif name in {"read_source_file", "read_file"}:
+                hints.append(f"{name} path={args.get('path', '')!r}")
+            else:
+                hints.append(name)
+
+            evidence_line = self._first_evidence_line(result)
+            if evidence_line:
+                hints.append(evidence_line)
+            if len(hints) >= 3:
+                break
+        return "；".join(hints[:3]) + "。"
+
+    def _first_evidence_line(self, result: str) -> str:
+        for line in (result or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Error:"):
+                continue
+            if len(stripped) > 80:
+                stripped = stripped[:77] + "..."
+            return stripped
+        return ""
 
     def _set_unfinished_todo_status(self, status: str):
         """暂停未完成任务，防止编排器继续自动循环。"""

@@ -42,14 +42,23 @@ def read_piped_prompt(stdin=None) -> Optional[str]:
     return stdin.read().strip()
 
 
-def run_chat(mode: str = "mentor", user_id: str = DEFAULT_USER_ID, project_id: str = DEFAULT_PROJECT_ID):
+def run_chat(
+    mode: str = "mentor",
+    user_id: str = DEFAULT_USER_ID,
+    project_id: str = DEFAULT_PROJECT_ID,
+    answer_style: str = "default",
+):
     """进入命令行对话流程，即旧版 main.py 中的外层 while 循环。"""
 
     configure_console_encoding()
     print("正在启动 Klonet 专用教学协作 Agent...")
     profile = get_profile(mode)
     session = AgentSession(user_id=user_id, project_id=project_id, mode=profile.name)
-    orchestrator = AgentOrchestrator(profile=profile, session=session)
+    orchestrator = AgentOrchestrator(
+        profile=profile,
+        session=session,
+        answer_style=answer_style,
+    )
     history = orchestrator.init_history()
     token = 0
     print(f"Klonet Agent：已进入 {profile.name} 模式。(输入 exit 退出)\n")

@@ -95,6 +95,16 @@ def decide_model_intent_clarification(
     if _context_resolves_late_supplement(user_input, recent_history or []):
         return ClarificationDecision()
 
+    if _looks_like_low_information_input(user_input, recent_history or []):
+        return ClarificationDecision(
+            should_stop=True,
+            reason="low_information_input",
+            reply=(
+                "我还没理解你的意思。你可以补充一下想问 Klonet 的哪类问题吗？"
+                "比如环境安装、平台启动、拓扑操作、报错排查或源码实现。"
+            ),
+        )
+
     if intent.clarification_required:
         question = intent.clarification_question or (
             "\u8fd9\u4e2a\u95ee\u9898\u7684\u610f\u56fe\u8fd8\u4e0d\u591f\u660e\u786e\uff0c"
@@ -128,6 +138,56 @@ def _looks_like_ambiguous_klonet_deploy(text: str, route: QueryRoute | None) -> 
     if not any(term in text for term in _DEPLOY_TERMS):
         return False
     return not any(term in text for term in _DEPLOY_SPECIFIC_TERMS)
+
+
+def _looks_like_low_information_input(
+    user_input: str,
+    recent_history: list[dict],
+) -> bool:
+    """短乱码/缩写不能触发具体业务澄清。"""
+
+    text = (user_input or "").strip()
+    compact = "".join(text.lower().split())
+    if not compact:
+        return True
+    if _looks_like_context_option_reply(compact, recent_history):
+        return False
+
+    meaningful_short_terms = {
+        "ip",
+        "vm",
+        "kvm",
+        "ovs",
+        "ssh",
+        "api",
+        "gpu",
+        "cpu",
+        "ram",
+    }
+    if compact in meaningful_short_terms:
+        return False
+    if any("\u4e00" <= char <= "\u9fff" for char in compact):
+        return False
+    if any(char in compact for char in ("/", "_", "-", ".")):
+        return False
+    return len(compact) <= 3
+
+
+def _looks_like_context_option_reply(
+    compact_text: str,
+    recent_history: list[dict],
+) -> bool:
+    if compact_text not in {"a", "b", "1", "2"}:
+        return False
+    recent_assistant_text = "\n".join(
+        str(message.get("content") or "")
+        for message in recent_history[-6:]
+        if message.get("role") == "assistant"
+    ).lower()
+    return any(
+        marker in recent_assistant_text
+        for marker in ("a：", "b：", "a:", "b:", "场景一", "场景二", "第一种", "第二种")
+    )
 
 
 def _context_resolves_reference(user_input: str, recent_history: list[dict]) -> bool:

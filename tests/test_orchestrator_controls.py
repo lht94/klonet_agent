@@ -288,6 +288,113 @@ class StreamingTimeoutThenNonStreamLLM:
         )
 
 
+class CapturingIntentAnalyzer:
+    """在意图解析期间检查用户是否已经看到正在思考提示。"""
+
+    def __init__(self, capsys):
+        self.capsys = capsys
+        self.output_during_analyze = ""
+
+    def analyze(self, user_input, *, recent_history=None):
+        from klonet_agent.knowledge.intent_analyzer import IntentAnalysis
+        from klonet_agent.knowledge.intent import QueryIntent
+
+        self.output_during_analyze = self.capsys.readouterr().out
+        return IntentAnalysis(
+            intent=QueryIntent.from_mapping(
+                {
+                    "scope": "klonet",
+                    "task_type": "concept",
+                    "operation": "unknown",
+                    "confidence": 0.9,
+                }
+            ),
+            token_usage=0,
+        )
+
+
+class ClarifyingContinueIntentAnalyzer:
+    """模拟模型把“继续”误判成部署澄清。"""
+
+    def analyze(self, user_input, *, recent_history=None):
+        from klonet_agent.knowledge.intent_analyzer import IntentAnalysis
+        from klonet_agent.knowledge.intent import QueryIntent
+
+        if user_input.strip() == "继续":
+            return IntentAnalysis(
+                intent=QueryIntent.from_mapping(
+                    {
+                        "scope": "klonet",
+                        "task_type": "deployment_guidance",
+                        "operation": "unknown",
+                        "clarification_required": True,
+                        "clarification_question": "你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？",
+                        "confidence": 0.95,
+                    }
+                ),
+                token_usage=0,
+            )
+        return IntentAnalysis(
+            intent=QueryIntent.from_mapping(
+                {
+                    "scope": "klonet",
+                    "task_type": "concept",
+                    "operation": "unknown",
+                    "confidence": 0.9,
+                }
+            ),
+            token_usage=0,
+        )
+
+
+class PauseThenAnswerLLM:
+    """第一轮触发工具调用上限，第二轮恢复后给最终回答。"""
+
+    def __init__(self):
+        self.calls = []
+        self.answer_calls = 0
+
+    def complete(self, messages, tools, stream=False):
+        self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+        self.answer_calls += 1
+        if self.answer_calls == 1:
+            return iter(
+                [
+                    _stream_chunk(
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="search-before-pause",
+                                function=SimpleNamespace(
+                                    name="search_knowledge",
+                                    arguments=json.dumps(
+                                        {
+                                            "query": "卫星平台",
+                                            "intent": {
+                                                "scope": "klonet",
+                                                "task_type": "concept",
+                                                "operation": "unknown",
+                                                "confidence": 0.9,
+                                            },
+                                        },
+                                        ensure_ascii=False,
+                                    ),
+                                ),
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                        usage=SimpleNamespace(total_tokens=5),
+                    )
+                ]
+            )
+        return iter(
+            [
+                _stream_chunk(content="继续上一轮卫星平台介绍。"),
+                _stream_chunk(finish_reason="stop", usage=SimpleNamespace(total_tokens=6)),
+            ]
+        )
+
+
 def _orchestrator(temp_dir, mode="mentor"):
     from klonet_agent.agents import get_profile
     from klonet_agent.memory.store import MemoryStore
@@ -654,6 +761,108 @@ def test_single_chat_streams_plain_answer_without_duplicate_print(capsys):
     assert _answer_calls(llm)[0]["stream"] is True
 
 
+def test_default_mode_prints_visible_reasoning_trace(capsys):
+    """默认模式应输出用户可见的思考摘要，再输出最终回答。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingAnswerLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        _, history, _ = orchestrator.single_chat("解释 Klonet", history, 0)
+
+    output = capsys.readouterr().out
+    assert "思考摘要" in output
+    assert "问题类型" in output
+    assert output.index("思考摘要") < output.index(history[-1]["content"])
+
+
+def test_thinking_prompt_is_printed_before_intent_analysis(capsys):
+    """用户输入后应立刻显示正在思考，避免意图解析阶段卡顿。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingAnswerLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        intent_analyzer = CapturingIntentAnalyzer(capsys)
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=intent_analyzer,
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat("解释 Klonet", history, 0)
+
+    assert "正在思考" in intent_analyzer.output_during_analyze
+
+
+def test_brief_mode_prints_only_final_answer(capsys):
+    """简短模式不输出思考摘要。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingAnswerLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            answer_style="brief",
+        )
+        history = orchestrator.init_history()
+        _, history, _ = orchestrator.single_chat("解释 Klonet", history, 0)
+
+    output = capsys.readouterr().out
+    assert "思考摘要" not in output
+    assert "正在思考" not in output
+    assert f"Klonet Agent：{history[-1]['content']}" in output
+
+
 def test_single_chat_streams_tool_call_then_final_answer(capsys):
     """流式模式下仍能聚合 tool call 参数、执行工具，再流式输出最终回答。"""
 
@@ -729,3 +938,88 @@ def test_stream_timeout_falls_back_to_non_stream_answer(capsys):
     assert history[-1]["content"] == "fallback answer"
     assert token == 11
     assert [call["stream"] for call in _answer_calls(llm)] == [True, False]
+
+
+def test_continue_after_tool_limit_resumes_paused_turn_before_clarification(
+    capsys,
+    monkeypatch,
+):
+    """工具上限暂停后，“继续”应恢复上一轮，不触发部署澄清。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    monkeypatch.setattr("klonet_agent.orchestrator.MAX_TOOL_ROUNDS", 1)
+
+    with local_temp_dir() as temp_dir:
+        llm = PauseThenAnswerLLM()
+        executor = RecordingToolExecutor()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            tool_executor=executor,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=ClarifyingContinueIntentAnalyzer(),
+        )
+        history = orchestrator.init_history()
+        _, history, token = orchestrator.single_chat("介绍一下卫星平台", history, 0)
+        paused_output = capsys.readouterr().out
+
+        reply, history, token = orchestrator.single_chat("继续", history, token)
+
+    output = capsys.readouterr().out
+    assert "本轮工具调用已达到上限" in paused_output
+    assert "首次安装 Klonet 环境" not in output
+    assert reply == "继续上一轮卫星平台介绍。"
+    assert history[-1]["content"] == "继续上一轮卫星平台介绍。"
+
+
+def test_continue_after_normal_answer_resumes_last_turn_before_clarification(
+    capsys,
+):
+    """即使没有工具上限暂停，“继续”也应优先延续上一轮主题。"""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = PauseThenAnswerLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=session,
+            llm=llm,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=ClarifyingContinueIntentAnalyzer(),
+        )
+        history = orchestrator.init_history()
+        _, history, token = orchestrator.single_chat("介绍一下卫星平台", history, 0)
+        capsys.readouterr()
+
+        reply, history, token = orchestrator.single_chat("继续", history, token)
+
+    output = capsys.readouterr().out
+    assert "首次安装 Klonet 环境" not in output
+    assert reply == "继续上一轮卫星平台介绍。"

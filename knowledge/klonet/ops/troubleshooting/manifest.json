@@ -1,0 +1,34 @@
+{
+  "collection_id": "klonet_common_troubleshooting",
+  "title": "Klonet common troubleshooting runbook",
+  "paths": [
+    "knowledge/klonet/ops/common_troubleshooting.md",
+    "knowledge/klonet/ops/startup_shutdown.md",
+    "knowledge/klonet/ops/environment_setup.md"
+  ],
+  "task_types": ["troubleshooting"],
+  "operations": [],
+  "targets": [
+    "troubleshooting",
+    "worker",
+    "master",
+    "redis",
+    "mysql",
+    "rabbitmq",
+    "nginx",
+    "gunicorn",
+    "celery",
+    "web_terminal",
+    "frontend",
+    "backend",
+    "connection refused",
+    "address already in use",
+    "500",
+    "排查",
+    "报错",
+    "异常",
+    "失败"
+  ],
+  "excluded_operations": []
+}
+

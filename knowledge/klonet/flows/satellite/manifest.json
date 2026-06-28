@@ -1,0 +1,26 @@
+{
+  "collection_id": "klonet_satellite_platform",
+  "title": "Klonet satellite platform and space-ground topology flow",
+  "paths": [
+    "knowledge/klonet/flows/satellite_platform.md",
+    "knowledge/klonet/flows/topology_deploy.md"
+  ],
+  "task_types": ["concept", "operation_guide", "troubleshooting", "code_lookup", "development"],
+  "operations": [],
+  "targets": [
+    "satellite",
+    "satellite_platform",
+    "space_ground",
+    "constellation",
+    "orbit",
+    "topology",
+    "卫星",
+    "卫星平台",
+    "天地一体化",
+    "星座",
+    "星间链路",
+    "星地链路"
+  ],
+  "excluded_operations": ["environment_setup", "platform_start"]
+}
+

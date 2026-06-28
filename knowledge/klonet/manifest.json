@@ -1,0 +1,25 @@
+{
+  "collection_id": "klonet_foundation",
+  "title": "Klonet project overview, architecture and domain terms",
+  "paths": [
+    "knowledge/klonet/00_project_overview.md",
+    "knowledge/klonet/01_architecture.md",
+    "knowledge/klonet/03_domain_terms.md"
+  ],
+  "task_types": ["concept", "project_progress"],
+  "operations": [],
+  "targets": [
+    "klonet",
+    "klonet_platform",
+    "platform",
+    "project",
+    "overview",
+    "architecture",
+    "terminology",
+    "domain_terms",
+    "模块",
+    "架构",
+    "术语"
+  ],
+  "excluded_operations": []
+}

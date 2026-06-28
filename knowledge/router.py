@@ -17,6 +17,7 @@ _EXPLICIT_GENERAL = re.compile(
 )
 _KLONET_TERMS = {
     "klonet", "vemu", "topodeployapi", "service_layer", "process_bar",
+    "卫星", "satellite", "天地一体化", "星座",
     "拓扑部署", "拓扑删除", "worker注册", "worker 注册", "验收差异",
     "项目日志", "虚拟机终端", "链路时延", "进度条卡住",
 }
@@ -32,6 +33,7 @@ _DOMAIN_TERMS = {
     "monitor": ("监控", "prometheus", "grafana"),
     "auth": ("用户", "登录", "密码", "权限"),
     "runtime": ("部署", "启动", "关闭", "环境"),
+    "satellite": ("卫星", "satellite", "天地一体化", "星座", "星间链路", "星地链路"),
 }
 
 

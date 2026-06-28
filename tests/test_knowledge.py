@@ -81,6 +81,32 @@ def test_task_templates_are_available_to_knowledge_index():
     assert results
     assert results[0].path == "knowledge/task_templates.md"
 
+
+def test_satellite_platform_overview_is_retrievable_from_curated_knowledge():
+    """卫星平台介绍应优先命中 curated 概览，而不是只靠源码索引兜底。"""
+
+    from klonet_agent.knowledge.retriever import KnowledgeRetriever
+
+    results = KnowledgeRetriever().search(
+        "卫星平台 是什么 架构 功能 接管",
+        top_k=5,
+        task_type="concept",
+    )
+
+    assert results
+    assert results[0].path == "knowledge/klonet/flows/satellite_platform.md"
+
+
+def test_satellite_query_routes_to_satellite_domain():
+    """卫星问题应带 satellite domain，帮助检索收窄证据范围。"""
+
+    from klonet_agent.knowledge import route_query
+
+    route = route_query("卫星平台是什么")
+
+    assert "satellite" in route.domains
+
+
 def test_general_query_does_not_force_klonet_results():
     """明确排除 Klonet 的通用问题不应该返回 Klonet 证据。"""
 

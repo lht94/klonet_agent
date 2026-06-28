@@ -1,0 +1,30 @@
+{
+  "collection_id": "klonet_vm_networking",
+  "title": "Klonet KVM virtual machine networking and terminal flow",
+  "paths": [
+    "knowledge/klonet/flows/kvm_and_vm_networking.md",
+    "knowledge/klonet/ops/common_troubleshooting.md"
+  ],
+  "task_types": ["concept", "operation_guide", "troubleshooting", "code_lookup"],
+  "operations": [],
+  "targets": [
+    "kvm",
+    "vm",
+    "virtual_machine",
+    "terminal",
+    "web_terminal",
+    "ssh",
+    "libvirt",
+    "virsh",
+    "qemu",
+    "image",
+    "networking",
+    "虚机",
+    "虚拟机",
+    "终端",
+    "镜像",
+    "组网"
+  ],
+  "excluded_operations": ["environment_setup", "platform_start"]
+}
+

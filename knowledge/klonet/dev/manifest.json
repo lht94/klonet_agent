@@ -1,0 +1,25 @@
+{
+  "collection_id": "klonet_development",
+  "title": "Klonet backend API development and Git workflow",
+  "paths": [
+    "knowledge/klonet/dev/backend_api_development.md",
+    "knowledge/klonet/dev/git_workflow.md"
+  ],
+  "task_types": ["development", "code_lookup", "concept"],
+  "operations": [],
+  "targets": [
+    "development",
+    "backend",
+    "api",
+    "methodview",
+    "master",
+    "worker",
+    "git",
+    "workflow",
+    "开发",
+    "接口",
+    "后端"
+  ],
+  "excluded_operations": ["environment_setup", "platform_start", "platform_stop", "platform_restart"]
+}
+

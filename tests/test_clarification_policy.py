@@ -372,6 +372,40 @@ def test_late_platform_name_supplement_ignores_model_deploy_clarification(capsys
     assert token == 12
 
 
+def test_low_information_input_uses_generic_clarification_not_deploy_choice(capsys):
+    """低信息输入即使被模型误判，也不应触发环境/启动二选一澄清。"""
+
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"klonet","task_type":"deployment_guidance",'
+                    '"operation":"unknown","target":"klonet_platform",'
+                    '"clarification_required":true,'
+                    '"clarification_question":"你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？",'
+                    '"confidence":0.7}',
+                    tokens=5,
+                ),
+            ]
+        )
+        orchestrator = _mentor_orchestrator(
+            temp_dir,
+            llm=llm,
+            executor=RecordingToolExecutor(),
+        )
+        history = orchestrator.init_history()
+
+        reply, history, token = orchestrator.single_chat("NH", history, 0)
+
+    assert "首次安装" not in reply
+    assert "启动已经安装" not in reply
+    assert "没理解" in reply or "补充" in reply
+    assert "环境" in reply
+    assert "拓扑" in reply
+    assert token == 5
+    assert len(llm.calls) == 1
+
+
 def test_b_option_inherits_platform_start_and_runtime_path_guard(capsys):
     """用户只回答 B 时，应继承上文平台启动路线，并保留运行路径验证约束。"""
 
