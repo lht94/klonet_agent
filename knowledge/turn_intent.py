@@ -53,6 +53,7 @@ class TurnIntent:
     clarification_question: str = ""
     source_need: str = SOURCE_NONE
     requires_retrieval: bool = True
+    requires_environment_diagnosis: bool = False
     original_user_input: str = ""
     effective_user_input: str = ""
     prerequisites: tuple[str, ...] = ()
@@ -87,6 +88,7 @@ class TurnIntent:
                 "excluded_intents": excluded,
                 "prerequisites": list(self.prerequisites),
                 "requires_retrieval": self.requires_retrieval,
+                "requires_environment_diagnosis": self.requires_environment_diagnosis,
                 "clarification_required": self.clarification_type
                 in {CLARIFICATION_MODEL_REQUESTED, CLARIFICATION_LOW_CONFIDENCE},
                 "clarification_question": self.clarification_question,
@@ -190,6 +192,7 @@ class TurnIntentBuilder:
             clarification_question=intent.clarification_question,
             source_need=_source_need_for(user_input),
             requires_retrieval=intent.requires_retrieval,
+            requires_environment_diagnosis=intent.requires_environment_diagnosis,
             original_user_input=user_input,
             effective_user_input=effective_user_input or user_input,
             prerequisites=intent.prerequisites,
@@ -287,6 +290,7 @@ def _inherit_for_continue(
         clarification_question="",
         source_need=_source_need_for(user_input) or previous.source_need,
         requires_retrieval=previous.requires_retrieval,
+        requires_environment_diagnosis=previous.requires_environment_diagnosis,
         original_user_input=user_input,
         effective_user_input=effective_user_input or previous.effective_user_input,
         prerequisites=previous.prerequisites,

@@ -16,6 +16,11 @@ from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
+from klonet_agent.tools.environment import (
+    inspect_klonet_runtime,
+    inspect_system_environment,
+    read_klonet_logs,
+)
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
 from klonet_agent.tools.source_code import (
     list_source_files,
@@ -107,6 +112,15 @@ class ToolExecutor:
                 intent=intent,
                 conversation_state=conversation_state,
             )
+
+        if tool_name == "inspect_system_environment":
+            return inspect_system_environment(tool_args)
+
+        if tool_name == "inspect_klonet_runtime":
+            return inspect_klonet_runtime(tool_args)
+
+        if tool_name == "read_klonet_logs":
+            return read_klonet_logs(tool_args)
 
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))

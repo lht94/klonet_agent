@@ -45,6 +45,31 @@ _OPERATION_MIN_TOP_K = {
     "environment_setup": 5,
     "dependency_install": 5,
 }
+_ENVIRONMENT_DIAGNOSIS_TERMS = {
+    "address_already_in_use",
+    "celery",
+    "connection_refused",
+    "docker",
+    "gunicorn",
+    "kvm",
+    "libvirt",
+    "mysql",
+    "nginx",
+    "onos",
+    "ovs",
+    "port",
+    "port_conflict",
+    "rabbitmq",
+    "redis",
+    "screen",
+    "terminal",
+    "topology",
+    "web_terminal",
+    "worker",
+    "端口",
+    "报错",
+    "启动失败",
+}
 
 
 @dataclass(frozen=True)
@@ -59,6 +84,7 @@ class QueryIntent:
     excluded_intents: tuple[str, ...] = ()
     prerequisites: tuple[str, ...] = ()
     requires_retrieval: bool = True
+    requires_environment_diagnosis: bool = False
     clarification_required: bool = False
     clarification_question: str = ""
     is_correction: bool = False
@@ -80,6 +106,14 @@ class QueryIntent:
             ALLOWED_OPERATIONS,
             "unknown",
         )
+        requires_environment_diagnosis = raw.get("requires_environment_diagnosis") is True
+        if not requires_environment_diagnosis:
+            requires_environment_diagnosis = _looks_like_environment_diagnosis(
+                task_type=task_type,
+                operation=operation,
+                target=str(raw.get("target") or ""),
+                symptom=str(raw.get("symptom") or ""),
+            )
         return cls(
             scope=scope,
             task_type=task_type,
@@ -92,6 +126,7 @@ class QueryIntent:
             ),
             prerequisites=_string_tuple(raw.get("prerequisites")),
             requires_retrieval=raw.get("requires_retrieval") is not False,
+            requires_environment_diagnosis=requires_environment_diagnosis,
             clarification_required=raw.get("clarification_required") is True,
             clarification_question=str(raw.get("clarification_question") or "").strip(),
             is_correction=raw.get("is_correction") is True,
@@ -140,3 +175,16 @@ def _confidence(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return round(min(1.0, max(0.0, number)), 4)
+
+
+def _looks_like_environment_diagnosis(
+    *,
+    task_type: str,
+    operation: str,
+    target: str,
+    symptom: str,
+) -> bool:
+    if task_type != "troubleshooting":
+        return False
+    text = f"{operation} {target} {symptom}".lower()
+    return any(term in text for term in _ENVIRONMENT_DIAGNOSIS_TERMS)

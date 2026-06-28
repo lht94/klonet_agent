@@ -987,6 +987,7 @@ class AgentOrchestrator:
                     f"- task_type: {self._turn_intent.task_type}",
                     f"- operation: {self._turn_intent.operation}",
                     f"- target: {self._turn_intent.target}",
+                    f"- requires_environment_diagnosis: {self._turn_intent.requires_environment_diagnosis}",
                     f"- user_role: {self._turn_intent.user_role}",
                     f"- machine_role: {self._turn_intent.machine_role}",
                     f"- phase: {self._turn_intent.phase}",
@@ -996,6 +997,16 @@ class AgentOrchestrator:
                     "- Downstream clarification, retrieval, source lookup and answer policy must follow this TurnIntent.",
                 ]
             )
+            if (
+                self.profile.name == "mentor"
+                and self._turn_intent.requires_environment_diagnosis
+            ):
+                rules.extend(
+                    [
+                        "- 这是 Klonet 运维诊断类问题；回答中应建议用户切换到 Ops 模式继续排查。",
+                        "- 如本轮需要环境事实，只能调用 inspect_system_environment、inspect_klonet_runtime 或 read_klonet_logs 等只读工具。",
+                    ]
+                )
         if self._intent_decision is not None and self._intent_decision.soft_note:
             rules.extend(
                 [
@@ -1063,6 +1074,7 @@ class AgentOrchestrator:
             "excluded_intents": list(intent.excluded_intents),
             "prerequisites": list(intent.prerequisites),
             "requires_retrieval": intent.requires_retrieval,
+            "requires_environment_diagnosis": intent.requires_environment_diagnosis,
             "clarification_required": intent.clarification_required,
             "clarification_question": intent.clarification_question,
             "is_correction": intent.is_correction,

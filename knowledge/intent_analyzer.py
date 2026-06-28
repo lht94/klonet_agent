@@ -39,6 +39,7 @@ INTENT_ANALYSIS_PROMPT = """
 - excluded_intents: 用户明确否定的方向数组
 - prerequisites: 用户已说明的前提数组
 - requires_retrieval: 是否需要 Klonet 知识库证据
+- requires_environment_diagnosis: 是否需要读取本机只读环境状态来诊断故障
 - clarification_required: 是否应该先追问用户
 - clarification_question: 需要追问时的一句话问题
 - is_correction: 用户是否在纠正上一轮回答
@@ -50,6 +51,7 @@ INTENT_ANALYSIS_PROMPT = """
 3. “启动 Klonet、启动平台、web-terminal、gunicorn、celery、nginx”属于 deployment_guidance 或 troubleshooting / platform_start。
 4. 用户明确说不需要 Klonet 时，scope=general，requires_retrieval=false。
 5. 不要补造 Klonet 架构；不确定时降低 confidence 或要求澄清。
+6. Klonet 启动失败、端口占用、screen 报错、nginx/Docker/Redis/RabbitMQ/MySQL/OVS/KVM/libvirt/Worker/拓扑进度卡住等运维故障，task_type=troubleshooting 且 requires_environment_diagnosis=true。
 """
 
 

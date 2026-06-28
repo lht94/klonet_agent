@@ -5,7 +5,7 @@ Profile 只描述行为差异，不承载复杂业务逻辑。真正的工具执
 
 from dataclasses import dataclass, field
 
-from klonet_agent.prompts import CODING_PROMPT, MENTOR_PROMPT
+from klonet_agent.prompts import CODING_PROMPT, MENTOR_PROMPT, OPS_PROMPT
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,27 @@ MENTOR_TOOLS = {
     "web_fetch",
 }
 
+ENVIRONMENT_TOOLS = {
+    "inspect_system_environment",
+    "inspect_klonet_runtime",
+    "read_klonet_logs",
+}
+
+MENTOR_TOOLS = MENTOR_TOOLS | ENVIRONMENT_TOOLS
+
+OPS_TOOLS = {
+    "load_skill",
+    "search_knowledge",
+    "search_code",
+    "read_source_file",
+    "list_source_files",
+    "read_project_journal",
+    "list_files",
+    "read_file",
+    "append_episode",
+    "web_fetch",
+} | ENVIRONMENT_TOOLS
+
 CODING_TOOLS = MENTOR_TOOLS | {
     "update_todos",
     "list_files",
@@ -62,6 +83,15 @@ def get_profile(name: str) -> AgentProfile:
             default_workflow="plan -> retrieve -> edit -> test -> diff -> journal -> review",
             requires_rag=True,
             requires_review=True,
+        )
+    if normalized == "ops":
+        return AgentProfile(
+            name="ops",
+            mode_prompt=OPS_PROMPT,
+            allowed_tools=OPS_TOOLS,
+            default_workflow="route -> retrieve runbook -> inspect read-only environment -> diagnose",
+            requires_rag=True,
+            requires_review=False,
         )
     return AgentProfile(
         name="mentor",

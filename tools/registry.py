@@ -101,6 +101,7 @@ TOOLS = [
                         "items": {"type": "string"},
                     },
                     "requires_retrieval": {"type": "boolean"},
+                    "requires_environment_diagnosis": {"type": "boolean"},
                     "clarification_required": {"type": "boolean"},
                     "clarification_question": {"type": "string"},
                     "is_correction": {"type": "boolean"},
@@ -149,6 +150,56 @@ TOOLS = [
             },
         },
         ["query", "intent"],
+    ),
+    _tool(
+        "inspect_system_environment",
+        "只读检查本机基础环境状态，返回 detected/missing/unchecked。用于 Klonet 运维故障诊断，不会修改环境。",
+        {
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["os", "python", "disk", "virtualization"],
+                },
+                "description": "可选检查项；默认检查 os、python、disk、virtualization",
+            }
+        },
+        [],
+    ),
+    _tool(
+        "inspect_klonet_runtime",
+        "只读检查本机 Klonet 相关运行状态，例如端口、screen、nginx、Docker、Redis、RabbitMQ、MySQL、OVS、KVM、libvirt。",
+        {
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "ports",
+                        "screen",
+                        "nginx",
+                        "docker",
+                        "redis",
+                        "rabbitmq",
+                        "mysql",
+                        "ovs",
+                        "kvm",
+                        "libvirt",
+                    ],
+                },
+                "description": "可选检查项；默认检查常见 Klonet 运行依赖",
+            }
+        },
+        [],
+    ),
+    _tool(
+        "read_klonet_logs",
+        "只读读取安全日志文件尾部并脱敏。拒绝 .env、私钥、token、密码和非日志后缀文件。",
+        {
+            "path": {"type": "string", "description": "日志文件路径，仅允许普通日志后缀"},
+            "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
+        },
+        ["path"],
     ),
     _tool(
         "list_files",

@@ -5,13 +5,15 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.helpers import local_temp_dir
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_PARENT = PROJECT_ROOT.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
+
+from tests.helpers import local_temp_dir
 
 
 def test_query_intent_preserves_correction_and_exclusions():
@@ -27,6 +29,7 @@ def test_query_intent_preserves_correction_and_exclusions():
             "target": "klonet_platform",
             "excluded_intents": ["environment_setup", ""],
             "prerequisites": ["environment_ready"],
+            "requires_environment_diagnosis": True,
             "is_correction": True,
             "confidence": 0.96,
         }
@@ -38,6 +41,7 @@ def test_query_intent_preserves_correction_and_exclusions():
     assert intent.target == "klonet_platform"
     assert intent.excluded_intents == ("environment_setup",)
     assert intent.prerequisites == ("environment_ready",)
+    assert intent.requires_environment_diagnosis is True
     assert intent.is_correction is True
     assert intent.confidence == 0.96
 
@@ -60,6 +64,25 @@ def test_query_intent_rejects_unknown_enum_values_and_clamps_confidence():
     assert intent.task_type == "concept"
     assert intent.operation == "unknown"
     assert intent.confidence == 1.0
+
+
+def test_troubleshooting_ops_terms_enable_environment_diagnosis():
+    """模型漏填新字段时，运维类故障也应进入环境诊断分支。"""
+
+    from klonet_agent.knowledge.intent import QueryIntent
+
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "troubleshooting",
+            "operation": "platform_start",
+            "target": "nginx",
+            "symptom": "port_conflict",
+            "confidence": 0.91,
+        }
+    )
+
+    assert intent.requires_environment_diagnosis is True
 
 
 def test_platform_start_intent_filters_environment_setup():
@@ -178,6 +201,7 @@ def test_search_tool_requires_structured_intent_schema():
         "target",
         "excluded_intents",
         "prerequisites",
+        "requires_environment_diagnosis",
         "is_correction",
         "confidence",
     } <= set(intent_schema["properties"])

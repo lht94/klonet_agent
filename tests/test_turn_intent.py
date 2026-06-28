@@ -1,5 +1,14 @@
 """Unified turn intent and decision planning."""
 
+import sys
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_PARENT = PROJECT_ROOT.parent
+if str(PACKAGE_PARENT) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_PARENT))
+
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.conversation_state import ConversationStateManager
 from klonet_agent.knowledge.intent import QueryIntent
@@ -256,3 +265,26 @@ def test_source_question_marks_source_need_without_changing_business_intent():
     assert turn_intent.task_type == "operation_guide"
     assert turn_intent.operation == "topology_deploy"
     assert turn_decision.source_required is True
+
+
+def test_troubleshooting_can_request_environment_diagnosis():
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "troubleshooting",
+            "operation": "platform_start",
+            "target": "nginx",
+            "symptom": "port_conflict",
+            "requires_environment_diagnosis": True,
+            "confidence": 0.91,
+        }
+    )
+
+    turn_intent = TurnIntentBuilder().build(
+        "Klonet nginx 启动报端口占用",
+        intent=intent,
+    )
+
+    assert intent.requires_environment_diagnosis is True
+    assert turn_intent.requires_environment_diagnosis is True
+    assert turn_intent.to_query_intent().requires_environment_diagnosis is True
