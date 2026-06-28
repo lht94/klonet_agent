@@ -32,6 +32,12 @@ from klonet_agent.knowledge.conversation_state import (
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.intent_analyzer import IntentAnalyzer, route_from_intent
 from klonet_agent.knowledge.semantic_understanding import IntentDecision
+from klonet_agent.knowledge.turn_intent import (
+    TurnDecision,
+    TurnDecisionPlanner,
+    TurnIntent,
+    TurnIntentBuilder,
+)
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
@@ -73,6 +79,10 @@ class AgentOrchestrator:
         self._query_route = route_query("Klonet")
         self._query_intent: QueryIntent | None = None
         self._intent_decision: IntentDecision | None = None
+        self._turn_intent: TurnIntent | None = None
+        self._turn_decision: TurnDecision | None = None
+        self._turn_intent_builder = TurnIntentBuilder()
+        self._turn_decision_planner = TurnDecisionPlanner()
         self._conversation_state = ConversationState()
         self._conversation_state_manager = ConversationStateManager()
         self._knowledge_search_count = 0
@@ -377,7 +387,10 @@ class AgentOrchestrator:
         reasoning_trace_printed = False
         self._query_intent = None
         self._intent_decision = None
+        self._turn_intent = None
+        self._turn_decision = None
         self._knowledge_search_count = 0
+        semantic_frame = None
         resume_state = self._resume_state_for(user_input)
         resume_paused_turn = (
             resume_state is not None
@@ -415,6 +428,12 @@ class AgentOrchestrator:
             self._intent_decision = state.get("decision")
             self._query_route = state.get("route") or route_query(effective_user_input)
             self._conversation_state = state.get("conversation_state") or ConversationState()
+            self._refresh_turn_plan(
+                user_input,
+                recent_history=recent_history_for_intent,
+                resume_state=state,
+                effective_user_input=effective_user_input,
+            )
             turn_resume_message = {
                 "role": "system",
                 "content": (
@@ -459,19 +478,40 @@ class AgentOrchestrator:
                     previous_state=self._conversation_state,
                 )
                 self._query_route = route_from_intent(user_input, analysis.intent)
+                semantic_frame = analysis.semantic_frame
+                self._refresh_turn_plan(
+                    user_input,
+                    recent_history=recent_history_for_intent,
+                    semantic_frame=semantic_frame,
+                )
             except Exception:
                 self._query_route = route_query(user_input)
                 self._query_intent = None
                 self._intent_decision = None
+                self._refresh_turn_plan(
+                    user_input,
+                    recent_history=recent_history_for_intent,
+                )
         elif not resume_previous_turn:
             self._query_route = route_query(user_input)
-
-        if self._query_intent is not None and not resume_previous_turn:
-            clarification = decide_model_intent_clarification(
-                self._query_intent,
-                user_input=user_input,
+            self._refresh_turn_plan(
+                user_input,
                 recent_history=recent_history_for_intent,
             )
+
+        if (
+            self.profile.name == "mentor"
+            and self._query_intent is not None
+            and not resume_previous_turn
+        ):
+            if self._turn_decision is not None:
+                clarification = self._turn_decision.to_clarification_decision()
+            else:
+                clarification = decide_model_intent_clarification(
+                    self._query_intent,
+                    user_input=user_input,
+                    recent_history=recent_history_for_intent,
+                )
             if clarification.should_stop:
                 reply = clarification.reply
                 assistant_msg = {"role": "assistant", "content": reply}
@@ -488,7 +528,11 @@ class AgentOrchestrator:
             turn_answer_policy_message = {
                 "role": "system",
                 "content": build_answer_policy(
-                    self._query_route.task_type,
+                    (
+                        self._turn_decision.answer_task_type
+                        if self._turn_decision is not None
+                        else self._query_route.task_type
+                    ),
                     effective_user_input,
                     intent=self._query_intent,
                 ),
@@ -534,16 +578,23 @@ class AgentOrchestrator:
                     tool_name = tool_call.function.name
                     # 工具参数，即 schema 中 function.parameters 约束出的标准 JSON。
                     tool_args = json.loads(tool_call.function.arguments)
-                    if tool_name == "search_knowledge" and self._query_intent is not None and self._query_intent.confidence >= 0.6:
-                        tool_args["intent"] = self._query_intent_tool_args()
-                        tool_args["conversation_state"] = (
-                            self._conversation_state.to_tool_args()
-                        )
                     if tool_name == "search_knowledge":
                         candidate_intent = QueryIntent.from_mapping(
                             tool_args.get("intent")
                         )
-                        if candidate_intent.confidence >= 0.6:
+                        current_intent_confidence = (
+                            self._query_intent.confidence
+                            if self._query_intent is not None
+                            else 0.0
+                        )
+                        should_accept_candidate_intent = (
+                            candidate_intent.confidence >= 0.6
+                            and (
+                                current_intent_confidence < 0.6
+                                or candidate_intent.is_correction
+                            )
+                        )
+                        if should_accept_candidate_intent:
                             self._query_intent = candidate_intent
                             self._conversation_state = (
                                 self._conversation_state_manager.from_turn(
@@ -553,9 +604,14 @@ class AgentOrchestrator:
                                     previous_state=self._conversation_state,
                                 )
                             )
+                            self._refresh_turn_plan(
+                                user_input,
+                                recent_history=recent_history_for_intent,
+                            )
                             tool_args["conversation_state"] = (
                                 self._conversation_state.to_tool_args()
                             )
+                            tool_args["intent"] = self._query_intent_tool_args()
                             if turn_answer_policy_message is not None:
                                 turn_answer_policy_message["content"] = (
                                     build_answer_policy(
@@ -564,6 +620,11 @@ class AgentOrchestrator:
                                         intent=candidate_intent,
                                     )
                                 )
+                        elif self._query_intent is not None:
+                            tool_args["intent"] = self._query_intent_tool_args()
+                            tool_args["conversation_state"] = (
+                                self._conversation_state.to_tool_args()
+                            )
                     # 调用工具函数，开始执行命令或其他动作。
                     result = self.use_tool(tool_name, tool_args)
                     tool_events.append(
@@ -719,9 +780,52 @@ class AgentOrchestrator:
             "original_user_input": original_user_input,
             "intent": self._query_intent,
             "decision": self._intent_decision,
+            "turn_intent": self._turn_intent,
+            "turn_decision": self._turn_decision,
             "route": self._query_route,
             "conversation_state": self._conversation_state,
         }
+
+    def _refresh_turn_plan(
+        self,
+        user_input: str,
+        *,
+        recent_history: list[dict] | None = None,
+        semantic_frame=None,
+        resume_state: dict | None = None,
+        effective_user_input: str | None = None,
+    ) -> None:
+        """Build the single turn intent/decision used by downstream actions."""
+
+        current_route = self._query_route
+        if self._query_intent is None and current_route is not None:
+            self._query_intent = QueryIntent.from_mapping(
+                {
+                    "scope": current_route.scope,
+                    "task_type": current_route.task_type,
+                    "requires_retrieval": not current_route.hard_disable_rag,
+                    "confidence": current_route.confidence,
+                }
+            )
+        self._turn_intent = self._turn_intent_builder.build(
+            user_input,
+            recent_history=recent_history,
+            intent=self._query_intent,
+            semantic_frame=semantic_frame,
+            decision=self._intent_decision,
+            conversation_state=self._conversation_state,
+            resume_state=resume_state,
+            effective_user_input=effective_user_input,
+        )
+        self._turn_decision = self._turn_decision_planner.plan(self._turn_intent)
+        self._query_intent = self._turn_intent.to_query_intent()
+        if current_route is not None and current_route.hard_disable_rag:
+            self._query_route = current_route
+        else:
+            self._query_route = route_from_intent(
+                self._turn_intent.effective_user_input or user_input,
+                self._query_intent,
+            )
 
     def _render_visible_reasoning_trace(self, tool_events: list[dict]) -> str:
         """把本轮已发生的路由、意图和工具动作整理成可见摘要。
@@ -845,6 +949,22 @@ class AgentOrchestrator:
             f"- original_user_input: {user_input}",
             "- 本轮范围由原始用户输入确定，后续查询改写不得改变。",
         ]
+        if self._turn_intent is not None:
+            rules.extend(
+                [
+                    "【Unified TurnIntent】",
+                    f"- task_type: {self._turn_intent.task_type}",
+                    f"- operation: {self._turn_intent.operation}",
+                    f"- target: {self._turn_intent.target}",
+                    f"- user_role: {self._turn_intent.user_role}",
+                    f"- machine_role: {self._turn_intent.machine_role}",
+                    f"- phase: {self._turn_intent.phase}",
+                    f"- context_ref: {self._turn_intent.context_ref}",
+                    f"- source_need: {self._turn_intent.source_need}",
+                    f"- excluded_meanings: {', '.join(self._turn_intent.excluded_meanings)}",
+                    "- Downstream clarification, retrieval, source lookup and answer policy must follow this TurnIntent.",
+                ]
+            )
         if self._intent_decision is not None and self._intent_decision.soft_note:
             rules.extend(
                 [
@@ -896,7 +1016,11 @@ class AgentOrchestrator:
     def _query_intent_tool_args(self) -> dict:
         """Return the front-loaded intent as safe tool arguments."""
 
-        intent = self._query_intent
+        intent = (
+            self._turn_intent.to_query_intent()
+            if self._turn_intent is not None
+            else self._query_intent
+        )
         if intent is None:
             return {}
         return {
