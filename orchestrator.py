@@ -421,6 +421,12 @@ class AgentOrchestrator:
             print(self._render_visible_reasoning_trace(tool_events))
             reasoning_trace_printed = True
 
+        def print_progress(message: str):
+            if not self._show_progress_updates():
+                return
+            clear_thinking_prompt()
+            print(f"Klonet Agent：{message}")
+
         if resume_previous_turn:
             state = resume_state or {}
             effective_user_input = str(state.get("original_user_input") or user_input)
@@ -462,6 +468,7 @@ class AgentOrchestrator:
 
         if self.profile.name == "mentor" and not resume_previous_turn:
             try:
+                print_progress("正在理解你的问题...")
                 analysis = self.intent_analyzer.analyze(
                     user_input,
                     recent_history=recent_history_for_intent,
@@ -484,6 +491,7 @@ class AgentOrchestrator:
                     recent_history=recent_history_for_intent,
                     semantic_frame=semantic_frame,
                 )
+                print_progress(self._progress_intent_summary())
             except Exception:
                 self._query_route = route_query(user_input)
                 self._query_intent = None
@@ -492,12 +500,14 @@ class AgentOrchestrator:
                     user_input,
                     recent_history=recent_history_for_intent,
                 )
+                print_progress(self._progress_intent_summary())
         elif not resume_previous_turn:
             self._query_route = route_query(user_input)
             self._refresh_turn_plan(
                 user_input,
                 recent_history=recent_history_for_intent,
             )
+            print_progress(self._progress_intent_summary())
 
         if (
             self.profile.name == "mentor"
@@ -543,6 +553,8 @@ class AgentOrchestrator:
         while tool_rounds < MAX_TOOL_ROUNDS:
             tool_rounds += 1
             printed_stream_reply = False
+            if tool_rounds == 1:
+                print_progress("正在组织回答...")
 
             def print_reply_delta(delta: str):
                 nonlocal printed_stream_reply
@@ -626,7 +638,9 @@ class AgentOrchestrator:
                                 self._conversation_state.to_tool_args()
                             )
                     # 调用工具函数，开始执行命令或其他动作。
+                    print_progress(f"正在调用工具：{tool_name}")
                     result = self.use_tool(tool_name, tool_args)
+                    print_progress(f"工具完成：{tool_name}")
                     tool_events.append(
                         {
                             "name": tool_name,
@@ -744,6 +758,23 @@ class AgentOrchestrator:
         """默认输出用户可见思考摘要；brief 模式只输出最终答案。"""
 
         return self.answer_style != "brief"
+
+    def _show_progress_updates(self) -> bool:
+        """Show safe CLI progress milestones without adding them to model context."""
+
+        return self.profile.name == "mentor" and self.answer_style != "brief"
+
+    def _progress_intent_summary(self) -> str:
+        """Return a short, non-sensitive summary of the current turn intent."""
+
+        if self._turn_intent is None:
+            return "已完成问题理解。"
+        parts = [self._turn_intent.task_type]
+        if self._turn_intent.phase and self._turn_intent.phase != "unknown":
+            parts.append(self._turn_intent.phase)
+        if self._turn_intent.operation and self._turn_intent.operation != "unknown":
+            parts.append(self._turn_intent.operation)
+        return "已识别：" + " / ".join(parts)
 
     def _is_resume_request(self, user_input: str) -> bool:
         """判断当前输入是否是在请求继续上一轮暂停任务。"""
