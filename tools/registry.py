@@ -4,6 +4,8 @@
 它只负责声明工具能力，不负责真正执行工具。
 """
 
+from __future__ import annotations
+
 
 # 工具数组定义。LLM 会通过这段 JSON schema 判断什么时候需要调用什么工具，
 # 并输出调用该工具的标准参数。

@@ -3,6 +3,8 @@
 Profile 只描述行为差异，不承载复杂业务逻辑。真正的工具执行、记忆、日志和检索仍在各自模块中。
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 from klonet_agent.prompts import CODING_PROMPT, MENTOR_PROMPT, OPS_PROMPT

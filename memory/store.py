@@ -4,6 +4,8 @@
 它关注“agent 记住了什么”，不负责具体项目的 Markdown 开发日志。
 """
 
+from __future__ import annotations
+
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path

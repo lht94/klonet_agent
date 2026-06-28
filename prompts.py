@@ -4,6 +4,8 @@
 但在行为边界、工具选择和输出风格上保持差异。
 """
 
+from __future__ import annotations
+
 
 CORE_SYSTEM_PROMPT = """
 你是 Klonet 专用教学协作 Agent，服务对象是正在学习和维护 Klonet 的同学。

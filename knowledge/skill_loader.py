@@ -4,6 +4,8 @@
 skill 更适合放流程型知识，Klonet 代码规范和历史项目经验则更适合进入 RAG 知识库。
 """
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
 
