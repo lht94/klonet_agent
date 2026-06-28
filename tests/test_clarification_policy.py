@@ -372,6 +372,50 @@ def test_late_platform_name_supplement_ignores_model_deploy_clarification(capsys
     assert token == 12
 
 
+def test_accept_any_deploy_choice_does_not_repeat_same_clarification(capsys):
+    """用户接受任一路线时，应直接给双路径入口，而不是重复二选一追问。"""
+
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"klonet","task_type":"concept",'
+                    '"operation":"unknown","target":"klonet_platform",'
+                    '"clarification_required":true,'
+                    '"clarification_question":"你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？",'
+                    '"confidence":0.66}',
+                    tokens=5,
+                ),
+                _response("安装环境和启动平台两条路径都可以，下面分别给入口。", tokens=7),
+            ]
+        )
+        orchestrator = _mentor_orchestrator(
+            temp_dir,
+            llm=llm,
+            executor=RecordingToolExecutor(),
+        )
+        history = orchestrator.init_history()
+        history.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？"
+                        "A：首次环境部署。B：平台启动。"
+                    ),
+                },
+                {"role": "user", "content": "都行"},
+            ]
+        )
+
+        reply, history, token = orchestrator.single_chat("我说了都行", history, 0)
+
+    assert "你是想首次安装" not in reply
+    assert "安装环境和启动平台" in reply
+    assert len(llm.calls) == 2
+    assert token == 12
+
+
 def test_low_information_input_uses_generic_clarification_not_deploy_choice(capsys):
     """低信息输入即使被模型误判，也不应触发环境/启动二选一澄清。"""
 

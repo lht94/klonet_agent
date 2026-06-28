@@ -123,6 +123,43 @@ def test_short_unknown_token_uses_low_information_clarification():
     assert "安装环境还是启动平台" not in turn_decision.clarification_reply
 
 
+def test_accept_any_reply_to_deploy_choice_does_not_clarify_again():
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "concept",
+            "operation": "unknown",
+            "target": "klonet_platform",
+            "clarification_required": True,
+            "clarification_question": "你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？",
+            "confidence": 0.66,
+        }
+    )
+
+    turn_intent = TurnIntentBuilder().build(
+        "我说了都行",
+        recent_history=[
+            {
+                "role": "assistant",
+                "content": (
+                    "你是想首次安装 Klonet 环境，还是启动已经安装好的平台服务？"
+                    "A：首次环境部署。B：平台启动。"
+                ),
+            },
+            {"role": "user", "content": "都行"},
+        ],
+        intent=intent,
+    )
+    turn_decision = TurnDecisionPlanner().plan(turn_intent)
+
+    assert turn_intent.context_ref == "accept_any"
+    assert turn_intent.task_type == "deployment_guidance"
+    assert turn_intent.operation == "unknown"
+    assert turn_intent.target == "klonet_platform"
+    assert turn_decision.should_clarify is False
+    assert turn_intent.to_query_intent().clarification_required is False
+
+
 def test_source_question_marks_source_need_without_changing_business_intent():
     turn_intent = TurnIntentBuilder().build(
         "你这边没有源码吗？TopoManager.py 里有哪些节点？",

@@ -20,6 +20,7 @@ from klonet_agent.knowledge.semantic_understanding import IntentDecision, Semant
 CONTEXT_NONE = "none"
 CONTEXT_CONTINUE = "continue"
 CONTEXT_OPTION_SELECT = "option_select"
+CONTEXT_ACCEPT_ANY = "accept_any"
 CONTEXT_LATE_ENTITY_FILL = "late_entity_fill"
 CONTEXT_CORRECTION = "correction"
 
@@ -308,6 +309,8 @@ def _context_ref_for(
         return CONTEXT_CORRECTION
     if compact in {"继续", "接着说", "继续说", "继续上面", "goon", "continue"}:
         return CONTEXT_CONTINUE
+    if _is_accept_any_reply(compact, history):
+        return CONTEXT_ACCEPT_ANY
     if _is_late_entity_fill(compact, history, state):
         return CONTEXT_LATE_ENTITY_FILL
     if compact in {"a", "b", "1", "2"} or any(
@@ -337,6 +340,34 @@ def _is_late_entity_fill(
     )
 
 
+def _is_accept_any_reply(compact_text: str, history: list[dict]) -> bool:
+    accept_terms = {
+        "都可以",
+        "都行",
+        "都可以的",
+        "都行吧",
+        "都可",
+        "都好",
+        "哪个都行",
+        "哪种都行",
+        "我说了都行",
+        "随便",
+        "都无所谓",
+    }
+    if compact_text not in accept_terms:
+        return False
+    recent_assistant_text = "\n".join(
+        str(message.get("content") or "")
+        for message in history[-6:]
+        if message.get("role") == "assistant"
+    )
+    return (
+        "Klonet" in recent_assistant_text
+        and any(term in recent_assistant_text for term in ("首次", "安装", "环境"))
+        and any(term in recent_assistant_text for term in ("启动", "平台服务", "已经安装"))
+    )
+
+
 def _phase_for(
     intent: QueryIntent,
     frame: SemanticFrame,
@@ -351,6 +382,8 @@ def _phase_for(
 
 
 def _task_type_for(intent: QueryIntent, phase: str, context_ref: str) -> str:
+    if context_ref == CONTEXT_ACCEPT_ANY:
+        return "deployment_guidance"
     if context_ref == CONTEXT_LATE_ENTITY_FILL or phase == "platform_usage":
         return "operation_guide"
     if phase == "local_tool_preparation":
@@ -391,6 +424,7 @@ def _clarification_type_for(
     if context_ref in {
         CONTEXT_CONTINUE,
         CONTEXT_OPTION_SELECT,
+        CONTEXT_ACCEPT_ANY,
         CONTEXT_LATE_ENTITY_FILL,
     }:
         return CLARIFICATION_NONE
