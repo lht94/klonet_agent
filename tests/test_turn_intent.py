@@ -1,6 +1,7 @@
 """Unified turn intent and decision planning."""
 
 from klonet_agent.knowledge.conversation_state import ConversationState
+from klonet_agent.knowledge.conversation_state import ConversationStateManager
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.semantic_understanding import IntentDecision, SemanticFrame
 from klonet_agent.knowledge.turn_intent import TurnIntentBuilder, TurnDecisionPlanner
@@ -158,6 +159,82 @@ def test_accept_any_reply_to_deploy_choice_does_not_clarify_again():
     assert turn_intent.target == "klonet_platform"
     assert turn_decision.should_clarify is False
     assert turn_intent.to_query_intent().clarification_required is False
+
+
+def test_accept_any_reply_to_generic_options_does_not_require_deploy_context():
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "operation_guide",
+            "operation": "topology_deploy",
+            "target": "topology",
+            "clarification_required": True,
+            "clarification_question": "你想创建拓扑、导入拓扑，还是查看拓扑节点？",
+            "confidence": 0.68,
+        }
+    )
+
+    turn_intent = TurnIntentBuilder().build(
+        "都可以",
+        recent_history=[
+            {
+                "role": "assistant",
+                "content": "A：创建拓扑。B：导入拓扑。C：查看拓扑节点。",
+            },
+        ],
+        intent=intent,
+    )
+    turn_decision = TurnDecisionPlanner().plan(turn_intent)
+
+    assert turn_intent.context_ref == "accept_any"
+    assert turn_intent.task_type == "operation_guide"
+    assert turn_intent.operation == "topology_deploy"
+    assert turn_decision.should_clarify is False
+
+
+def test_third_or_c_option_reply_is_treated_as_context_option():
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "concept",
+            "operation": "unknown",
+            "target": "topology",
+            "clarification_required": True,
+            "clarification_question": "你选的是哪一种？",
+            "confidence": 0.63,
+        }
+    )
+
+    for user_input in ("选C", "第三种", "方案三", "第3个", "C", "选D", "第四种", "路线四"):
+        turn_intent = TurnIntentBuilder().build(
+            user_input,
+            recent_history=[
+                {
+                    "role": "assistant",
+                    "content": "A：虚拟机。B：OVS 交换机。C：路由器。D：控制器。",
+                },
+            ],
+            intent=intent,
+        )
+        turn_decision = TurnDecisionPlanner().plan(turn_intent)
+
+        assert turn_intent.context_ref == "option_select"
+        assert turn_decision.should_clarify is False
+
+
+def test_conversation_state_records_general_c_option_selection():
+    state = ConversationStateManager().from_turn(
+        "选C",
+        recent_history=[
+            {
+                "role": "assistant",
+                "content": "A：虚拟机。B：OVS 交换机。C：路由器。D：控制器。",
+            }
+        ],
+    )
+
+    assert state.confirmed_slots["selected_option"] == "C"
+    assert state.last_option_map["C"] == "option_c"
 
 
 def test_source_question_marks_source_need_without_changing_business_intent():

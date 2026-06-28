@@ -128,6 +128,8 @@ def _option_map_from_history(history: list[dict]) -> dict[str, str]:
     if "场景二" in text and ("部署" in text or "管理员" in text):
         result["第二种"] = "platform_startup"
         result["场景二"] = "platform_startup"
+    for key, value in _generic_option_map(text).items():
+        result.setdefault(key, value)
     return result
 
 
@@ -150,15 +152,85 @@ def _is_late_platform_usage_supplement(user_input: str, history: list[dict]) -> 
 def _selected_option(user_input: str) -> str:
     text = user_input.strip()
     lowered = text.lower()
-    if text == "B" or lowered == "b":
-        return "B"
-    if text == "A" or lowered == "a":
-        return "A"
-    if "第一种" in text or "场景一" in text:
-        return "第一种"
-    if "第二种" in text or "场景二" in text:
-        return "第二种"
+    compact = "".join(lowered.split())
+    letter_aliases = {
+        "a": "A",
+        "b": "B",
+        "c": "C",
+        "d": "D",
+        "e": "E",
+        "f": "F",
+        "选a": "A",
+        "选b": "B",
+        "选c": "C",
+        "选d": "D",
+        "选e": "E",
+        "选f": "F",
+        "a方案": "A",
+        "b方案": "B",
+        "c方案": "C",
+        "d方案": "D",
+        "e方案": "E",
+        "f方案": "F",
+    }
+    if compact in letter_aliases:
+        return letter_aliases[compact]
+    number_aliases = {
+        "1": "第一种",
+        "2": "第二种",
+        "3": "第三种",
+        "4": "第四种",
+        "5": "第五种",
+        "6": "第六种",
+        "选1": "第一种",
+        "选2": "第二种",
+        "选3": "第三种",
+        "选4": "第四种",
+        "选5": "第五种",
+        "选6": "第六种",
+        "第1个": "第一种",
+        "第2个": "第二种",
+        "第3个": "第三种",
+        "第4个": "第四种",
+        "第5个": "第五种",
+        "第6个": "第六种",
+    }
+    if compact in number_aliases:
+        return number_aliases[compact]
+    explicit_options = (
+        ("第一种", ("第一种", "场景一", "方案一", "路径一", "路线一")),
+        ("第二种", ("第二种", "场景二", "方案二", "路径二", "路线二")),
+        ("第三种", ("第三种", "场景三", "方案三", "路径三", "路线三")),
+        ("第四种", ("第四种", "场景四", "方案四", "路径四", "路线四")),
+        ("第五种", ("第五种", "场景五", "方案五", "路径五", "路线五")),
+        ("第六种", ("第六种", "场景六", "方案六", "路径六", "路线六")),
+    )
+    for normalized, terms in explicit_options:
+        if any(term in text for term in terms):
+            return normalized
     return ""
+
+
+def _generic_option_map(text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for letter in ("A", "B", "C", "D", "E", "F"):
+        if f"{letter}：" in text or f"{letter}:" in text:
+            result[letter] = f"option_{letter.lower()}"
+    option_names = (
+        ("第一种", "option_1", ("第一种", "场景一", "方案一", "路径一", "路线一")),
+        ("第二种", "option_2", ("第二种", "场景二", "方案二", "路径二", "路线二")),
+        ("第三种", "option_3", ("第三种", "场景三", "方案三", "路径三", "路线三")),
+        ("第四种", "option_4", ("第四种", "场景四", "方案四", "路径四", "路线四")),
+        ("第五种", "option_5", ("第五种", "场景五", "方案五", "路径五", "路线五")),
+        ("第六种", "option_6", ("第六种", "场景六", "方案六", "路径六", "路线六")),
+    )
+    for canonical, value, markers in option_names:
+        if any(marker in text for marker in markers):
+            result.setdefault(canonical, value)
+            for marker in markers:
+                if marker in text:
+                    result.setdefault(marker, value)
+    return result
 
 
 def _phase_from_operation(operation: str) -> str:

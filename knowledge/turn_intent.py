@@ -313,9 +313,7 @@ def _context_ref_for(
         return CONTEXT_ACCEPT_ANY
     if _is_late_entity_fill(compact, history, state):
         return CONTEXT_LATE_ENTITY_FILL
-    if compact in {"a", "b", "1", "2"} or any(
-        term in text for term in ("第一种", "第二种", "场景一", "场景二")
-    ):
+    if _is_option_selection_reply(text, compact, history):
         return CONTEXT_OPTION_SELECT
     return CONTEXT_NONE
 
@@ -356,16 +354,157 @@ def _is_accept_any_reply(compact_text: str, history: list[dict]) -> bool:
     }
     if compact_text not in accept_terms:
         return False
+    return _recent_history_has_options(history)
+
+
+def _recent_history_has_options(history: list[dict]) -> bool:
     recent_assistant_text = "\n".join(
         str(message.get("content") or "")
         for message in history[-6:]
         if message.get("role") == "assistant"
     )
-    return (
-        "Klonet" in recent_assistant_text
-        and any(term in recent_assistant_text for term in ("首次", "安装", "环境"))
-        and any(term in recent_assistant_text for term in ("启动", "平台服务", "已经安装"))
+    if not recent_assistant_text:
+        return False
+    option_markers = (
+        "A：",
+        "B：",
+        "C：",
+        "D：",
+        "E：",
+        "F：",
+        "A:",
+        "B:",
+        "C:",
+        "D:",
+        "E:",
+        "F:",
+        "1.",
+        "2.",
+        "3.",
+        "4.",
+        "5.",
+        "6.",
+        "1：",
+        "2：",
+        "3：",
+        "4：",
+        "5：",
+        "6：",
+        "第一种",
+        "第二种",
+        "第三种",
+        "第四种",
+        "第五种",
+        "第六种",
+        "场景一",
+        "场景二",
+        "场景三",
+        "场景四",
+        "场景五",
+        "场景六",
+        "方案一",
+        "方案二",
+        "方案三",
+        "方案四",
+        "方案五",
+        "方案六",
+        "路径一",
+        "路径二",
+        "路径三",
+        "路径四",
+        "路径五",
+        "路径六",
+        "路线一",
+        "路线二",
+        "路线三",
+        "路线四",
+        "路线五",
+        "路线六",
     )
+    return sum(1 for marker in option_markers if marker in recent_assistant_text) >= 2
+
+
+def _is_option_selection_reply(text: str, compact_text: str, history: list[dict]) -> bool:
+    if not _recent_history_has_options(history):
+        return False
+    if compact_text in {
+        "a",
+        "b",
+        "c",
+        "d",
+        "e",
+        "f",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "选a",
+        "选b",
+        "选c",
+        "选d",
+        "选e",
+        "选f",
+        "选1",
+        "选2",
+        "选3",
+        "选4",
+        "选5",
+        "选6",
+        "a方案",
+        "b方案",
+        "c方案",
+        "d方案",
+        "e方案",
+        "f方案",
+    }:
+        return True
+    option_terms = (
+        "第一种",
+        "第二种",
+        "第三种",
+        "第四种",
+        "第五种",
+        "第六种",
+        "第一个",
+        "第二个",
+        "第三个",
+        "第四个",
+        "第五个",
+        "第六个",
+        "第1个",
+        "第2个",
+        "第3个",
+        "第4个",
+        "第5个",
+        "第6个",
+        "场景一",
+        "场景二",
+        "场景三",
+        "场景四",
+        "场景五",
+        "场景六",
+        "方案一",
+        "方案二",
+        "方案三",
+        "方案四",
+        "方案五",
+        "方案六",
+        "路径一",
+        "路径二",
+        "路径三",
+        "路径四",
+        "路径五",
+        "路径六",
+        "路线一",
+        "路线二",
+        "路线三",
+        "路线四",
+        "路线五",
+        "路线六",
+    )
+    return any(term in text for term in option_terms)
 
 
 def _phase_for(
@@ -382,13 +521,22 @@ def _phase_for(
 
 
 def _task_type_for(intent: QueryIntent, phase: str, context_ref: str) -> str:
-    if context_ref == CONTEXT_ACCEPT_ANY:
+    if context_ref == CONTEXT_ACCEPT_ANY and _looks_like_deploy_choice_intent(intent):
         return "deployment_guidance"
     if context_ref == CONTEXT_LATE_ENTITY_FILL or phase == "platform_usage":
         return "operation_guide"
     if phase == "local_tool_preparation":
         return "deployment_preparation"
     return intent.task_type
+
+
+def _looks_like_deploy_choice_intent(intent: QueryIntent) -> bool:
+    text = f"{intent.target} {intent.clarification_question}".lower()
+    return (
+        "klonet" in text
+        and any(term in text for term in ("安装", "环境", "首次"))
+        and any(term in text for term in ("启动", "平台服务", "已经安装"))
+    )
 
 
 def _operation_for(intent: QueryIntent, phase: str, context_ref: str) -> str:
