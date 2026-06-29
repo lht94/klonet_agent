@@ -27,3 +27,13 @@ def test_mentor_prompt_requires_source_tools_for_code_facts():
     assert "search_code" in MENTOR_PROMPT
     assert "read_source_file" in MENTOR_PROMPT
     assert "代码、接口、配置、启动脚本或报错" in MENTOR_PROMPT
+
+
+def test_ops_prompt_separates_workspace_from_runtime_source():
+    """Ops must not treat uploaded workspace code as the running platform source."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "workspace != runtime source" in OPS_PROMPT
+    assert "process cwd" in OPS_PROMPT
+    assert "traceback" in OPS_PROMPT
