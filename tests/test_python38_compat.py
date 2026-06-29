@@ -43,6 +43,18 @@ def test_runtime_modules_with_modern_annotations_use_future_annotations():
     assert missing == []
 
 
+def test_runtime_modules_do_not_call_python39_path_is_relative_to():
+    """Python 3.8 pathlib.Path does not provide is_relative_to()."""
+
+    offenders = []
+    for path in _runtime_python_files():
+        text = path.read_text(encoding="utf-8")
+        if ".is_relative_to(" in text:
+            offenders.append(str(path.relative_to(PROJECT_ROOT)))
+
+    assert offenders == []
+
+
 def _runtime_python_files():
     for relative in RUNTIME_PATHS:
         path = PROJECT_ROOT / relative
