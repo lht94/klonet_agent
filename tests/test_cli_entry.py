@@ -132,27 +132,9 @@ def test_piped_prompt_preserves_multiline_chinese_as_one_turn():
     assert route_query(prompt).scope == "general"
 
 
-def test_cli_can_clear_interactive_input_line():
-    """Ubuntu 交互终端提交输入后，应能清掉上一行避免残留。"""
+def test_cli_does_not_clear_user_input_line():
+    """用户提交的问题应保留在终端历史里，不能被 agent 清掉。"""
 
-    from klonet_agent.app.cli import clear_interactive_input_line
+    import klonet_agent.app.cli as cli
 
-    class TtyWriter:
-        def __init__(self):
-            self.output = ""
-            self.flushed = False
-
-        def isatty(self):
-            return True
-
-        def write(self, value):
-            self.output += value
-
-        def flush(self):
-            self.flushed = True
-
-    stdout = TtyWriter()
-    clear_interactive_input_line(stdout=stdout)
-
-    assert stdout.output == "\033[A\033[2K"
-    assert stdout.flushed is True
+    assert not hasattr(cli, "clear_interactive_input_line")
