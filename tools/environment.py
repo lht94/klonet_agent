@@ -35,6 +35,9 @@ _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b(password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*([^\s]+)"
     ),
+    re.compile(
+        r"(?i)(--(?:password|passwd|pwd|api-key|api_key|secret|token)(?:=|\s+))([^\s]+)"
+    ),
     re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+([^\s]+)"),
     re.compile(r"(?i)\b(cookie\s*:\s*)(.+)$", re.MULTILINE),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
@@ -83,7 +86,16 @@ def inspect_klonet_runtime(args: dict | None = None) -> str:
 
     requested = _requested_checks(
         args,
-        default=("ports", "screen", "nginx", "docker", "redis", "rabbitmq", "mysql"),
+        default=(
+            "ports",
+            "screen",
+            "processes",
+            "nginx",
+            "docker",
+            "redis",
+            "rabbitmq",
+            "mysql",
+        ),
     )
     results = [run_read_only_probe(check) for check in requested]
     return _render_tool_result("inspect_klonet_runtime", results)
@@ -152,7 +164,8 @@ def run_read_only_probe(name: str) -> ProbeResult:
         return ProbeResult(normalized, STATUS_UNCHECKED, output or f"exit {result.returncode}")
     if not output:
         return ProbeResult(normalized, STATUS_MISSING, "no output")
-    return ProbeResult(normalized, STATUS_DETECTED, _single_line(output))
+    max_chars = 1800 if normalized == "processes" else 600
+    return ProbeResult(normalized, STATUS_DETECTED, _single_line(output, max_chars=max_chars))
 
 
 def redact_sensitive_text(text: str) -> str:
@@ -193,6 +206,21 @@ def _posix_probe_command(name: str) -> list[str] | None:
         "virtualization": ["sh", "-c", "egrep -c '(vmx|svm)' /proc/cpuinfo 2>/dev/null || true"],
         "ports": ["ss", "-ltnp"],
         "screen": ["screen", "-ls"],
+        "processes": [
+            "sh",
+            "-c",
+            (
+                "for pid in $(pgrep -f 'vemu|klonet|gunicorn|celery|screen|"
+                "master_main|worker_main|web_terminal' 2>/dev/null | head -80); do "
+                "[ \"$pid\" = \"$$\" ] && continue; "
+                "cwd=$(readlink /proc/$pid/cwd 2>/dev/null || echo '?'); "
+                "cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | "
+                "sed 's/[[:space:]]\\+/ /g'); "
+                "[ -n \"$cmd\" ] || cmd=$(ps -p \"$pid\" -o args= 2>/dev/null); "
+                "printf 'pid=%s cwd=%s cmd=%s\\n' \"$pid\" \"$cwd\" \"$cmd\"; "
+                "done"
+            ),
+        ],
         "nginx": ["systemctl", "is-active", "nginx"],
         "docker": ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
         "redis": ["systemctl", "is-active", "redis"],
@@ -210,6 +238,7 @@ def _windows_probe_command(name: str) -> list[str] | None:
         "virtualization": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty VirtualizationFirmwareEnabled"],
         "ports": ["powershell", "-NoProfile", "-Command", "Get-NetTCPConnection -State Listen | Select-Object -First 80 LocalAddress,LocalPort,OwningProcess"],
         "screen": ["powershell", "-NoProfile", "-Command", "'screen is not a Windows service'"],
+        "processes": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'vemu|klonet|gunicorn|celery|screen|master_main|worker_main|web_terminal' } | Select-Object -First 80 ProcessId,CommandLine"],
         "nginx": ["powershell", "-NoProfile", "-Command", "Get-Service nginx -ErrorAction SilentlyContinue | Select-Object Name,Status"],
         "docker": ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
         "redis": ["powershell", "-NoProfile", "-Command", "Get-Service redis* -ErrorAction SilentlyContinue | Select-Object Name,Status"],

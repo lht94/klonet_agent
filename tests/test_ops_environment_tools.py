@@ -58,6 +58,24 @@ def test_environment_tools_are_registered_for_llm():
     assert "read_klonet_logs" in tool_names
 
 
+def test_runtime_probe_supports_process_cwd_evidence():
+    """Ops diagnosis needs process cwd evidence before tying a platform to source."""
+
+    from klonet_agent.tools.environment import _probe_command
+    from klonet_agent.tools.registry import TOOLS
+
+    command = _probe_command("processes")
+    runtime_tool = next(
+        item
+        for item in TOOLS
+        if item["function"]["name"] == "inspect_klonet_runtime"
+    )
+    checks = runtime_tool["function"]["parameters"]["properties"]["checks"]["items"]["enum"]
+
+    assert command is not None
+    assert "processes" in checks
+
+
 def test_executor_dispatches_environment_tool():
     from klonet_agent.tools.executor import ToolExecutor
 

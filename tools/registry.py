@@ -179,6 +179,7 @@ TOOLS = [
                     "enum": [
                         "ports",
                         "screen",
+                        "processes",
                         "nginx",
                         "docker",
                         "redis",
