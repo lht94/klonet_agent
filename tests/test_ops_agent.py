@@ -24,6 +24,14 @@ def test_ops_profile_uses_read_only_environment_tools():
     assert "write_file" not in profile.allowed_tools
 
 
+def test_agent_profile_source_avoids_python38_runtime_builtin_generics():
+    """profile.py is imported during startup on Python 3.8."""
+
+    source = (PROJECT_ROOT / "agents" / "profile.py").read_text(encoding="utf-8")
+
+    assert "set[str]" not in source
+
+
 def test_mentor_profile_can_recommend_ops_without_shell_access():
     from klonet_agent.agents import get_profile
 

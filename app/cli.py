@@ -42,6 +42,16 @@ def read_piped_prompt(stdin=None) -> Optional[str]:
     return stdin.read().strip()
 
 
+def clear_interactive_input_line(stdout=None):
+    """在支持 ANSI 的交互式终端里清掉刚提交的输入行。"""
+
+    stdout = stdout or sys.stdout
+    if not hasattr(stdout, "isatty") or not stdout.isatty():
+        return
+    stdout.write("\033[A\033[2K")
+    stdout.flush()
+
+
 def run_chat(
     mode: str = "mentor",
     user_id: str = DEFAULT_USER_ID,
@@ -77,6 +87,7 @@ def run_chat(
 
         while True:
             user_input = input("用户：").strip()
+            clear_interactive_input_line()
 
             # 处理空输入。
             if not user_input:

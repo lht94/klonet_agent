@@ -162,6 +162,14 @@ class SemanticDecisionPlanner:
         task_type = _task_type_for(frame, phase)
         operation = _operation_for(phase, frame)
         target = _target_for(frame, phase)
+        requires_environment_diagnosis = _requires_environment_diagnosis(
+            user_input,
+            frame,
+            task_type,
+            target,
+        )
+        if requires_environment_diagnosis and task_type == "concept":
+            task_type = "troubleshooting"
         clarification_action = _clarification_action_for(frame, phase)
         soft_note = (
             "这里先按启动已安装好的 Klonet 平台服务理解；如果你指首次安装环境，流程不同。"
@@ -177,6 +185,7 @@ class SemanticDecisionPlanner:
                 "symptom": frame.symptom,
                 "excluded_intents": _excluded_intents_for(frame, phase),
                 "requires_retrieval": frame.scope != "general",
+                "requires_environment_diagnosis": requires_environment_diagnosis,
                 "clarification_required": clarification_action == "ask_before_answer",
                 "clarification_question": _clarification_question_for(frame, phase),
                 "confidence": max(frame.confidence, 0.7 if phase != "unknown" else 0.0),
@@ -255,6 +264,37 @@ def _task_type_for(frame: SemanticFrame, phase: str) -> str:
     if phase in {"topology_deploy", "platform_usage"}:
         return "operation_guide"
     return "concept"
+
+
+def _requires_environment_diagnosis(
+    user_input: str,
+    frame: SemanticFrame,
+    task_type: str,
+    target: str,
+) -> bool:
+    text = f"{user_input} {frame.target_component} {frame.symptom} {target}".lower()
+    if frame.action_goal == "inspect_error" or frame.perspective == "debugging_runtime":
+        return True
+    if task_type == "troubleshooting" and any(
+        term in text
+        for term in (
+            "nginx",
+            "docker",
+            "redis",
+            "rabbitmq",
+            "mysql",
+            "ovs",
+            "kvm",
+            "libvirt",
+            "screen",
+            "worker",
+            "端口",
+            "报错",
+            "启动失败",
+        )
+    ):
+        return True
+    return False
 
 
 def _operation_for(phase: str, frame: SemanticFrame) -> str:

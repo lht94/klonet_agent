@@ -154,12 +154,16 @@ class TurnIntentBuilder:
         task_type = _task_type_for(intent, phase, context_ref)
         operation = _operation_for(intent, phase, context_ref)
         target = _target_for(intent, frame, state)
+        requires_environment_diagnosis = intent.requires_environment_diagnosis
+        if requires_environment_diagnosis and task_type == "concept":
+            task_type = "troubleshooting"
         clarification_type = _clarification_type_for(
             user_input=user_input,
             history=history,
             intent=intent,
             decision=decision,
             context_ref=context_ref,
+            requires_environment_diagnosis=requires_environment_diagnosis,
         )
         excluded = _unique(
             list(intent.excluded_intents)
@@ -192,7 +196,7 @@ class TurnIntentBuilder:
             clarification_question=intent.clarification_question,
             source_need=_source_need_for(user_input),
             requires_retrieval=intent.requires_retrieval,
-            requires_environment_diagnosis=intent.requires_environment_diagnosis,
+            requires_environment_diagnosis=requires_environment_diagnosis,
             original_user_input=user_input,
             effective_user_input=effective_user_input or user_input,
             prerequisites=intent.prerequisites,
@@ -572,7 +576,10 @@ def _clarification_type_for(
     intent: QueryIntent,
     decision: IntentDecision | None,
     context_ref: str,
+    requires_environment_diagnosis: bool = False,
 ) -> str:
+    if requires_environment_diagnosis:
+        return CLARIFICATION_NONE
     if context_ref in {
         CONTEXT_CONTINUE,
         CONTEXT_OPTION_SELECT,

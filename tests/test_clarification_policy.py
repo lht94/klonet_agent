@@ -168,6 +168,50 @@ def test_mentor_runs_structured_intent_analysis_before_tool_enabled_answer():
     assert llm.calls[1]["stream"] is True
 
 
+def test_server_platform_inspection_recommends_ops_instead_of_deploy_clarification():
+    """查看服务器当前平台状态是运维诊断，不应追问首次安装还是启动平台。"""
+
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM(
+            [
+                _response(
+                    '{"scope":"klonet","task_type":"concept",'
+                    '"operation":"unknown","target_component":"server_platforms",'
+                    '"perspective":"debugging_runtime",'
+                    '"machine_role":"target_server",'
+                    '"action_goal":"inspect_error",'
+                    '"requires_retrieval":true,'
+                    '"confidence":0.72}',
+                    tokens=5,
+                ),
+                _response("这类服务器状态排查适合切换到 Ops 模式。", tokens=7),
+            ]
+        )
+        orchestrator = _mentor_orchestrator(
+            temp_dir,
+            llm=llm,
+            executor=RecordingToolExecutor(),
+        )
+        history = orchestrator.init_history()
+        reply, history, token = orchestrator.single_chat(
+            "你能帮我看看服务器现在有哪些平台吗？",
+            history,
+            0,
+        )
+
+    assert "首次安装" not in reply
+    assert "Ops" in reply
+    assert token == 12
+    assert len(llm.calls) == 2
+    assert "真实运行状态、故障现场或当前环境事实" in llm.calls[0]["messages"][0]["content"]
+    second_turn_context = "\n".join(
+        message["content"] for message in llm.calls[1]["messages"]
+    )
+    assert "requires_environment_diagnosis: True" in second_turn_context
+    assert "切换到 Ops 模式" in second_turn_context
+    assert "先尝试基于当前知识库证据" in second_turn_context
+
+
 
 
 def test_search_tool_inherits_front_loaded_intent_instead_of_reinterpreting():

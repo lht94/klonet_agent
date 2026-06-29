@@ -76,7 +76,8 @@ INTENT_ANALYSIS_PROMPT += """
 4. “部署拓扑/创建拓扑/进度条/TopoDeployAPI”属于 topology_deploy，不要混成平台启动。
 5. 如果上文给出 A/B 或场景一/场景二选项，当前输入只有 “A”“B”“第一种”“第二种” 时，必须解析 context_refs 并结合上文，不要当作全新问题。
 6. 如果当前输入只是“klonet平台/这个平台/平台”等短补充，而上文正在确认“使用哪个平台/普通用户使用/浏览器使用”，应理解为补充上一轮对象，优先解析为 platform_usage，不要重新追问首次安装还是启动平台。
-7. 只输出 JSON，不要输出 Markdown，不要解释。
+7. 当用户目标是了解目标机器的真实运行状态、故障现场或当前环境事实，而不是询问标准安装/启动步骤时，使用 perspective=debugging_runtime 或 action_goal=inspect_error，并设置 requires_environment_diagnosis=true。
+8. 只输出 JSON，不要输出 Markdown，不要解释。
 """
 
 

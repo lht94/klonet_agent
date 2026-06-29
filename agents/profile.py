@@ -3,9 +3,8 @@
 Profile 只描述行为差异，不承载复杂业务逻辑。真正的工具执行、记忆、日志和检索仍在各自模块中。
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
+from typing import Set
 
 from klonet_agent.prompts import CODING_PROMPT, MENTOR_PROMPT, OPS_PROMPT
 
@@ -16,7 +15,7 @@ class AgentProfile:
 
     name: str                                             # 模式名
     mode_prompt: str                                      # 该模式专用提示词
-    allowed_tools: set[str] = field(default_factory=set)  # 允许调用哪些工具
+    allowed_tools: Set[str] = field(default_factory=set)  # 允许调用哪些工具
     default_workflow: str = ""                            # 默认工作流
     requires_rag: bool = False                            # 是否需要知识检索
     requires_review: bool = False                         # 是否需要 review

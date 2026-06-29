@@ -316,3 +316,33 @@ def test_intent_analyzer_does_not_inject_conflicting_intent_cases(tmp_path):
     assert "Intent Case" not in user_message
     assert "deploy_means_startup" not in user_message
     assert "deploy_means_environment_setup" not in user_message
+
+
+def test_semantic_planner_marks_runtime_inspection_as_environment_diagnosis():
+    from klonet_agent.knowledge.semantic_understanding import (
+        SemanticDecisionPlanner,
+        SemanticFrame,
+        SemanticState,
+    )
+
+    frame = SemanticFrame.from_mapping(
+        {
+            "scope": "klonet",
+            "perspective": "debugging_runtime",
+            "machine_role": "target_server",
+            "action_goal": "inspect_error",
+            "target_component": "server_platforms",
+            "confidence": 0.82,
+        }
+    )
+
+    decision = SemanticDecisionPlanner().plan(
+        "你能帮我看看服务器现在有哪些平台吗？",
+        frame,
+        SemanticState(),
+    )
+
+    assert decision.intent.task_type == "troubleshooting"
+    assert decision.intent.target == "server_platforms"
+    assert decision.intent.requires_environment_diagnosis is True
+    assert decision.intent.clarification_required is False
