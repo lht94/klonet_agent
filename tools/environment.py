@@ -7,12 +7,15 @@ import platform
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
 
 MAX_LOG_CHARS = 8000
+MAX_SCREEN_CHARS = 8000
 PROBE_TIMEOUT_SECONDS = 5
 STATUS_DETECTED = "detected"
 STATUS_MISSING = "missing"
@@ -31,6 +34,7 @@ _SENSITIVE_NAME_PARTS = (
     "password",
 )
 _SAFE_LOG_SUFFIXES = {".log", ".txt", ".out", ".err"}
+_SAFE_SCREEN_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b(password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*([^\s]+)"
@@ -118,6 +122,8 @@ def read_klonet_logs(args: dict | None = None) -> str:
             "read_klonet_logs",
             [ProbeResult(str(path), STATUS_UNCHECKED, "file does not exist or is not a file")],
         )
+    resolved_path = path.resolve()
+    stat = path.stat()
     max_chars = _safe_int(args.get("max_chars"), MAX_LOG_CHARS)
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -130,10 +136,93 @@ def read_klonet_logs(args: dict | None = None) -> str:
     return "\n".join(
         [
             "read_klonet_logs",
-            ProbeResult(str(path), STATUS_DETECTED, f"showing last {len(tail)} chars").render(),
+            ProbeResult(
+                str(resolved_path),
+                STATUS_DETECTED,
+                (
+                    f"resolved_path={resolved_path} "
+                    f"mtime={_format_mtime(stat.st_mtime)} "
+                    f"size_bytes={stat.st_size} "
+                    f"showing last {len(tail)} chars"
+                ),
+            ).render(),
             redact_sensitive_text(tail),
         ]
     )
+
+
+def inspect_screen_session(args: dict | None = None) -> str:
+    """Capture a read-only snapshot of a detached screen session scrollback."""
+
+    args = args or {}
+    session = str(args.get("session") or "").strip()
+    if not session:
+        return "Error: session is required"
+    if not _SAFE_SCREEN_NAME.match(session):
+        return f"Error: unsafe screen session name: {session!r}"
+    if os.name == "nt":
+        return "Error: screen is not available on Windows"
+    if shutil.which("screen") is None:
+        return _render_tool_result(
+            "inspect_screen_session",
+            [ProbeResult(session, STATUS_UNCHECKED, "screen not found")],
+        )
+
+    max_chars = _safe_int(args.get("max_chars"), MAX_SCREEN_CHARS)
+    snapshot_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="klonet-screen-",
+            suffix=".log",
+            delete=False,
+        ) as handle:
+            snapshot_path = Path(handle.name)
+
+        completed = subprocess.run(
+            ["screen", "-S", session, "-X", "hardcopy", str(snapshot_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if completed.returncode != 0:
+            output = redact_sensitive_text((completed.stderr or completed.stdout or "").strip())
+            return _render_tool_result(
+                "inspect_screen_session",
+                [ProbeResult(session, STATUS_UNCHECKED, output or f"exit {completed.returncode}")],
+            )
+
+        text = snapshot_path.read_text(encoding="utf-8", errors="replace")
+        tail = text[-max_chars:]
+        return "\n".join(
+            [
+                "inspect_screen_session",
+                ProbeResult(
+                    session,
+                    STATUS_DETECTED,
+                    f"hardcopy snapshot; showing last {len(tail)} chars",
+                ).render(),
+                redact_sensitive_text(tail),
+            ]
+        )
+    except subprocess.TimeoutExpired:
+        return _render_tool_result(
+            "inspect_screen_session",
+            [ProbeResult(session, STATUS_UNCHECKED, "screen hardcopy timed out")],
+        )
+    except OSError as exc:
+        return _render_tool_result(
+            "inspect_screen_session",
+            [ProbeResult(session, STATUS_UNCHECKED, str(exc))],
+        )
+    finally:
+        if snapshot_path is not None:
+            try:
+                snapshot_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def run_read_only_probe(name: str) -> ProbeResult:
@@ -269,6 +358,10 @@ def _safe_int(value, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, min(number, MAX_LOG_CHARS))
+
+
+def _format_mtime(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).isoformat(timespec="seconds")
 
 
 def _render_tool_result(name: str, results: Iterable[ProbeResult]) -> str:

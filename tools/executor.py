@@ -17,6 +17,7 @@ from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
+    inspect_screen_session,
     inspect_klonet_runtime,
     inspect_system_environment,
     read_klonet_logs,
@@ -121,6 +122,9 @@ class ToolExecutor:
 
         if tool_name == "read_klonet_logs":
             return read_klonet_logs(tool_args)
+
+        if tool_name == "inspect_screen_session":
+            return inspect_screen_session(tool_args)
 
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))

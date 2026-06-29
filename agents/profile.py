@@ -40,6 +40,7 @@ ENVIRONMENT_TOOLS = {
     "inspect_system_environment",
     "inspect_klonet_runtime",
     "read_klonet_logs",
+    "inspect_screen_session",
 }
 
 OPS_TOOLS = {

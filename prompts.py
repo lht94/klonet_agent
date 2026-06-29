@@ -78,6 +78,8 @@ OPS_PROMPT = """
 6. 任何日志、配置和命令输出进入回答前都必须脱敏；不得输出密码、token、私钥、cookie、Authorization header 或 .env 正文。
 7. 第一段直接给出当前最可能原因；随后给出证据、排查链路和只读验证方式。
 8. workspace != runtime source。当前 workspace 里的源码只能作为用户上传的分析副本，不能直接当作正在运行的平台源码。定位某个平台的实际源码路径时，必须优先依据运行态证据，例如 process cwd、启动命令、screen 名称对应进程、端口 PID、日志 traceback 中的绝对路径；证据不足时只能说“尚未确认运行源码路径”。
+9. 读取日志时必须在回答中说明 resolved_path、mtime 和 size_bytes；如果日志没有新记录，不得直接推断服务未运行，必须交叉检查进程、端口或 screen 输出。
+10. 对 screen 常驻的 Klonet 服务，排查 master、worker、celery、web_terminal 时应优先使用 inspect_screen_session 查看最近输出；screen 快照是运行态证据，不等同于 workspace 文件。
 """
 
 

@@ -48,6 +48,22 @@ def test_log_reader_refuses_env_files():
     assert "refused" in result.lower()
 
 
+def test_log_reader_reports_resolved_path_mtime_and_size():
+    from klonet_agent.tools.environment import read_klonet_logs
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        log_file = temp_dir / "error.log"
+        log_file.write_text("first line\nlatest line\n", encoding="utf-8")
+
+        result = read_klonet_logs({"path": str(log_file), "max_chars": 100})
+
+    assert "resolved_path=" in result
+    assert "mtime=" in result
+    assert "size_bytes=" in result
+    assert "latest line" in result
+
+
 def test_environment_tools_are_registered_for_llm():
     from klonet_agent.tools.registry import TOOLS
 
@@ -56,6 +72,24 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_system_environment" in tool_names
     assert "inspect_klonet_runtime" in tool_names
     assert "read_klonet_logs" in tool_names
+    assert "inspect_screen_session" in tool_names
+
+
+def test_ops_profile_allows_screen_inspection():
+    from klonet_agent.agents import get_profile
+
+    profile = get_profile("ops")
+
+    assert "inspect_screen_session" in profile.allowed_tools
+
+
+def test_screen_inspection_rejects_unsafe_session_name():
+    from klonet_agent.tools.environment import inspect_screen_session
+
+    result = inspect_screen_session({"session": "102_m; rm -rf /"})
+
+    assert result.startswith("Error:")
+    assert "unsafe" in result.lower()
 
 
 def test_runtime_probe_supports_process_cwd_evidence():
@@ -86,3 +120,15 @@ def test_executor_dispatches_environment_tool():
 
     assert "inspect_system_environment" in result
     assert any(status in result for status in ("detected", "missing", "unchecked"))
+
+
+def test_executor_dispatches_screen_inspection_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_screen_session"}).run(
+        "inspect_screen_session",
+        {"session": "102_m; rm -rf /"},
+    )
+
+    assert result.startswith("Error:")
+    assert "unsafe" in result.lower()

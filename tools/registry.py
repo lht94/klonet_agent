@@ -205,6 +205,18 @@ TOOLS = [
         ["path"],
     ),
     _tool(
+        "inspect_screen_session",
+        "只读抓取指定 screen 会话的当前窗口/滚屏快照，用于查看 master、worker、celery、web_terminal 最近输出。使用 screen hardcopy，不发送交互输入。",
+        {
+            "session": {
+                "type": "string",
+                "description": "screen 会话名或 id.name，例如 1024293.102_m 或 102_m",
+            },
+            "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
+        },
+        ["session"],
+    ),
+    _tool(
         "list_files",
         "列出当前 workspace 内的文件或目录。",
         {"path": {"type": "string", "description": "workspace 内相对路径，默认 ."}},
