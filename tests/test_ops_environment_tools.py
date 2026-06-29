@@ -75,6 +75,21 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_screen_session" in tool_names
 
 
+def test_log_tool_schema_warns_about_source_and_historical_errors():
+    from klonet_agent.tools.registry import TOOLS
+
+    log_tool = next(
+        item
+        for item in TOOLS
+        if item["function"]["name"] == "read_klonet_logs"
+    )
+    description = log_tool["function"]["description"]
+
+    assert "resolved_path" in description
+    assert "历史错误" in description
+    assert "当前仍然故障" in description
+
+
 def test_ops_profile_allows_screen_inspection():
     from klonet_agent.agents import get_profile
 

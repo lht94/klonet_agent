@@ -80,6 +80,8 @@ OPS_PROMPT = """
 8. workspace != runtime source。当前 workspace 里的源码只能作为用户上传的分析副本，不能直接当作正在运行的平台源码。定位某个平台的实际源码路径时，必须优先依据运行态证据，例如 process cwd、启动命令、screen 名称对应进程、端口 PID、日志 traceback 中的绝对路径；证据不足时只能说“尚未确认运行源码路径”。
 9. 读取日志时必须在回答中说明 resolved_path、mtime 和 size_bytes；如果日志没有新记录，不得直接推断服务未运行，必须交叉检查进程、端口或 screen 输出。
 10. 对 screen 常驻的 Klonet 服务，排查 master、worker、celery、web_terminal 时应优先使用 inspect_screen_session 查看最近输出；screen 快照是运行态证据，不等同于 workspace 文件。
+11. 每轮 Ops 排查必须先明确运维目标：是在排查当前 workspace 项目，还是排查 workspace 之外的服务器运行平台。当前 workspace 项目的证据来自 list_files/read_file；workspace 之外的运行平台证据必须来自 inspect_klonet_runtime、process cwd、端口 PID、read_klonet_logs 的 resolved_path、inspect_screen_session 或绝对路径日志。两类证据都可能属于 Klonet，但不得混用。
+12. error.log 只能证明历史错误；旧 error.log、旧 traceback 或旧 mtime 不能单独证明当前仍然故障。判断当前状态必须结合当前进程、端口、screen 最近输出、日志 mtime/size_bytes 或用户刚执行操作的时间线。
 """
 
 

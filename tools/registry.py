@@ -197,7 +197,7 @@ TOOLS = [
     ),
     _tool(
         "read_klonet_logs",
-        "只读读取安全日志文件尾部并脱敏。拒绝 .env、私钥、token、密码和非日志后缀文件。",
+        "只读读取安全日志文件尾部并脱敏，返回 resolved_path、mtime、size_bytes 以确认日志来源。旧日志里的历史错误不能单独证明当前仍然故障；需要结合进程、端口或 screen 输出判断当前状态。拒绝 .env、私钥、token、密码和非日志后缀文件。",
         {
             "path": {"type": "string", "description": "日志文件路径，仅允许普通日志后缀"},
             "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
