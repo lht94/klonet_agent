@@ -107,8 +107,8 @@ def test_satellite_query_routes_to_satellite_domain():
     assert "satellite" in route.domains
 
 
-def test_current_server_startup_path_is_retrievable():
-    """103 platform startup should prefer the current server Python path correction."""
+def test_multi_platform_startup_runbook_is_retrievable():
+    """Platform startup should prefer the generic conflict-aware runbook."""
 
     from klonet_agent.knowledge.retriever import KnowledgeRetriever
 
@@ -120,7 +120,7 @@ def test_current_server_startup_path_is_retrievable():
     )
 
     assert results
-    assert results[0].path == "knowledge/klonet/ops/current_server_startup_path.md"
+    assert results[0].path == "knowledge/klonet/ops/multi_platform_startup.md"
     assert "/usr/local/python3/bin/gunicorn" in results[0].snippet
 
 

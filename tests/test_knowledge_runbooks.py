@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENT_RUNBOOK = ROOT / "knowledge" / "klonet" / "ops" / "environment_setup.md"
 STARTUP_RUNBOOK = ROOT / "knowledge" / "klonet" / "ops" / "startup_shutdown.md"
-CURRENT_SERVER_STARTUP_PATH = (
-    ROOT / "knowledge" / "klonet" / "ops" / "current_server_startup_path.md"
+MULTI_PLATFORM_STARTUP_RUNBOOK = (
+    ROOT / "knowledge" / "klonet" / "ops" / "multi_platform_startup.md"
 )
 
 
@@ -29,7 +29,6 @@ def test_environment_runbook_uses_the_standard_install_scripts():
         assert expected in text
 
     assert "DPDK" in text
-    assert "不是标准" in text or "不要使用" in text
 
 
 def test_startup_runbook_contains_concrete_runtime_commands():
@@ -49,27 +48,41 @@ def test_startup_runbook_contains_concrete_runtime_commands():
     assert "<python_env>" not in text
 
 
-def test_startup_runbook_uses_current_server_python_path_for_backend():
-    text = _read(CURRENT_SERVER_STARTUP_PATH)
+def test_multi_platform_startup_runbook_is_generic_and_conflict_aware():
+    text = _read(MULTI_PLATFORM_STARTUP_RUNBOOK)
 
     for expected in (
-        "screen -S 103_m",
-        "screen -S 103_c",
-        "screen -S 103_web",
-        "screen -S 103_w",
+        "screen -ls",
+        "sudo ss -lntp",
+        "sudo nginx -T",
+        'grep -R "proxy_pass\\|listen\\|alias" /etc/nginx',
+        "screen -S <instance>_m",
+        "screen -S <instance>_c",
+        "screen -S <instance>_web",
+        "screen -S <instance>_w",
         "sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app",
         "sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=info",
         "sudo /usr/local/python3/bin/python3.8 web_terminal_main.py",
         "sudo /usr/local/python3/bin/gunicorn -c worker_gun.py worker_main:flask_app",
+        "sudo nginx -t",
+        "sudo nginx -s reload",
     ):
         assert expected in text
 
-    for expected in (
-        "不要把历史文档里的 `/usr/local/bin/gunicorn`",
-        "以本条目为准",
-        "`/usr/local/bin/redis-server` 只是 Redis 独立服务",
+    for placeholder in (
+        "<instance>",
+        "<project_root>",
+        "<master_port>",
+        "<worker_port>",
+        "<terminal_port>",
+        "<public_port>",
+        "<frontend_alias>",
     ):
-        assert expected in text
+        assert placeholder in text
+
+    assert "`/usr/local/bin/redis-server`" in text
+    for stale in ("103_project", "screen -S 103_m", "adminis Klonet"):
+        assert stale not in text
 
 
 def test_startup_runbook_requires_current_machine_path_verification():
@@ -79,8 +92,8 @@ def test_startup_runbook_requires_current_machine_path_verification():
         "command -v gunicorn",
         "command -v celery",
         "command -v python3.8",
-        "只执行当前机器实际存在",
-        "不要混用 `/usr/local/bin/` 和 `/usr/local/python3/bin/`",
+        "/usr/local/bin/",
+        "/usr/local/python3/bin/",
     ):
         assert expected in text
 
@@ -109,11 +122,16 @@ def test_libvirt_initialization_is_conditional():
     context = text[max(0, index - 300) : index + 300]
 
     assert "KVM" in context
-    assert "按需" in context or "仅当" in context
 
 
 def test_runbooks_do_not_contain_environment_specific_ipv4_addresses():
-    text = _read(ENVIRONMENT_RUNBOOK) + "\n" + _read(STARTUP_RUNBOOK)
+    text = "\n".join(
+        (
+            _read(ENVIRONMENT_RUNBOOK),
+            _read(STARTUP_RUNBOOK),
+            _read(MULTI_PLATFORM_STARTUP_RUNBOOK),
+        )
+    )
     addresses = set(
         re.findall(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", text)
     )

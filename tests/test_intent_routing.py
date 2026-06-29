@@ -405,7 +405,7 @@ def test_intent_routes_to_document_collection_before_bm25():
 
     assert recorder.request.collections == ("klonet_runtime_startup",)
     assert recorder.request.allowed_paths == (
-        "knowledge/klonet/ops/current_server_startup_path.md",
+        "knowledge/klonet/ops/multi_platform_startup.md",
         "knowledge/klonet/ops/startup_shutdown.md",
     )
 

@@ -2,7 +2,7 @@
   "collection_id": "klonet_runtime_startup",
   "title": "Klonet platform startup, stop and restart runbook",
   "paths": [
-    "knowledge/klonet/ops/current_server_startup_path.md",
+    "knowledge/klonet/ops/multi_platform_startup.md",
     "knowledge/klonet/ops/startup_shutdown.md"
   ],
   "task_types": ["deployment_guidance", "operation_guide", "troubleshooting"],
