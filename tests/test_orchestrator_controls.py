@@ -265,6 +265,70 @@ class StreamingToolThenAnswerLLM:
         )
 
 
+class OpsPlanInjectionLLM:
+    """First requests runtime inspection, then records the final-answer context."""
+
+    def __init__(self):
+        self.calls = []
+        self.answer_calls = 0
+
+    def complete(self, messages, tools, stream=False):
+        self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+        if tools is None:
+            return _intent_response(
+                json.dumps(
+                    {
+                        "intent": {
+                            "scope": "klonet",
+                            "task_type": "operation_guide",
+                            "operation": "platform_start",
+                            "confidence": 0.95,
+                        }
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        self.answer_calls += 1
+        if self.answer_calls == 1:
+            return iter(
+                [
+                    _stream_chunk(
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="runtime-1",
+                                function=SimpleNamespace(
+                                    name="inspect_klonet_runtime",
+                                    arguments='{"checks":["redis","docker_containers","ports","screen"]}',
+                                ),
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                        usage=SimpleNamespace(total_tokens=4),
+                    )
+                ]
+            )
+        return iter(
+            [
+                _stream_chunk(content="按当前环境启动建议如下"),
+                _stream_chunk(finish_reason="stop", usage=SimpleNamespace(total_tokens=6)),
+            ]
+        )
+
+
+class StaticOpsExecutor:
+    def run(self, tool_name, tool_args):
+        return "\n".join(
+            [
+                "inspect_klonet_runtime",
+                "- redis: detected - active",
+                "- docker_containers: detected - redis_102 Up 6 days",
+                "- ports: detected - LISTEN 0 4096 0.0.0.0:12000",
+                "- screen: detected - 102_m lht_m",
+            ]
+        )
+
+
 class StreamTimeoutError(Exception):
     pass
 
@@ -953,6 +1017,49 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
     assert "工具结果摘要：" in output
     assert "下一步：" in output
     assert "思考摘要" not in output
+
+
+def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):
+    """Ops final answers should be constrained by a deterministic environment plan."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = OpsPlanInjectionLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="ops",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=session,
+            llm=llm,
+            tool_executor=StaticOpsExecutor(),
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat("我怎么启动 Klonet", history, 0)
+
+    final_messages = _answer_calls(llm)[1]["messages"]
+    plan_messages = [
+        message["content"]
+        for message in final_messages
+        if message["role"] == "system"
+        and "Ops deterministic environment plan" in message["content"]
+    ]
+
+    assert plan_messages
+    assert "step=redis action=skip" in plan_messages[0]
+    assert "step=docker action=skip" in plan_messages[0]
+    assert "step=gunicorn action=verify" in plan_messages[0]
 
 
 def test_ops_tool_observation_is_appended_to_shared_memory(capsys):

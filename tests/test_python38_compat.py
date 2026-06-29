@@ -15,6 +15,7 @@ RUNTIME_PATHS = (
     "knowledge",
     "llm",
     "memory",
+    "ops",
     "orchestrator.py",
     "prompts.py",
     "session.py",

@@ -42,6 +42,7 @@ from klonet_agent.knowledge.turn_intent import (
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
+from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
 from klonet_agent.tools import TOOLS, ToolExecutor
@@ -543,6 +544,7 @@ class AgentOrchestrator:
         turn_scope_message = self._build_turn_scope_message(effective_user_input)
         history.append(turn_scope_message)
         turn_answer_policy_message = None
+        ops_environment_plan_message = None
         if self.profile.name == "mentor":
             turn_answer_policy_message = {
                 "role": "system",
@@ -557,6 +559,28 @@ class AgentOrchestrator:
                 ),
             }
             history.append(turn_answer_policy_message)
+
+        def refresh_ops_environment_plan():
+            nonlocal ops_environment_plan_message
+            if self.profile.name != "ops":
+                return
+            operation = (
+                self._query_intent.operation
+                if self._query_intent is not None
+                else "unknown"
+            )
+            plan = build_ops_environment_plan(
+                user_input=effective_user_input,
+                operation=operation,
+                tool_events=tool_events,
+            )
+            if not plan:
+                return
+            if ops_environment_plan_message is None:
+                ops_environment_plan_message = {"role": "system", "content": plan}
+                history.append(ops_environment_plan_message)
+            else:
+                ops_environment_plan_message["content"] = plan
 
         # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
         while tool_rounds < self._max_tool_rounds():
@@ -658,6 +682,7 @@ class AgentOrchestrator:
                             "result": result,
                         }
                     )
+                    refresh_ops_environment_plan()
 
                     tool_msg = {
                         "role": "tool",
@@ -753,6 +778,7 @@ class AgentOrchestrator:
             if (
                 message is not turn_scope_message
                 and message is not turn_answer_policy_message
+                and message is not ops_environment_plan_message
                 and message is not turn_resume_message
             )
         ]
