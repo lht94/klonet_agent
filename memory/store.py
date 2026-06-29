@@ -11,7 +11,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from klonet_agent.config import MEMORY_DIR
+from klonet_agent.config import (
+    MEMORY_DIR,
+    SHARED_OPS_MEMORY_RECENT_DAYS,
+    SHARED_OPS_MEMORY_SEARCH_LIMIT,
+)
 
 
 _UTC8 = timezone(timedelta(hours=8))
@@ -119,6 +123,94 @@ class MemoryStore:
             chunks.append(path.read_text(encoding="utf-8"))
         return "\n\n".join(chunks)
 
+    def append_shared_ops_record(
+        self,
+        *,
+        question: str,
+        intent: str,
+        target: str,
+        tools: list[str],
+        evidence: list[str],
+        conclusion: str,
+        confidence: str,
+        caveat: str,
+    ):
+        """Append one structured Ops diagnosis record to shared daily memory."""
+
+        now = datetime.now(_UTC8).isoformat(timespec="seconds")
+        tool_text = ", ".join(tools) if tools else "none"
+        evidence_lines = evidence or ["no reusable evidence captured"]
+        block = "\n".join(
+            [
+                "## Ops 诊断记录",
+                f"- time: {now}",
+                f"- question: {_one_line(question, 500)}",
+                f"- intent: {_one_line(intent, 160)}",
+                f"- target: {_one_line(target, 160)}",
+                f"- tools: {tool_text}",
+                "- evidence:",
+                *[f"  - {_one_line(item, 260)}" for item in evidence_lines[:8]],
+                f"- conclusion: {_one_line(conclusion, 700)}",
+                f"- confidence: {_one_line(confidence, 80)}",
+                f"- caveat: {_one_line(caveat, 260)}",
+            ]
+        )
+        self.append_shared_episode(block)
+
+    def read_shared_memory(
+        self,
+        *,
+        today: str | None = None,
+        recent_days: int = SHARED_OPS_MEMORY_RECENT_DAYS,
+    ) -> str:
+        """Read recent shared Ops memory that is safe to inject automatically."""
+
+        base = self.shared_dir or (self.memory_dir / "shared" / "ops")
+        if not base.exists():
+            return ""
+        today_date = _parse_date(today) if today else datetime.now(_UTC8).date()
+        if today_date is None:
+            today_date = datetime.now(_UTC8).date()
+        day_count = max(1, recent_days)
+        start_date = today_date - timedelta(days=day_count - 1)
+        chunks = []
+        for path in sorted(base.glob("*.md")):
+            file_date = _parse_date(path.stem)
+            if file_date is None or file_date < start_date or file_date > today_date:
+                continue
+            chunks.append(path.read_text(encoding="utf-8"))
+        return "\n\n".join(chunks)
+
+    def search_shared_memory(
+        self,
+        query: str,
+        max_results: int = SHARED_OPS_MEMORY_SEARCH_LIMIT,
+    ) -> str:
+        """Search all shared Ops memories, including archived days."""
+
+        base = self.shared_dir or (self.memory_dir / "shared" / "ops")
+        if not base.exists():
+            return "未检索到匹配的共享 Ops 记忆。"
+        terms = _search_terms(query)
+        scored = []
+        for path in sorted(base.glob("*.md"), reverse=True):
+            text = path.read_text(encoding="utf-8")
+            lowered = text.lower()
+            score = sum(1 for term in terms if term in lowered)
+            if score <= 0:
+                continue
+            scored.append((score, path.name, text))
+        if not scored:
+            return "未检索到匹配的共享 Ops 记忆。"
+        chunks = [
+            "以下是历史共享 Ops 记忆检索结果，只能作为线索；用于当前诊断前必须再用本轮工具确认："
+        ]
+        for _, name, text in sorted(scored, key=lambda item: (-item[0], item[1]))[
+            : max(1, max_results)
+        ]:
+            chunks.append(f"\n## {name}\n{_truncate_text(text.strip(), 1200)}")
+        return "\n".join(chunks)
+
     def read_memory(self) -> str:
         """读取长期记忆 MEMORY.md。"""
 
@@ -182,11 +274,17 @@ class MemoryStore:
         current_memory = self.read_memory()
         current_user = self.read_user()
         shared_ops_memory = self.read_shared_memory()
+        shared_ops_policy = (
+            f"仅自动注入最近 {SHARED_OPS_MEMORY_RECENT_DAYS} 天的共享 Ops 诊断记录；"
+            "更早记录需要通过 search_shared_ops_memory 按需检索。"
+            "共享记忆是历史线索，不是当前事实，使用前必须结合本轮工具结果确认。"
+        )
         return f"""
             【当前长期记忆 (MEMORY.md)】
             {current_memory}
 
             【多用户共享 Ops 情景记忆】
+            {shared_ops_policy}
             {shared_ops_memory}
 
             【用户画像与偏好 (USER.md)】
@@ -215,6 +313,45 @@ def _append_markdown_once(path: Path, content: str):
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(existing.rstrip() + "\n\n" + block + "\n", encoding="utf-8")
+
+
+def _parse_date(value: str | None):
+    """Parse YYYY-MM-DD dates from shared memory file names."""
+
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _search_terms(query: str) -> list[str]:
+    """Build simple terms for lightweight markdown memory retrieval."""
+
+    lowered = (query or "").strip().lower()
+    terms = []
+    for part in lowered.replace("/", " ").replace("_", " ").split():
+        if part and part not in terms:
+            terms.append(part)
+    if lowered and lowered not in terms:
+        terms.append(lowered)
+    return terms or [lowered]
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    """Return a bounded text snippet."""
+
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 20].rstrip() + "\n...（已截断）"
+
+
+def _one_line(value: str, max_chars: int) -> str:
+    """Collapse markdown/newlines for structured memory fields."""
+
+    text = " ".join((value or "").split())
+    return _truncate_text(text, max_chars)
 
 
 def _safe_path_component(value: str) -> str:

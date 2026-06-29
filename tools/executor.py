@@ -126,6 +126,12 @@ class ToolExecutor:
         if tool_name == "inspect_screen_session":
             return inspect_screen_session(tool_args)
 
+        if tool_name == "search_shared_ops_memory":
+            return self.memory_store.search_shared_memory(
+                tool_args["query"],
+                tool_args.get("max_results", 5),
+            )
+
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))
 

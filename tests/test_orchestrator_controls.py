@@ -974,8 +974,13 @@ def test_ops_tool_observation_is_appended_to_shared_memory(capsys):
         history = orchestrator.init_history()
         orchestrator.single_chat("看看有哪些平台", history, 0)
 
-        assert "inspect_klonet_runtime" in memory_store.read_shared_memory()
-        assert "102_m lht_m" in memory_store.read_shared_memory()
+        shared = memory_store.read_shared_memory()
+
+        assert "## Ops 诊断记录" in shared
+        assert "- question: 看看有哪些平台" in shared
+        assert "inspect_klonet_runtime" in shared
+        assert "102_m lht_m" in shared
+        assert "- conclusion: 当前有 102 和 lht。" in shared
 
 
 def test_brief_mode_prints_only_final_answer(capsys):

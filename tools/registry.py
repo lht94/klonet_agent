@@ -217,6 +217,21 @@ TOOLS = [
         ["session"],
     ),
     _tool(
+        "search_shared_ops_memory",
+        "按需检索多用户共享 Ops 记忆中的历史诊断记录。用于查找超过最近几天未自动注入的相似问题；返回内容只能作为历史线索，不能直接当作当前环境事实。",
+        {
+            "query": {
+                "type": "string",
+                "description": "要检索的历史问题、平台名、服务名、端口、报错或诊断关键词",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "最多返回多少条日期文件结果，默认 5",
+            },
+        },
+        ["query"],
+    ),
+    _tool(
         "list_files",
         "列出当前 workspace 内的文件或目录。",
         {"path": {"type": "string", "description": "workspace 内相对路径，默认 ."}},

@@ -131,3 +131,45 @@ def test_shared_ops_memory_is_visible_across_users():
 
         assert "102_m and lht_m" in second.read_shared_memory()
         assert "102_m and lht_m" in second.memory_prompt()
+
+
+def test_shared_ops_memory_only_injects_recent_days():
+    """最近几天的共享 Ops 记忆自动注入，旧记录不自动注入。"""
+
+    from klonet_agent.memory.store import MemoryStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = MemoryStore.for_session(temp_dir, "u1", "p1")
+        shared_dir = store.shared_dir
+        assert shared_dir is not None
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        (shared_dir / "2026-06-29.md").write_text("recent diagnostic\n", encoding="utf-8")
+        (shared_dir / "2026-06-01.md").write_text("old diagnostic\n", encoding="utf-8")
+
+        injected = store.read_shared_memory(today="2026-06-29", recent_days=3)
+
+    assert "recent diagnostic" in injected
+    assert "old diagnostic" not in injected
+
+
+def test_shared_ops_memory_can_search_archived_days_on_demand():
+    """旧共享记忆不自动注入，但可以按需检索。"""
+
+    from klonet_agent.memory.store import MemoryStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = MemoryStore.for_session(temp_dir, "u1", "p1")
+        shared_dir = store.shared_dir
+        assert shared_dir is not None
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        (shared_dir / "2026-06-01.md").write_text(
+            "question: 怎么启动新平台\nconclusion: Redis 是共享依赖\n",
+            encoding="utf-8",
+        )
+
+        result = store.search_shared_memory("Redis 新平台")
+
+    assert "2026-06-01.md" in result
+    assert "Redis 是共享依赖" in result

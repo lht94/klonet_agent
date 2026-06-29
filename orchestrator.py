@@ -643,7 +643,6 @@ class AgentOrchestrator:
                     result = self.use_tool(tool_name, tool_args)
                     print_progress(f"工具完成：{tool_name}")
                     self._print_tool_loop_observation(tool_name, result)
-                    self._record_ops_shared_observation(tool_name, tool_args, result)
                     tool_events.append(
                         {
                             "name": tool_name,
@@ -724,6 +723,7 @@ class AgentOrchestrator:
 
                 history.append(assistant_msg)
                 self.memory_store.append_history(assistant_msg)
+                self._record_ops_shared_turn(effective_user_input, tool_events, reply)
                 self._last_turn_state = self._snapshot_turn_state(effective_user_input)
                 self._paused_turn_state = None
                 break
@@ -782,6 +782,96 @@ class AgentOrchestrator:
         evidence_line = self._first_evidence_line(result) or "工具没有返回可展示的摘要。"
         print(f"Klonet Agent：工具结果摘要：{tool_name} -> {evidence_line}")
         print("Klonet Agent：下一步：把该结果交给模型判断是否继续调用工具或形成诊断结论。")
+
+    def _record_ops_shared_turn(
+        self,
+        user_input: str,
+        tool_events: list[dict],
+        reply: str,
+    ) -> None:
+        """Persist one completed Ops diagnosis as structured shared memory."""
+
+        if self.profile.name != "ops" or not tool_events:
+            return
+        reusable_tools = {
+            "inspect_klonet_runtime",
+            "inspect_system_environment",
+            "inspect_screen_session",
+            "read_klonet_logs",
+            "search_shared_ops_memory",
+            "search_knowledge",
+            "search_code",
+            "list_source_files",
+        }
+        useful_events = [
+            event for event in tool_events if event.get("name") in reusable_tools
+        ]
+        if not useful_events:
+            return
+        evidence = []
+        for event in useful_events:
+            evidence_line = self._shared_evidence_line(
+                str(event.get("name") or ""),
+                str(event.get("result") or ""),
+            )
+            if evidence_line:
+                evidence.append(f"{event.get('name')}: {evidence_line}")
+        if not evidence:
+            return
+        self.memory_store.append_shared_ops_record(
+            question=user_input,
+            intent=self._ops_turn_intent_summary(),
+            target=self._infer_ops_target(user_input),
+            tools=[str(event.get("name") or "") for event in useful_events],
+            evidence=evidence,
+            conclusion=reply,
+            confidence=self._ops_memory_confidence(useful_events),
+            caveat=(
+                "运行态证据会随进程、端口、日志和 screen 输出变化而过期；"
+                "再次使用该记录前必须用当前工具结果确认。"
+            ),
+        )
+
+    def _ops_turn_intent_summary(self) -> str:
+        """Return a compact intent label for shared Ops memory."""
+
+        if self._turn_intent is None:
+            return "unknown"
+        parts = [self._turn_intent.task_type or "unknown"]
+        if self._turn_intent.operation and self._turn_intent.operation != "unknown":
+            parts.append(self._turn_intent.operation)
+        if self._turn_intent.phase and self._turn_intent.phase != "unknown":
+            parts.append(self._turn_intent.phase)
+        return " / ".join(parts)
+
+    def _infer_ops_target(self, user_input: str) -> str:
+        """Infer the rough runtime target from the user's question."""
+
+        text = user_input or ""
+        lowered = text.lower()
+        targets = []
+        for marker in ("102", "lht", "master", "worker", "celery", "web"):
+            if marker in lowered and marker not in targets:
+                targets.append(marker)
+        if any(word in text for word in ("哪些平台", "所有平台", "全部平台", "冲突")):
+            targets.append("全机平台")
+        return ", ".join(targets) if targets else "未确认"
+
+    def _ops_memory_confidence(self, useful_events: list[dict]) -> str:
+        """Give a coarse trust level for a stored Ops diagnosis."""
+
+        tool_names = {str(event.get("name") or "") for event in useful_events}
+        runtime_tools = {
+            "inspect_klonet_runtime",
+            "inspect_system_environment",
+            "inspect_screen_session",
+            "read_klonet_logs",
+        }
+        if len(useful_events) >= 2 and tool_names & runtime_tools:
+            return "medium-high"
+        if tool_names & runtime_tools:
+            return "medium"
+        return "low"
 
     def _record_ops_shared_observation(
         self,

@@ -73,6 +73,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_klonet_runtime" in tool_names
     assert "read_klonet_logs" in tool_names
     assert "inspect_screen_session" in tool_names
+    assert "search_shared_ops_memory" in tool_names
 
 
 def test_log_tool_schema_warns_about_source_and_historical_errors():
