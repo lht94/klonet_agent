@@ -37,3 +37,15 @@ def test_ops_prompt_separates_workspace_from_runtime_source():
     assert "workspace != runtime source" in OPS_PROMPT
     assert "process cwd" in OPS_PROMPT
     assert "traceback" in OPS_PROMPT
+
+
+def test_ops_prompt_requires_target_evidence_scope_for_logs():
+    """Ops should separate workspace project evidence from external runtime evidence."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "运维目标" in OPS_PROMPT
+    assert "当前 workspace 项目" in OPS_PROMPT
+    assert "workspace 之外" in OPS_PROMPT
+    assert "error.log 只能证明历史错误" in OPS_PROMPT
+    assert "不能单独证明当前仍然故障" in OPS_PROMPT
