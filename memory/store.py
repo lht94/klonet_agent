@@ -107,6 +107,36 @@ class MemoryStore:
         date = datetime.now(_UTC8).strftime("%Y-%m-%d")
         return base / f"{date}.md"
 
+    def shared_ops_baseline_path(self) -> Path:
+        """Return the semi-permanent shared Ops environment baseline path."""
+
+        base = self.shared_dir or (self.memory_dir / "shared" / "ops")
+        return base / "BASELINE.md"
+
+    def write_shared_ops_baseline(self, content: str):
+        """Overwrite the shared Ops baseline snapshot."""
+
+        path = self.shared_ops_baseline_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(_UTC8).isoformat(timespec="seconds")
+        body = "\n".join(
+            [
+                "# Ops 半永久环境基线",
+                "",
+                f"- updated_at: {stamp}",
+                "",
+                content.strip(),
+                "",
+            ]
+        )
+        path.write_text(body, encoding="utf-8")
+
+    def read_shared_ops_baseline(self) -> str:
+        """Read the semi-permanent shared Ops environment baseline."""
+
+        path = self.shared_ops_baseline_path()
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
     def append_shared_episode(self, content: str):
         """向多用户共享 Ops 情景记忆追加已验证工具证据。"""
 
@@ -273,6 +303,7 @@ class MemoryStore:
 
         current_memory = self.read_memory()
         current_user = self.read_user()
+        shared_ops_baseline = self.read_shared_ops_baseline()
         shared_ops_memory = self.read_shared_memory()
         shared_ops_policy = (
             f"仅自动注入最近 {SHARED_OPS_MEMORY_RECENT_DAYS} 天的共享 Ops 诊断记录；"
@@ -286,6 +317,10 @@ class MemoryStore:
             【多用户共享 Ops 情景记忆】
             {shared_ops_policy}
             {shared_ops_memory}
+
+            【多用户共享 Ops 半永久环境基线】
+            这部分来自 inspect_ops_context 的 baseline 快照，可作为 Ubuntu/内核/架构/CPU/内存/磁盘/虚拟化/工具版本等低频变化事实的起点；涉及端口、进程、服务、screen、容器等运行态问题时仍必须刷新 runtime。
+            {shared_ops_baseline}
 
             【用户画像与偏好 (USER.md)】
             {current_user}

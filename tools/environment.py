@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional, Sequence
 
 
 MAX_LOG_CHARS = 8000
@@ -20,6 +20,52 @@ PROBE_TIMEOUT_SECONDS = 5
 STATUS_DETECTED = "detected"
 STATUS_MISSING = "missing"
 STATUS_UNCHECKED = "unchecked"
+OPS_BASELINE_CHECKS = (
+    "os_release",
+    "kernel",
+    "arch",
+    "cpu",
+    "memory",
+    "disk",
+    "virtualization",
+    "python",
+    "rust",
+    "docker_version",
+    "compose_version",
+    "ovs",
+    "kvm",
+    "libvirt",
+)
+OPS_RUNTIME_CHECKS = (
+    "ports",
+    "services",
+    "screen",
+    "processes",
+    "docker_containers",
+    "docker_images",
+    "docker_networks",
+    "redis",
+    "mysql",
+    "rabbitmq",
+    "nginx",
+)
+OPS_CONTEXT_SECTIONS = ("baseline", "runtime", "assets")
+DEPLOYMENT_ASSET_NAMES = {
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    "dockerfile",
+    "gun.py",
+    "worker_gun.py",
+    "master_main.py",
+    "worker_main.py",
+    "web_terminal_main.py",
+    "celery_worker.py",
+    "config.py",
+    "nginx.conf",
+}
+DEPLOYMENT_ASSET_SUFFIXES = {".service", ".conf", ".ini", ".yml", ".yaml", ".toml"}
 
 _SENSITIVE_NAME_PARTS = (
     ".env",
@@ -60,11 +106,11 @@ class ProbeResult:
         return f"- {self.name}: {self.status} - {self.detail}"
 
 
-def inspect_system_environment(args: dict | None = None) -> str:
+def inspect_system_environment(args: Optional[dict] = None) -> str:
     """Inspect basic local system facts without modifying the host."""
 
     requested = _requested_checks(args, default=("os", "python", "disk", "virtualization"))
-    results: list[ProbeResult] = []
+    results = []
     if "os" in requested:
         results.append(
             ProbeResult(
@@ -85,7 +131,7 @@ def inspect_system_environment(args: dict | None = None) -> str:
     return _render_tool_result("inspect_system_environment", results)
 
 
-def inspect_klonet_runtime(args: dict | None = None) -> str:
+def inspect_klonet_runtime(args: Optional[dict] = None) -> str:
     """Inspect local runtime hints relevant to Klonet troubleshooting."""
 
     requested = _requested_checks(
@@ -105,7 +151,25 @@ def inspect_klonet_runtime(args: dict | None = None) -> str:
     return _render_tool_result("inspect_klonet_runtime", results)
 
 
-def read_klonet_logs(args: dict | None = None) -> str:
+def inspect_ops_context(args: Optional[dict] = None) -> str:
+    """Collect Ops baseline, runtime and deployment-asset context in one pass."""
+
+    args = args or {}
+    sections = _requested_sections(args)
+    lines = ["inspect_ops_context"]
+    if "baseline" in sections:
+        lines.append("## baseline")
+        lines.extend(result.render() for result in _ops_probe_many(OPS_BASELINE_CHECKS))
+    if "runtime" in sections:
+        lines.append("## runtime")
+        lines.extend(result.render() for result in _ops_probe_many(OPS_RUNTIME_CHECKS))
+    if "assets" in sections:
+        lines.append("## assets")
+        lines.extend(_scan_deployment_assets(args))
+    return "\n".join(lines)
+
+
+def read_klonet_logs(args: Optional[dict] = None) -> str:
     """Read a safe tail of a whitelisted log file and redact sensitive values."""
 
     args = args or {}
@@ -151,7 +215,7 @@ def read_klonet_logs(args: dict | None = None) -> str:
     )
 
 
-def inspect_screen_session(args: dict | None = None) -> str:
+def inspect_screen_session(args: Optional[dict] = None) -> str:
     """Capture a read-only snapshot of a detached screen session scrollback."""
 
     args = args or {}
@@ -169,7 +233,7 @@ def inspect_screen_session(args: dict | None = None) -> str:
         )
 
     max_chars = _safe_int(args.get("max_chars"), MAX_SCREEN_CHARS)
-    snapshot_path: Path | None = None
+    snapshot_path = None
     try:
         with tempfile.NamedTemporaryFile(
             prefix="klonet-screen-",
@@ -272,7 +336,80 @@ def _redact_match(match: re.Match) -> str:
     return "[REDACTED]"
 
 
-def _requested_checks(args: dict | None, *, default: tuple[str, ...]) -> tuple[str, ...]:
+def _ops_probe_many(checks: Sequence[str]):
+    for check in checks:
+        if check == "disk":
+            yield _disk_usage_probe()
+        else:
+            yield run_read_only_probe(check)
+
+
+def _requested_sections(args: dict) -> tuple:
+    raw_sections = args.get("sections")
+    if not isinstance(raw_sections, list) or not raw_sections:
+        return OPS_CONTEXT_SECTIONS
+    sections = []
+    for section in raw_sections:
+        normalized = str(section or "").strip().lower()
+        if normalized in OPS_CONTEXT_SECTIONS and normalized not in sections:
+            sections.append(normalized)
+    return tuple(sections) or OPS_CONTEXT_SECTIONS
+
+
+def _scan_deployment_assets(args: dict):
+    roots = args.get("asset_roots")
+    if not isinstance(roots, list) or not roots:
+        roots = [str(Path.cwd())]
+    max_assets = _safe_int(args.get("max_assets"), 100)
+    shown = 0
+    rows = []
+    for raw_root in roots:
+        root = Path(str(raw_root or "")).expanduser()
+        if not root.exists() or not root.is_dir():
+            rows.append(
+                ProbeResult(
+                    "asset_roots",
+                    STATUS_UNCHECKED,
+                    f"{root} does not exist or is not a directory",
+                ).render()
+            )
+            continue
+        matches = []
+        for path in root.rglob("*"):
+            if shown >= max_assets:
+                break
+            if not path.is_file() or _is_sensitive_path(path):
+                continue
+            if _is_deployment_asset(path):
+                matches.append(str(path.relative_to(root)))
+                shown += 1
+        if matches:
+            rows.append(
+                ProbeResult(
+                    "asset_roots",
+                    STATUS_DETECTED,
+                    f"{root}: " + ", ".join(matches[:max_assets]),
+                ).render()
+            )
+        else:
+            rows.append(
+                ProbeResult(
+                    "asset_roots",
+                    STATUS_MISSING,
+                    f"{root}: no deployment assets found",
+                ).render()
+            )
+    return rows
+
+
+def _is_deployment_asset(path: Path) -> bool:
+    lower_name = path.name.lower()
+    if lower_name in DEPLOYMENT_ASSET_NAMES or lower_name.startswith("dockerfile"):
+        return True
+    return path.suffix.lower() in DEPLOYMENT_ASSET_SUFFIXES
+
+
+def _requested_checks(args: Optional[dict], *, default: tuple) -> tuple:
     checks = (args or {}).get("checks")
     if not isinstance(checks, list) or not checks:
         return default
@@ -284,16 +421,57 @@ def _requested_checks(args: dict | None, *, default: tuple[str, ...]) -> tuple[s
     return tuple(result) or default
 
 
-def _probe_command(name: str) -> list[str] | None:
+def _probe_command(name: str) -> Optional[list]:
     if os.name == "nt":
         return _windows_probe_command(name)
     return _posix_probe_command(name)
 
 
-def _posix_probe_command(name: str) -> list[str] | None:
+def _posix_probe_command(name: str) -> Optional[list]:
     commands = {
+        "os_release": ["sh", "-c", "cat /etc/os-release 2>/dev/null || uname -a"],
+        "kernel": ["uname", "-r"],
+        "arch": ["uname", "-m"],
+        "cpu": [
+            "sh",
+            "-c",
+            (
+                "lscpu 2>/dev/null | egrep 'Model name|CPU\\(s\\)|Architecture|Virtualization' "
+                "|| grep -m1 'model name' /proc/cpuinfo 2>/dev/null || true"
+            ),
+        ],
+        "memory": ["free", "-h"],
         "virtualization": ["sh", "-c", "egrep -c '(vmx|svm)' /proc/cpuinfo 2>/dev/null || true"],
+        "python": [
+            "sh",
+            "-c",
+            (
+                "command -v python3 2>/dev/null; python3 --version 2>&1; "
+                "command -v /usr/local/python3/bin/python3.8 2>/dev/null || true; "
+                "/usr/local/python3/bin/python3.8 --version 2>&1 || true; "
+                "command -v gunicorn 2>/dev/null || true; command -v celery 2>/dev/null || true"
+            ),
+        ],
+        "rust": [
+            "sh",
+            "-c",
+            "command -v rustc 2>/dev/null && rustc --version; command -v cargo 2>/dev/null && cargo --version",
+        ],
+        "docker_version": ["sh", "-c", "docker version --format '{{.Server.Version}}' 2>/dev/null || true"],
+        "compose_version": [
+            "sh",
+            "-c",
+            "docker compose version 2>/dev/null || docker-compose --version 2>/dev/null || true",
+        ],
         "ports": ["ss", "-ltnp"],
+        "services": [
+            "sh",
+            "-c",
+            (
+                "systemctl --type=service --state=running --no-pager --no-legend 2>/dev/null "
+                "| head -80 || service --status-all 2>/dev/null | head -80"
+            ),
+        ],
         "screen": ["screen", "-ls"],
         "processes": [
             "sh",
@@ -312,6 +490,13 @@ def _posix_probe_command(name: str) -> list[str] | None:
         ],
         "nginx": ["systemctl", "is-active", "nginx"],
         "docker": ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
+        "docker_containers": ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
+        "docker_images": [
+            "sh",
+            "-c",
+            "docker images --format '{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}' 2>/dev/null | head -100",
+        ],
+        "docker_networks": ["docker", "network", "ls", "--format", "{{.Name}}\t{{.Driver}}\t{{.Scope}}"],
         "redis": ["systemctl", "is-active", "redis"],
         "rabbitmq": ["systemctl", "is-active", "rabbitmq-server"],
         "mysql": ["systemctl", "is-active", "mysql"],
@@ -322,17 +507,33 @@ def _posix_probe_command(name: str) -> list[str] | None:
     return commands.get(name)
 
 
-def _windows_probe_command(name: str) -> list[str] | None:
+def _windows_probe_command(name: str) -> Optional[list]:
     commands = {
+        "os_release": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber"],
+        "kernel": ["powershell", "-NoProfile", "-Command", "[Environment]::OSVersion.VersionString"],
+        "arch": ["powershell", "-NoProfile", "-Command", "[Runtime.InteropServices.RuntimeInformation]::OSArchitecture"],
+        "cpu": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors"],
+        "memory": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory"],
         "virtualization": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty VirtualizationFirmwareEnabled"],
+        "python": ["powershell", "-NoProfile", "-Command", "python --version; py -3.8 --version 2>$null"],
+        "rust": ["powershell", "-NoProfile", "-Command", "rustc --version 2>$null; cargo --version 2>$null"],
+        "docker_version": ["powershell", "-NoProfile", "-Command", "docker version --format '{{.Server.Version}}' 2>$null"],
+        "compose_version": ["powershell", "-NoProfile", "-Command", "docker compose version 2>$null; docker-compose --version 2>$null"],
         "ports": ["powershell", "-NoProfile", "-Command", "Get-NetTCPConnection -State Listen | Select-Object -First 80 LocalAddress,LocalPort,OwningProcess"],
+        "services": ["powershell", "-NoProfile", "-Command", "Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object -First 80 Name,Status"],
         "screen": ["powershell", "-NoProfile", "-Command", "'screen is not a Windows service'"],
         "processes": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'vemu|klonet|gunicorn|celery|screen|master_main|worker_main|web_terminal' } | Select-Object -First 80 ProcessId,CommandLine"],
         "nginx": ["powershell", "-NoProfile", "-Command", "Get-Service nginx -ErrorAction SilentlyContinue | Select-Object Name,Status"],
         "docker": ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
+        "docker_containers": ["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Ports}}"],
+        "docker_images": ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}\t{{.ID}}\t{{.Size}}"],
+        "docker_networks": ["docker", "network", "ls", "--format", "{{.Name}}\t{{.Driver}}\t{{.Scope}}"],
         "redis": ["powershell", "-NoProfile", "-Command", "Get-Service redis* -ErrorAction SilentlyContinue | Select-Object Name,Status"],
         "rabbitmq": ["powershell", "-NoProfile", "-Command", "Get-Service rabbit* -ErrorAction SilentlyContinue | Select-Object Name,Status"],
         "mysql": ["powershell", "-NoProfile", "-Command", "Get-Service mysql* -ErrorAction SilentlyContinue | Select-Object Name,Status"],
+        "libvirt": ["powershell", "-NoProfile", "-Command", "'libvirt is not a Windows service'"],
+        "ovs": ["powershell", "-NoProfile", "-Command", "Get-Service *openvswitch* -ErrorAction SilentlyContinue | Select-Object Name,Status"],
+        "kvm": ["powershell", "-NoProfile", "-Command", "'kvm is not available on Windows'"],
     }
     return commands.get(name)
 

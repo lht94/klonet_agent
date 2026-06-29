@@ -154,6 +154,30 @@ TOOLS = [
         ["query", "intent"],
     ),
     _tool(
+        "inspect_ops_context",
+        "只读收集 Ops 全量环境上下文：baseline 适合半永久记录，runtime 需要按次刷新，assets 只扫描允许目录中的源码/Compose/Dockerfile/部署配置文件名。",
+        {
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["baseline", "runtime", "assets"],
+                },
+                "description": "要采集的上下文分区；默认采集 baseline、runtime、assets。",
+            },
+            "asset_roots": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "允许扫描部署资产的目录；默认当前工作目录。只返回文件名，不读取敏感配置正文。",
+            },
+            "max_assets": {
+                "type": "integer",
+                "description": "最多返回多少个部署资产文件名，默认 100。",
+            },
+        },
+        [],
+    ),
+    _tool(
         "inspect_system_environment",
         "只读检查本机基础环境状态，返回 detected/missing/unchecked。用于 Klonet 运维故障诊断，不会修改环境。",
         {

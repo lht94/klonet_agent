@@ -69,6 +69,7 @@ def test_environment_tools_are_registered_for_llm():
 
     tool_names = {item["function"]["name"] for item in TOOLS}
 
+    assert "inspect_ops_context" in tool_names
     assert "inspect_system_environment" in tool_names
     assert "inspect_klonet_runtime" in tool_names
     assert "read_klonet_logs" in tool_names
@@ -97,6 +98,57 @@ def test_ops_profile_allows_screen_inspection():
     profile = get_profile("ops")
 
     assert "inspect_screen_session" in profile.allowed_tools
+    assert "inspect_ops_context" in profile.allowed_tools
+
+
+def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    def fake_probe(name):
+        return environment.ProbeResult(name, "detected", f"{name}-detail")
+
+    monkeypatch.setattr(environment, "run_read_only_probe", fake_probe)
+    with local_temp_dir() as temp_dir:
+        (temp_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (temp_dir / "Dockerfile").write_text("FROM python:3.8\n", encoding="utf-8")
+
+        result = environment.inspect_ops_context(
+            {
+                "sections": ["baseline", "runtime", "assets"],
+                "asset_roots": [str(temp_dir)],
+            }
+        )
+
+    assert "inspect_ops_context" in result
+    assert "## baseline" in result
+    assert "os_release-detail" in result
+    assert "docker_version-detail" in result
+    assert "## runtime" in result
+    assert "ports-detail" in result
+    assert "docker_containers-detail" in result
+    assert "## assets" in result
+    assert "docker-compose.yml" in result
+    assert "Dockerfile" in result
+
+
+def test_executor_persists_ops_baseline_snapshot():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        result = ToolExecutor(
+            allowed_tools={"inspect_ops_context"},
+            memory_store=store,
+        ).run("inspect_ops_context", {"sections": ["baseline"]})
+
+        baseline = store.read_shared_ops_baseline()
+
+    assert "inspect_ops_context" in result
+    assert "## baseline" in baseline
+    assert "os_release" in baseline
 
 
 def test_screen_inspection_rejects_unsafe_session_name():

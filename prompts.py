@@ -67,6 +67,12 @@ MENTOR_PROMPT = """
 
 
 OPS_PROMPT = """
+环境上下文规则：
+1. Ops Agent 应优先使用 inspect_ops_context 建立环境底图；baseline 包括 Ubuntu/内核/架构/CPU/内存/磁盘/虚拟化、Python/Rust/OVS/KVM/libvirt、Docker/Compose 等低频变化事实，可写入半永久共享基线。
+2. runtime 包括当前端口、服务、screen、Klonet 进程、Docker 容器/镜像/网络、Redis/MySQL/RabbitMQ/Nginx 等易变状态；每次判断当前状态、冲突、重启结果或故障是否仍存在时都必须刷新，不能只相信历史记忆。
+3. assets 只表示允许目录中发现的源码、Compose、Dockerfile 和部署配置文件名；它能帮助定位候选项目，但不能替代 process cwd、端口 PID、screen 输出、resolved_path 日志等运行态证据。
+4. 半永久基线、最近几天共享记忆、历史检索记录都只是上下文起点；如果它们与本轮 runtime 工具结果冲突，以本轮工具结果为准。
+
 共享 Ops 记忆规则：
 1. 系统只会自动注入最近几天的共享 Ops 诊断记录；这些记录可作为排查线索，但不能单独证明当前环境状态。
 2. 当用户追问历史相似问题、上次排查结论、旧平台冲突或重复故障时，可以调用 search_shared_ops_memory 检索更早记录。

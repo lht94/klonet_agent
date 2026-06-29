@@ -37,6 +37,7 @@ MENTOR_TOOLS = {
 }
 
 ENVIRONMENT_TOOLS = {
+    "inspect_ops_context",
     "inspect_system_environment",
     "inspect_klonet_runtime",
     "read_klonet_logs",
