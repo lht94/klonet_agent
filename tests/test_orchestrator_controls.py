@@ -557,6 +557,54 @@ def test_klonet_search_budget_is_two():
     assert any("检索预算" in result for result in tool_results)
 
 
+def test_ops_klonet_search_budget_is_wider_than_mentor():
+    """Ops mode should allow more Klonet retrieval attempts during diagnosis loops."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = BatchSearchLLM()
+        executor = RecordingToolExecutor()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="ops",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=session,
+            llm=llm,
+            tool_executor=executor,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        _, history, _ = orchestrator.single_chat(
+            "Klonet 鎷撴墤閮ㄧ讲鎬庝箞瀹炵幇",
+            history,
+            0,
+        )
+
+    search_calls = [
+        call
+        for call in executor.calls
+        if call[0] == "search_knowledge"
+    ]
+    tool_results = [
+        message["content"]
+        for message in history
+        if message["role"] == "tool"
+    ]
+    assert len(search_calls) == 3
+    assert not any("retrieval budget" in result for result in tool_results)
+
+
 def test_mixed_search_budget_is_two_and_requires_split_answer():
     """mixed 问题检索两次，并要求分区组织两类依据。"""
 

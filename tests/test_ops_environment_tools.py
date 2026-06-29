@@ -72,6 +72,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_ops_context" in tool_names
     assert "inspect_system_environment" in tool_names
     assert "inspect_klonet_runtime" in tool_names
+    assert "read_ops_file" in tool_names
     assert "read_klonet_logs" in tool_names
     assert "inspect_screen_session" in tool_names
     assert "search_shared_ops_memory" in tool_names
@@ -99,6 +100,7 @@ def test_ops_profile_allows_screen_inspection():
 
     assert "inspect_screen_session" in profile.allowed_tools
     assert "inspect_ops_context" in profile.allowed_tools
+    assert "read_ops_file" in profile.allowed_tools
 
 
 def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):
@@ -149,6 +151,40 @@ def test_executor_persists_ops_baseline_snapshot():
     assert "inspect_ops_context" in result
     assert "## baseline" in baseline
     assert "os_release" in baseline
+
+
+def test_ops_file_reader_allows_config_and_redacts_secrets():
+    from klonet_agent.tools.environment import read_ops_file
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        config = temp_dir / "config.py"
+        config.write_text(
+            "master_port = 12000\nredis_password = 'abc123'\n",
+            encoding="utf-8",
+        )
+
+        result = read_ops_file({"path": str(config), "max_chars": 500})
+
+    assert "read_ops_file" in result
+    assert "resolved_path=" in result
+    assert "master_port = 12000" in result
+    assert "abc123" not in result
+    assert "[REDACTED]" in result
+
+
+def test_ops_file_reader_rejects_env_files():
+    from klonet_agent.tools.environment import read_ops_file
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        env_file = temp_dir / ".env"
+        env_file.write_text("OPENAI_API_KEY=secret", encoding="utf-8")
+
+        result = read_ops_file({"path": str(env_file)})
+
+    assert result.startswith("Error:")
+    assert "refused" in result.lower()
 
 
 def test_screen_inspection_rejects_unsafe_session_name():

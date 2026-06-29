@@ -279,7 +279,7 @@ class AgentOrchestrator:
         if tool_name != "search_knowledge":
             return self.tool_executor.run(tool_name, tool_args)
 
-        budget = RAG_SEARCH_BUDGETS[scope]
+        budget = self._rag_search_budget(scope)
         if self._knowledge_search_count >= budget:
             return (
                 f"本轮 {scope} 检索预算已用完（最多 {budget} 次）。"
@@ -295,6 +295,14 @@ class AgentOrchestrator:
                 f"{result}"
             )
         return result
+
+    def _rag_search_budget(self, scope: str) -> int:
+        """Return the per-turn knowledge retrieval budget for the active profile."""
+
+        base = RAG_SEARCH_BUDGETS.get(scope, RAG_SEARCH_BUDGETS["klonet"])
+        if self.profile.name == "ops" and scope in {"klonet", "mixed"}:
+            return max(base, 4)
+        return base
 
     def compress_memory(self, history: list[dict], token: int):
         """触发记忆复盘与压缩。"""
@@ -866,6 +874,7 @@ class AgentOrchestrator:
             "inspect_system_environment",
             "inspect_screen_session",
             "read_klonet_logs",
+            "read_ops_file",
         }
         if len(useful_events) >= 2 and tool_names & runtime_tools:
             return "medium-high"
@@ -888,6 +897,7 @@ class AgentOrchestrator:
             "inspect_system_environment",
             "inspect_screen_session",
             "read_klonet_logs",
+            "read_ops_file",
             "search_knowledge",
             "search_code",
             "list_source_files",
@@ -1206,17 +1216,19 @@ class AgentOrchestrator:
                 ]
             )
         elif route.scope == "mixed":
+            budget = self._rag_search_budget(route.scope)
             rules.extend(
                 [
                     "- 通用知识与 Klonet 证据需要分区回答。",
-                    "- 本轮 Klonet 知识检索最多 2 次。",
+                    f"- 本轮 Klonet 知识检索最多 {budget} 次。",
                 ]
             )
         else:
+            budget = self._rag_search_budget(route.scope)
             rules.extend(
                 [
                     "- Klonet RAG 是主要事实依据。",
-                    "- 本轮 Klonet 知识检索最多 2 次。",
+                    f"- 本轮 Klonet 知识检索最多 {budget} 次。",
                 ]
             )
         return {"role": "system", "content": "\n".join(rules)}

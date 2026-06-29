@@ -22,6 +22,7 @@ from klonet_agent.tools.environment import (
     inspect_ops_context,
     inspect_system_environment,
     read_klonet_logs,
+    read_ops_file,
 )
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
 from klonet_agent.tools.source_code import (
@@ -129,6 +130,9 @@ class ToolExecutor:
 
         if tool_name == "read_klonet_logs":
             return read_klonet_logs(tool_args)
+
+        if tool_name == "read_ops_file":
+            return read_ops_file(tool_args)
 
         if tool_name == "inspect_screen_session":
             return inspect_screen_session(tool_args)

@@ -229,6 +229,18 @@ TOOLS = [
         ["path"],
     ),
     _tool(
+        "read_ops_file",
+        "只读读取 Klonet 运维相关配置/源码/部署文件并脱敏，例如 config.py、nginx .conf、Compose、Dockerfile、systemd service、启动脚本和前端 config.js。可用于核对端口、路径、Nginx 路由和启动参数；不能读取 .env、私钥、token 或密码文件，也不能单独替代进程/端口/screen 的运行态证据。",
+        {
+            "path": {
+                "type": "string",
+                "description": "要读取的配置/源码/部署文件路径，可为服务器绝对路径；支持常见 .py/.conf/.yml/.yaml/.json/.ini/.service/.sh/.js 等运维文本文件。",
+            },
+            "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
+        },
+        ["path"],
+    ),
+    _tool(
         "inspect_screen_session",
         "只读抓取指定 screen 会话的当前窗口/滚屏快照，用于查看 master、worker、celery、web_terminal 最近输出。使用 screen hardcopy，不发送交互输入。",
         {

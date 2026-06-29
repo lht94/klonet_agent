@@ -41,6 +41,7 @@ ENVIRONMENT_TOOLS = {
     "inspect_system_environment",
     "inspect_klonet_runtime",
     "read_klonet_logs",
+    "read_ops_file",
     "inspect_screen_session",
     "search_shared_ops_memory",
 }

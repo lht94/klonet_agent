@@ -80,10 +80,24 @@ _SENSITIVE_NAME_PARTS = (
     "password",
 )
 _SAFE_LOG_SUFFIXES = {".log", ".txt", ".out", ".err"}
+_SAFE_OPS_FILE_SUFFIXES = {
+    ".py",
+    ".conf",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".js",
+    ".service",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
 _SAFE_SCREEN_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _SECRET_PATTERNS = (
     re.compile(
-        r"(?i)\b(password|passwd|pwd|api[_-]?key|secret|token)\s*[:=]\s*([^\s]+)"
+        r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
     ),
     re.compile(
         r"(?i)(--(?:password|passwd|pwd|api-key|api_key|secret|token)(?:=|\s+))([^\s]+)"
@@ -211,6 +225,52 @@ def read_klonet_logs(args: Optional[dict] = None) -> str:
                 ),
             ).render(),
             redact_sensitive_text(tail),
+        ]
+    )
+
+
+def read_ops_file(args: Optional[dict] = None) -> str:
+    """Read a safe operational config/source file and redact sensitive values."""
+
+    args = args or {}
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return "Error: path is required"
+    path = Path(raw_path).expanduser()
+    if _is_sensitive_path(path):
+        return f"Error: refused to read sensitive file: {path.name}"
+    if not _is_safe_ops_file_path(path):
+        return f"Error: refused to read unsupported ops file: {path.name}"
+    if not path.exists() or not path.is_file():
+        return _render_tool_result(
+            "read_ops_file",
+            [ProbeResult(str(path), STATUS_UNCHECKED, "file does not exist or is not a file")],
+        )
+    resolved_path = path.resolve()
+    stat = path.stat()
+    max_chars = _safe_int(args.get("max_chars"), MAX_LOG_CHARS)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return _render_tool_result(
+            "read_ops_file",
+            [ProbeResult(str(path), STATUS_UNCHECKED, str(exc))],
+        )
+    snippet = text[-max_chars:]
+    return "\n".join(
+        [
+            "read_ops_file",
+            ProbeResult(
+                str(resolved_path),
+                STATUS_DETECTED,
+                (
+                    f"resolved_path={resolved_path} "
+                    f"mtime={_format_mtime(stat.st_mtime)} "
+                    f"size_bytes={stat.st_size} "
+                    f"showing last {len(snippet)} chars"
+                ),
+            ).render(),
+            redact_sensitive_text(snippet),
         ]
     )
 
@@ -551,6 +611,16 @@ def _disk_usage_probe() -> ProbeResult:
 def _is_sensitive_path(path: Path) -> bool:
     lower = path.name.lower()
     return any(part in lower for part in _SENSITIVE_NAME_PARTS)
+
+
+def _is_safe_ops_file_path(path: Path) -> bool:
+    lower_name = path.name.lower()
+    if lower_name in DEPLOYMENT_ASSET_NAMES or lower_name.startswith("dockerfile"):
+        return True
+    if path.suffix.lower() in _SAFE_OPS_FILE_SUFFIXES:
+        return True
+    normalized_parts = {part.lower() for part in path.parts}
+    return "nginx" in normalized_parts and {"sites-enabled", "sites-available"} & normalized_parts
 
 
 def _safe_int(value, default: int) -> int:
