@@ -7,6 +7,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENT_RUNBOOK = ROOT / "knowledge" / "klonet" / "ops" / "environment_setup.md"
 STARTUP_RUNBOOK = ROOT / "knowledge" / "klonet" / "ops" / "startup_shutdown.md"
+CURRENT_SERVER_STARTUP_PATH = (
+    ROOT / "knowledge" / "klonet" / "ops" / "current_server_startup_path.md"
+)
 
 
 def _read(path: Path) -> str:
@@ -33,9 +36,7 @@ def test_startup_runbook_contains_concrete_runtime_commands():
     text = _read(STARTUP_RUNBOOK)
 
     for expected in (
-        "/usr/local/bin/gunicorn",
         "/usr/local/python3/bin/gunicorn",
-        "/usr/local/bin/celery",
         "/usr/local/python3/bin/celery",
         "service_begin_both/begin_redis.sh",
         "/usr/local/bin/redis-server redis.conf &",
@@ -46,6 +47,29 @@ def test_startup_runbook_contains_concrete_runtime_commands():
         assert expected in text
 
     assert "<python_env>" not in text
+
+
+def test_startup_runbook_uses_current_server_python_path_for_backend():
+    text = _read(CURRENT_SERVER_STARTUP_PATH)
+
+    for expected in (
+        "screen -S 103_m",
+        "screen -S 103_c",
+        "screen -S 103_web",
+        "screen -S 103_w",
+        "sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app",
+        "sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=info",
+        "sudo /usr/local/python3/bin/python3.8 web_terminal_main.py",
+        "sudo /usr/local/python3/bin/gunicorn -c worker_gun.py worker_main:flask_app",
+    ):
+        assert expected in text
+
+    for expected in (
+        "不要把历史文档里的 `/usr/local/bin/gunicorn`",
+        "以本条目为准",
+        "`/usr/local/bin/redis-server` 只是 Redis 独立服务",
+    ):
+        assert expected in text
 
 
 def test_startup_runbook_requires_current_machine_path_verification():

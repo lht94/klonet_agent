@@ -107,6 +107,23 @@ def test_satellite_query_routes_to_satellite_domain():
     assert "satellite" in route.domains
 
 
+def test_current_server_startup_path_is_retrievable():
+    """103 platform startup should prefer the current server Python path correction."""
+
+    from klonet_agent.knowledge.retriever import KnowledgeRetriever
+
+    results = KnowledgeRetriever().search(
+        "103 平台 启动 screen 103_m /usr/local/python3/bin gunicorn celery",
+        top_k=3,
+        task_type="deployment_guidance",
+        domains=("runtime",),
+    )
+
+    assert results
+    assert results[0].path == "knowledge/klonet/ops/current_server_startup_path.md"
+    assert "/usr/local/python3/bin/gunicorn" in results[0].snippet
+
+
 def test_general_query_does_not_force_klonet_results():
     """明确排除 Klonet 的通用问题不应该返回 Klonet 证据。"""
 
