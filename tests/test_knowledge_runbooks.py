@@ -60,6 +60,8 @@ def test_multi_platform_startup_runbook_is_generic_and_conflict_aware():
         "screen -S <instance>_c",
         "screen -S <instance>_web",
         "screen -S <instance>_w",
+        "cp mains/gun.py mains/master_main.py mains/celery_worker.py mains/web_terminal_main.py mains/worker_gun.py mains/worker_main.py .",
+        "cd <project_root>",
         "sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app",
         "sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=info",
         "sudo /usr/local/python3/bin/python3.8 web_terminal_main.py",
@@ -81,7 +83,13 @@ def test_multi_platform_startup_runbook_is_generic_and_conflict_aware():
         assert placeholder in text
 
     assert "`/usr/local/bin/redis-server`" in text
-    for stale in ("103_project", "screen -S 103_m", "adminis Klonet"):
+    for stale in (
+        "103_project",
+        "screen -S 103_m",
+        "adminis Klonet",
+        "cd <project_root>/mains",
+        "所有后端命令都从 `<project_root>/mains` 执行",
+    ):
         assert stale not in text
 
 

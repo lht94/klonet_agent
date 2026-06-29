@@ -52,14 +52,15 @@ grep -R "proxy_pass\|listen\|alias" /etc/nginx
 <frontend_path>  新前端目录
 ```
 
-修改 `<project_root>/vemu_uestc/vemu_config/config.py`、`<project_root>/mains/web_terminal_main.py`、前端 `scripts/config.js` 和 Nginx 配置时，必须使用同一组参数。
+修改 `<project_root>/vemu_uestc/vemu_config/config.py`、`<project_root>/mains/web_terminal_main.py`、前端 `scripts/config.js` 和 Nginx 配置时，必须使用同一组参数。启动前需要把 `mains/` 中的启动入口文件复制到 `<project_root>` 根目录，后续 Gunicorn、Celery 和 Web Terminal 命令也在 `<project_root>` 下执行。
 
-## 第三步：进入运行目录
+## 第三步：准备运行目录
 
-所有后端命令都从 `<project_root>/mains` 执行：
+先进入 `<project_root>`，把 `mains/` 中的启动入口文件复制到项目根目录，再确认根目录下已经存在这些入口文件：
 
 ```bash
-cd <project_root>/mains
+cd <project_root>
+cp mains/gun.py mains/master_main.py mains/celery_worker.py mains/web_terminal_main.py mains/worker_gun.py mains/worker_main.py .
 pwd
 test -f gun.py
 test -f master_main.py
@@ -76,7 +77,7 @@ test -f worker_main.py
 `/usr/local/bin/redis-server` 只是 Redis 独立服务的历史常见路径，不能用它推断 Klonet 后端 Gunicorn/Celery 的 Python 环境。
 
 ```bash
-cd <project_root>/mains
+cd <project_root>
 
 # Master
 screen -S <instance>_m
