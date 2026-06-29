@@ -42,7 +42,7 @@ Expected: the file is non-empty and contains the complete old package list.
 
 ```bash
 test ! -e .venv
-git check-ignore -q .venv
+git check-ignore -q .venv/bin/python
 ```
 
 Expected: both commands exit 0.
@@ -50,12 +50,13 @@ Expected: both commands exit 0.
 - [ ] **Step 3: Create the new environment with the same base interpreter**
 
 ```bash
-/usr/local/python3/bin/python3.8 -m venv .venv
+PATH=/usr/local/python3/bin /usr/local/python3/bin/python3.8 -m venv .venv
 .venv/bin/python --version
 readlink -f .venv/bin/python
+test -f .venv/bin/activate
 ```
 
-Expected: Python 3.8.0 and `/usr/local/python3/bin/python3.8`.
+Expected: Python 3.8.0, `/usr/local/python3/bin/python3.8`, and a complete activation script. The restricted creation PATH prevents the bundled pip 19.2.3 from invoking the host's broken `/usr/bin/lsb_release` script.
 
 ### Task 2: Install and compare exact package versions
 
@@ -68,15 +69,27 @@ Expected: Python 3.8.0 and `/usr/local/python3/bin/python3.8`.
 - Consumes: the exact old snapshot and `.venv/bin/python`.
 - Produces: an installed `.venv` and a normalized comparison snapshot.
 
-- [ ] **Step 1: Install every pinned distribution**
+- [ ] **Step 1: Bootstrap the exact packaging-tool versions**
 
 ```bash
-.venv/bin/python -m pip install -r /tmp/klonet_agent_venv_old.txt
+PATH=/usr/local/python3/bin .venv/bin/python -m pip install \
+    pip==25.0.1 setuptools==75.3.4 wheel==0.45.1
 ```
 
-Expected: pip exits 0 with every requested pinned version installed.
+Expected: the packaging tools match the old environment. The restricted PATH prevents pip 19.2.3 from invoking the host's broken `/usr/bin/lsb_release` during this one-time upgrade.
 
-- [ ] **Step 2: Export and compare the new package snapshot**
+- [ ] **Step 2: Install every pinned distribution**
+
+```bash
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    .venv/bin/python -m pip install \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+    -r /tmp/klonet_agent_venv_old.txt
+```
+
+Expected: pip exits 0 with every requested pinned version installed. Proxy variables are cleared only for this command; system and shell proxy configuration remain unchanged.
+
+- [ ] **Step 3: Export and compare the new package snapshot**
 
 ```bash
 .venv/bin/python -m pip freeze --all | LC_ALL=C sort > /tmp/klonet_agent_venv_new.txt
