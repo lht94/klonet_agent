@@ -124,7 +124,7 @@ class KnowledgeIndexer:
                     continue
                 if path.resolve() == self.index_file.resolve():
                     continue
-                if path.is_relative_to(knowledge_root):
+                if _path_is_relative_to(path, knowledge_root):
                     relative = path.relative_to(knowledge_root)
                     if relative.parts and relative.parts[0] in SKIP_KNOWLEDGE_DIRS:
                         continue
@@ -148,7 +148,7 @@ class KnowledgeIndexer:
         except UnicodeDecodeError:
             text = path.read_text(encoding="utf-8", errors="ignore")
 
-        relative = path.relative_to(self.root) if path.is_relative_to(self.root) else path
+        relative = path.relative_to(self.root) if _path_is_relative_to(path, self.root) else path
         relative_text = relative.as_posix()
         layer = _knowledge_layer(relative_text)
         defaults = dict(_LAYER_DEFAULTS[layer])
@@ -201,6 +201,16 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
     raw = text[4:end]
     metadata = yaml.safe_load(raw) or {}
     return metadata if isinstance(metadata, dict) else {}, text[end + 5:]
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    """Return whether path is inside root, compatible with Python 3.8."""
+
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def _normalize_metadata(
