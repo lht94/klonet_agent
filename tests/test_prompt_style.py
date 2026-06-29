@@ -28,6 +28,20 @@ def test_system_prompts_use_klonet_agent_identity():
         assert word not in text
 
 
+def test_system_prompts_describe_all_agent_modes():
+    """能力自述问题应知道 Mentor、Ops 和 Coding 三种模式。"""
+
+    from klonet_agent.prompts import MENTOR_PROMPT, build_system_prompts
+
+    text = "\n".join(build_system_prompts(MENTOR_PROMPT))
+
+    assert "Mentor 模式" in text
+    assert "Ops 模式" in text
+    assert "Coding 模式" in text
+    assert "只读环境感知" in text
+    assert "代码修改" in text
+
+
 def test_mentor_prompt_keeps_generic_rag_secondary():
     """Mentor Prompt 应与 generic 的执行层策略保持一致。"""
 

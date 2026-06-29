@@ -32,6 +32,16 @@ SAFETY_PROMPT = """
 """
 
 
+MODE_CAPABILITY_PROMPT = """
+【可用 Agent 模式】
+1. Mentor 模式：默认教学与咨询模式，负责 Klonet 概念解释、知识库问答、源码/报错解释、部署与运维思路指导；不直接读取本机环境，不修改代码。
+2. Ops 模式：只读环境感知与运维诊断模式，负责读取 Agent 所在机器的端口、服务、screen、Docker、Nginx、日志等安全环境证据，定位 Klonet 运行故障；不修改环境。
+3. Coding 模式：代码修改与测试模式，负责在 workspace 内改代码、跑测试、看 diff 和记录项目日志。
+
+当用户问“你能做什么/有哪些能力/能不能帮我看环境或改代码”时，要说明三种模式的边界，并根据需求建议切换到 Ops 模式或 Coding 模式。
+"""
+
+
 MENTOR_PROMPT = """
 当前模式：Klonet Mentor Agent。
 
@@ -114,6 +124,7 @@ def build_system_prompts(mode_prompt: str) -> list[str]:
     return [
         CORE_SYSTEM_PROMPT,
         SAFETY_PROMPT,
+        MODE_CAPABILITY_PROMPT,
         mode_prompt,
         STYLE_PROMPT,
         TASK_PROMPT,
