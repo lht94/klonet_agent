@@ -4,6 +4,7 @@
 CLI 只处理输入输出，不承载 agent 的核心业务逻辑。
 """
 
+import importlib
 import sys
 from typing import Optional
 
@@ -33,6 +34,28 @@ def configure_console_encoding(stdin=None, stdout=None, stderr=None):
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def configure_interactive_input(stdin=None, stdout=None):
+    """在 Unix 交互终端启用系统 readline，正确编辑多字节字符。"""
+
+    stdin = stdin or sys.stdin
+    stdout = stdout or sys.stdout
+    if sys.platform == "win32":
+        return
+    if not (
+        hasattr(stdin, "isatty")
+        and stdin.isatty()
+        and hasattr(stdout, "isatty")
+        and stdout.isatty()
+    ):
+        return
+
+    try:
+        importlib.import_module("readline")
+    except ModuleNotFoundError as exc:
+        if exc.name != "readline":
+            raise
+
+
 def read_piped_prompt(stdin=None) -> Optional[str]:
     """非交互 stdin 一次读取完整问题，避免多行内容被拆成多个回合。"""
 
@@ -51,6 +74,7 @@ def run_chat(
     """进入命令行对话流程，即旧版 main.py 中的外层 while 循环。"""
 
     configure_console_encoding()
+    configure_interactive_input()
     print("正在启动 Klonet 专用教学协作 Agent...")
     profile = get_profile(mode)
     session = AgentSession(user_id=user_id, project_id=project_id, mode=profile.name)
