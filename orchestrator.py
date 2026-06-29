@@ -1004,8 +1004,8 @@ class AgentOrchestrator:
                 rules.extend(
                     [
                         "- 这是 Klonet 运维诊断类问题；回答中应建议用户切换到 Ops 模式继续排查。",
-                        "- 不要只给切换建议；先尝试基于当前知识库证据和已允许的只读环境工具回答可确认部分，再建议切换到 Ops 模式做持续排查。",
-                        "- 如本轮需要环境事实，只能调用 inspect_system_environment、inspect_klonet_runtime 或 read_klonet_logs 等只读工具。",
+                        "- 不要只给切换建议；先尝试基于当前知识库证据和已有上下文回答可确认部分，再建议切换到 Ops 模式读取本机环境做持续排查。",
+                        "- Mentor 模式不得直接读取本机环境；inspect_system_environment、inspect_klonet_runtime、read_klonet_logs 只属于 Ops 模式。",
                     ]
                 )
         if self._intent_decision is not None and self._intent_decision.soft_note:

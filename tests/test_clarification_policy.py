@@ -209,7 +209,11 @@ def test_server_platform_inspection_recommends_ops_instead_of_deploy_clarificati
     )
     assert "requires_environment_diagnosis: True" in second_turn_context
     assert "切换到 Ops 模式" in second_turn_context
-    assert "先尝试基于当前知识库证据" in second_turn_context
+    assert "Mentor 模式不得直接读取本机环境" in second_turn_context
+    tool_names = {tool["function"]["name"] for tool in llm.calls[1]["tools"]}
+    assert "inspect_system_environment" not in tool_names
+    assert "inspect_klonet_runtime" not in tool_names
+    assert "read_klonet_logs" not in tool_names
 
 
 

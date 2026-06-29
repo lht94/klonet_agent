@@ -42,8 +42,6 @@ ENVIRONMENT_TOOLS = {
     "read_klonet_logs",
 }
 
-MENTOR_TOOLS = MENTOR_TOOLS | ENVIRONMENT_TOOLS
-
 OPS_TOOLS = {
     "load_skill",
     "search_knowledge",

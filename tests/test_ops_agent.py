@@ -37,9 +37,9 @@ def test_mentor_profile_can_recommend_ops_without_shell_access():
 
     profile = get_profile("mentor")
 
-    assert "inspect_system_environment" in profile.allowed_tools
-    assert "inspect_klonet_runtime" in profile.allowed_tools
-    assert "read_klonet_logs" in profile.allowed_tools
+    assert "inspect_system_environment" not in profile.allowed_tools
+    assert "inspect_klonet_runtime" not in profile.allowed_tools
+    assert "read_klonet_logs" not in profile.allowed_tools
     assert "run_command" not in profile.allowed_tools
 
 
