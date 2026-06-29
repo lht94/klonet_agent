@@ -641,6 +641,7 @@ class AgentOrchestrator:
                     print_progress(f"正在调用工具：{tool_name}")
                     result = self.use_tool(tool_name, tool_args)
                     print_progress(f"工具完成：{tool_name}")
+                    self._print_tool_loop_observation(tool_name, result)
                     tool_events.append(
                         {
                             "name": tool_name,
@@ -757,12 +758,21 @@ class AgentOrchestrator:
     def _show_visible_reasoning_trace(self) -> bool:
         """默认输出用户可见思考摘要；brief 模式只输出最终答案。"""
 
-        return self.answer_style != "brief"
+        return self.profile.name != "ops" and self.answer_style != "brief"
 
     def _show_progress_updates(self) -> bool:
         """Show safe CLI progress milestones without adding them to model context."""
 
-        return self.profile.name == "mentor" and self.answer_style != "brief"
+        return self.profile.name in {"mentor", "ops"} and self.answer_style != "brief"
+
+    def _print_tool_loop_observation(self, tool_name: str, result: str) -> None:
+        """Print an audit-friendly Ops tool-loop observation."""
+
+        if self.profile.name != "ops" or self.answer_style == "brief":
+            return
+        evidence_line = self._first_evidence_line(result) or "工具没有返回可展示的摘要。"
+        print(f"Klonet Agent：工具结果摘要：{tool_name} -> {evidence_line}")
+        print("Klonet Agent：下一步：把该结果交给模型判断是否继续调用工具或形成诊断结论。")
 
     def _progress_intent_summary(self) -> str:
         """Return a short, non-sensitive summary of the current turn intent."""

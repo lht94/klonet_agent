@@ -868,6 +868,45 @@ def test_default_mode_prints_progress_milestones(capsys):
     assert '"semantic_frame"' not in output
 
 
+def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
+    """Ops mode should show audit-friendly tool-loop progress, not reasoning summary."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        llm = StreamingToolThenAnswerLLM()
+        executor = RecordingToolExecutor()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="ops",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=session,
+            llm=llm,
+            tool_executor=executor,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat("帮我看看有哪些平台", history, 0)
+
+    output = capsys.readouterr().out
+    assert "已识别：" in output
+    assert "正在调用工具：search_knowledge" in output
+    assert "工具完成：search_knowledge" in output
+    assert "工具结果摘要：" in output
+    assert "下一步：" in output
+    assert "思考摘要" not in output
+
+
 def test_brief_mode_prints_only_final_answer(capsys):
     """简短模式不输出思考摘要。"""
 
