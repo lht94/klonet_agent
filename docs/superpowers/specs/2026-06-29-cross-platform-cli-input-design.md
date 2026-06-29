@@ -56,6 +56,7 @@ The implementation follows test-driven development: add the failing platform-bra
 ## Acceptance Criteria
 
 - On Ubuntu, typing `你好` and pressing Backspace once leaves `你`, with no residual character or damaged UTF-8 input.
+- Existing single-byte English input and Backspace behavior remain unchanged.
 - On Windows, interactive input behavior remains unchanged.
 - No new third-party dependency is added.
 - Submitted user input remains visible after Enter.
