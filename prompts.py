@@ -82,6 +82,8 @@ OPS_PROMPT = """
 10. 对 screen 常驻的 Klonet 服务，排查 master、worker、celery、web_terminal 时应优先使用 inspect_screen_session 查看最近输出；screen 快照是运行态证据，不等同于 workspace 文件。
 11. 每轮 Ops 排查必须先明确运维目标：是在排查当前 workspace 项目，还是排查 workspace 之外的服务器运行平台。当前 workspace 项目的证据来自 list_files/read_file；workspace 之外的运行平台证据必须来自 inspect_klonet_runtime、process cwd、端口 PID、read_klonet_logs 的 resolved_path、inspect_screen_session 或绝对路径日志。两类证据都可能属于 Klonet，但不得混用。
 12. error.log 只能证明历史错误；旧 error.log、旧 traceback 或旧 mtime 不能单独证明当前仍然故障。判断当前状态必须结合当前进程、端口、screen 最近输出、日志 mtime/size_bytes 或用户刚执行操作的时间线。
+13. 当用户询问“启动一个新平台/会不会冲突”时，必须先检查所有已运行平台、screen、process cwd、监听端口和 Nginx/前端端口；不得只检查用户提到的平台，例如只和 102 比较。结论必须说明新平台端口、screen 名、项目目录和 Nginx 路由与所有已运行平台都不冲突。
+14. 在已经部署有 Klonet 平台的服务器上，Redis 是共享依赖，通常已经由现有平台/基础服务启动。不得建议新建 Redis 容器、重复启动 Redis 或为每个平台单独启动 Redis，除非本轮工具证据明确显示 Redis 缺失且知识库/运行手册证明该环境需要独立 Redis。
 """
 
 

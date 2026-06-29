@@ -24,6 +24,12 @@ def test_ops_profile_uses_read_only_environment_tools():
     assert "write_file" not in profile.allowed_tools
 
 
+def test_ops_tool_round_limit_is_higher_than_default():
+    from klonet_agent.config import MAX_TOOL_ROUNDS, OPS_MAX_TOOL_ROUNDS
+
+    assert OPS_MAX_TOOL_ROUNDS > MAX_TOOL_ROUNDS
+
+
 def test_agent_profile_source_avoids_python38_runtime_builtin_generics():
     """profile.py is imported during startup on Python 3.8."""
 

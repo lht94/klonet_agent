@@ -49,3 +49,14 @@ def test_ops_prompt_requires_target_evidence_scope_for_logs():
     assert "workspace 之外" in OPS_PROMPT
     assert "error.log 只能证明历史错误" in OPS_PROMPT
     assert "不能单独证明当前仍然故障" in OPS_PROMPT
+
+
+def test_ops_prompt_requires_all_platform_conflict_and_redis_evidence():
+    """New platform guidance must check all platforms and avoid Redis startup hallucination."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "所有已运行平台" in OPS_PROMPT
+    assert "不得只检查用户提到的平台" in OPS_PROMPT
+    assert "Redis 是共享依赖" in OPS_PROMPT
+    assert "不得建议新建 Redis 容器" in OPS_PROMPT

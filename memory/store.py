@@ -14,7 +14,6 @@ from typing import Any
 from klonet_agent.config import MEMORY_DIR
 
 
-# 获取北京时间。datetime 默认是本机时间，这里显式指定 UTC+8，保证记忆日志时间稳定。
 _UTC8 = timezone(timedelta(hours=8))
 
 
@@ -27,12 +26,18 @@ class MemoryStore:
     3. 长期记忆：MEMORY.md 和 USER.md，常驻系统提示词。
     """
 
-    def __init__(self, memory_dir: Path, user_file: Path):
+    def __init__(
+        self,
+        memory_dir: Path,
+        user_file: Path,
+        shared_dir: Path | None = None,
+    ):
         self.memory_dir = memory_dir
-        self.memory_file = memory_dir / "MEMORY.md"  # 长期记忆文件
-        self.history_file = memory_dir / "history.jsonl"  # 工作记忆文件
-        self.user_file = user_file  # 用户画像文件
-        self._ensure()  # 如果没有记忆文件，则初始化
+        self.memory_file = memory_dir / "MEMORY.md"
+        self.history_file = memory_dir / "history.jsonl"
+        self.user_file = user_file
+        self.shared_dir = shared_dir
+        self._ensure()
 
     @classmethod
     def for_session(
@@ -47,9 +52,8 @@ class MemoryStore:
         project_name = _safe_path_component(project_id)
         project_dir = memory_root / "sessions" / user_name / project_name
         user_file = memory_root / "users" / user_name / "USER.md"
-        return cls(project_dir, user_file)
-
-    """-------------下面是记忆文件读取的实现----------------"""
+        shared_dir = memory_root / "shared" / "ops"
+        return cls(project_dir, user_file, shared_dir=shared_dir)
 
     def _ensure(self):
         """初始化记忆目录和必要文件。"""
@@ -62,28 +66,21 @@ class MemoryStore:
             )
         if not self.history_file.exists():
             self.history_file.write_text("", encoding="utf-8")
+        if self.shared_dir is not None:
+            self.shared_dir.mkdir(parents=True, exist_ok=True)
 
     def append_history(self, msg_dict: dict[str, Any]):
-        """追加一条工作记忆。
-
-        比早期版本多了当前时间戳，方便后续审计和复盘。
-        """
+        """追加一条工作记忆。"""
 
         row = {
             "ts": datetime.now(_UTC8).isoformat(timespec="seconds"),
         }
-        # 使用 update 将消息字典里的所有字段
-        # role、content、tool_call_id、tool_calls、reasoning_content 等平铺写入 row。
         row.update(_json_safe(msg_dict))
-        # "a" 表示 append 追加写入。jsonl 每行是一条 JSON，适合持续增长的日志。
-        with self.history_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self.history_file.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def today_episode_path(self) -> Path:
-        """返回今天的情景记忆文件路径。
-
-        情景记忆按天创建，文件名形如 2026-06-16.md。
-        """
+        """返回今天的情景记忆文件路径。"""
 
         date = datetime.now(_UTC8).strftime("%Y-%m-%d")
         return self.memory_dir / f"{date}.md"
@@ -97,15 +94,30 @@ class MemoryStore:
     def append_episode(self, content: str):
         """向今天的情景记忆追加内容。"""
 
-        path = self.today_episode_path()
-        existing = (
-            path.read_text(encoding="utf-8")
-            if path.exists()
-            else f"# {path.stem} 情景记忆\n"
-        )
-        # strip() 去掉首尾空白，保证 Markdown 版式稳定。
-        new_text = existing.rstrip() + "\n\n" + content.strip() + "\n"
-        path.write_text(new_text, encoding="utf-8")
+        _append_markdown_once(self.today_episode_path(), content)
+
+    def shared_episode_path(self) -> Path:
+        """返回多用户共享 Ops 情景记忆路径。"""
+
+        base = self.shared_dir or (self.memory_dir / "shared" / "ops")
+        date = datetime.now(_UTC8).strftime("%Y-%m-%d")
+        return base / f"{date}.md"
+
+    def append_shared_episode(self, content: str):
+        """向多用户共享 Ops 情景记忆追加已验证工具证据。"""
+
+        _append_markdown_once(self.shared_episode_path(), content)
+
+    def read_shared_memory(self) -> str:
+        """读取最近的多用户共享 Ops 情景记忆。"""
+
+        base = self.shared_dir or (self.memory_dir / "shared" / "ops")
+        if not base.exists():
+            return ""
+        chunks = []
+        for path in sorted(base.glob("*.md"))[-3:]:
+            chunks.append(path.read_text(encoding="utf-8"))
+        return "\n\n".join(chunks)
 
     def read_memory(self) -> str:
         """读取长期记忆 MEMORY.md。"""
@@ -127,12 +139,6 @@ class MemoryStore:
 
         self.user_file.write_text(content.strip() + "\n", encoding="utf-8")
 
-    """-------------下面是记忆压缩机制的实现----------------
-
-    具体流程：
-    检测溢出 -> 工作记忆写入标记 -> 工作记忆只读取标记后的内容 -> 标记前的内容写入情景记忆。
-    """
-
     def append_compact_marker(self):
         """在 history.jsonl 中打上压缩归档标记。"""
 
@@ -140,18 +146,14 @@ class MemoryStore:
             "ts": datetime.now(_UTC8).isoformat(timespec="seconds"),
             "type": "compact_event",
         }
-        with self.history_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self.history_file.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def load_unarchived_history(self, max_messages: int = 20) -> list[dict[str, Any]]:
-        """返回最新的工作记忆。
-
-        只加载最后一个 compact_event 之后的对话，避免每次启动都把完整历史塞进上下文。
-        """
+        """返回最新的工作记忆。"""
 
         if not self.history_file.exists():
             return []
-        # 倒序扫描文件：找到最后一个 compact_event 后立刻停止，避免全量正序加载。
         unarchived_reversed = []
         for line in _iter_jsonl_lines_reverse(self.history_file):
             if not line:
@@ -164,15 +166,12 @@ class MemoryStore:
             if row.get("type") == "compact_event":
                 break
             if "role" in row:
-                # 绝不硬编码 role 和 content！直接提取除了时间戳 ts 以外的所有完整字段。
                 msg = {key: value for key, value in row.items() if key != "ts"}
                 unarchived_reversed.append(msg)
                 if max_messages > 0 and len(unarchived_reversed) >= max_messages:
                     break
 
-        # 倒序收集后再翻转回时间正序。
         messages = list(reversed(unarchived_reversed))
-        # 被截断的历史不能从孤立 tool 消息开始，否则模型 API 会拒绝上下文。
         while messages and messages[0].get("role") == "tool":
             messages.pop(0)
         return messages
@@ -182,9 +181,13 @@ class MemoryStore:
 
         current_memory = self.read_memory()
         current_user = self.read_user()
+        shared_ops_memory = self.read_shared_memory()
         return f"""
             【当前长期记忆 (MEMORY.md)】
             {current_memory}
+
+            【多用户共享 Ops 情景记忆】
+            {shared_ops_memory}
 
             【用户画像与偏好 (USER.md)】
             {current_user}
@@ -195,7 +198,23 @@ class MemoryStore:
             2. 项目长期目标或关键事实确实变化时，才调用 write_memory。
             3. 用户明确表达稳定偏好时，才调用 write_user。
             4. 不要把临时问题、工具报错或其他项目的内容写入当前会话记忆。
+            5. 多用户共享 Ops 情景记忆只作为工具证据索引；如果它与本轮工具结果冲突，以本轮工具结果为准。
             """
+
+
+def _append_markdown_once(path: Path, content: str):
+    """Append a markdown block if it is not already present."""
+
+    existing = (
+        path.read_text(encoding="utf-8")
+        if path.exists()
+        else f"# {path.stem} 情景记忆\n"
+    )
+    block = content.strip()
+    if not block or block in existing:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(existing.rstrip() + "\n\n" + block + "\n", encoding="utf-8")
 
 
 def _safe_path_component(value: str) -> str:
@@ -209,14 +228,11 @@ def _safe_path_component(value: str) -> str:
 
 
 def _iter_jsonl_lines_reverse(path: Path, chunk_size: int = 8192):
-    """从 JSONL 文件尾部开始逐行读取。
+    """从 JSONL 文件尾部开始逐行读取。"""
 
-    这样不需要把整个 history.jsonl 一次性加载进内存。
-    """
-
-    with path.open("rb") as f:
-        f.seek(0, 2)
-        file_size = f.tell()
+    with path.open("rb") as file:
+        file.seek(0, 2)
+        file_size = file.tell()
         if file_size == 0:
             return
 
@@ -225,8 +241,8 @@ def _iter_jsonl_lines_reverse(path: Path, chunk_size: int = 8192):
         while pos > 0:
             read_size = min(chunk_size, pos)
             pos -= read_size
-            f.seek(pos)
-            chunk = f.read(read_size)
+            file.seek(pos)
+            chunk = file.read(read_size)
             buffer = chunk + buffer
 
             parts = buffer.split(b"\n")
@@ -250,10 +266,8 @@ def _json_safe(obj: Any):
     except (TypeError, ValueError):
         pass
     if isinstance(obj, list):
-        # 递归处理列表里的每一个元素。
         return [_json_safe(item) for item in obj]
     if isinstance(obj, dict):
-        # 递归处理字典里的每一个值。
         return {key: _json_safe(value) for key, value in obj.items()}
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
@@ -266,5 +280,4 @@ def _json_safe(obj: Any):
     return str(obj)
 
 
-# 保留默认实例兼容旧调用；正式会话由 Orchestrator 按用户和项目创建实例。
 MEMORY_STORE = MemoryStore.for_session(MEMORY_DIR, "default", "default")

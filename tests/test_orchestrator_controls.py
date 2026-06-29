@@ -907,6 +907,77 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
     assert "思考摘要" not in output
 
 
+def test_ops_tool_observation_is_appended_to_shared_memory(capsys):
+    """Ops tool observations should be reusable across users via shared memory."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    class RuntimeExecutor:
+        def run(self, tool_name, tool_args):
+            return "inspect_klonet_runtime\n- screen: detected - 102_m lht_m"
+
+    class RuntimeThenAnswerLLM:
+        def __init__(self):
+            self.calls = []
+            self.answer_calls = 0
+
+        def complete(self, messages, tools, stream=False):
+            self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+            self.answer_calls += 1
+            if self.answer_calls == 1:
+                return iter(
+                    [
+                        _stream_chunk(
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="runtime-1",
+                                    function=SimpleNamespace(
+                                        name="inspect_klonet_runtime",
+                                        arguments='{"checks":["screen"]}',
+                                    ),
+                                )
+                            ],
+                            finish_reason="tool_calls",
+                            usage=SimpleNamespace(total_tokens=4),
+                        )
+                    ]
+                )
+            return iter(
+                [
+                    _stream_chunk(content="当前有 102 和 lht。"),
+                    _stream_chunk(finish_reason="stop", usage=SimpleNamespace(total_tokens=6)),
+                ]
+            )
+
+    with local_temp_dir() as temp_dir:
+        memory_store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="ops",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=session,
+            llm=RuntimeThenAnswerLLM(),
+            tool_executor=RuntimeExecutor(),
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=memory_store,
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat("看看有哪些平台", history, 0)
+
+        assert "inspect_klonet_runtime" in memory_store.read_shared_memory()
+        assert "102_m lht_m" in memory_store.read_shared_memory()
+
+
 def test_brief_mode_prints_only_final_answer(capsys):
     """简短模式不输出思考摘要。"""
 

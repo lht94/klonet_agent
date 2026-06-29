@@ -18,6 +18,7 @@ from klonet_agent.config import (
     MAX_TOKEN,
     MAX_TOOL_ROUNDS,
     MEMORY_DIR,
+    OPS_MAX_TOOL_ROUNDS,
     RAG_SEARCH_BUDGETS,
     TRACE_FILE,
 )
@@ -550,7 +551,7 @@ class AgentOrchestrator:
             history.append(turn_answer_policy_message)
 
         # 工具循环有明确上限，避免模型反复调用工具后阻塞 CLI。
-        while tool_rounds < MAX_TOOL_ROUNDS:
+        while tool_rounds < self._max_tool_rounds():
             tool_rounds += 1
             printed_stream_reply = False
             if tool_rounds == 1:
@@ -642,6 +643,7 @@ class AgentOrchestrator:
                     result = self.use_tool(tool_name, tool_args)
                     print_progress(f"工具完成：{tool_name}")
                     self._print_tool_loop_observation(tool_name, result)
+                    self._record_ops_shared_observation(tool_name, tool_args, result)
                     tool_events.append(
                         {
                             "name": tool_name,
@@ -760,6 +762,13 @@ class AgentOrchestrator:
 
         return self.profile.name != "ops" and self.answer_style != "brief"
 
+    def _max_tool_rounds(self) -> int:
+        """Return the tool loop budget for the current profile."""
+
+        if self.profile.name == "ops":
+            return OPS_MAX_TOOL_ROUNDS
+        return MAX_TOOL_ROUNDS
+
     def _show_progress_updates(self) -> bool:
         """Show safe CLI progress milestones without adding them to model context."""
 
@@ -773,6 +782,70 @@ class AgentOrchestrator:
         evidence_line = self._first_evidence_line(result) or "工具没有返回可展示的摘要。"
         print(f"Klonet Agent：工具结果摘要：{tool_name} -> {evidence_line}")
         print("Klonet Agent：下一步：把该结果交给模型判断是否继续调用工具或形成诊断结论。")
+
+    def _record_ops_shared_observation(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        result: str,
+    ) -> None:
+        """Persist reusable Ops tool evidence in shared memory."""
+
+        if self.profile.name != "ops":
+            return
+        if tool_name not in {
+            "inspect_klonet_runtime",
+            "inspect_system_environment",
+            "inspect_screen_session",
+            "read_klonet_logs",
+            "search_knowledge",
+            "search_code",
+            "list_source_files",
+        }:
+            return
+        evidence_line = self._shared_evidence_line(tool_name, result)
+        if not evidence_line:
+            return
+        args_summary = self._safe_tool_args_summary(tool_args)
+        self.memory_store.append_shared_episode(
+            "\n".join(
+                [
+                    "## Ops 工具证据",
+                    f"- tool: {tool_name}",
+                    f"- args: {args_summary}",
+                    f"- evidence: {evidence_line}",
+                    "- status: tool_observation",
+                ]
+            )
+        )
+
+    def _safe_tool_args_summary(self, tool_args: dict) -> str:
+        """Render a short, non-secret tool argument summary."""
+
+        safe = {}
+        for key, value in (tool_args or {}).items():
+            if any(part in key.lower() for part in ("password", "token", "secret", "key")):
+                safe[key] = "[REDACTED]"
+            else:
+                safe[key] = value
+        text = json.dumps(safe, ensure_ascii=False, sort_keys=True)
+        return text[:300]
+
+    def _shared_evidence_line(self, tool_name: str, result: str) -> str:
+        """Return the first useful evidence line for shared Ops memory."""
+
+        fallback = ""
+        for line in (result or "").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("Error:"):
+                continue
+            if stripped == tool_name:
+                fallback = stripped
+                continue
+            if len(stripped) > 240:
+                stripped = stripped[:237] + "..."
+            return stripped
+        return fallback
 
     def _progress_intent_summary(self) -> str:
         """Return a short, non-sensitive summary of the current turn intent."""

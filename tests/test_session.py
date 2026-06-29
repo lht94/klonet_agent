@@ -113,3 +113,21 @@ def test_memory_history_only_loads_recent_messages():
 
     assert len(history) == 20
     assert history[0]["content"] == "message-10"
+
+
+def test_shared_ops_memory_is_visible_across_users():
+    """Ops 工具证据应能沉淀到多用户共享记忆，但不混入用户画像。"""
+
+    from klonet_agent.memory.store import MemoryStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        first = MemoryStore.for_session(temp_dir, "u1", "p1")
+        second = MemoryStore.for_session(temp_dir, "u2", "p2")
+
+        first.append_shared_episode(
+            "tool_observation: inspect_klonet_runtime found 102_m and lht_m"
+        )
+
+        assert "102_m and lht_m" in second.read_shared_memory()
+        assert "102_m and lht_m" in second.memory_prompt()
