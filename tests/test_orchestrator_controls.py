@@ -1159,6 +1159,45 @@ def test_ops_observation_shows_three_real_lines_and_omission():
     assert omitted is True
 
 
+def test_ops_knowledge_observation_prioritizes_source_and_evidence():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    lines, omitted = orchestrator._tool_observation_lines(
+        "search_knowledge",
+        "\n".join(
+            [
+                "检索到以下可靠 Klonet 证据：",
+                "- retrieval_status: reliable",
+                "- confidence: 1.0",
+                "- route_scope: klonet",
+                "",
+                "[1] knowledge/klonet/architecture/frontend.md / Web 前端",
+                "- layer: curated",
+                "- path: knowledge/klonet/architecture/frontend.md",
+                "- snippet:",
+                "vemu_frontend 是 Klonet 平台的 Web 前端，负责展示平台页面。",
+                "",
+                "[2] knowledge/klonet/ops/startup.md / 启动",
+                "- layer: curated",
+                "- path: knowledge/klonet/ops/startup.md",
+                "- snippet:",
+                "后端核心进程通过 screen 会话启动。",
+            ]
+        ),
+    )
+
+    assert lines == [
+        "- 来源：knowledge/klonet/architecture/frontend.md",
+        "- 证据：vemu_frontend 是 Klonet 平台的 Web 前端，负责展示平台页面。",
+        "- 另有 1 条证据已省略",
+    ]
+    assert omitted is False
+
+
 def test_ops_observation_handles_empty_error_and_long_lines():
     from klonet_agent.agents import get_profile
     from klonet_agent.orchestrator import AgentOrchestrator

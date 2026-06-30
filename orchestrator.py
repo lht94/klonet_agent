@@ -864,6 +864,11 @@ class AgentOrchestrator:
     ) -> tuple[list[str], bool]:
         """Extract at most three meaningful, bounded lines from a tool result."""
 
+        if tool_name == "search_knowledge":
+            knowledge_lines = self._knowledge_observation_lines(result)
+            if knowledge_lines:
+                return knowledge_lines, False
+
         candidates = []
         for raw_line in (result or "").splitlines():
             line = raw_line.strip()
@@ -877,6 +882,71 @@ class AgentOrchestrator:
         if not candidates:
             return ["工具未返回可展示结果。"], False
         return candidates[:3], len(candidates) > 3
+
+    def _knowledge_observation_lines(self, result: str) -> list[str]:
+        """Summarize knowledge retrieval by cited source and evidence snippet."""
+
+        evidence_items = []
+        current_path = ""
+        current_snippet: list[str] = []
+        collecting_snippet = False
+
+        def flush_current() -> None:
+            nonlocal current_path, current_snippet, collecting_snippet
+            snippet = " ".join(" ".join(current_snippet).split())
+            if current_path and snippet:
+                evidence_items.append(
+                    {
+                        "path": current_path,
+                        "snippet": snippet,
+                    }
+                )
+            current_path = ""
+            current_snippet = []
+            collecting_snippet = False
+
+        for raw_line in (result or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("[") and "]" in line:
+                flush_current()
+                title = line.split("]", 1)[1].strip()
+                if title:
+                    current_path = title.split(" / ", 1)[0].strip()
+                continue
+            if line.startswith("- path:"):
+                current_path = line.split(":", 1)[1].strip()
+                continue
+            if line.startswith("- snippet:"):
+                collecting_snippet = True
+                inline_snippet = line.split(":", 1)[1].strip()
+                if inline_snippet:
+                    current_snippet.append(inline_snippet)
+                continue
+            if collecting_snippet:
+                current_snippet.append(line)
+
+        flush_current()
+        if not evidence_items:
+            return []
+
+        first = evidence_items[0]
+        lines = [
+            f"- 来源：{self._compact_observation_text(first['path'])}",
+            f"- 证据：{self._compact_observation_text(first['snippet'])}",
+        ]
+        omitted_count = len(evidence_items) - 1
+        if omitted_count:
+            lines.append(f"- 另有 {omitted_count} 条证据已省略")
+        return lines
+
+    @staticmethod
+    def _compact_observation_text(text: str, limit: int = 160) -> str:
+        compacted = " ".join(str(text or "").split())
+        if len(compacted) > limit:
+            return compacted[: limit - 3] + "..."
+        return compacted
 
     def _record_ops_shared_turn(
         self,
