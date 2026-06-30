@@ -25,32 +25,44 @@ class KnowledgeVectorIndex:
         self.vector_file = Path(vector_file)
         self.embedding_provider = embedding_provider
 
-    def build(self, rows: Sequence[Mapping[str, Any]]) -> int:
+    def build(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        append: bool = False,
+        limit: int | None = None,
+        include_paths: Sequence[str] | None = None,
+    ) -> int:
         """Embed rows and write chunk_id -> vector records."""
 
         if self.embedding_provider is None:
             return 0
 
         self.vector_file.parent.mkdir(parents=True, exist_ok=True)
+        existing = self.load() if append else {}
+        selected_paths = {path for path in include_paths or () if path}
         count = 0
-        with self.vector_file.open("w", encoding="utf-8") as file:
-            for index, row in enumerate(rows):
-                chunk_id = str(row.get("chunk_id") or f"legacy-{index}")
-                text = _row_text(row)
-                vector = _vector(self.embedding_provider(text))
-                if vector is None:
-                    continue
-                file.write(
-                    json.dumps(
-                        {
-                            "chunk_id": chunk_id,
-                            "embedding": vector,
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
-                count += 1
+        vectors = dict(existing)
+        if limit is not None and limit <= 0:
+            _write_vectors(self.vector_file, vectors)
+            return 0
+
+        for index, row in enumerate(rows):
+            chunk_id = str(row.get("chunk_id") or f"legacy-{index}")
+            if chunk_id in vectors:
+                continue
+            if selected_paths and str(row.get("path") or "") not in selected_paths:
+                continue
+            text = _row_text(row)
+            vector = _vector(self.embedding_provider(text))
+            if vector is None:
+                continue
+            vectors[chunk_id] = vector
+            count += 1
+            if limit is not None and count >= limit:
+                break
+
+        _write_vectors(self.vector_file, vectors)
         return count
 
     def load(self) -> dict[str, tuple[float, ...]]:
@@ -100,6 +112,21 @@ def _row_text(row: Mapping[str, Any]) -> str:
     title = str(row.get("title") or "").strip()
     content = str(row.get("content") or "").strip()
     return "\n".join(part for part in (title, content) if part)
+
+
+def _write_vectors(path: Path, vectors: Mapping[str, Sequence[float]]):
+    with path.open("w", encoding="utf-8") as file:
+        for chunk_id, vector in vectors.items():
+            file.write(
+                json.dumps(
+                    {
+                        "chunk_id": chunk_id,
+                        "embedding": tuple(float(value) for value in vector),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 def _vector(values: Sequence[float] | None) -> tuple[float, ...] | None:

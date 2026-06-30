@@ -48,6 +48,61 @@ def test_knowledge_vector_index_builds_embeddings_for_chunks():
     assert loaded == {"one": (1.0, 0.0), "two": (0.0, 1.0)}
 
 
+def test_knowledge_vector_index_can_append_limited_path_subset():
+    from klonet_agent.knowledge.vector_index import KnowledgeVectorIndex
+
+    calls = []
+
+    def embed(text: str):
+        calls.append(text)
+        return [float(len(calls)), 0.0]
+
+    rows = [
+        {
+            "chunk_id": "existing",
+            "path": "knowledge/klonet/00_project_overview.md",
+            "title": "existing title",
+            "content": "existing body",
+        },
+        {
+            "chunk_id": "target",
+            "path": "knowledge/klonet/00_project_overview.md",
+            "title": "target title",
+            "content": "target body",
+        },
+        {
+            "chunk_id": "ignored",
+            "path": "doc/00_project_overview.md",
+            "title": "ignored title",
+            "content": "ignored body",
+        },
+    ]
+
+    with local_temp_dir() as temp_dir:
+        vector_file = temp_dir / "vectors.jsonl"
+        vector_file.write_text(
+            '{"chunk_id": "existing", "embedding": [9.0, 0.0]}\n',
+            encoding="utf-8",
+        )
+        count = KnowledgeVectorIndex(
+            vector_file=vector_file,
+            embedding_provider=embed,
+        ).build(
+            rows,
+            append=True,
+            limit=1,
+            include_paths=("knowledge/klonet/00_project_overview.md",),
+        )
+        loaded = KnowledgeVectorIndex(vector_file=vector_file).load()
+
+    assert count == 1
+    assert calls == ["target title\ntarget body"]
+    assert loaded == {
+        "existing": (9.0, 0.0),
+        "target": (1.0, 0.0),
+    }
+
+
 def test_retriever_uses_semantic_vector_match_when_keywords_differ():
     from klonet_agent.knowledge.models import SearchRequest
     from klonet_agent.knowledge.retriever import KnowledgeRetriever
@@ -137,13 +192,43 @@ def test_build_knowledge_vectors_script_delegates_to_retriever():
 
     class FakeRetriever:
         def __init__(self):
-            self.called = False
+            self.kwargs = None
 
-        def build_vector_index(self):
-            self.called = True
+        def build_vector_index(self, **kwargs):
+            self.kwargs = kwargs
             return 42
 
     retriever = FakeRetriever()
 
     assert build_vectors(retriever=retriever) == 42
-    assert retriever.called is True
+    assert retriever.kwargs == {
+        "append": False,
+        "limit": None,
+        "include_paths": (),
+    }
+
+
+def test_build_knowledge_vectors_script_passes_incremental_options():
+    from scripts.build_knowledge_vectors import build_vectors
+
+    class FakeRetriever:
+        def __init__(self):
+            self.kwargs = None
+
+        def build_vector_index(self, **kwargs):
+            self.kwargs = kwargs
+            return 3
+
+    retriever = FakeRetriever()
+
+    assert build_vectors(
+        retriever=retriever,
+        append=True,
+        limit=3,
+        include_paths=("knowledge/klonet/00_project_overview.md",),
+    ) == 3
+    assert retriever.kwargs == {
+        "append": True,
+        "limit": 3,
+        "include_paths": ("knowledge/klonet/00_project_overview.md",),
+    }

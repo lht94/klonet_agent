@@ -86,7 +86,7 @@ class QueryBuilder:
         task = intent.task_type if intent is not None else task_type or "auto"
         plan_top_k = max(top_k, _OPERATION_MIN_TOP_K.get(operation, top_k))
 
-        parts = [f"原始问题:{original_user_input.strip()}"]
+        parts = [f"raw_query:{original_user_input.strip()}"]
         debug_parts = ["original_user_input"]
         if intent is not None:
             _append(parts, debug_parts, "task_type", intent.task_type)

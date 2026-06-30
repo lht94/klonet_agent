@@ -172,8 +172,18 @@ class KnowledgeRetriever:
                 exact_score,
                 bm25_score,
             )
+            has_routed_concept_evidence = _has_routed_concept_evidence(
+                request,
+                metadata,
+                matched_terms,
+                exact_score,
+            )
             has_semantic_evidence = semantic_score >= 0.75
-            if not has_lexical_evidence and not has_semantic_evidence:
+            if (
+                not has_lexical_evidence
+                and not has_routed_concept_evidence
+                and not has_semantic_evidence
+            ):
                 continue
 
             metadata_score = _metadata_weight(metadata, task_type)
@@ -268,7 +278,13 @@ class KnowledgeRetriever:
         self._mtime_ns = None
         self._ensure_loaded()
 
-    def build_vector_index(self) -> int:
+    def build_vector_index(
+        self,
+        *,
+        append: bool = False,
+        limit: int | None = None,
+        include_paths: tuple[str, ...] = (),
+    ) -> int:
         """Build the semantic vector sidecar for the loaded knowledge rows."""
 
         self._ensure_loaded()
@@ -278,7 +294,12 @@ class KnowledgeRetriever:
         count = KnowledgeVectorIndex(
             vector_file=self.vector_index_file,
             embedding_provider=embedding_provider,
-        ).build(self._rows)
+        ).build(
+            self._rows,
+            append=append,
+            limit=limit,
+            include_paths=include_paths,
+        )
         self._vector_mtime_ns = None
         self._load_vectors()
         return count
@@ -480,7 +501,28 @@ def _exact_score(query: str, query_tokens: list[str], row: dict[str, Any]) -> fl
             score += 4
         if token in path:
             score += 3
+    if _is_definition_query(query):
+        if "核心结论" in title:
+            score += 15
+        if "00_project_overview" in path:
+            score += 10
     return score
+
+
+def _is_definition_query(query: str) -> bool:
+    lowered = query.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "是什么",
+            "是啥",
+            "介绍",
+            "概述",
+            "overview",
+            "introduction",
+            "what is",
+        )
+    )
 
 
 def _has_enough_evidence(
@@ -502,6 +544,27 @@ def _has_enough_evidence(
     )
 
 
+def _has_routed_concept_evidence(
+    request: SearchRequest,
+    metadata: dict[str, Any],
+    matched_terms: tuple[str, ...],
+    exact_score: float,
+) -> bool:
+    """Allow short definition queries after manifest routing has narrowed scope."""
+
+    if request.task_type != "concept":
+        return False
+    if not request.allowed_paths and not request.collections:
+        return False
+    if metadata.get("layer") != "curated":
+        return False
+    if metadata.get("priority") != "P0":
+        return False
+    if not matched_terms:
+        return False
+    return exact_score >= 4
+
+
 def _classify_outcome(results: list[RetrievedChunk]) -> SearchOutcome:
     """根据最高分、精确命中和分差判断整体可靠性。"""
 
@@ -513,6 +576,13 @@ def _classify_outcome(results: list[RetrievedChunk]) -> SearchOutcome:
     margin = top.score - second_score
     reliable = (
         top.exact_score >= 20
+        or (
+            top.layer == "curated"
+            and top.priority == "P0"
+            and top.exact_score >= 4
+            and len(top.matched_terms) >= 1
+            and top.score >= 10
+        )
         or (
             len(top.matched_terms) >= 2
             and top.score >= 6

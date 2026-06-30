@@ -2658,6 +2658,106 @@ Embedding model：负责把文本变成向量，用于相似度检索。
   2. 给 knowledge retrieval 用
 ```
 
+### 2. RAG、检索和 BM25 的层级关系
+
+RAG 不是一个单独的检索算法，而是一整段“基于外部证据回答问题”的流程：
+
+```text
+RAG = Retrieval + Augmentation + Generation
+      检索       上下文增强      生成回答
+```
+
+展开后可以理解为：
+
+```text
+用户问题
+  → 意图识别 / QueryBuilder
+  → Retrieval：从知识库找到相关 chunk
+  → Augmentation：把证据拼进 prompt
+  → Generation：LLM 基于证据组织回答
+```
+
+所以“检索出问题”和“RAG 出问题”不是互斥关系。更准确的说法是：
+
+```text
+RAG 链路中的 Retrieval 阶段出了问题。
+```
+
+BM25 是 Retrieval 阶段里常用的一种关键词检索算法。它关注的是用户 query 和文档之间的词面重合、词频和区分度，适合检索：
+
+```text
+命令、脚本名、报错、函数名、文件名、配置项、服务名、接口名。
+```
+
+例如：
+
+```text
+gunicorn
+redis.conf
+TopoDeployAPI
+OVSStartError
+worker_main.py
+```
+
+但 BM25 不真正理解语义。它更像“高级关键词匹配”。当用户表达很口语化、很短，或者文档表达和用户表达不一致时，BM25 可能召回不足。
+
+向量检索则负责语义相似度，不要求词完全一样。例如：
+
+```text
+用户：我想用 Klonet 做实验
+文档：普通用户通过浏览器进入平台，创建拓扑并部署实验
+```
+
+这两句话关键词不一定高度重合，但语义接近，适合由 embedding / vector search 补充召回。
+
+因此更合理的知识检索层应该是混合检索：
+
+```text
+Intent / collection route：先确定应该在哪类知识里找。
+BM25 / keyword / exact match：负责精确词面召回。
+Vector search：负责语义召回和口语化表达。
+Metadata weight：根据文档层级、质量、任务类型加权。
+Evidence threshold：避免把弱相关内容当成证据。
+```
+
+这里有一个关键原则：
+
+```text
+意图路由已经高置信收窄范围时，检索器的证据阈值不能还按全库搜索的标准过度保守。
+```
+
+例如用户问：
+
+```text
+klonet是什么
+```
+
+前置链路已经识别为：
+
+```text
+scope=klonet
+task_type=concept
+target=klonet_platform
+collection=klonet_foundation
+```
+
+此时 `knowledge/klonet/00_project_overview.md` 中已经有直接答案：
+
+```text
+Klonet 是面向网络虚拟化、网络仿真和教学实验的分布式平台。
+```
+
+如果检索器因为短 query 只稳定匹配到 `klonet` 一个词，就把 P0 概览文档判成 `no_relevant_evidence`，那么问题不在意图识别，也不在 collection 路由，而在 Retrieval 的证据充分性策略太保守。
+
+这类问题的通用修复方向是：
+
+```text
+1. QueryBuilder 对 concept / overview 类问题补充稳定扩展词。
+2. Retriever 对高置信 intent + 明确 collection + P0 curated 文档降低短 query 阈值。
+3. SearchOutcome 区分“没有索引文档”和“有候选文档但阈值未通过”。
+4. 最终回答不要在摘要中说无证据，却在正文里给出确定结论。
+```
+
 ## 源码机器索引与真实源码读取
 
 源码机器索引可以理解为“源码地图”，而不是真实源码本身。
