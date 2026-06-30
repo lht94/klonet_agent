@@ -843,13 +843,40 @@ class AgentOrchestrator:
         return f"{action}：{value}" if value else action
 
     def _print_tool_loop_observation(self, tool_name: str, result: str) -> None:
-        """Print an audit-friendly Ops tool-loop observation."""
+        """Print bounded real tool output as an Ops observation."""
 
         if self.profile.name != "ops" or self.answer_style == "brief":
             return
-        evidence_line = self._first_evidence_line(result) or "工具没有返回可展示的摘要。"
-        print(f"Klonet Agent：工具结果摘要：{tool_name} -> {evidence_line}")
-        print("Klonet Agent：下一步：把该结果交给模型判断是否继续调用工具或形成诊断结论。")
+        lines, omitted = self._tool_observation_lines(tool_name, result)
+        if len(lines) == 1 and not omitted:
+            print(f"Klonet Agent：观察：{lines[0]}")
+            return
+        print("Klonet Agent：观察：")
+        for line in lines:
+            print(f"  {line}")
+        if omitted:
+            print("  - 其余内容已省略")
+
+    def _tool_observation_lines(
+        self,
+        tool_name: str,
+        result: str,
+    ) -> tuple[list[str], bool]:
+        """Extract at most three meaningful, bounded lines from a tool result."""
+
+        candidates = []
+        for raw_line in (result or "").splitlines():
+            line = raw_line.strip()
+            if not line or line == tool_name or line in {"```", "```text"}:
+                continue
+            if line.startswith("Error:"):
+                line = "失败：" + line[len("Error:") :].strip()
+            if len(line) > 160:
+                line = line[:157] + "..."
+            candidates.append(line)
+        if not candidates:
+            return ["工具未返回可展示结果。"], False
+        return candidates[:3], len(candidates) > 3
 
     def _record_ops_shared_turn(
         self,

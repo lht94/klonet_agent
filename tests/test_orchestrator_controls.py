@@ -1131,6 +1131,58 @@ def test_ops_tool_action_uses_safe_arguments_only():
     ) == "正在执行工具：unknown_tool"
 
 
+def test_ops_observation_shows_three_real_lines_and_omission():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    lines, omitted = orchestrator._tool_observation_lines(
+        "inspect_klonet_runtime",
+        "\n".join(
+            [
+                "inspect_klonet_runtime",
+                "- redis: detected - active",
+                "- docker: detected - redis_102 Up 6 days",
+                "- ports: detected - 0.0.0.0:12000",
+                "- screen: detected - 102_m",
+            ]
+        ),
+    )
+
+    assert lines == [
+        "- redis: detected - active",
+        "- docker: detected - redis_102 Up 6 days",
+        "- ports: detected - 0.0.0.0:12000",
+    ]
+    assert omitted is True
+
+
+def test_ops_observation_handles_empty_error_and_long_lines():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+
+    assert orchestrator._tool_observation_lines("search_code", "") == (
+        ["工具未返回可展示结果。"],
+        False,
+    )
+    assert orchestrator._tool_observation_lines(
+        "search_code",
+        "Error: source index unavailable",
+    ) == (["失败：source index unavailable"], False)
+    lines, omitted = orchestrator._tool_observation_lines(
+        "search_code",
+        "x" * 200,
+    )
+    assert lines == ["x" * 157 + "..."]
+    assert omitted is False
+
+
 def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):
     """Ops final answers should be constrained by a deterministic environment plan."""
 
