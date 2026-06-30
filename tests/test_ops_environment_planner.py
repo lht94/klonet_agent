@@ -57,6 +57,12 @@ def test_platform_start_plan_skips_running_services_and_blocks_conflicts():
     assert "command -v gunicorn" in plan
     assert "step=screen action=block" in plan
     assert "103_m" in plan
+    assert "step=startup_commands action=verify" in plan
+    assert "cd <project_root>" in plan
+    assert "/usr/local/python3/bin/gunicorn" in plan
+    assert "/usr/local/python3/bin/celery" in plan
+    assert "/usr/local/python3/bin/python3.8" in plan
+    assert "python3 mains/master_main.py" in plan
 
 
 def test_platform_start_plan_proceeds_when_no_conflict_and_paths_verified():

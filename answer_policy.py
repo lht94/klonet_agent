@@ -52,6 +52,15 @@ def build_answer_policy(
             "只执行当前机器实际存在的一套命令；"
             "不得仅凭“服务器路径”或“虚拟机路径”标签选择 /usr/local/bin 或 /usr/local/python3/bin。"
         )
+    if intent is not None and intent.operation == "platform_start":
+        rules.append(
+            "- 标准新平台启动命令应先 `cd <project_root>` 并复制 mains 入口文件到根目录；"
+            "Master/Worker 使用 `/usr/local/python3/bin/gunicorn`，"
+            "Celery 使用 `/usr/local/python3/bin/celery`，"
+            "Web Terminal 使用 `/usr/local/python3/bin/python3.8`；"
+            "不得生成 `python3 mains/master_main.py`、`python3 mains/worker_main.py` "
+            "或 `python3 mains/web_terminal_main.py` 作为 screen 启动命令。"
+        )
     return "\n".join(rules)
 
 

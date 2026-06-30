@@ -10,6 +10,26 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 
+def test_platform_start_policy_forbids_direct_python_mains_entrypoints():
+    from klonet_agent.answer_policy import build_answer_policy
+    from klonet_agent.knowledge.intent import QueryIntent
+
+    intent = QueryIntent.from_mapping(
+        {
+            "scope": "klonet",
+            "task_type": "operation_guide",
+            "operation": "platform_start",
+            "target": "klonet_platform",
+            "confidence": 0.95,
+        }
+    )
+
+    text = build_answer_policy("operation_guide", "启动新平台", intent=intent)
+
+    assert "python3 mains/master_main.py" in text
+    assert "/usr/local/python3/bin/gunicorn" in text
+
+
 def test_troubleshooting_policy_uses_diagnostic_structure():
     """故障排查应按原因、顺序和依据组织，并允许必要展开。"""
 

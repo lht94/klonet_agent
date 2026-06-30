@@ -97,10 +97,11 @@ sudo docker logs --tail 100 <container_name>
 
 ## 第三步：进入正确运行目录
 
-以下后端命令均从 `mains` 目录执行：
+以下后端命令均从 `<project_root>` 根目录执行；启动前需要先把 `mains/` 中的入口文件复制到根目录：
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
+cp mains/gun.py mains/master_main.py mains/celery_worker.py mains/web_terminal_main.py mains/worker_gun.py mains/worker_main.py .
 pwd
 test -f gun.py
 test -f master_main.py
@@ -130,15 +131,15 @@ ls -l /usr/local/python3/bin/gunicorn /usr/local/python3/bin/celery
 ### 服务器路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_master
-sudo /usr/local/bin/gunicorn -c gun.py master_main:flask_app
+sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app
 ~~~
 
 ### 服务器内虚拟机路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_master
 sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app
 ~~~
@@ -150,15 +151,15 @@ sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app
 ### 服务器路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_celery
-sudo /usr/local/bin/celery -A celery_worker.celery worker --loglevel=info
+sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=info
 ~~~
 
 ### 服务器内虚拟机路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_celery
 sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=info
 ~~~
@@ -170,15 +171,15 @@ sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=inf
 ### 服务器路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_web_terminal
-sudo /usr/local/bin/python3.8 web_terminal_main.py
+sudo /usr/local/python3/bin/python3.8 web_terminal_main.py
 ~~~
 
 ### 服务器内虚拟机路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_web_terminal
 sudo /usr/local/python3/bin/python3.8 web_terminal_main.py
 ~~~
@@ -206,15 +207,15 @@ sudo ./libvirt_config.sh
 ### 服务器路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_worker
-sudo /usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app
+sudo /usr/local/python3/bin/gunicorn -c worker_gun.py worker_main:flask_app
 ~~~
 
 ### 服务器内虚拟机路径
 
 ~~~bash
-cd <project_root>/mains
+cd <project_root>
 screen -S <instance>_worker
 sudo /usr/local/python3/bin/gunicorn -c worker_gun.py worker_main:flask_app
 ~~~
@@ -360,7 +361,7 @@ Nginx、Docker、Redis、MySQL 和 RabbitMQ 通常是共享或基础服务，单
 1. 使用 `screen -r <screen_name>` 返回目标 screen。
 2. 按 `Ctrl+C` 停止该进程。
 3. 确认端口已经释放。
-4. 在同一 `<project_root>/mains` 目录执行该服务原来的完整启动命令。
+4. 在同一 `<project_root>` 根目录执行该服务原来的完整启动命令。
 5. 用 `Ctrl+A`、`D` 离开 screen。
 6. 重新执行对应健康检查。
 
@@ -389,7 +390,7 @@ sudo lsof -i :<port>
 
 ### Master 启动即报 import 错误
 
-确认运行目录为 `<project_root>/mains`，并确认 Gunicorn、Celery 与 Python 使用同一套 `/usr/local/bin` 或 `/usr/local/python3/bin` 环境。不要混用两套依赖。
+确认运行目录为 `<project_root>`，并确认 Gunicorn、Celery 与 Python 使用同一套 `/usr/local/python3/bin` 环境；如果当前机器路径不同，必须先用 `command -v` 或 `ls -l` 验证，不要混用两套依赖。
 
 ### Worker 进程存在但平台不可见
 

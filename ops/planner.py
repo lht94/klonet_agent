@@ -71,6 +71,18 @@ def build_ops_environment_plan(
             "step=gunicorn action=verify command=command -v gunicorn && command -v celery && command -v python3.8 reason=启动命令路径尚未由当前机器验证。"
         )
 
+    decisions.append(
+        "step=startup_commands action=verify "
+        "cwd=cd <project_root> "
+        "prepare=cp mains/gun.py mains/master_main.py mains/celery_worker.py mains/web_terminal_main.py mains/worker_gun.py mains/worker_main.py . "
+        "master=sudo /usr/local/python3/bin/gunicorn -c gun.py master_main:flask_app "
+        "celery=sudo /usr/local/python3/bin/celery -A celery_worker.celery worker --loglevel=info "
+        "web_terminal=sudo /usr/local/python3/bin/python3.8 web_terminal_main.py "
+        "worker=sudo /usr/local/python3/bin/gunicorn -c worker_gun.py worker_main:flask_app "
+        "forbidden=python3 mains/master_main.py|python3 mains/worker_main.py|python3 mains/web_terminal_main.py "
+        "reason=Klonet 后端启动入口先复制到项目根目录；Master/Worker 用 gunicorn，Celery 用 celery，只有 Web Terminal 直接用 python3.8。"
+    )
+
     if conflicting_screens:
         decisions.append(
             "step=screen action=block reason=已存在同名 screen session，不能重复 screen -S 创建 sessions="

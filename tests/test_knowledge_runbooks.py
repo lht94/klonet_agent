@@ -106,6 +106,25 @@ def test_startup_runbook_requires_current_machine_path_verification():
         assert expected in text
 
 
+def test_startup_runbooks_do_not_mix_legacy_python_entrypoints():
+    text = "\n".join((_read(STARTUP_RUNBOOK), _read(MULTI_PLATFORM_STARTUP_RUNBOOK)))
+
+    stale_commands = (
+        "cd <project_root>/mains",
+        "python3 mains/master_main.py",
+        "python3 mains/worker_main.py",
+        "python3 mains/web_terminal_main.py",
+        "python3.8 mains/master_main.py",
+        "python3.8 mains/worker_main.py",
+        "python3.8 mains/web_terminal_main.py",
+        "sudo /usr/local/bin/gunicorn",
+        "sudo /usr/local/bin/celery",
+        "sudo /usr/local/bin/python3.8",
+    )
+    for stale in stale_commands:
+        assert stale not in text
+
+
 def test_startup_runbook_contains_complete_nginx_template():
     text = _read(STARTUP_RUNBOOK)
 
