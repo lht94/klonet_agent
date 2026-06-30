@@ -672,9 +672,8 @@ class AgentOrchestrator:
                                 self._conversation_state.to_tool_args()
                             )
                     # 调用工具函数，开始执行命令或其他动作。
-                    print_progress(f"正在调用工具：{tool_name}")
+                    self._print_tool_loop_action(tool_name, tool_args)
                     result = self.use_tool(tool_name, tool_args)
-                    print_progress(f"工具完成：{tool_name}")
                     self._print_tool_loop_observation(tool_name, result)
                     tool_events.append(
                         {
@@ -806,6 +805,13 @@ class AgentOrchestrator:
         """Show safe CLI progress milestones without adding them to model context."""
 
         return self.profile.name in {"mentor", "ops"} and self.answer_style != "brief"
+
+    def _print_tool_loop_action(self, tool_name: str, tool_args: dict) -> None:
+        """Print one safe Ops action before a tool executes."""
+
+        if self.profile.name != "ops" or self.answer_style == "brief":
+            return
+        print(f"Klonet Agent：正在执行工具：{tool_name}")
 
     def _print_tool_loop_observation(self, tool_name: str, result: str) -> None:
         """Print an audit-friendly Ops tool-loop observation."""

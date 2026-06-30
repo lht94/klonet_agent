@@ -1057,9 +1057,13 @@ def test_default_mode_prints_progress_milestones(capsys):
     output = capsys.readouterr().out
     assert "正在理解你的问题" in output
     assert "已识别：" in output
-    assert "正在调用工具：search_knowledge" in output
-    assert "工具完成：search_knowledge" in output
     assert "正在组织回答" in output
+    assert "正在检索知识库" not in output
+    assert "正在调用工具" not in output
+    assert "工具完成" not in output
+    assert "观察：" not in output
+    assert "思考摘要" in output
+    assert "已调用 search_knowledge" in output
     assert "INTENT_ANALYSIS_PROMPT" not in output
     assert '"semantic_frame"' not in output
 
