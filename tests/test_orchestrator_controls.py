@@ -1100,11 +1100,35 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
 
     output = capsys.readouterr().out
     assert "已识别：" in output
-    assert "正在调用工具：search_knowledge" in output
-    assert "工具完成：search_knowledge" in output
-    assert "工具结果摘要：" in output
-    assert "下一步：" in output
+    assert "正在检索知识库：Klonet 启动" in output
+    assert "观察：unexpected tool result" in output
+    assert "正在调用工具" not in output
+    assert "工具完成" not in output
+    assert "工具结果摘要" not in output
+    assert "下一步：" not in output
     assert "思考摘要" not in output
+
+
+def test_ops_tool_action_uses_safe_arguments_only():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+
+    assert orchestrator._format_tool_action(
+        "search_code",
+        {"query": "vemu_frontend", "token": "secret"},
+    ) == "正在搜索源码：vemu_frontend"
+    assert orchestrator._format_tool_action(
+        "inspect_screen_session",
+        {"session": "102_m", "password": "secret"},
+    ) == "正在检查 screen 会话：102_m"
+    assert orchestrator._format_tool_action(
+        "unknown_tool",
+        {"password": "secret"},
+    ) == "正在执行工具：unknown_tool"
 
 
 def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):

@@ -811,7 +811,36 @@ class AgentOrchestrator:
 
         if self.profile.name != "ops" or self.answer_style == "brief":
             return
-        print(f"Klonet Agent：正在执行工具：{tool_name}")
+        print(f"Klonet Agent：{self._format_tool_action(tool_name, tool_args)}")
+
+    def _format_tool_action(self, tool_name: str, tool_args: dict) -> str:
+        """Return a deterministic action using only allowlisted arguments."""
+
+        actions = {
+            "search_knowledge": ("正在检索知识库", "query"),
+            "search_shared_ops_memory": ("正在检索历史诊断", "query"),
+            "search_code": ("正在搜索源码", "query"),
+            "list_source_files": ("正在查看源码目录", "path"),
+            "list_files": ("正在查看目录", "path"),
+            "read_source_file": ("正在读取源码", "path"),
+            "read_file": ("正在读取文件", "path"),
+            "read_ops_file": ("正在读取运维文件", "path"),
+            "read_klonet_logs": ("正在读取 Klonet 日志", "path"),
+            "inspect_screen_session": ("正在检查 screen 会话", "session"),
+            "inspect_system_environment": ("正在检查系统环境", "checks"),
+            "inspect_ops_context": ("正在检查运维环境", "checks"),
+            "inspect_klonet_runtime": ("正在检查 Klonet 运行状态", "checks"),
+        }
+        action, key = actions.get(tool_name, (f"正在执行工具：{tool_name}", ""))
+        if not key or key not in tool_args:
+            return action
+        raw_value = tool_args[key]
+        if isinstance(raw_value, list):
+            raw_value = "、".join(str(item) for item in raw_value)
+        value = " ".join(str(raw_value).split())
+        if len(value) > 120:
+            value = value[:117] + "..."
+        return f"{action}：{value}" if value else action
 
     def _print_tool_loop_observation(self, tool_name: str, result: str) -> None:
         """Print an audit-friendly Ops tool-loop observation."""
