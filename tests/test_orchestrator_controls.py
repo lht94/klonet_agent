@@ -329,6 +329,90 @@ class StaticOpsExecutor:
         )
 
 
+class PlatformStartIntentAnalyzer:
+    """Return a deterministic platform-start intent for Ops planner tests."""
+
+    def analyze(self, user_input, *, recent_history=None):
+        from klonet_agent.knowledge.intent import QueryIntent
+        from klonet_agent.knowledge.intent_analyzer import IntentAnalysis
+
+        return IntentAnalysis(
+            intent=QueryIntent.from_mapping(
+                {
+                    "scope": "klonet",
+                    "task_type": "operation_guide",
+                    "operation": "platform_start",
+                    "confidence": 0.95,
+                }
+            ),
+            token_usage=0,
+        )
+
+
+class MultiToolOpsPlanLLM:
+    """Request multiple tools, then capture the follow-up model context."""
+
+    def __init__(self):
+        self.calls = []
+        self.answer_calls = 0
+
+    def complete(self, messages, tools, stream=False):
+        self.calls.append({"messages": list(messages), "tools": tools, "stream": stream})
+        if tools is None:
+            return _intent_response()
+        self.answer_calls += 1
+        if self.answer_calls == 1:
+            return iter(
+                [
+                    _stream_chunk(
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="knowledge-1",
+                                function=SimpleNamespace(
+                                    name="search_knowledge",
+                                    arguments='{"query":"Klonet 平台启动"}',
+                                ),
+                            ),
+                            SimpleNamespace(
+                                index=1,
+                                id="runtime-1",
+                                function=SimpleNamespace(
+                                    name="inspect_klonet_runtime",
+                                    arguments='{"checks":["redis","ports","screen"]}',
+                                ),
+                            ),
+                            SimpleNamespace(
+                                index=2,
+                                id="memory-1",
+                                function=SimpleNamespace(
+                                    name="search_shared_ops_memory",
+                                    arguments='{"query":"启动新平台"}',
+                                ),
+                            ),
+                        ],
+                        finish_reason="tool_calls",
+                        usage=SimpleNamespace(total_tokens=4),
+                    )
+                ]
+            )
+        return iter(
+            [
+                _stream_chunk(content="按当前环境启动建议如下。"),
+                _stream_chunk(finish_reason="stop", usage=SimpleNamespace(total_tokens=6)),
+            ]
+        )
+
+
+class MultiToolStaticOpsExecutor:
+    def run(self, tool_name, tool_args):
+        if tool_name == "search_knowledge":
+            return "检索到以下可靠 Klonet 证据：平台启动应检查端口和 screen。"
+        if tool_name == "search_shared_ops_memory":
+            return "以下是历史共享 Ops 记忆检索结果，只能作为线索。"
+        return StaticOpsExecutor().run(tool_name, tool_args)
+
+
 class StreamTimeoutError(Exception):
     pass
 
@@ -1060,6 +1144,63 @@ def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):
     assert "step=redis action=skip" in plan_messages[0]
     assert "step=docker action=skip" in plan_messages[0]
     assert "step=gunicorn action=verify" in plan_messages[0]
+
+
+def test_ops_plan_does_not_split_assistant_tool_response_pair(capsys, monkeypatch):
+    """OpenAI requires assistant tool_calls to be followed directly by tool messages."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    def planner_after_first_tool(*, user_input, operation, tool_events):
+        if not tool_events:
+            return ""
+        return "【Ops deterministic environment plan】\nstep=ports action=verify"
+
+    monkeypatch.setattr(
+        "klonet_agent.orchestrator.build_ops_environment_plan",
+        planner_after_first_tool,
+    )
+
+    with local_temp_dir() as temp_dir:
+        llm = MultiToolOpsPlanLLM()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="ops",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=session,
+            llm=llm,
+            tool_executor=MultiToolStaticOpsExecutor(),
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=PlatformStartIntentAnalyzer(),
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat("鎴戞€庝箞鍚姩 Klonet", history, 0)
+
+    final_messages = _answer_calls(llm)[1]["messages"]
+    assistant_index = next(
+        index
+        for index, message in enumerate(final_messages)
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    tool_call_count = len(final_messages[assistant_index]["tool_calls"])
+    following_roles = [
+        message.get("role")
+        for message in final_messages[
+            assistant_index + 1 : assistant_index + 1 + tool_call_count
+        ]
+    ]
+
+    assert following_roles == ["tool"] * tool_call_count
 
 
 def test_ops_tool_observation_is_appended_to_shared_memory(capsys):

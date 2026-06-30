@@ -598,6 +598,7 @@ class AgentOrchestrator:
                     printed_stream_reply = True
                 print(delta, end="", flush=True)
 
+            refresh_ops_environment_plan()
             response = self.chat_with_llm(
                 history,
                 stream=True,
@@ -682,8 +683,6 @@ class AgentOrchestrator:
                             "result": result,
                         }
                     )
-                    refresh_ops_environment_plan()
-
                     tool_msg = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
