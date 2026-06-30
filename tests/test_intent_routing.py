@@ -1,5 +1,7 @@
 """结构化意图路由与知识目录过滤测试。"""
 
+from __future__ import annotations
+
 import json
 import sys
 from pathlib import Path

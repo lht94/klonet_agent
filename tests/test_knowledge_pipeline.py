@@ -1,5 +1,7 @@
 """Klonet 四层知识资产构建与索引接入测试。"""
 
+from __future__ import annotations
+
 import json
 import warnings
 from pathlib import Path

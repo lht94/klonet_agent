@@ -1,5 +1,7 @@
 """Intent-case retrieval for semantic intent analysis."""
 
+from __future__ import annotations
+
 import json
 
 
