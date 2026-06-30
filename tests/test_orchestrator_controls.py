@@ -1146,6 +1146,62 @@ def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):
     assert "step=gunicorn action=verify" in plan_messages[0]
 
 
+def test_init_history_scopes_shared_ops_memory_by_mode():
+    """Mentor history should not receive shared runtime environment memories."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    with local_temp_dir() as temp_dir:
+        memory_store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        memory_store.append_shared_episode(
+            "tool_observation: inspect_klonet_runtime found 102_m and lht_m"
+        )
+        memory_store.write_shared_ops_baseline("Ubuntu 22.04; nginx active")
+
+        mentor = AgentOrchestrator(
+            profile=get_profile("mentor"),
+            session=AgentSession(
+                user_id="u1",
+                project_id="p1",
+                mode="mentor",
+                workspace_path=temp_dir / "workspace",
+                journal_path=temp_dir / "journal.md",
+            ),
+            llm=FakeLLM(),
+            trace_logger=TraceLogger(temp_dir / "mentor_trace.jsonl"),
+            memory_store=memory_store,
+        )
+        ops = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=AgentSession(
+                user_id="u1",
+                project_id="p1",
+                mode="ops",
+                workspace_path=temp_dir / "workspace",
+                journal_path=temp_dir / "journal.md",
+            ),
+            llm=FakeLLM(),
+            trace_logger=TraceLogger(temp_dir / "ops_trace.jsonl"),
+            memory_store=memory_store,
+        )
+
+        mentor_context = "\n".join(
+            message.get("content", "") for message in mentor.init_history()
+        )
+        ops_context = "\n".join(
+            message.get("content", "") for message in ops.init_history()
+        )
+
+    assert "102_m and lht_m" not in mentor_context
+    assert "Ubuntu 22.04" not in mentor_context
+    assert "102_m and lht_m" in ops_context
+    assert "Ubuntu 22.04" in ops_context
+
+
 def test_ops_plan_does_not_split_assistant_tool_response_pair(capsys, monkeypatch):
     """OpenAI requires assistant tool_calls to be followed directly by tool messages."""
 

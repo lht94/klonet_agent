@@ -107,7 +107,7 @@ class AgentOrchestrator:
             history.append({"role": "system", "content": prompt})
 
         # 把记忆设定加入到系统提示词中。
-        memory_prompt = self.memory_store.memory_prompt()
+        memory_prompt = self.memory_store.memory_prompt(mode=self.profile.name)
         history.append({"role": "system", "content": memory_prompt})
 
         # 把目前已有的 skill 加入到系统提示词中。
@@ -1263,7 +1263,7 @@ class AgentOrchestrator:
 
         for msg in history:
             if msg.get("role") == "system" and "MEMORY.md" in msg.get("content", ""):
-                msg["content"] = self.memory_store.memory_prompt()
+                msg["content"] = self.memory_store.memory_prompt(mode=self.profile.name)
                 return
 
     def _query_intent_tool_args(self) -> dict:

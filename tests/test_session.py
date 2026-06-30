@@ -130,7 +130,31 @@ def test_shared_ops_memory_is_visible_across_users():
         )
 
         assert "102_m and lht_m" in second.read_shared_memory()
-        assert "102_m and lht_m" in second.memory_prompt()
+        assert "102_m and lht_m" in second.memory_prompt(mode="ops")
+
+
+def test_shared_ops_memory_is_not_injected_into_mentor_prompt():
+    """Mentor should not see runtime Ops memory unless it explicitly switches mode."""
+
+    from klonet_agent.memory.store import MemoryStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = MemoryStore.for_session(temp_dir, "u1", "p1")
+        store.append_shared_episode(
+            "tool_observation: inspect_klonet_runtime found 102_m and lht_m"
+        )
+        store.write_shared_ops_baseline(
+            "Ubuntu 22.04; nginx active; redis ports 8873, 8872"
+        )
+
+        mentor_prompt = store.memory_prompt(mode="mentor")
+        ops_prompt = store.memory_prompt(mode="ops")
+
+    assert "102_m and lht_m" not in mentor_prompt
+    assert "Ubuntu 22.04" not in mentor_prompt
+    assert "102_m and lht_m" in ops_prompt
+    assert "Ubuntu 22.04" in ops_prompt
 
 
 def test_shared_ops_memory_only_injects_recent_days():

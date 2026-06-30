@@ -298,7 +298,7 @@ class MemoryStore:
             messages.pop(0)
         return messages
 
-    def memory_prompt(self) -> str:
+    def memory_prompt(self, mode: str = "ops") -> str:
         """生成记忆系统提示词，让大模型知道如何主动维护记忆。"""
 
         current_memory = self.read_memory()
@@ -310,6 +310,10 @@ class MemoryStore:
             "更早记录需要通过 search_shared_ops_memory 按需检索。"
             "共享记忆是历史线索，不是当前事实，使用前必须结合本轮工具结果确认。"
         )
+        if (mode or "").strip().lower() != "ops":
+            shared_ops_baseline = ""
+            shared_ops_memory = ""
+            shared_ops_policy = "当前模式不注入共享 Ops 环境记忆；如需读取服务器运行态，请切换到 Ops 模式。"
         return f"""
             【当前长期记忆 (MEMORY.md)】
             {current_memory}
