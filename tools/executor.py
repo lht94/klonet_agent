@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from time import perf_counter
 
-from klonet_agent.config import DEFAULT_RAG_TOP_K
+from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_enabled
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
@@ -302,7 +302,9 @@ class ToolExecutor:
     def _operation_plan_store(self) -> OperationPlanStore:
         return OperationPlanStore(
             self.memory_store.memory_dir / "ops_operation_plans",
-            recipe_runner=ControlledRecipeRunner(dry_run=True),
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=not ops_real_execution_enabled()
+            ),
         )
 
     def _record_trace(

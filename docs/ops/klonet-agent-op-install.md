@@ -33,6 +33,22 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 
 原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护都在 helper 内完成。放行底层命令会绕过这些校验。
 
+## 启用真实执行
+
+Agent 侧默认仍然 dry-run。即使 helper 和 sudoers 已安装，`execute_ops_operation_step` 也只会生成预览，除非运行 Agent 的环境显式设置：
+
+```bash
+export KLONET_AGENT_OPS_REAL_EXECUTION=1
+```
+
+建议只在完成以下检查后设置该变量：
+
+- `/usr/local/bin/klonet-agent-op` 已安装并归属 `root:root`
+- `/etc/sudoers.d/klonet-agent-op` 已通过 `visudo -cf`
+- 当前 Linux 用户只拥有 helper 入口的 sudo 权限
+- 本轮 OperationPlan 已经展示给用户并收到精确 `confirm <plan_id>`
+- 特权步骤已经收到精确 `confirm-step <plan_id> <step_id>`
+
 ## 验证
 
 ```bash

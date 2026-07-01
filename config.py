@@ -5,6 +5,7 @@
 """
 
 from pathlib import Path
+import os
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -40,3 +41,10 @@ KLONET_SOURCE_ROOT = PROJECT_ROOT / "klonet_knowledge" / "02_vemu_uestc_code"
 DEFAULT_USER_ID = "default"
 DEFAULT_PROJECT_ID = "default"
 DEFAULT_MODE = "mentor"
+
+
+def ops_real_execution_enabled() -> bool:
+    """Return whether Ops recipes may call the real server-side helper."""
+
+    value = os.getenv("KLONET_AGENT_OPS_REAL_EXECUTION", "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}

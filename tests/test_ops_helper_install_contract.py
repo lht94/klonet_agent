@@ -27,4 +27,5 @@ def test_install_doc_requires_root_owned_helper_and_visudo_validation():
     assert "chmod 0755 /usr/local/bin/klonet-agent-op" in text
     assert "visudo -cf /etc/sudoers.d/klonet-agent-op" in text
     assert "Agent 侧默认仍然 dry-run" in text
+    assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" in text
     assert "不要直接放行 screen、kill、bash、python" in text

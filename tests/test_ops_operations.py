@@ -619,6 +619,22 @@ def test_executor_operation_plan_store_defaults_to_dry_run_recipe_runner():
     assert operation_store.recipe_runner.dry_run is True
 
 
+def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypatch):
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    monkeypatch.setenv("KLONET_AGENT_OPS_REAL_EXECUTION", "1")
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(session=session, memory_store=store)
+        operation_store = executor._operation_plan_store()
+
+    assert operation_store.recipe_runner.dry_run is False
+
+
 def _extract_plan_id(text: str) -> str:
     for line in text.splitlines():
         if line.startswith("plan_id="):
