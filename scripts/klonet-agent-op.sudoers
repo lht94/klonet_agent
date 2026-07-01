@@ -9,6 +9,7 @@
 # OperationPlan execution on this server.
 
 Cmnd_Alias KLONET_AGENT_OP = /usr/local/bin/klonet-agent-op restart-screen-component --execute *, \
+    /usr/local/bin/klonet-agent-op stop-screen-component --execute *, \
     /usr/local/bin/klonet-agent-op start-platform-screens --execute *
 
 %klonet-ops ALL=(root) NOPASSWD: KLONET_AGENT_OP

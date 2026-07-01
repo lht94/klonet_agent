@@ -464,6 +464,52 @@ def test_start_platform_screens_recipe_dry_run_generates_safe_preview():
     assert statuses["prepare-files"] == "pending"
 
 
+def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="destroy_platform",
+            target="102",
+            objective="stop platform 102 master",
+            recipe_bindings={
+                "stop-services": {
+                    "recipe_id": "stop_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "stop-services")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "stop-services")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=stop_screen_component" in result
+    assert "command_preview=/usr/local/bin/klonet-agent-op stop-screen-component" in result
+    assert "--platform 102" in result
+    assert "--component master" in result
+    assert "--screen 102_m" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["stop-services"] == "completed"
+    assert statuses["identify-owned-resources"] == "pending"
+    assert statuses["cleanup-owned-resources"] == "pending"
+
+
 def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

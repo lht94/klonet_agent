@@ -39,6 +39,13 @@ def main(argv=None) -> int:
     restart.add_argument("--component", required=True)
     restart.add_argument("--screen", required=True, dest="screen_session")
     restart.add_argument("--project-root", required=True)
+    stop = subcommands.add_parser("stop-screen-component")
+    stop_mode = stop.add_mutually_exclusive_group(required=True)
+    stop_mode.add_argument("--dry-run", action="store_true")
+    stop_mode.add_argument("--execute", action="store_true")
+    stop.add_argument("--platform", required=True)
+    stop.add_argument("--component", required=True)
+    stop.add_argument("--screen", required=True, dest="screen_session")
     start = subcommands.add_parser("start-platform-screens")
     start_mode = start.add_mutually_exclusive_group(required=True)
     start_mode.add_argument("--dry-run", action="store_true")
@@ -48,6 +55,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
+    if args.action == "stop-screen-component":
+        return _stop_screen_component(args)
     if args.action == "start-platform-screens":
         return _start_platform_screens(args)
     _print_error(f"unsupported_action={args.action}")
@@ -78,6 +87,28 @@ def _restart_screen_component(args) -> int:
     return 0
 
 
+def _stop_screen_component(args) -> int:
+    problem = _validate_screen_component_args(
+        args.platform,
+        args.component,
+        args.screen_session,
+    )
+    if problem:
+        _print_error(problem)
+        return 2
+    if args.execute:
+        for command in _stop_commands(args.screen_session):
+            run_checked(command)
+    print("klonet_agent_op")
+    print("action=stop-screen-component")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"platform={args.platform}")
+    print(f"component={args.component}")
+    print(f"screen_session={args.screen_session}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
 def _start_platform_screens(args) -> int:
     problem = _validate_start_platform_args(args.platform, args.project_root)
     if problem:
@@ -97,6 +128,15 @@ def _start_platform_screens(args) -> int:
 
 
 def _validate_restart_args(platform: str, component: str, screen_session: str, project_root: str) -> str:
+    problem = _validate_screen_component_args(platform, component, screen_session)
+    if problem:
+        return problem
+    if not project_root or _unsafe_path(project_root):
+        return f"invalid_project_root={project_root or 'missing'}"
+    return ""
+
+
+def _validate_screen_component_args(platform: str, component: str, screen_session: str) -> str:
     if not _safe_name(platform):
         return f"invalid_platform={platform or 'missing'}"
     if component not in ALLOWED_COMPONENTS:
@@ -105,8 +145,6 @@ def _validate_restart_args(platform: str, component: str, screen_session: str, p
         return f"invalid_screen_session={screen_session or 'missing'}"
     if not screen_session.startswith(f"{platform}_") and f".{platform}_" not in screen_session:
         return "screen_session_does_not_match_platform"
-    if not project_root or _unsafe_path(project_root):
-        return f"invalid_project_root={project_root or 'missing'}"
     return ""
 
 
@@ -138,7 +176,7 @@ def _print_error(problem: str) -> None:
 
 def _restart_commands(component: str, screen_session: str, project_root: str) -> list:
     return [
-        ["screen", "-S", screen_session, "-X", "quit"],
+        *_stop_commands(screen_session),
         [
             "screen",
             "-dmS",
@@ -148,6 +186,10 @@ def _restart_commands(component: str, screen_session: str, project_root: str) ->
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
         ],
     ]
+
+
+def _stop_commands(screen_session: str) -> list:
+    return [["screen", "-S", screen_session, "-X", "quit"]]
 
 
 def _start_screen_sessions(platform: str) -> list:
