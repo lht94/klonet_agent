@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Server-side Klonet Ops helper.
+
+This helper is intended to be installed as /usr/local/bin/klonet-agent-op and
+allowlisted in sudoers later. The current contract is validation-only dry-run:
+it does not modify the host.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+
+ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
+SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="klonet-agent-op")
+    subcommands = parser.add_subparsers(dest="action", required=True)
+    restart = subcommands.add_parser("restart-screen-component")
+    restart.add_argument("--dry-run", action="store_true", required=True)
+    restart.add_argument("--platform", required=True)
+    restart.add_argument("--component", required=True)
+    restart.add_argument("--screen", required=True, dest="screen_session")
+    restart.add_argument("--project-root", required=True)
+    args = parser.parse_args(argv)
+    if args.action == "restart-screen-component":
+        return _restart_screen_component(args)
+    _print_error(f"unsupported_action={args.action}")
+    return 2
+
+
+def _restart_screen_component(args) -> int:
+    problem = _validate_restart_args(
+        args.platform,
+        args.component,
+        args.screen_session,
+        args.project_root,
+    )
+    if problem:
+        _print_error(problem)
+        return 2
+    print("klonet_agent_op")
+    print("action=restart-screen-component")
+    print("dry_run=true")
+    print(f"platform={args.platform}")
+    print(f"component={args.component}")
+    print(f"screen_session={args.screen_session}")
+    print(f"project_root={args.project_root}")
+    print("environment_changed=false")
+    return 0
+
+
+def _validate_restart_args(platform: str, component: str, screen_session: str, project_root: str) -> str:
+    if not _safe_name(platform):
+        return f"invalid_platform={platform or 'missing'}"
+    if component not in ALLOWED_COMPONENTS:
+        return f"unsupported_component={component or 'missing'}"
+    if not _safe_name(screen_session):
+        return f"invalid_screen_session={screen_session or 'missing'}"
+    if not screen_session.startswith(f"{platform}_") and f".{platform}_" not in screen_session:
+        return "screen_session_does_not_match_platform"
+    if not project_root or _unsafe_path(project_root):
+        return f"invalid_project_root={project_root or 'missing'}"
+    return ""
+
+
+def _safe_name(value: str) -> bool:
+    return bool(value and SAFE_NAME.match(value))
+
+
+def _unsafe_path(value: str) -> bool:
+    if any(part in value for part in ("\x00", "\n", "\r")):
+        return True
+    return not (value.startswith("/") or Path(value).is_absolute())
+
+
+def _print_error(problem: str) -> None:
+    print("klonet_agent_op", file=sys.stderr)
+    print(f"error={problem}", file=sys.stderr)
+    print("environment_changed=false", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
