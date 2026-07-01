@@ -219,6 +219,111 @@ def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
     ]
 
 
+def test_store_executes_confirmed_allowlisted_recipe_and_persists_result():
+    from klonet_agent.ops.operations import (
+        OperationPlanStore,
+        RecipeExecutionResult,
+        render_plan,
+    )
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def recipe_runner(plan, step):
+        calls.append((plan.plan_id, step.step_id, step.recipe_id))
+        return RecipeExecutionResult("completed", "recipe_id=test-restart executed=true")
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir, recipe_runner=recipe_runner)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        step.recipe_id = "test-restart"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    assert calls == [(plan.plan_id, "restart-master", "test-restart")]
+    assert "ops_operation_execution" in result
+    assert "result_status=completed" in result
+    assert "execution_result=recipe_id=test-restart executed=true" in result
+    assert "recipe=test-restart" in rendered
+    assert [step.status for step in loaded.steps] == [
+        "pending",
+        "completed",
+        "pending",
+    ]
+
+
+def test_store_blocks_bound_recipe_when_runner_is_not_configured():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        step.recipe_id = "test-restart"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "execution_result=recipe_runner_unavailable; environment unchanged" in result
+    assert [step.status for step in loaded.steps] == [
+        "pending",
+        "blocked",
+        "pending",
+    ]
+
+
+def test_store_marks_recipe_exception_as_failed_and_fails_plan():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    def recipe_runner(plan, step):
+        raise RuntimeError("boom")
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir, recipe_runner=recipe_runner)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        step.recipe_id = "test-restart"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=failed" in result
+    assert "execution_result=recipe_exception=boom" in result
+    assert loaded.status == "failed"
+    assert [step.status for step in loaded.steps] == [
+        "pending",
+        "failed",
+        "pending",
+    ]
+
+
 def _extract_plan_id(text: str) -> str:
     for line in text.splitlines():
         if line.startswith("plan_id="):

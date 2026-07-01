@@ -1,8 +1,9 @@
 """Controlled Ops operation plans.
 
 This module is the phase-three safety substrate. It stores auditable operation
-plans and confirmation state, but deliberately does not execute shell commands.
-Concrete deployment/restart/destroy recipes can be attached later step by step.
+plans and confirmation state, and only executes an injected controlled recipe
+runner for steps that explicitly bind a recipe_id. It never turns model text
+into arbitrary shell.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 _UTC8 = timezone(timedelta(hours=8))
@@ -29,6 +30,13 @@ class OperationStep:
     risk: str = "normal"
     requires_step_confirmation: bool = False
     status: str = "pending"
+    recipe_id: str = ""
+
+
+@dataclass
+class RecipeExecutionResult:
+    status: str
+    output: str
 
 
 @dataclass
@@ -47,8 +55,9 @@ class OperationPlan:
 class OperationPlanStore:
     """Filesystem-backed OperationPlan store."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, recipe_runner: Optional[Callable] = None):
         self.root = Path(root)
+        self.recipe_runner = recipe_runner
         self.root.mkdir(parents=True, exist_ok=True)
 
     def create_plan(
@@ -122,16 +131,53 @@ class OperationPlanStore:
                 f"{plan.plan_id} {step.step_id} before execution."
             )
         previous_status = step.status
-        step.status = "blocked"
+        if not step.recipe_id:
+            step.status = "blocked"
+            self.save_plan(plan)
+            return _render_step_execution(
+                plan,
+                step,
+                previous_status=previous_status,
+                result_status="blocked",
+                execution_result="no_recipe_attached; environment unchanged",
+                next_required_action="attach a controlled recipe before executing this step",
+            )
+        if self.recipe_runner is None:
+            step.status = "blocked"
+            self.save_plan(plan)
+            return _render_step_execution(
+                plan,
+                step,
+                previous_status=previous_status,
+                result_status="blocked",
+                execution_result="recipe_runner_unavailable; environment unchanged",
+                next_required_action="configure a controlled recipe runner for this environment",
+            )
+        step.status = "running"
+        self.save_plan(plan)
+        result = self._run_recipe(plan, step)
+        step.status = _recipe_status(result.status)
+        if step.status == "failed":
+            plan.status = "failed"
+        elif _all_steps_completed(plan):
+            plan.status = "completed"
         self.save_plan(plan)
         return _render_step_execution(
             plan,
             step,
             previous_status=previous_status,
-            result_status="blocked",
-            execution_result="no_recipe_attached; environment unchanged",
-            next_required_action="attach a controlled recipe before executing this step",
+            result_status=step.status,
+            execution_result=result.output,
         )
+
+    def _run_recipe(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
+        try:
+            result = self.recipe_runner(plan, step)
+        except Exception as exc:
+            return RecipeExecutionResult("failed", f"recipe_exception={exc}")
+        if isinstance(result, RecipeExecutionResult):
+            return result
+        return RecipeExecutionResult("failed", "recipe_runner_returned_invalid_result")
 
     def _path(self, plan_id: str) -> Path:
         return self.root / f"{_safe_plan_id(plan_id)}.json"
@@ -168,9 +214,10 @@ def render_plan(plan: OperationPlan) -> str:
     lines.append("steps:")
     for step in plan.steps:
         confirm = " step-confirm" if step.requires_step_confirmation else ""
+        recipe = f" recipe={step.recipe_id}" if step.recipe_id else ""
         lines.append(
             f"  - {step.step_id}: {step.title} "
-            f"risk={step.risk}{confirm} status={step.status}"
+            f"risk={step.risk}{confirm}{recipe} status={step.status}"
         )
     lines.append(f"approve_plan_command=confirm {plan.plan_id}")
     lines.append(
@@ -260,6 +307,17 @@ def _next_step_id(plan: OperationPlan) -> str:
         if step.status not in {"completed", "blocked", "failed"}:
             return step.step_id
     return "none"
+
+
+def _recipe_status(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized in {"completed", "failed", "blocked"}:
+        return normalized
+    return "failed"
+
+
+def _all_steps_completed(plan: OperationPlan) -> bool:
+    return bool(plan.steps) and all(step.status == "completed" for step in plan.steps)
 
 
 def _plan_to_mapping(plan: OperationPlan) -> dict:

@@ -348,7 +348,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_operation_step",
-        "执行已确认 Ops 计划中的一个受控 recipe 步骤。当前阶段只提供安全骨架，未知或未接入 recipe 的步骤会被拒绝，不会执行任意 shell。",
+        "执行已确认 Ops 计划中的一个受控 recipe 步骤。需要先完成 confirm <plan_id>；特权步骤还必须 confirm-step <plan_id> <step_id>。只会运行该步骤绑定 recipe_id 的白名单 runner；未知、未绑定或未接入 recipe 的步骤会 blocked，不会执行任意 shell。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
             "step_id": {"type": "string", "description": "要执行的步骤 ID。"},
