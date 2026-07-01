@@ -77,6 +77,16 @@ def test_mentor_prompt_requires_structured_intent_before_retrieval():
     assert "先向用户澄清" in MENTOR_PROMPT
 
 
+def test_mentor_prompt_forbids_operation_plan_generation():
+    """Mentor may recommend Ops but must not list executable environment plans."""
+
+    from klonet_agent.prompts import MENTOR_PROMPT
+
+    assert "Mentor 模式不得生成 OperationPlan" in MENTOR_PROMPT
+    assert "不得输出 confirm <plan_id>" in MENTOR_PROMPT
+    assert "建议切换到 Ops 模式" in MENTOR_PROMPT
+
+
 
 def test_memory_prompt_uses_teaching_agent_language():
     """记忆提示词不应该残留旧个人 Agent 称呼。"""

@@ -268,6 +268,61 @@ TOOLS = [
         ["query"],
     ),
     _tool(
+        "create_ops_operation_plan",
+        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存计划，不执行任何环境修改；计划必须先让用户看到并确认。",
+        {
+            "operation": {
+                "type": "string",
+                "enum": ["deploy_platform", "restart_platform", "destroy_platform"],
+                "description": "计划类型：部署、重启或销毁平台。",
+            },
+            "target": {
+                "type": "string",
+                "description": "目标平台名、实例名或待创建平台名；不确定时写 unknown。",
+            },
+            "objective": {
+                "type": "string",
+                "description": "用户可读的计划目标。",
+            },
+            "constraints": {
+                "type": "string",
+                "description": "来自 ops.planner 或只读工具的约束，例如端口冲突、screen 冲突、Redis/Docker 复用判断。",
+            },
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "本轮只读工具或知识库证据摘要。",
+            },
+        },
+        ["operation", "target"],
+    ),
+    _tool(
+        "approve_ops_operation_plan",
+        "记录用户对 Ops 操作计划或单个特权步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>，模型不能自行授权。",
+        {
+            "plan_id": {"type": "string", "description": "要确认的计划 ID。"},
+            "scope": {
+                "type": "string",
+                "enum": ["plan", "step"],
+                "description": "确认整个计划或单个步骤。",
+            },
+            "step_id": {
+                "type": "string",
+                "description": "scope=step 时必填的步骤 ID。",
+            },
+        },
+        ["plan_id", "scope"],
+    ),
+    _tool(
+        "execute_ops_operation_step",
+        "执行已确认 Ops 计划中的一个受控 recipe 步骤。当前阶段只提供安全骨架，未知或未接入 recipe 的步骤会被拒绝，不会执行任意 shell。",
+        {
+            "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
+            "step_id": {"type": "string", "description": "要执行的步骤 ID。"},
+        },
+        ["plan_id", "step_id"],
+    ),
+    _tool(
         "list_files",
         "列出当前 workspace 内的文件或目录。",
         {"path": {"type": "string", "description": "workspace 内相对路径，默认 ."}},

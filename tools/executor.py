@@ -14,6 +14,11 @@ from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.memory import MEMORY_STORE, MemoryStore
+from klonet_agent.ops.operations import (
+    OperationPlanStore,
+    execute_step_preview,
+    render_plan,
+)
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
@@ -58,6 +63,12 @@ class ToolExecutor:
         self.allowed_tools = allowed_tools
         self.trace_logger = trace_logger
         self.memory_store = memory_store or MEMORY_STORE
+        self._current_user_input = ""
+
+    def set_user_authorization_context(self, user_input: str) -> None:
+        """Set raw user text used to validate Ops confirmation commands."""
+
+        self._current_user_input = " ".join(str(user_input or "").split())
 
     def run(self, tool_name: str, tool_args: dict) -> str:
         """执行一个工具调用，并返回给大模型看的文本结果。"""
@@ -142,6 +153,28 @@ class ToolExecutor:
                 tool_args["query"],
                 tool_args.get("max_results", 5),
             )
+
+        if tool_name == "create_ops_operation_plan":
+            plan = self._operation_plan_store().create_plan(
+                operation=tool_args["operation"],
+                target=tool_args.get("target", ""),
+                objective=tool_args.get("objective", ""),
+                constraints=tool_args.get("constraints", ""),
+                evidence=[
+                    str(item)
+                    for item in tool_args.get("evidence", [])
+                    if item
+                ],
+            )
+            return render_plan(plan)
+
+        if tool_name == "approve_ops_operation_plan":
+            return self._approve_ops_operation_plan(tool_args)
+
+        if tool_name == "execute_ops_operation_step":
+            store = self._operation_plan_store()
+            plan = store.load_plan(tool_args["plan_id"])
+            return execute_step_preview(plan, tool_args["step_id"])
 
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))
@@ -238,6 +271,32 @@ class ToolExecutor:
             return journal.record_acceptance_gap(tool_args["content"])
 
         return f"Error:Unknown tool {tool_name}"
+
+    def _approve_ops_operation_plan(self, tool_args: dict) -> str:
+        store = self._operation_plan_store()
+        plan_id = str(tool_args.get("plan_id") or "")
+        scope = str(tool_args.get("scope") or "plan")
+        step_id = str(tool_args.get("step_id") or "")
+        if scope == "step":
+            expected = f"confirm-step {plan_id} {step_id}"
+            if self._current_user_input != expected:
+                return (
+                    "Error: 用户原文必须是 confirm-step <plan_id> <step_id>，"
+                    "模型不能自行授权特权步骤。"
+                )
+            plan = store.approve_step(plan_id, step_id)
+        else:
+            expected = f"confirm {plan_id}"
+            if self._current_user_input != expected:
+                return (
+                    "Error: 用户原文必须是 confirm <plan_id>，"
+                    "模型不能自行授权计划。"
+                )
+            plan = store.approve_plan(plan_id)
+        return render_plan(plan)
+
+    def _operation_plan_store(self) -> OperationPlanStore:
+        return OperationPlanStore(self.memory_store.memory_dir / "ops_operation_plans")
 
     def _record_trace(
         self,

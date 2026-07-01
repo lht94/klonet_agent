@@ -409,6 +409,8 @@ class AgentOrchestrator:
         resume_previous_turn = resume_state is not None
         effective_user_input = user_input
         turn_resume_message = None
+        if hasattr(self.tool_executor, "set_user_authorization_context"):
+            self.tool_executor.set_user_authorization_context(user_input)
 
         thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."
         thinking_visible = False

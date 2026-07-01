@@ -46,6 +46,12 @@ ENVIRONMENT_TOOLS = {
     "search_shared_ops_memory",
 }
 
+OPS_OPERATION_TOOLS = {
+    "create_ops_operation_plan",
+    "approve_ops_operation_plan",
+    "execute_ops_operation_step",
+}
+
 OPS_TOOLS = {
     "load_skill",
     "search_knowledge",
@@ -57,7 +63,7 @@ OPS_TOOLS = {
     "read_file",
     "append_episode",
     "web_fetch",
-} | ENVIRONMENT_TOOLS
+} | ENVIRONMENT_TOOLS | OPS_OPERATION_TOOLS
 
 CODING_TOOLS = MENTOR_TOOLS | {
     "update_todos",
@@ -92,7 +98,7 @@ def get_profile(name: str) -> AgentProfile:
             name="ops",
             mode_prompt=OPS_PROMPT,
             allowed_tools=OPS_TOOLS,
-            default_workflow="route -> retrieve runbook -> inspect read-only environment -> diagnose",
+            default_workflow="route -> retrieve runbook -> inspect read-only environment -> plan -> confirm -> execute controlled recipe",
             requires_rag=True,
             requires_review=False,
         )
