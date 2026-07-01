@@ -165,6 +165,37 @@ OperationPlan、确认协议和 recipe allowlist 决定。Ops 的“识别”只
 | P1 | Ops 输出结构由运维目标决定 | 通用回答策略会把运行态诊断写成概念解释、源码解释或项目进度 | 按 Ops 目标选择固定输出结构：已确认、未确认、证据来源、风险、下一步只读检查或计划确认命令 | “5045 被占用”这类问题必须输出 PID/cmd/cwd 的确认状态；证据不足时明确列出缺口，而不是给概念解释 |
 | P1 | 写操作请求进入计划流程 | 用户说“重启/部署/销毁/kill”时，当前容易混入 Coding 或普通建议 | Ops 识别到 `action=restart/deploy/destroy/stop/kill` 时，只能生成 OperationPlan 或拒绝直接执行；Coding 模式不处理服务器运行环境修改 | Mentor 建议切 Ops；Ops 生成计划；Coding 不被推荐用于服务器 kill、重启或销毁 |
 
+### Ops 工具能力清单与实现顺序
+
+Ops Agent 的目标不是开放任意 shell，而是逐步补齐 Ubuntu 运维人员常用的结构化能力。
+每个工具都必须有明确输入、结构化输出、脱敏规则、失败状态和测试用例。只读工具可直接用于诊断；
+修改环境的工具必须挂在 OperationPlan、确认协议和 recipe allowlist 后面。
+
+#### 第一批：只读精准诊断工具
+
+| 优先级 | 工具能力 | 目的 | 典型输入 | 输出要求 | 验收标准 |
+| --- | --- | --- | --- | --- | --- |
+| P0 | `inspect_port_owner` 或 `inspect_klonet_runtime(port_owner)` | 精确确认端口占用者，解决全量 `ss` 输出截断问题 | `ports=[5045]` | `port/status/pid/ppid/user/cmd/cwd`，无法读取时标记 `unchecked` 和原因 | 查询 5045 时能直接返回 PID、命令和 cwd；不得靠 screen 或历史记忆推断 |
+| P0 | `inspect_process_detail` | 按 PID 或关键词读取进程详情 | `pids=[1467095]` 或 `keywords=["web_terminal_main.py"]` | `pid/ppid/user/cmdline/cwd/create_time/listen_ports` | 能把 `python3.8 web_terminal_main.py` 与 cwd、监听端口关联起来 |
+| P0 | `inspect_screen_session` 增强 | 区分 screen 历史滚屏和当前进程状态 | `session="102_web"` | `session/status/snapshot_time/evidence_type=screen_scrollback/current_state=false` | 回答中不会把旧 traceback 或 `Started!` 单独当作当前状态 |
+| P1 | `inspect_platform_instances` | 聚合平台实例、screen、运行目录和端口 | `instance_names=["102","lht"]` 或空 | 每个平台的 `instance/runtime_dir/screens/config_paths/ports/confidence` | “有哪些平台在运行”能输出字段完整的短表，未确认字段写未确认 |
+| P1 | `inspect_nginx_routes` | 只读解析 Nginx 配置和反代端口 | `paths=["/etc/nginx/sites-available/default"]` | `server_name/location/proxy_pass/alias/source_path` | 新平台部署前能判断前端和后端路由是否冲突 |
+| P1 | `inspect_service_status` | 检查共享依赖状态 | `services=["nginx","docker","redis","mysql","rabbitmq","ovs","libvirt"]` | `service/status/source/unchecked_reason` | 不因 systemctl 不存在或权限不足误判服务缺失 |
+| P2 | `inspect_recent_errors` | 聚合指定日志的 mtime、size 和新增错误 | `paths=[...]`、`since_time=...` | `resolved_path/mtime/size/new_errors/error_count` | 旧 error.log 不能被当作当前错误；能说明“没有新日志”和“未检查”的区别 |
+
+#### 第二批：受控修改工具
+
+这些工具不直接暴露给模型自由调用，只能作为 OperationPlan step 的 recipe 执行器。每个 step 执行前必须校验目标资源归属，
+高风险步骤必须 `confirm-step <plan_id> <step_id>`。
+
+| 优先级 | 受控能力 | 适用场景 | 前置校验 | 验收标准 |
+| --- | --- | --- | --- | --- |
+| P0 | `restart_screen_service` | 重启已确认归属的平台 screen 服务 | 已确认 `instance/session/pid/cwd/start_command`，且目标不属于其他平台 | 只重启目标 screen；完成后端口、进程和 screen 状态通过验证 |
+| P1 | `render_klonet_config` | 为新平台生成后端配置、Web Terminal 配置和前端配置 | 端口、实例名、项目目录、Nginx 路由均无冲突；备份旧文件 | 输出 diff/备份路径；未确认前不覆盖配置 |
+| P1 | `start_platform_screens` | 启动 Master、Celery、Web Terminal、Worker | 启动命令来自知识库和当前机器 `command -v` 验证；screen 名不冲突 | 四个 screen 创建成功；端口和进程验证通过 |
+| P1 | `reload_nginx_checked` | 修改前端或反代后 reload Nginx | 已执行并通过 `nginx -t`；只修改计划创建或明确归属片段 | `nginx -t` 失败时不得 reload；成功后记录验证结果 |
+| P2 | `destroy_platform_resources` | 销毁指定平台 | 能证明 screen、目录、Nginx 片段、端口和临时资源属于该平台；共享服务排除 | 不删除 Redis/Docker/OVS/Nginx 等共享服务；只清理计划归属资源 |
+
 ## 阶段三：增加受控环境操作
 
 ### 阶段目标
