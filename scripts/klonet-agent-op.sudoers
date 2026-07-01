@@ -1,0 +1,13 @@
+# Klonet Agent controlled Ops helper.
+#
+# Install this file as:
+#   /etc/sudoers.d/klonet-agent-op
+# Validate with:
+#   visudo -cf /etc/sudoers.d/klonet-agent-op
+#
+# Replace %klonet-ops with the Linux group that is allowed to approve Ops
+# OperationPlan execution on this server.
+
+Cmnd_Alias KLONET_AGENT_OP = /usr/local/bin/klonet-agent-op restart-screen-component --execute *
+
+%klonet-ops ALL=(root) NOPASSWD: KLONET_AGENT_OP

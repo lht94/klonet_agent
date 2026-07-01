@@ -1,0 +1,30 @@
+"""Ops helper installation and sudoers contract tests."""
+
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUDOERS_TEMPLATE = PROJECT_ROOT / "scripts" / "klonet-agent-op.sudoers"
+INSTALL_DOC = PROJECT_ROOT / "docs" / "ops" / "klonet-agent-op-install.md"
+
+
+def test_sudoers_template_only_allows_fixed_helper_entrypoint():
+    text = SUDOERS_TEMPLATE.read_text(encoding="utf-8")
+
+    assert "/usr/local/bin/klonet-agent-op restart-screen-component --execute" in text
+    assert "NOPASSWD:" in text
+    assert "/bin/bash" not in text
+    assert "/usr/bin/screen" not in text
+    assert "/usr/bin/kill" not in text
+    assert "/usr/bin/python" not in text
+    assert "/usr/local/python3/bin/python3.8" not in text
+
+
+def test_install_doc_requires_root_owned_helper_and_visudo_validation():
+    text = INSTALL_DOC.read_text(encoding="utf-8")
+
+    assert "chown root:root /usr/local/bin/klonet-agent-op" in text
+    assert "chmod 0755 /usr/local/bin/klonet-agent-op" in text
+    assert "visudo -cf /etc/sudoers.d/klonet-agent-op" in text
+    assert "Agent 侧默认仍然 dry-run" in text
+    assert "不要直接放行 screen、kill、bash、python" in text
