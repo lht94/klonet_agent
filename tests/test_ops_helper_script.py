@@ -1,5 +1,7 @@
 """Server-side Ops helper contract tests."""
 
+import importlib.machinery
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -67,3 +69,135 @@ def test_restart_screen_component_helper_rejects_unknown_component():
     assert result.returncode == 2
     assert "unsupported_component=database" in result.stderr
     assert "environment_changed=false" in result.stderr
+
+
+def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+
+    code = helper.main(
+        [
+            "restart-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [
+        ["screen", "-S", "102_m", "-X", "quit"],
+        [
+            "screen",
+            "-dmS",
+            "102_m",
+            "bash",
+            "-lc",
+            "cd /home/adminis/lht/102_project && /usr/local/bin/gunicorn -c gun.py master_main:flask_app",
+        ],
+    ]
+    assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_restart_web_terminal_helper_uses_server_python_path(monkeypatch):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+
+    code = helper.main(
+        [
+            "restart-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "web_terminal",
+            "--screen",
+            "102_web",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    )
+
+    assert code == 0
+    assert commands[1] == [
+        "screen",
+        "-dmS",
+        "102_web",
+        "bash",
+        "-lc",
+        "cd /home/adminis/lht/102_project && /usr/local/python3/bin/python3.8 web_terminal_main.py",
+    ]
+
+
+def test_restart_screen_component_helper_rejects_screen_platform_mismatch():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "restart-screen-component",
+            "--dry-run",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "lht_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 2
+    assert "screen_session_does_not_match_platform" in result.stderr
+    assert "environment_changed=false" in result.stderr
+
+
+def test_restart_screen_component_helper_rejects_shell_metacharacters_in_project_root():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "restart-screen-component",
+            "--dry-run",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project;touch /tmp/pwned",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 2
+    assert "invalid_project_root=" in result.stderr
+    assert "environment_changed=false" in result.stderr
+
+
+def _load_helper_module():
+    loader = importlib.machinery.SourceFileLoader("klonet_agent_op_helper", str(HELPER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module

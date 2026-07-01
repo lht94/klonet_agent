@@ -10,19 +10,30 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
 
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
+COMPONENT_COMMANDS = {
+    "master": "/usr/local/bin/gunicorn -c gun.py master_main:flask_app",
+    "worker": "/usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app",
+    "celery": "/usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
+    "web_terminal": "/usr/local/python3/bin/python3.8 web_terminal_main.py",
+}
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="klonet-agent-op")
     subcommands = parser.add_subparsers(dest="action", required=True)
     restart = subcommands.add_parser("restart-screen-component")
-    restart.add_argument("--dry-run", action="store_true", required=True)
+    mode = restart.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--execute", action="store_true")
     restart.add_argument("--platform", required=True)
     restart.add_argument("--component", required=True)
     restart.add_argument("--screen", required=True, dest="screen_session")
@@ -44,14 +55,17 @@ def _restart_screen_component(args) -> int:
     if problem:
         _print_error(problem)
         return 2
+    if args.execute:
+        for command in _restart_commands(args.component, args.screen_session, args.project_root):
+            run_checked(command)
     print("klonet_agent_op")
     print("action=restart-screen-component")
-    print("dry_run=true")
+    print(f"dry_run={str(args.dry_run).lower()}")
     print(f"platform={args.platform}")
     print(f"component={args.component}")
     print(f"screen_session={args.screen_session}")
     print(f"project_root={args.project_root}")
-    print("environment_changed=false")
+    print(f"environment_changed={str(args.execute).lower()}")
     return 0
 
 
@@ -76,13 +90,33 @@ def _safe_name(value: str) -> bool:
 def _unsafe_path(value: str) -> bool:
     if any(part in value for part in ("\x00", "\n", "\r")):
         return True
-    return not (value.startswith("/") or Path(value).is_absolute())
+    if value.startswith("/"):
+        return not SAFE_ABSOLUTE_PATH.match(value)
+    return not Path(value).is_absolute()
 
 
 def _print_error(problem: str) -> None:
     print("klonet_agent_op", file=sys.stderr)
     print(f"error={problem}", file=sys.stderr)
     print("environment_changed=false", file=sys.stderr)
+
+
+def _restart_commands(component: str, screen_session: str, project_root: str) -> list:
+    return [
+        ["screen", "-S", screen_session, "-X", "quit"],
+        [
+            "screen",
+            "-dmS",
+            screen_session,
+            "bash",
+            "-lc",
+            f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
+        ],
+    ]
+
+
+def run_checked(command: list) -> None:
+    subprocess.run(command, check=True)
 
 
 if __name__ == "__main__":
