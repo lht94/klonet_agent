@@ -836,6 +836,7 @@ class AgentOrchestrator:
             "inspect_screen_session": ("正在检查 screen 会话", "session"),
             "inspect_system_environment": ("正在检查系统环境", "checks"),
             "inspect_ops_context": ("正在检查运维环境", "checks"),
+            "inspect_platform_instances": ("正在盘点 Klonet 平台实例", "project_roots"),
             "inspect_klonet_runtime": ("正在检查 Klonet 运行状态", "checks"),
         }
         action, key = actions.get(tool_name, (f"正在执行工具：{tool_name}", ""))

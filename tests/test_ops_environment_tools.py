@@ -70,6 +70,7 @@ def test_environment_tools_are_registered_for_llm():
     tool_names = {item["function"]["name"] for item in TOOLS}
 
     assert "inspect_ops_context" in tool_names
+    assert "inspect_platform_instances" in tool_names
     assert "inspect_system_environment" in tool_names
     assert "inspect_klonet_runtime" in tool_names
     assert "read_ops_file" in tool_names
@@ -99,6 +100,7 @@ def test_ops_profile_allows_screen_inspection():
     profile = get_profile("ops")
 
     assert "inspect_screen_session" in profile.allowed_tools
+    assert "inspect_platform_instances" in profile.allowed_tools
     assert "inspect_ops_context" in profile.allowed_tools
     assert "read_ops_file" in profile.allowed_tools
 
@@ -132,6 +134,66 @@ def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):
     assert "## assets" in result
     assert "docker-compose.yml" in result
     assert "Dockerfile" in result
+
+
+def test_platform_instance_inspection_groups_screens_processes_and_config(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        project = temp_dir / "102_project"
+        project.mkdir()
+        (project / "config.py").write_text(
+            "master_port = 12000\n"
+            "worker_port = 12001\n"
+            "public_port = 12002\n"
+            "web_terminal_port = 5045\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            environment,
+            "_screen_instance_rows",
+            lambda: [
+                {"session": "1024293.102_m", "platform": "102", "role": "master"},
+                {"session": "1034358.102_c", "platform": "102", "role": "celery"},
+                {"session": "1037323.102_w", "platform": "102", "role": "worker"},
+                {"session": "1039800.102_web", "platform": "102", "role": "web_terminal"},
+                {"session": "647892.lht_m", "platform": "lht", "role": "master"},
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {
+                    "pid": 1467011,
+                    "cwd": str(project),
+                    "cmd": "sudo /usr/local/bin/gunicorn -c gun.py master_main:flask_app",
+                    "platform": "102",
+                    "role": "master",
+                },
+                {
+                    "pid": 1467095,
+                    "cwd": str(project),
+                    "cmd": "python3.8 web_terminal_main.py",
+                    "platform": "102",
+                    "role": "web_terminal",
+                },
+            ],
+        )
+
+        result = environment.inspect_platform_instances(
+            {"project_roots": [str(project)], "max_instances": 10}
+        )
+
+    assert "inspect_platform_instances" in result
+    assert "platform=102" in result
+    assert "roles=celery,master,web_terminal,worker" in result
+    assert f"project_roots={project}" in result
+    assert "ports=master_port:12000,worker_port:12001,public_port:12002,web_terminal_port:5045" in result
+    assert "platform=lht" in result
+    assert "source=screen" in result
 
 
 def test_executor_persists_ops_baseline_snapshot():

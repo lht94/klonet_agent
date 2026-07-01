@@ -193,6 +193,22 @@ TOOLS = [
         [],
     ),
     _tool(
+        "inspect_platform_instances",
+        "只读盘点当前服务器上的 Klonet 平台实例。综合 screen 会话、Klonet 相关进程 cwd/命令和可选项目根目录 config.py，输出 platform、roles、screen_sessions、pids、project_roots、ports；部署/重启/销毁前应先用它检查所有平台名称和端口冲突。",
+        {
+            "project_roots": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：已知 Klonet 项目根目录列表，用于读取各自 config.py 中的端口配置，例如 /home/adminis/lht/102_project。",
+            },
+            "max_instances": {
+                "type": "integer",
+                "description": "最多返回多少个平台实例，默认 50。",
+            },
+        },
+        [],
+    ),
+    _tool(
         "inspect_klonet_runtime",
         "只读检查本机 Klonet 相关运行状态，例如端口、screen、nginx、Docker、Redis、RabbitMQ、MySQL、OVS、KVM、libvirt。",
         {

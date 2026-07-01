@@ -22,6 +22,7 @@ from klonet_agent.ops.operations import (
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
+    inspect_platform_instances,
     inspect_screen_session,
     inspect_klonet_runtime,
     inspect_ops_context,
@@ -135,6 +136,9 @@ class ToolExecutor:
             if "## baseline" in result:
                 self.memory_store.write_shared_ops_baseline(result)
             return result
+
+        if tool_name == "inspect_platform_instances":
+            return inspect_platform_instances(tool_args)
 
         if tool_name == "inspect_klonet_runtime":
             return inspect_klonet_runtime(tool_args)

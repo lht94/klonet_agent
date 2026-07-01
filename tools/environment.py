@@ -66,6 +66,12 @@ DEPLOYMENT_ASSET_NAMES = {
     "nginx.conf",
 }
 DEPLOYMENT_ASSET_SUFFIXES = {".service", ".conf", ".ini", ".yml", ".yaml", ".toml"}
+KLONET_PORT_KEYS = (
+    "master_port",
+    "worker_port",
+    "public_port",
+    "web_terminal_port",
+)
 
 _SENSITIVE_NAME_PARTS = (
     ".env",
@@ -188,6 +194,61 @@ def inspect_ops_context(args: Optional[dict] = None) -> str:
     if "assets" in sections:
         lines.append("## assets")
         lines.extend(_scan_deployment_assets(args))
+    return "\n".join(lines)
+
+
+def inspect_platform_instances(args: Optional[dict] = None) -> str:
+    """Inspect running Klonet-like platform instances from screen, processes and configs."""
+
+    args = args or {}
+    instances = {}
+    evidence = []
+    for row in _screen_instance_rows():
+        entry = _platform_entry(instances, row["platform"])
+        entry["roles"].add(row["role"])
+        entry["screen_sessions"].append(row["session"])
+        entry["sources"].add("screen")
+    for row in _process_instance_rows():
+        entry = _platform_entry(instances, row["platform"])
+        entry["roles"].add(row["role"])
+        entry["pids"].append(row["pid"])
+        if row["cwd"] and row["cwd"] != "?":
+            entry["project_roots"].add(row["cwd"])
+        entry["sources"].add("process")
+    for root in _requested_project_roots(args):
+        platform_name = _platform_from_project_root(root)
+        entry = _platform_entry(instances, platform_name)
+        entry["project_roots"].add(str(root))
+        entry["sources"].add("config")
+        ports = _read_config_ports_from_root(root)
+        entry["ports"].update(ports)
+    max_instances = _safe_int(args.get("max_instances"), 50)
+    lines = ["inspect_platform_instances"]
+    if not instances:
+        return _render_tool_result(
+            "inspect_platform_instances",
+            [ProbeResult("platform_instances", STATUS_MISSING, "no screen/process/config evidence found")],
+        )
+    for name in sorted(instances)[:max_instances]:
+        entry = instances[name]
+        detail_parts = [
+            f"platform={name}",
+            f"source={','.join(sorted(entry['sources'])) or 'unchecked'}",
+            f"roles={','.join(sorted(entry['roles'])) or 'unchecked'}",
+        ]
+        if entry["screen_sessions"]:
+            detail_parts.append("screen_sessions=" + ",".join(sorted(entry["screen_sessions"])))
+        if entry["pids"]:
+            detail_parts.append("pids=" + ",".join(str(pid) for pid in sorted(set(entry["pids"]))))
+        if entry["project_roots"]:
+            detail_parts.append("project_roots=" + ",".join(sorted(entry["project_roots"])))
+        if entry["ports"]:
+            detail_parts.append(
+                "ports="
+                + ",".join(f"{key}:{entry['ports'][key]}" for key in _ordered_ports(entry["ports"]))
+            )
+        evidence.append(ProbeResult("platform_instance", STATUS_DETECTED, " ".join(detail_parts)))
+    lines.extend(item.render() for item in evidence)
     return "\n".join(lines)
 
 
@@ -359,6 +420,176 @@ def inspect_screen_session(args: Optional[dict] = None) -> str:
                 snapshot_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _platform_entry(instances: dict, platform: str) -> dict:
+    normalized = platform or "unknown"
+    if normalized not in instances:
+        instances[normalized] = {
+            "roles": set(),
+            "screen_sessions": [],
+            "pids": [],
+            "project_roots": set(),
+            "ports": {},
+            "sources": set(),
+        }
+    return instances[normalized]
+
+
+def _screen_instance_rows() -> list:
+    if os.name == "nt" or shutil.which("screen") is None:
+        return []
+    try:
+        completed = subprocess.run(
+            ["screen", "-ls"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    rows = []
+    for raw_line in (completed.stdout or "").splitlines():
+        token = raw_line.strip().split(None, 1)[0] if raw_line.strip() else ""
+        if "." not in token:
+            continue
+        logical_name = token.split(".", 1)[1]
+        parsed = _platform_role_from_name(logical_name)
+        if parsed:
+            platform, role = parsed
+            rows.append({"session": token, "platform": platform, "role": role})
+    return rows
+
+
+def _process_instance_rows() -> list:
+    command = _probe_command("processes")
+    if command is None:
+        return []
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if completed.returncode != 0:
+        return []
+    rows = []
+    for raw_line in (completed.stdout or "").splitlines():
+        match = re.search(r"\bpid=(\d+)\s+cwd=(\S+)\s+cmd=(.*)$", raw_line)
+        if not match:
+            continue
+        pid = int(match.group(1))
+        cwd = match.group(2)
+        cmd = match.group(3)
+        role = _role_from_command(cmd)
+        platform = _platform_from_cwd(cwd)
+        if role or platform != "unknown":
+            rows.append(
+                {
+                    "pid": pid,
+                    "cwd": cwd,
+                    "cmd": redact_sensitive_text(_single_line(cmd, max_chars=300)),
+                    "platform": platform,
+                    "role": role or "unknown",
+                }
+            )
+    return rows
+
+
+def _requested_project_roots(args: dict) -> list:
+    roots = args.get("project_roots")
+    if not isinstance(roots, list):
+        return []
+    result = []
+    for raw_root in roots:
+        path = Path(str(raw_root or "")).expanduser()
+        if path.exists() and path.is_dir() and not _is_sensitive_path(path):
+            result.append(path)
+    return result
+
+
+def _platform_role_from_name(name: str) -> Optional[tuple]:
+    suffix_roles = (
+        ("_web", "web_terminal"),
+        ("_t", "web_terminal"),
+        ("_m", "master"),
+        ("_w", "worker"),
+        ("_c", "celery"),
+    )
+    for suffix, role in suffix_roles:
+        if name.endswith(suffix) and len(name) > len(suffix):
+            return name[: -len(suffix)], role
+    return None
+
+
+def _role_from_command(command: str) -> str:
+    lowered = (command or "").lower()
+    if "web_terminal_main.py" in lowered:
+        return "web_terminal"
+    if "worker_main" in lowered or "worker_gun.py" in lowered:
+        return "worker"
+    if "master_main" in lowered or "gun.py" in lowered:
+        return "master"
+    if "celery" in lowered:
+        return "celery"
+    return ""
+
+
+def _platform_from_cwd(cwd: str) -> str:
+    if not cwd or cwd == "?":
+        return "unknown"
+    return _platform_from_project_root(Path(cwd))
+
+
+def _platform_from_project_root(root: Path) -> str:
+    for part in reversed(root.parts):
+        lower = part.lower()
+        if lower.endswith("_project") and len(part) > len("_project"):
+            return part[: -len("_project")]
+    return root.name or "unknown"
+
+
+def _read_config_ports(config_path: Path) -> dict:
+    if not config_path.exists() or not config_path.is_file() or _is_sensitive_path(config_path):
+        return {}
+    try:
+        text = config_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    ports = {}
+    for key in KLONET_PORT_KEYS:
+        match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*['\"]?(\d+)['\"]?", text)
+        if match:
+            ports[key] = match.group(1)
+    return ports
+
+
+def _read_config_ports_from_root(root: Path) -> dict:
+    candidates = (
+        root / "config.py",
+        root / "vemu_uestc" / "config.py",
+        root / "mains" / "config.py",
+    )
+    for config_path in candidates:
+        ports = _read_config_ports(config_path)
+        if ports:
+            return ports
+    return {}
+
+
+def _ordered_ports(ports: dict) -> list:
+    ordered = [key for key in KLONET_PORT_KEYS if key in ports]
+    ordered.extend(sorted(key for key in ports if key not in ordered))
+    return ordered
 
 
 def run_read_only_probe(name: str) -> ProbeResult:
