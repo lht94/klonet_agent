@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import subprocess
 from pathlib import Path
 
 from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExecutionResult
@@ -22,9 +23,16 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 class ControlledRecipeRunner:
     """Dispatch allowlisted Ops recipes."""
 
-    def __init__(self, *, dry_run: bool = True, helper_path: str = "/usr/local/bin/klonet-agent-op"):
+    def __init__(
+        self,
+        *,
+        dry_run: bool = True,
+        helper_path: str = "/usr/local/bin/klonet-agent-op",
+        command_runner=None,
+    ):
         self.dry_run = dry_run
         self.helper_path = helper_path
+        self.command_runner = command_runner or _run_command
 
     def __call__(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         if step.recipe_id == RESTART_SCREEN_COMPONENT:
@@ -43,6 +51,7 @@ class ControlledRecipeRunner:
         command = [
             self.helper_path,
             "restart-screen-component",
+            "--dry-run" if self.dry_run else "--execute",
             "--platform",
             platform,
             "--component",
@@ -52,6 +61,27 @@ class ControlledRecipeRunner:
             "--project-root",
             project_root,
         ]
+        if not self.dry_run:
+            try:
+                output = self.command_runner(command)
+            except subprocess.CalledProcessError as exc:
+                return RecipeExecutionResult(
+                    "failed",
+                    (
+                        f"helper_failed returncode={exc.returncode} "
+                        f"stderr={_one_line(exc.stderr)} "
+                        f"stdout={_one_line(exc.output)}"
+                    ),
+                )
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    f"dry_run=false "
+                    f"recipe_id={RESTART_SCREEN_COMPONENT} "
+                    f"command={_format_command(command)} "
+                    f"helper_output={_one_line(output)}"
+                ),
+            )
         return RecipeExecutionResult(
             "completed",
             (
@@ -89,3 +119,19 @@ def _looks_unsafe_path(value: str) -> bool:
 
 def _format_command(command: list) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
+
+
+def _run_command(command: list) -> str:
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return completed.stdout.strip()
+
+
+def _one_line(text: str) -> str:
+    return " ".join(str(text or "").split())[:500]

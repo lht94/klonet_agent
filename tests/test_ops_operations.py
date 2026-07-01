@@ -389,6 +389,122 @@ def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
     ]
 
 
+def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return "helper stdout ok"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102 master",
+            recipe_bindings={
+                "restart-master": {
+                    "recipe_id": "restart_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert calls == [
+        [
+            "/usr/local/bin/klonet-agent-op",
+            "restart-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    ]
+    assert "result_status=completed" in result
+    assert "dry_run=false" in result
+    assert "helper stdout ok" in result
+    assert [step.status for step in loaded.steps] == [
+        "pending",
+        "completed",
+        "pending",
+    ]
+
+
+def test_restart_screen_component_recipe_execute_reports_helper_failure():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(7, command, output="bad", stderr="screen failed")
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102 master",
+            recipe_bindings={
+                "restart-master": {
+                    "recipe_id": "restart_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=failed" in result
+    assert "helper_failed returncode=7" in result
+    assert "screen failed" in result
+    assert loaded.status == "failed"
+
+
 def test_restart_screen_component_recipe_blocks_unknown_component():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -486,6 +602,21 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
     assert "dry_run=true" in result
     assert "recipe_id=restart_screen_component" in result
     assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
+
+
+def test_executor_operation_plan_store_defaults_to_dry_run_recipe_runner():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(session=session, memory_store=store)
+        operation_store = executor._operation_plan_store()
+
+    assert operation_store.recipe_runner.dry_run is True
 
 
 def _extract_plan_id(text: str) -> str:
