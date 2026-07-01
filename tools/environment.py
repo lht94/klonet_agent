@@ -148,6 +148,7 @@ def inspect_system_environment(args: Optional[dict] = None) -> str:
 def inspect_klonet_runtime(args: Optional[dict] = None) -> str:
     """Inspect local runtime hints relevant to Klonet troubleshooting."""
 
+    args = args or {}
     requested = _requested_checks(
         args,
         default=(
@@ -161,7 +162,14 @@ def inspect_klonet_runtime(args: Optional[dict] = None) -> str:
             "mysql",
         ),
     )
-    results = [run_read_only_probe(check) for check in requested]
+    results = []
+    for check in requested:
+        if check == "port_owner":
+            results.extend(_inspect_port_owners(args))
+        elif check == "process_details":
+            results.extend(_inspect_process_details(args))
+        else:
+            results.append(run_read_only_probe(check))
     return _render_tool_result("inspect_klonet_runtime", results)
 
 
@@ -379,6 +387,182 @@ def run_read_only_probe(name: str) -> ProbeResult:
         return ProbeResult(normalized, STATUS_MISSING, "no output")
     max_chars = 1800 if normalized == "processes" else 600
     return ProbeResult(normalized, STATUS_DETECTED, _single_line(output, max_chars=max_chars))
+
+
+def _inspect_port_owners(args: dict) -> list:
+    ports = _requested_ports(args)
+    if not ports:
+        return [ProbeResult("port_owner", STATUS_UNCHECKED, "ports is required")]
+    if os.name == "nt":
+        return [ProbeResult("port_owner", STATUS_UNCHECKED, "port_owner is not implemented on Windows")]
+    if shutil.which("ss") is None:
+        return [ProbeResult("port_owner", STATUS_UNCHECKED, "ss not found")]
+
+    results = []
+    for port in ports:
+        try:
+            completed = subprocess.run(
+                ["ss", "-ltnp", f"sport = :{port}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} probe timed out"))
+            continue
+        except OSError as exc:
+            results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} {exc}"))
+            continue
+        output = redact_sensitive_text((completed.stdout or completed.stderr or "").strip())
+        if completed.returncode != 0:
+            results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} {output or 'ss failed'}"))
+            continue
+        pid = _pid_from_ss_output(output)
+        if pid:
+            results.append(_process_owner_result(port, pid))
+        elif _port_is_listening(output, port):
+            results.append(ProbeResult("port_owner", STATUS_DETECTED, f"port={port} pid=unchecked reason=ss did not expose pid"))
+        else:
+            results.append(ProbeResult("port_owner", STATUS_MISSING, f"port={port} not listening"))
+    return results
+
+
+def _inspect_process_details(args: dict) -> list:
+    pids = _requested_pids(args)
+    keywords = [str(item) for item in args.get("process_keywords", []) if str(item).strip()]
+    if not pids and not keywords:
+        return [ProbeResult("process_details", STATUS_UNCHECKED, "pids or process_keywords is required")]
+    if os.name == "nt":
+        return [ProbeResult("process_details", STATUS_UNCHECKED, "process_details is not implemented on Windows")]
+    selected_pids = list(pids)
+    if keywords:
+        selected_pids.extend(_pids_for_keywords(keywords))
+    selected_pids = _dedupe_ints(selected_pids)
+    if not selected_pids:
+        return [ProbeResult("process_details", STATUS_MISSING, "no matching process")]
+    return [_process_detail_result(pid) for pid in selected_pids[:20]]
+
+
+def _process_owner_result(port: int, pid: int) -> ProbeResult:
+    detail = _process_detail(pid)
+    fields = [f"port={port}", f"pid={pid}"]
+    fields.extend(_detail_fields(detail))
+    return ProbeResult("port_owner", STATUS_DETECTED, " ".join(fields))
+
+
+def _process_detail_result(pid: int) -> ProbeResult:
+    detail = _process_detail(pid)
+    fields = [f"pid={pid}"]
+    fields.extend(_detail_fields(detail))
+    return ProbeResult("process_details", STATUS_DETECTED, " ".join(fields))
+
+
+def _process_detail(pid: int) -> dict:
+    ps = _ps_detail(pid)
+    cmd = _read_proc_text(f"/proc/{pid}/cmdline").replace("\x00", " ").strip()
+    cwd = _read_proc_link(f"/proc/{pid}/cwd")
+    if not cmd:
+        cmd = ps.get("cmd", "")
+    return {
+        "ppid": ps.get("ppid", ""),
+        "user": ps.get("user", ""),
+        "cmd": redact_sensitive_text(_single_line(cmd, max_chars=300)) if cmd else "unchecked",
+        "cwd": cwd or "unchecked",
+    }
+
+
+def _detail_fields(detail: dict) -> list:
+    fields = []
+    for key in ("ppid", "user", "cmd", "cwd"):
+        value = str(detail.get(key) or "unchecked")
+        fields.append(f"{key}={value}")
+    return fields
+
+
+def _ps_detail(pid: int) -> dict:
+    if shutil.which("ps") is None:
+        return {}
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pid=,ppid=,user=,args="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    line = (completed.stdout or "").strip()
+    match = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$", line)
+    if not match:
+        return {}
+    return {"pid": match.group(1), "ppid": match.group(2), "user": match.group(3), "cmd": match.group(4)}
+
+
+def _pids_for_keywords(keywords: list) -> list:
+    if shutil.which("pgrep") is None:
+        return []
+    pattern = "|".join(re.escape(item) for item in keywords if item)
+    if not pattern:
+        return []
+    try:
+        completed = subprocess.run(
+            ["pgrep", "-f", pattern],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return [int(item) for item in re.findall(r"\b\d+\b", completed.stdout or "")]
+
+
+def _pid_from_ss_output(output: str) -> Optional[int]:
+    match = re.search(r"\bpid=(\d+)\b", output or "")
+    return int(match.group(1)) if match else None
+
+
+def _port_is_listening(output: str, port: int) -> bool:
+    return bool(re.search(rf":{port}\b", output or ""))
+
+
+def _requested_ports(args: dict) -> list:
+    return _dedupe_ints(args.get("ports", []))
+
+
+def _requested_pids(args: dict) -> list:
+    return _dedupe_ints(args.get("pids", []))
+
+
+def _dedupe_ints(values) -> list:
+    result = []
+    for value in values or []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in result:
+            result.append(number)
+    return result
+
+
+def _read_proc_text(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _read_proc_link(path: str) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return ""
 
 
 def redact_sensitive_text(text: str) -> str:

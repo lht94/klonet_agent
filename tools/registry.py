@@ -202,8 +202,10 @@ TOOLS = [
                     "type": "string",
                     "enum": [
                         "ports",
+                        "port_owner",
                         "screen",
                         "processes",
+                        "process_details",
                         "nginx",
                         "docker",
                         "redis",
@@ -215,7 +217,22 @@ TOOLS = [
                     ],
                 },
                 "description": "可选检查项；默认检查常见 Klonet 运行依赖",
-            }
+            },
+            "ports": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "当 checks 包含 port_owner 时，按端口精确查询占用 PID、命令和 cwd，例如 [5045]。",
+            },
+            "pids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "当 checks 包含 process_details 时，按 PID 查询进程详情。",
+            },
+            "process_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "当 checks 包含 process_details 时，按进程命令关键词筛选，例如 web_terminal_main.py。",
+            },
         },
         [],
     ),

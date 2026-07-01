@@ -43,6 +43,7 @@ from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
 from klonet_agent.ops.planner import build_ops_environment_plan
+from klonet_agent.ops.routing import OpsRoute, route_ops_request
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
 from klonet_agent.tools import TOOLS, ToolExecutor
@@ -90,6 +91,7 @@ class AgentOrchestrator:
         self._knowledge_search_count = 0
         self._paused_turn_state: dict | None = None
         self._last_turn_state: dict | None = None
+        self._ops_route: OpsRoute | None = None
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
@@ -400,6 +402,7 @@ class AgentOrchestrator:
         self._turn_intent = None
         self._turn_decision = None
         self._knowledge_search_count = 0
+        self._ops_route = None
         semantic_frame = None
         resume_state = self._resume_state_for(user_input)
         resume_paused_turn = (
@@ -515,6 +518,8 @@ class AgentOrchestrator:
                 print_progress(self._progress_intent_summary())
         elif not resume_previous_turn:
             self._query_route = route_query(user_input)
+            if self.profile.name == "ops":
+                self._ops_route = route_ops_request(user_input)
             self._refresh_turn_plan(
                 user_input,
                 recent_history=recent_history_for_intent,
@@ -1111,6 +1116,8 @@ class AgentOrchestrator:
 
         if self._turn_intent is None:
             return "已完成问题理解。"
+        if self.profile.name == "ops" and self._ops_route is not None:
+            return self._ops_route.summary()
         parts = [self._turn_intent.task_type]
         if self._turn_intent.phase and self._turn_intent.phase != "unknown":
             parts.append(self._turn_intent.phase)

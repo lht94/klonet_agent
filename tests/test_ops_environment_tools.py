@@ -214,6 +214,62 @@ def test_runtime_probe_supports_process_cwd_evidence():
     assert "processes" in checks
 
 
+def test_runtime_port_owner_returns_target_pid_cmd_and_cwd(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+                    "LISTEN 0 128 0.0.0.0:5045 0.0.0.0:* users:((\"python3.8\",pid=1467095,fd=7))\n"
+                ),
+                stderr="",
+            )
+        if command[:2] == ["ps", "-p"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_text",
+        lambda path: "python3.8 web_terminal_main.py"
+        if path.endswith("/cmdline")
+        else "",
+    )
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_link",
+        lambda path: "/home/adminis/lht/102_project",
+    )
+
+    result = environment.inspect_klonet_runtime(
+        {"checks": ["port_owner"], "ports": [5045]}
+    )
+
+    assert "port_owner: detected" in result
+    assert "port=5045" in result
+    assert "pid=1467095" in result
+    assert "ppid=1467011" in result
+    assert "user=root" in result
+    assert "cmd=python3.8 web_terminal_main.py" in result
+    assert "cwd=/home/adminis/lht/102_project" in result
+    assert any(call[:2] == ["ss", "-ltnp"] for call in calls)
+
+
 def test_executor_dispatches_environment_tool():
     from klonet_agent.tools.executor import ToolExecutor
 

@@ -1099,7 +1099,8 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
         orchestrator.single_chat("帮我看看有哪些平台", history, 0)
 
     output = capsys.readouterr().out
-    assert "已识别：" in output
+    assert "目标：运行态盘点" in output
+    assert "模式：只读诊断" in output
     assert "正在检索知识库：Klonet 启动" in output
     assert "观察：unexpected tool result" in output
     assert "正在调用工具" not in output
@@ -1107,6 +1108,49 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
     assert "工具结果摘要" not in output
     assert "下一步：" not in output
     assert "思考摘要" not in output
+
+
+def test_ops_progress_uses_route_summary_not_generic_task_type(capsys):
+    """Ops progress should show operational goal/slots, not Mentor task_type labels."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    user_input = (
+        "我在 `/home/adminis/lht/102_project` 里再次启动 `web_terminal_main.py`，"
+        "报 address already in use。请精确确认占用 5045 的 PID、命令和 cwd；"
+        "不要仅凭 screen 存在下结论，也不要修改环境。"
+    )
+    with local_temp_dir() as temp_dir:
+        llm = StreamingAnswerLLM()
+        executor = RecordingToolExecutor()
+        session = AgentSession(
+            user_id="u1",
+            project_id="p1",
+            mode="ops",
+            workspace_path=temp_dir / "workspace",
+            journal_path=temp_dir / "journal.md",
+        )
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops"),
+            session=session,
+            llm=llm,
+            tool_executor=executor,
+            trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+        )
+        history = orchestrator.init_history()
+        orchestrator.single_chat(user_input, history, 0)
+
+    output = capsys.readouterr().out
+    assert "目标：端口占用诊断" in output
+    assert "线索：port=5045" in output
+    assert "component=web_terminal_main.py" in output
+    assert "模式：只读诊断" in output
+    assert "已识别：code_lookup" not in output
 
 
 def test_ops_tool_action_uses_safe_arguments_only():
