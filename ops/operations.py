@@ -31,6 +31,7 @@ class OperationStep:
     requires_step_confirmation: bool = False
     status: str = "pending"
     recipe_id: str = ""
+    recipe_args: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -68,6 +69,7 @@ class OperationPlanStore:
         evidence: Optional[List[str]] = None,
         objective: str = "",
         constraints: str = "",
+        recipe_bindings: Optional[dict] = None,
     ) -> OperationPlan:
         operation = operation if operation in VALID_OPERATIONS else "restart_platform"
         plan = OperationPlan(
@@ -80,6 +82,7 @@ class OperationPlanStore:
             evidence=[_one_line(item, 300) for item in (evidence or [])[:12]],
             steps=_default_steps(operation),
         )
+        _apply_recipe_bindings(plan, recipe_bindings or {})
         self.save_plan(plan)
         return plan
 
@@ -300,6 +303,26 @@ def _find_step(plan: OperationPlan, step_id: str) -> OperationStep:
         if step.step_id == step_id:
             return step
     raise ValueError(f"operation step not found: {step_id}")
+
+
+def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
+    if not isinstance(recipe_bindings, dict):
+        return
+    for step_id, binding in recipe_bindings.items():
+        if not isinstance(binding, dict):
+            continue
+        try:
+            step = _find_step(plan, str(step_id))
+        except ValueError:
+            continue
+        step.recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
+        args = binding.get("args")
+        if isinstance(args, dict):
+            step.recipe_args = {
+                _one_line(str(key), 80): _one_line(str(value), 300)
+                for key, value in args.items()
+                if key and value is not None
+            }
 
 
 def _next_step_id(plan: OperationPlan) -> str:

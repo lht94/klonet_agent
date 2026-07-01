@@ -18,6 +18,7 @@ from klonet_agent.ops.operations import (
     OperationPlanStore,
     render_plan,
 )
+from klonet_agent.ops.recipes import ControlledRecipeRunner
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
@@ -163,6 +164,7 @@ class ToolExecutor:
                 target=tool_args.get("target", ""),
                 objective=tool_args.get("objective", ""),
                 constraints=tool_args.get("constraints", ""),
+                recipe_bindings=tool_args.get("recipe_bindings"),
                 evidence=[
                     str(item)
                     for item in tool_args.get("evidence", [])
@@ -298,7 +300,10 @@ class ToolExecutor:
         return render_plan(plan)
 
     def _operation_plan_store(self) -> OperationPlanStore:
-        return OperationPlanStore(self.memory_store.memory_dir / "ops_operation_plans")
+        return OperationPlanStore(
+            self.memory_store.memory_dir / "ops_operation_plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
 
     def _record_trace(
         self,

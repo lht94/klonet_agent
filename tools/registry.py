@@ -302,7 +302,7 @@ TOOLS = [
     ),
     _tool(
         "create_ops_operation_plan",
-        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存计划，不执行任何环境修改；计划必须先让用户看到并确认。",
+        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存计划，不执行任何环境修改；可为步骤绑定白名单 recipe_id 和结构化参数，但必须等用户确认后才能执行。",
         {
             "operation": {
                 "type": "string",
@@ -325,6 +325,10 @@ TOOLS = [
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "本轮只读工具或知识库证据摘要。",
+            },
+            "recipe_bindings": {
+                "type": "object",
+                "description": "可选：按 step_id 绑定受控 recipe，例如 {\"restart-master\":{\"recipe_id\":\"restart_screen_component\",\"args\":{\"platform\":\"102\",\"component\":\"master\",\"screen_session\":\"102_m\",\"project_root\":\"/home/adminis/lht/102_project\"}}}。只保存绑定，不执行。",
             },
         },
         ["operation", "target"],

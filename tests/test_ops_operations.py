@@ -28,6 +28,22 @@ def test_ops_operation_tools_are_registered_and_profile_allowed():
     assert "run_command" not in profile.allowed_tools
 
 
+def test_create_operation_plan_schema_exposes_recipe_bindings_without_execution():
+    from klonet_agent.tools.registry import TOOLS
+
+    tool = next(
+        item
+        for item in TOOLS
+        if item["function"]["name"] == "create_ops_operation_plan"
+    )
+    properties = tool["function"]["parameters"]["properties"]
+    description = tool["function"]["description"]
+
+    assert "recipe_bindings" in properties
+    assert "只保存" in description
+    assert "确认后才能执行" in description
+
+
 def test_mentor_profile_cannot_create_or_approve_operation_plans():
     from klonet_agent.agents import get_profile
 
@@ -322,6 +338,154 @@ def test_store_marks_recipe_exception_as_failed_and_fails_plan():
         "failed",
         "pending",
     ]
+
+
+def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102 master",
+            recipe_bindings={
+                "restart-master": {
+                    "recipe_id": "restart_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=restart_screen_component" in result
+    assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
+    assert "--platform 102" in result
+    assert "--component master" in result
+    assert "--screen 102_m" in result
+    assert "--project-root /home/adminis/lht/102_project" in result
+    assert [step.status for step in loaded.steps] == [
+        "pending",
+        "completed",
+        "pending",
+    ]
+
+
+def test_restart_screen_component_recipe_blocks_unknown_component():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102 database",
+            recipe_bindings={
+                "restart-master": {
+                    "recipe_id": "restart_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "database",
+                        "screen_session": "102_db",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "unsupported_component=database" in result
+    assert [step.status for step in loaded.steps] == [
+        "pending",
+        "blocked",
+        "pending",
+    ]
+
+
+def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "approve_ops_operation_plan",
+                "execute_ops_operation_step",
+            },
+            memory_store=store,
+        )
+        created = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102 master",
+                "recipe_bindings": {
+                    "restart-master": {
+                        "recipe_id": "restart_screen_component",
+                        "args": {
+                            "platform": "102",
+                            "component": "master",
+                            "screen_session": "102_m",
+                            "project_root": "/home/adminis/lht/102_project",
+                        },
+                    }
+                },
+            },
+        )
+        plan_id = _extract_plan_id(created)
+        executor.set_user_authorization_context(f"confirm {plan_id}")
+        executor.run("approve_ops_operation_plan", {"plan_id": plan_id, "scope": "plan"})
+        executor.set_user_authorization_context(f"confirm-step {plan_id} restart-master")
+        executor.run(
+            "approve_ops_operation_plan",
+            {"plan_id": plan_id, "scope": "step", "step_id": "restart-master"},
+        )
+        result = executor.run(
+            "execute_ops_operation_step",
+            {"plan_id": plan_id, "step_id": "restart-master"},
+        )
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=restart_screen_component" in result
+    assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
 
 
 def _extract_plan_id(text: str) -> str:
