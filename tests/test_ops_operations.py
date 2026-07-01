@@ -420,6 +420,50 @@ def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
     assert statuses["verify-health"] == "pending"
 
 
+def test_start_platform_screens_recipe_dry_run_generates_safe_preview():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="start platform 103 screens",
+            recipe_bindings={
+                "start-services": {
+                    "recipe_id": "start_platform_screens",
+                    "args": {
+                        "platform": "103",
+                        "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "start-services")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-services")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=start_platform_screens" in result
+    assert "command_preview=/usr/local/bin/klonet-agent-op start-platform-screens" in result
+    assert "--platform 103" in result
+    assert "--project-root /home/adminis/lht/103_project/vemu_uestc" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["start-services"] == "completed"
+    assert statuses["precheck"] == "pending"
+    assert statuses["prepare-files"] == "pending"
+
+
 def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

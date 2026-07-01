@@ -29,9 +29,10 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 
 ```text
 /usr/local/bin/klonet-agent-op restart-screen-component --execute *
+/usr/local/bin/klonet-agent-op start-platform-screens --execute *
 ```
 
-原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护都在 helper 内完成。放行底层命令会绕过这些校验。
+原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护、启动命令模板都在 helper 内完成。放行底层命令会绕过这些校验。
 
 ## 启用真实执行
 
@@ -64,6 +65,24 @@ export KLONET_AGENT_OPS_REAL_EXECUTION=1
 ```text
 klonet_agent_op
 action=restart-screen-component
+dry_run=true
+environment_changed=false
+```
+
+新平台四个后端 screen 的 dry-run 验证：
+
+```bash
+/usr/local/bin/klonet-agent-op start-platform-screens --dry-run \
+  --platform 103 \
+  --project-root /home/adminis/lht/103_project/vemu_uestc
+```
+
+输出中应包含：
+
+```text
+klonet_agent_op
+action=start-platform-screens
+screen_sessions=103_m,103_c,103_web,103_w
 dry_run=true
 environment_changed=false
 ```

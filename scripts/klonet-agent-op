@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
+START_COMPONENT_ORDER = ("master", "celery", "web_terminal", "worker")
 COMPONENT_COMMANDS = {
     "master": "/usr/local/bin/gunicorn -c gun.py master_main:flask_app",
     "worker": "/usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app",
@@ -38,9 +39,17 @@ def main(argv=None) -> int:
     restart.add_argument("--component", required=True)
     restart.add_argument("--screen", required=True, dest="screen_session")
     restart.add_argument("--project-root", required=True)
+    start = subcommands.add_parser("start-platform-screens")
+    start_mode = start.add_mutually_exclusive_group(required=True)
+    start_mode.add_argument("--dry-run", action="store_true")
+    start_mode.add_argument("--execute", action="store_true")
+    start.add_argument("--platform", required=True)
+    start.add_argument("--project-root", required=True)
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
+    if args.action == "start-platform-screens":
+        return _start_platform_screens(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
 
@@ -69,6 +78,24 @@ def _restart_screen_component(args) -> int:
     return 0
 
 
+def _start_platform_screens(args) -> int:
+    problem = _validate_start_platform_args(args.platform, args.project_root)
+    if problem:
+        _print_error(problem)
+        return 2
+    if args.execute:
+        for command in _start_platform_commands(args.platform, args.project_root):
+            run_checked(command)
+    print("klonet_agent_op")
+    print("action=start-platform-screens")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"platform={args.platform}")
+    print(f"project_root={args.project_root}")
+    print(f"screen_sessions={','.join(_start_screen_sessions(args.platform))}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
 def _validate_restart_args(platform: str, component: str, screen_session: str, project_root: str) -> str:
     if not _safe_name(platform):
         return f"invalid_platform={platform or 'missing'}"
@@ -78,6 +105,14 @@ def _validate_restart_args(platform: str, component: str, screen_session: str, p
         return f"invalid_screen_session={screen_session or 'missing'}"
     if not screen_session.startswith(f"{platform}_") and f".{platform}_" not in screen_session:
         return "screen_session_does_not_match_platform"
+    if not project_root or _unsafe_path(project_root):
+        return f"invalid_project_root={project_root or 'missing'}"
+    return ""
+
+
+def _validate_start_platform_args(platform: str, project_root: str) -> str:
+    if not _safe_name(platform):
+        return f"invalid_platform={platform or 'missing'}"
     if not project_root or _unsafe_path(project_root):
         return f"invalid_project_root={project_root or 'missing'}"
     return ""
@@ -112,6 +147,30 @@ def _restart_commands(component: str, screen_session: str, project_root: str) ->
             "-lc",
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
         ],
+    ]
+
+
+def _start_screen_sessions(platform: str) -> list:
+    return [
+        f"{platform}_m",
+        f"{platform}_c",
+        f"{platform}_web",
+        f"{platform}_w",
+    ]
+
+
+def _start_platform_commands(platform: str, project_root: str) -> list:
+    screen_sessions = dict(zip(START_COMPONENT_ORDER, _start_screen_sessions(platform)))
+    return [
+        [
+            "screen",
+            "-dmS",
+            screen_sessions[component],
+            "bash",
+            "-lc",
+            f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
+        ]
+        for component in START_COMPONENT_ORDER
     ]
 
 

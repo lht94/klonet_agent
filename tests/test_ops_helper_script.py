@@ -44,6 +44,34 @@ def test_restart_screen_component_helper_dry_run_outputs_command_contract():
     assert "environment_changed=false" in result.stdout
 
 
+def test_start_platform_screens_helper_dry_run_outputs_command_contract():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "start-platform-screens",
+            "--dry-run",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "klonet_agent_op" in result.stdout
+    assert "action=start-platform-screens" in result.stdout
+    assert "dry_run=true" in result.stdout
+    assert "platform=103" in result.stdout
+    assert "project_root=/home/adminis/lht/103_project/vemu_uestc" in result.stdout
+    assert "screen_sessions=103_m,103_c,103_web,103_w" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
 def test_restart_screen_component_helper_rejects_unknown_component():
     result = subprocess.run(
         [
@@ -69,6 +97,63 @@ def test_restart_screen_component_helper_rejects_unknown_component():
     assert result.returncode == 2
     assert "unsupported_component=database" in result.stderr
     assert "environment_changed=false" in result.stderr
+
+
+def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [
+        [
+            "screen",
+            "-dmS",
+            "103_m",
+            "bash",
+            "-lc",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/bin/gunicorn -c gun.py master_main:flask_app",
+        ],
+        [
+            "screen",
+            "-dmS",
+            "103_c",
+            "bash",
+            "-lc",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
+        ],
+        [
+            "screen",
+            "-dmS",
+            "103_web",
+            "bash",
+            "-lc",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/python3/bin/python3.8 web_terminal_main.py",
+        ],
+        [
+            "screen",
+            "-dmS",
+            "103_w",
+            "bash",
+            "-lc",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app",
+        ],
+    ]
+    assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
 
 
 def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):

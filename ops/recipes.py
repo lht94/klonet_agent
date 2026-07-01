@@ -16,6 +16,7 @@ from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExec
 
 
 RESTART_SCREEN_COMPONENT = "restart_screen_component"
+START_PLATFORM_SCREENS = "start_platform_screens"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 
@@ -37,6 +38,8 @@ class ControlledRecipeRunner:
     def __call__(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         if step.recipe_id == RESTART_SCREEN_COMPONENT:
             return self._restart_screen_component(plan, step)
+        if step.recipe_id == START_PLATFORM_SCREENS:
+            return self._start_platform_screens(plan, step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _restart_screen_component(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
@@ -92,6 +95,53 @@ class ControlledRecipeRunner:
             ),
         )
 
+    def _start_platform_screens(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        platform = str(args.get("platform") or plan.target or "").strip()
+        project_root = str(args.get("project_root") or "").strip()
+        problem = _validate_start_platform_args(platform, project_root)
+        if problem:
+            return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
+        command = [
+            self.helper_path,
+            "start-platform-screens",
+            "--dry-run" if self.dry_run else "--execute",
+            "--platform",
+            platform,
+            "--project-root",
+            project_root,
+        ]
+        if not self.dry_run:
+            try:
+                output = self.command_runner(command)
+            except subprocess.CalledProcessError as exc:
+                return RecipeExecutionResult(
+                    "failed",
+                    (
+                        f"helper_failed returncode={exc.returncode} "
+                        f"stderr={_one_line(exc.stderr)} "
+                        f"stdout={_one_line(exc.output)}"
+                    ),
+                )
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=false "
+                    f"recipe_id={START_PLATFORM_SCREENS} "
+                    f"command={_format_command(command)} "
+                    f"helper_output={_one_line(output)}"
+                ),
+            )
+        return RecipeExecutionResult(
+            "completed",
+            (
+                f"dry_run={str(self.dry_run).lower()} "
+                f"recipe_id={START_PLATFORM_SCREENS} "
+                f"command_preview={_format_command(command)} "
+                "environment unchanged"
+            ),
+        )
+
 
 def _validate_restart_args(platform: str, component: str, screen_session: str, project_root: str) -> str:
     if not _safe_token(platform):
@@ -102,6 +152,14 @@ def _validate_restart_args(platform: str, component: str, screen_session: str, p
         return f"invalid_screen_session={screen_session or 'missing'}"
     if not screen_session.startswith(f"{platform}_") and f".{platform}_" not in screen_session:
         return "screen_session_does_not_match_platform"
+    if not project_root or _looks_unsafe_path(project_root):
+        return f"invalid_project_root={project_root or 'missing'}"
+    return ""
+
+
+def _validate_start_platform_args(platform: str, project_root: str) -> str:
+    if not _safe_token(platform):
+        return f"invalid_platform={platform or 'missing'}"
     if not project_root or _looks_unsafe_path(project_root):
         return f"invalid_project_root={project_root or 'missing'}"
     return ""
