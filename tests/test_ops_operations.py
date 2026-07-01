@@ -73,7 +73,39 @@ def test_create_operation_plan_persists_but_does_not_execute():
     assert loaded.operation == "restart_platform"
     assert loaded.target == "102"
     assert loaded.status == "pending"
-    assert [step.status for step in loaded.steps] == ["pending", "pending", "pending"]
+    assert set(_status_by_step(loaded).values()) == {"pending"}
+
+
+def test_restart_operation_plan_has_component_restart_steps():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+
+    assert [step.step_id for step in plan.steps] == [
+        "precheck-runtime",
+        "restart-master",
+        "restart-worker",
+        "restart-celery",
+        "restart-web-terminal",
+        "verify-health",
+    ]
+    assert {
+        step.step_id
+        for step in plan.steps
+        if step.requires_step_confirmation
+    } == {
+        "restart-master",
+        "restart-worker",
+        "restart-celery",
+        "restart-web-terminal",
+    }
 
 
 def test_render_plan_includes_execution_state_and_next_step():
@@ -90,10 +122,13 @@ def test_render_plan_includes_execution_state_and_next_step():
         rendered = render_plan(plan)
 
     assert "execution_state:" in rendered
-    assert "total_steps=3" in rendered
-    assert "pending=3" in rendered
+    assert "total_steps=6" in rendered
+    assert "pending=6" in rendered
     assert "next_step=precheck-runtime" in rendered
-    assert "execution_order=precheck-runtime -> restart-master -> verify-health" in rendered
+    assert (
+        "execution_order=precheck-runtime -> restart-master -> restart-worker -> "
+        "restart-celery -> restart-web-terminal -> verify-health"
+    ) in rendered
 
 
 def test_executor_refuses_plan_approval_without_user_confirm_text():
@@ -175,11 +210,7 @@ def test_executor_accepts_exact_user_confirm_text_and_requires_step_confirmation
     assert "status=approved" in approved
     assert blocked.startswith("Error:")
     assert "step requires explicit confirm-step" in blocked
-    assert [step.status for step in loaded_after_execute.steps] == [
-        "pending",
-        "pending",
-        "pending",
-    ]
+    assert set(_status_by_step(loaded_after_execute).values()) == {"pending"}
 
 
 def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
@@ -228,11 +259,11 @@ def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
     assert "execute_step=restart-master" in blocked
     assert "result_status=blocked" in blocked
     assert "execution_result=no_recipe_attached; environment unchanged" in blocked
-    assert [step.status for step in loaded_after_execute.steps] == [
-        "pending",
-        "blocked",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded_after_execute)
+    assert statuses["restart-master"] == "blocked"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_store_executes_confirmed_allowlisted_recipe_and_persists_result():
@@ -271,11 +302,11 @@ def test_store_executes_confirmed_allowlisted_recipe_and_persists_result():
     assert "result_status=completed" in result
     assert "execution_result=recipe_id=test-restart executed=true" in result
     assert "recipe=test-restart" in rendered
-    assert [step.status for step in loaded.steps] == [
-        "pending",
-        "completed",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded)
+    assert statuses["restart-master"] == "completed"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_store_blocks_bound_recipe_when_runner_is_not_configured():
@@ -300,11 +331,11 @@ def test_store_blocks_bound_recipe_when_runner_is_not_configured():
 
     assert "result_status=blocked" in result
     assert "execution_result=recipe_runner_unavailable; environment unchanged" in result
-    assert [step.status for step in loaded.steps] == [
-        "pending",
-        "blocked",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded)
+    assert statuses["restart-master"] == "blocked"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_store_marks_recipe_exception_as_failed_and_fails_plan():
@@ -333,11 +364,11 @@ def test_store_marks_recipe_exception_as_failed_and_fails_plan():
     assert "result_status=failed" in result
     assert "execution_result=recipe_exception=boom" in result
     assert loaded.status == "failed"
-    assert [step.status for step in loaded.steps] == [
-        "pending",
-        "failed",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded)
+    assert statuses["restart-master"] == "failed"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
@@ -382,11 +413,11 @@ def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
     assert "--component master" in result
     assert "--screen 102_m" in result
     assert "--project-root /home/adminis/lht/102_project" in result
-    assert [step.status for step in loaded.steps] == [
-        "pending",
-        "completed",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded)
+    assert statuses["restart-master"] == "completed"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
@@ -450,11 +481,11 @@ def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     assert "result_status=completed" in result
     assert "dry_run=false" in result
     assert "helper stdout ok" in result
-    assert [step.status for step in loaded.steps] == [
-        "pending",
-        "completed",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded)
+    assert statuses["restart-master"] == "completed"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_restart_screen_component_recipe_execute_reports_helper_failure():
@@ -541,11 +572,11 @@ def test_restart_screen_component_recipe_blocks_unknown_component():
 
     assert "result_status=blocked" in result
     assert "unsupported_component=database" in result
-    assert [step.status for step in loaded.steps] == [
-        "pending",
-        "blocked",
-        "pending",
-    ]
+    statuses = _status_by_step(loaded)
+    assert statuses["restart-master"] == "blocked"
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
@@ -640,3 +671,7 @@ def _extract_plan_id(text: str) -> str:
         if line.startswith("plan_id="):
             return line.split("=", 1)[1].strip()
     raise AssertionError(f"plan_id not found in:\n{text}")
+
+
+def _status_by_step(plan):
+    return {step.step_id: step.status for step in plan.steps}

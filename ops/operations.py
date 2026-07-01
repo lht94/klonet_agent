@@ -293,7 +293,10 @@ def _default_steps(operation: str) -> List[OperationStep]:
         ]
     return [
         OperationStep("precheck-runtime", "读取当前运行态", "确认目标平台、screen、端口和日志来源"),
-        OperationStep("restart-master", "重启目标平台核心进程", "按已确认启动命令重启相关 screen", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-master", "重启 Master", "按已确认启动命令重启 master screen", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-worker", "重启 Worker", "按已确认启动命令重启 worker screen", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-celery", "重启 Celery", "按已确认启动命令重启 celery screen", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-web-terminal", "重启 Web Terminal", "按已确认启动命令重启 web terminal screen", risk="privileged", requires_step_confirmation=True),
         OperationStep("verify-health", "验证重启结果", "检查 screen、进程、端口和最新日志"),
     ]
 
