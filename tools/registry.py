@@ -259,7 +259,7 @@ TOOLS = [
     ),
     _tool(
         "inspect_screen_session",
-        "只读抓取指定 screen 会话的当前窗口/滚屏快照，用于查看 master、worker、celery、web_terminal 最近输出。使用 screen hardcopy，不发送交互输入。",
+        "只读抓取指定 screen 会话的窗口/滚屏快照，用于查看 master、worker、celery、web_terminal 最近输出。返回 screen_scrollback 证据，current_state=false；不能单独证明当前进程仍存活。使用 screen hardcopy，不发送交互输入。",
         {
             "session": {
                 "type": "string",

@@ -334,7 +334,11 @@ def inspect_screen_session(args: Optional[dict] = None) -> str:
                 ProbeResult(
                     session,
                     STATUS_DETECTED,
-                    f"hardcopy snapshot; showing last {len(tail)} chars",
+                    (
+                        "evidence_type=screen_scrollback "
+                        "current_state=false "
+                        f"hardcopy snapshot; showing last {len(tail)} chars"
+                    ),
                 ).render(),
                 redact_sensitive_text(tail),
             ]

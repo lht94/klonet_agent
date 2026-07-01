@@ -196,6 +196,45 @@ def test_screen_inspection_rejects_unsafe_session_name():
     assert "unsafe" in result.lower()
 
 
+def test_screen_inspection_marks_scrollback_as_not_current_state(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    def fake_named_temp_file(**kwargs):
+        class TempFile:
+            name = str(snapshot)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        return TempFile()
+
+    with local_temp_dir() as temp_dir:
+        snapshot = temp_dir / "screen.log"
+        snapshot.write_text("Traceback old error\nStarted!\n", encoding="utf-8")
+
+        monkeypatch.setattr(environment.os, "name", "posix")
+        monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+        monkeypatch.setattr(environment.tempfile, "NamedTemporaryFile", fake_named_temp_file)
+        monkeypatch.setattr(
+            environment.subprocess,
+            "run",
+            lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        result = environment.inspect_screen_session({"session": "102_web", "max_chars": 200})
+
+    assert "102_web: detected" in result
+    assert "evidence_type=screen_scrollback" in result
+    assert "current_state=false" in result
+    assert "Traceback old error" in result
+
+
 def test_runtime_probe_supports_process_cwd_evidence():
     """Ops diagnosis needs process cwd evidence before tying a platform to source."""
 
