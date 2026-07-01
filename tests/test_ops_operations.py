@@ -60,6 +60,26 @@ def test_create_operation_plan_persists_but_does_not_execute():
     assert [step.status for step in loaded.steps] == ["pending", "pending", "pending"]
 
 
+def test_render_plan_includes_execution_state_and_next_step():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+        rendered = render_plan(plan)
+
+    assert "execution_state:" in rendered
+    assert "total_steps=3" in rendered
+    assert "pending=3" in rendered
+    assert "next_step=precheck-runtime" in rendered
+    assert "execution_order=precheck-runtime -> restart-master -> verify-health" in rendered
+
+
 def test_executor_refuses_plan_approval_without_user_confirm_text():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
@@ -97,7 +117,7 @@ def test_executor_refuses_plan_approval_without_user_confirm_text():
     assert "用户原文必须是 confirm" in denied
 
 
-def test_executor_accepts_exact_user_confirm_text_and_refuses_unknown_step_execution():
+def test_executor_accepts_exact_user_confirm_text_and_requires_step_confirmation():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
@@ -134,10 +154,69 @@ def test_executor_accepts_exact_user_confirm_text_and_refuses_unknown_step_execu
             "execute_ops_operation_step",
             {"plan_id": plan_id, "step_id": "restart-master"},
         )
+        loaded_after_execute = executor._operation_plan_store().load_plan(plan_id)
 
     assert "status=approved" in approved
     assert blocked.startswith("Error:")
-    assert "尚未接入真实执行 recipe" in blocked
+    assert "step requires explicit confirm-step" in blocked
+    assert [step.status for step in loaded_after_execute.steps] == [
+        "pending",
+        "pending",
+        "pending",
+    ]
+
+
+def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "approve_ops_operation_plan",
+                "execute_ops_operation_step",
+            },
+            memory_store=store,
+        )
+        created = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+            },
+        )
+        plan_id = _extract_plan_id(created)
+        executor.set_user_authorization_context(f"confirm {plan_id}")
+        executor.run("approve_ops_operation_plan", {"plan_id": plan_id, "scope": "plan"})
+        executor.set_user_authorization_context(f"confirm-step {plan_id} restart-master")
+        executor.run(
+            "approve_ops_operation_plan",
+            {"plan_id": plan_id, "scope": "step", "step_id": "restart-master"},
+        )
+
+        blocked = executor.run(
+            "execute_ops_operation_step",
+            {"plan_id": plan_id, "step_id": "restart-master"},
+        )
+        loaded_after_execute = executor._operation_plan_store().load_plan(plan_id)
+
+    assert "ops_operation_execution" in blocked
+    assert f"plan_id={plan_id}" in blocked
+    assert "execute_step=restart-master" in blocked
+    assert "result_status=blocked" in blocked
+    assert "execution_result=no_recipe_attached; environment unchanged" in blocked
+    assert [step.status for step in loaded_after_execute.steps] == [
+        "pending",
+        "blocked",
+        "pending",
+    ]
 
 
 def _extract_plan_id(text: str) -> str:

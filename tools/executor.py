@@ -16,7 +16,6 @@ from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.ops.operations import (
     OperationPlanStore,
-    execute_step_preview,
     render_plan,
 )
 from klonet_agent.session import AgentSession
@@ -177,8 +176,7 @@ class ToolExecutor:
 
         if tool_name == "execute_ops_operation_step":
             store = self._operation_plan_store()
-            plan = store.load_plan(tool_args["plan_id"])
-            return execute_step_preview(plan, tool_args["step_id"])
+            return store.execute_step(tool_args["plan_id"], tool_args["step_id"])
 
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))

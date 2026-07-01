@@ -97,10 +97,41 @@ class OperationPlanStore:
 
     def approve_step(self, plan_id: str, step_id: str) -> OperationPlan:
         plan = self.load_plan(plan_id)
+        if plan.status != "approved":
+            raise ValueError("plan must be approved before approving a step")
         step = _find_step(plan, step_id)
         step.status = "approved"
         self.save_plan(plan)
         return plan
+
+    def execute_step(self, plan_id: str, step_id: str) -> str:
+        plan = self.load_plan(plan_id)
+        if plan.status != "approved":
+            return "Error: plan must be approved before execution. Use confirm <plan_id>."
+        step = _find_step(plan, step_id)
+        if step.status == "completed":
+            return _render_step_execution(
+                plan,
+                step,
+                result_status="completed",
+                execution_result="step already completed; environment unchanged",
+            )
+        if step.requires_step_confirmation and step.status != "approved":
+            return (
+                "Error: step requires explicit confirm-step "
+                f"{plan.plan_id} {step.step_id} before execution."
+            )
+        previous_status = step.status
+        step.status = "blocked"
+        self.save_plan(plan)
+        return _render_step_execution(
+            plan,
+            step,
+            previous_status=previous_status,
+            result_status="blocked",
+            execution_result="no_recipe_attached; environment unchanged",
+            next_required_action="attach a controlled recipe before executing this step",
+        )
 
     def _path(self, plan_id: str) -> Path:
         return self.root / f"{_safe_plan_id(plan_id)}.json"
@@ -123,6 +154,17 @@ def render_plan(plan: OperationPlan) -> str:
     if plan.evidence:
         lines.append("evidence:")
         lines.extend(f"  - {item}" for item in plan.evidence[:8])
+    lines.append("execution_state:")
+    lines.append(f"  total_steps={len(plan.steps)}")
+    for status in sorted(VALID_STEP_STATUS):
+        count = sum(1 for step in plan.steps if step.status == status)
+        if count:
+            lines.append(f"  {status}={count}")
+    lines.append(f"  next_step={_next_step_id(plan)}")
+    lines.append(
+        "  execution_order="
+        + " -> ".join(step.step_id for step in plan.steps)
+    )
     lines.append("steps:")
     for step in plan.steps:
         confirm = " step-confirm" if step.requires_step_confirmation else ""
@@ -154,6 +196,38 @@ def execute_step_preview(plan: OperationPlan, step_id: str) -> str:
     )
 
 
+def _render_step_execution(
+    plan: OperationPlan,
+    step: OperationStep,
+    *,
+    result_status: str,
+    execution_result: str,
+    previous_status: str = "",
+    next_required_action: str = "",
+) -> str:
+    lines = [
+        "ops_operation_execution",
+        f"plan_id={plan.plan_id}",
+        f"operation={plan.operation}",
+        f"target={plan.target or 'unknown'}",
+        f"plan_status={plan.status}",
+        f"execute_step={step.step_id}",
+        f"step_title={step.title}",
+    ]
+    if previous_status:
+        lines.append(f"previous_step_status={previous_status}")
+    lines.extend(
+        [
+            f"step_status={step.status}",
+            f"result_status={result_status}",
+            f"execution_result={execution_result}",
+        ]
+    )
+    if next_required_action:
+        lines.append(f"next_required_action={next_required_action}")
+    return "\n".join(lines)
+
+
 def _default_steps(operation: str) -> List[OperationStep]:
     if operation == "deploy_platform":
         return [
@@ -179,6 +253,13 @@ def _find_step(plan: OperationPlan, step_id: str) -> OperationStep:
         if step.step_id == step_id:
             return step
     raise ValueError(f"operation step not found: {step_id}")
+
+
+def _next_step_id(plan: OperationPlan) -> str:
+    for step in plan.steps:
+        if step.status not in {"completed", "blocked", "failed"}:
+            return step.step_id
+    return "none"
 
 
 def _plan_to_mapping(plan: OperationPlan) -> dict:
