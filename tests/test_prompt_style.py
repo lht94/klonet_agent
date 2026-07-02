@@ -88,6 +88,17 @@ def test_mentor_prompt_forbids_operation_plan_generation():
 
 
 
+def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
+    """Ops should drive approved OperationPlans with the next-step tool."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "execute_ops_next_step" in OPS_PROMPT
+    assert "execute_ops_operation_step" in OPS_PROMPT
+    assert "批准后的 OperationPlan 默认调用 execute_ops_next_step" in OPS_PROMPT
+    assert "只有用户明确指定 step_id" in OPS_PROMPT
+
+
 def test_memory_prompt_uses_teaching_agent_language():
     """记忆提示词不应该残留旧个人 Agent 称呼。"""
 
