@@ -24,6 +24,14 @@ COMPONENT_COMMANDS = {
     "celery": "/usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
     "web_terminal": "/usr/local/python3/bin/python3.8 web_terminal_main.py",
 }
+REQUIRED_PROJECT_ENTRY_FILES = (
+    "gun.py",
+    "master_main.py",
+    "celery_worker.py",
+    "web_terminal_main.py",
+    "worker_gun.py",
+    "worker_main.py",
+)
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
 
@@ -143,6 +151,10 @@ def _start_platform_screens(args) -> int:
         if existing:
             _print_error(f"screen_session_already_exists={','.join(existing)}")
             return 2
+        missing = project_entry_files_missing(args.project_root)
+        if missing:
+            _print_error(f"missing_project_entry_files={','.join(missing)}")
+            return 2
     if args.execute:
         for command in _start_platform_commands(args.platform, args.project_root):
             run_checked(command)
@@ -256,6 +268,15 @@ def existing_screen_sessions(screen_sessions: list) -> list:
         if re.search(rf"(?:^|\s|\.){re.escape(session)}(?:\s|$)", output):
             existing.append(session)
     return existing
+
+
+def project_entry_files_missing(project_root: str) -> list:
+    root = Path(project_root)
+    return [
+        filename
+        for filename in REQUIRED_PROJECT_ENTRY_FILES
+        if not (root / filename).is_file()
+    ]
 
 
 def _start_platform_commands(platform: str, project_root: str) -> list:

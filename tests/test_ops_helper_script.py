@@ -212,6 +212,8 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
     commands = []
 
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
 
     code = helper.main(
         [
@@ -275,6 +277,7 @@ def test_start_platform_screens_helper_execute_rejects_existing_screen_session(m
         lambda sessions: ["103_m"],
         raising=False,
     )
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
 
     code = helper.main(
         [
@@ -291,6 +294,36 @@ def test_start_platform_screens_helper_execute_rejects_existing_screen_session(m
     assert code == 2
     assert commands == []
     assert "screen_session_already_exists=103_m" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
+def test_start_platform_screens_helper_execute_rejects_missing_project_entry_files(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(
+        helper,
+        "project_entry_files_missing",
+        lambda project_root: ["master_main.py", "worker_main.py"],
+    )
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "missing_project_entry_files=master_main.py,worker_main.py" in captured.err
     assert "environment_changed=false" in captured.err
 
 
