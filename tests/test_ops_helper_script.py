@@ -102,6 +102,31 @@ def test_stop_screen_component_helper_dry_run_outputs_command_contract():
     assert "environment_changed=false" in result.stdout
 
 
+def test_stop_platform_screens_helper_dry_run_outputs_command_contract():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "stop-platform-screens",
+            "--dry-run",
+            "--platform",
+            "102",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "klonet_agent_op" in result.stdout
+    assert "action=stop-platform-screens" in result.stdout
+    assert "dry_run=true" in result.stdout
+    assert "platform=102" in result.stdout
+    assert "screen_sessions=102_m,102_c,102_web,102_w" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
 def test_restart_screen_component_helper_rejects_unknown_component():
     result = subprocess.run(
         [
@@ -127,6 +152,33 @@ def test_restart_screen_component_helper_rejects_unknown_component():
     assert result.returncode == 2
     assert "unsupported_component=database" in result.stderr
     assert "environment_changed=false" in result.stderr
+
+
+def test_stop_platform_screens_helper_execute_uses_fixed_screen_quits(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+
+    code = helper.main(
+        [
+            "stop-platform-screens",
+            "--execute",
+            "--platform",
+            "102",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [
+        ["screen", "-S", "102_m", "-X", "quit"],
+        ["screen", "-S", "102_c", "-X", "quit"],
+        ["screen", "-S", "102_web", "-X", "quit"],
+        ["screen", "-S", "102_w", "-X", "quit"],
+    ]
+    assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
 
 
 def test_stop_screen_component_helper_execute_uses_fixed_screen_quit(monkeypatch, capsys):

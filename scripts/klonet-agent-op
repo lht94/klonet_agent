@@ -46,6 +46,11 @@ def main(argv=None) -> int:
     stop.add_argument("--platform", required=True)
     stop.add_argument("--component", required=True)
     stop.add_argument("--screen", required=True, dest="screen_session")
+    stop_platform = subcommands.add_parser("stop-platform-screens")
+    stop_platform_mode = stop_platform.add_mutually_exclusive_group(required=True)
+    stop_platform_mode.add_argument("--dry-run", action="store_true")
+    stop_platform_mode.add_argument("--execute", action="store_true")
+    stop_platform.add_argument("--platform", required=True)
     start = subcommands.add_parser("start-platform-screens")
     start_mode = start.add_mutually_exclusive_group(required=True)
     start_mode.add_argument("--dry-run", action="store_true")
@@ -57,6 +62,8 @@ def main(argv=None) -> int:
         return _restart_screen_component(args)
     if args.action == "stop-screen-component":
         return _stop_screen_component(args)
+    if args.action == "stop-platform-screens":
+        return _stop_platform_screens(args)
     if args.action == "start-platform-screens":
         return _start_platform_screens(args)
     _print_error(f"unsupported_action={args.action}")
@@ -105,6 +112,22 @@ def _stop_screen_component(args) -> int:
     print(f"platform={args.platform}")
     print(f"component={args.component}")
     print(f"screen_session={args.screen_session}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
+def _stop_platform_screens(args) -> int:
+    if not _safe_name(args.platform):
+        _print_error(f"invalid_platform={args.platform or 'missing'}")
+        return 2
+    if args.execute:
+        for command in _stop_platform_commands(args.platform):
+            run_checked(command)
+    print("klonet_agent_op")
+    print("action=stop-platform-screens")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"platform={args.platform}")
+    print(f"screen_sessions={','.join(_start_screen_sessions(args.platform))}")
     print(f"environment_changed={str(args.execute).lower()}")
     return 0
 
@@ -190,6 +213,14 @@ def _restart_commands(component: str, screen_session: str, project_root: str) ->
 
 def _stop_commands(screen_session: str) -> list:
     return [["screen", "-S", screen_session, "-X", "quit"]]
+
+
+def _stop_platform_commands(platform: str) -> list:
+    return [
+        command
+        for screen_session in _start_screen_sessions(platform)
+        for command in _stop_commands(screen_session)
+    ]
 
 
 def _start_screen_sessions(platform: str) -> list:

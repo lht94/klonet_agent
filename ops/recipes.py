@@ -17,6 +17,7 @@ from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExec
 
 RESTART_SCREEN_COMPONENT = "restart_screen_component"
 STOP_SCREEN_COMPONENT = "stop_screen_component"
+STOP_PLATFORM_SCREENS = "stop_platform_screens"
 START_PLATFORM_SCREENS = "start_platform_screens"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
@@ -41,6 +42,8 @@ class ControlledRecipeRunner:
             return self._restart_screen_component(plan, step)
         if step.recipe_id == STOP_SCREEN_COMPONENT:
             return self._stop_screen_component(plan, step)
+        if step.recipe_id == STOP_PLATFORM_SCREENS:
+            return self._stop_platform_screens(plan, step)
         if step.recipe_id == START_PLATFORM_SCREENS:
             return self._start_platform_screens(plan, step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
@@ -118,6 +121,20 @@ class ControlledRecipeRunner:
             screen_session,
         ]
         return self._helper_result(STOP_SCREEN_COMPONENT, command)
+
+    def _stop_platform_screens(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        platform = str(args.get("platform") or plan.target or "").strip()
+        if not _safe_token(platform):
+            return RecipeExecutionResult("blocked", f"invalid_platform={platform or 'missing'}; environment unchanged")
+        command = [
+            self.helper_path,
+            "stop-platform-screens",
+            "--dry-run" if self.dry_run else "--execute",
+            "--platform",
+            platform,
+        ]
+        return self._helper_result(STOP_PLATFORM_SCREENS, command)
 
     def _start_platform_screens(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}

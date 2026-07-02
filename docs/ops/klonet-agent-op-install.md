@@ -30,6 +30,7 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 ```text
 /usr/local/bin/klonet-agent-op restart-screen-component --execute *
 /usr/local/bin/klonet-agent-op stop-screen-component --execute *
+/usr/local/bin/klonet-agent-op stop-platform-screens --execute *
 /usr/local/bin/klonet-agent-op start-platform-screens --execute *
 ```
 
@@ -84,6 +85,23 @@ environment_changed=false
 ```text
 klonet_agent_op
 action=stop-screen-component
+dry_run=true
+environment_changed=false
+```
+
+停止整个平台四个后端 screen 的 dry-run 验证：
+
+```bash
+/usr/local/bin/klonet-agent-op stop-platform-screens --dry-run \
+  --platform 102
+```
+
+输出中应包含：
+
+```text
+klonet_agent_op
+action=stop-platform-screens
+screen_sessions=102_m,102_c,102_web,102_w
 dry_run=true
 environment_changed=false
 ```

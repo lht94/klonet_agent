@@ -13,6 +13,7 @@ def test_sudoers_template_only_allows_fixed_helper_entrypoint():
 
     assert "/usr/local/bin/klonet-agent-op restart-screen-component --execute" in text
     assert "/usr/local/bin/klonet-agent-op stop-screen-component --execute" in text
+    assert "/usr/local/bin/klonet-agent-op stop-platform-screens --execute" in text
     assert "/usr/local/bin/klonet-agent-op start-platform-screens --execute" in text
     assert "NOPASSWD:" in text
     assert "/bin/bash" not in text
