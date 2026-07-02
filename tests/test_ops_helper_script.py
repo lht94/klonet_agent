@@ -531,6 +531,44 @@ def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(mon
     assert "environment_changed=true" in captured.out
 
 
+def test_restart_screen_component_helper_execute_reports_command_failure(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    def fail_second_command(command):
+        commands.append(command)
+        if len(commands) == 2:
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(helper, "run_checked", fail_second_command)
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: ["102_m"])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+
+    code = helper.main(
+        [
+            "restart-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert len(commands) == 2
+    assert "error=command_failed" in captured.err
+    assert "failed_command=screen -dmS 102_m" in captured.err
+    assert "returncode=1" in captured.err
+    assert "environment_changed=unknown" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_restart_web_terminal_helper_uses_server_python_path(monkeypatch):
     helper = _load_helper_module()
     commands = []

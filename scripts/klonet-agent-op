@@ -105,8 +105,8 @@ def _restart_screen_component(args) -> int:
         if missing:
             _print_error(f"missing_project_entry_files={','.join(missing)}")
             return 2
-        for command in _restart_commands(args.component, args.screen_session, args.project_root):
-            run_checked(command)
+        if not _run_commands(_restart_commands(args.component, args.screen_session, args.project_root)):
+            return 1
     print("klonet_agent_op")
     print("action=restart-screen-component")
     print(f"dry_run={str(args.dry_run).lower()}")
@@ -132,8 +132,8 @@ def _stop_screen_component(args) -> int:
         if not existing:
             _print_error(f"screen_session_not_found={args.screen_session}")
             return 2
-        for command in _stop_commands(args.screen_session):
-            run_checked(command)
+        if not _run_commands(_stop_commands(args.screen_session)):
+            return 1
     print("klonet_agent_op")
     print("action=stop-screen-component")
     print(f"dry_run={str(args.dry_run).lower()}")
@@ -154,8 +154,8 @@ def _stop_platform_screens(args) -> int:
         if not existing:
             _print_error(f"screen_session_not_found={','.join(screen_sessions)}")
             return 2
-        for command in _stop_commands_for_sessions(existing):
-            run_checked(command)
+        if not _run_commands(_stop_commands_for_sessions(existing)):
+            return 1
     print("klonet_agent_op")
     print("action=stop-platform-screens")
     print(f"dry_run={str(args.dry_run).lower()}")
@@ -189,8 +189,8 @@ def _start_platform_screens(args) -> int:
             _print_error(f"port_already_listening={','.join(str(port) for port in occupied_ports)}")
             return 2
     if args.execute:
-        for command in _start_platform_commands(args.platform, args.project_root):
-            run_checked(command)
+        if not _run_commands(_start_platform_commands(args.platform, args.project_root)):
+            return 1
     print("klonet_agent_op")
     print("action=start-platform-screens")
     print(f"dry_run={str(args.dry_run).lower()}")
@@ -246,6 +246,27 @@ def _print_error(problem: str) -> None:
     print("klonet_agent_op", file=sys.stderr)
     print(f"error={problem}", file=sys.stderr)
     print("environment_changed=false", file=sys.stderr)
+
+
+def _print_command_failure(command: list, exc: Exception) -> None:
+    print("klonet_agent_op", file=sys.stderr)
+    print("error=command_failed", file=sys.stderr)
+    print(f"failed_command={shlex.join(command)}", file=sys.stderr)
+    if isinstance(exc, subprocess.CalledProcessError):
+        print(f"returncode={exc.returncode}", file=sys.stderr)
+    else:
+        print(f"exception={exc.__class__.__name__}", file=sys.stderr)
+    print("environment_changed=unknown", file=sys.stderr)
+
+
+def _run_commands(commands: list) -> bool:
+    for command in commands:
+        try:
+            run_checked(command)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            _print_command_failure(command, exc)
+            return False
+    return True
 
 
 def _restart_commands(component: str, screen_session: str, project_root: str) -> list:
