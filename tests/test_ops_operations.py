@@ -23,10 +23,12 @@ def test_ops_operation_tools_are_registered_and_profile_allowed():
     assert "approve_ops_operation_plan" in tool_names
     assert "execute_ops_operation_step" in tool_names
     assert "execute_ops_next_step" in tool_names
+    assert "resolve_ops_blocked_step" in tool_names
     assert "create_ops_operation_plan" in profile.allowed_tools
     assert "approve_ops_operation_plan" in profile.allowed_tools
     assert "execute_ops_operation_step" in profile.allowed_tools
     assert "execute_ops_next_step" in profile.allowed_tools
+    assert "resolve_ops_blocked_step" in profile.allowed_tools
     assert "run_command" not in profile.allowed_tools
 
 
@@ -55,6 +57,7 @@ def test_mentor_profile_cannot_create_or_approve_operation_plans():
     assert "create_ops_operation_plan" not in profile.allowed_tools
     assert "approve_ops_operation_plan" not in profile.allowed_tools
     assert "execute_ops_operation_step" not in profile.allowed_tools
+    assert "resolve_ops_blocked_step" not in profile.allowed_tools
 
 
 def test_create_operation_plan_persists_but_does_not_execute():
@@ -524,6 +527,39 @@ def test_store_next_step_stops_at_blocked_step_until_resolved():
     assert "execute_step=restart-master" in result
     assert "execution_result=step is blocked; resolve required action before continuing" in result
     assert _status_by_step(loaded)["restart-master"] == "blocked"
+
+
+def test_store_resolves_blocked_step_after_runtime_reinspection():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        blocked_step = next(item for item in plan.steps if item.step_id == "restart-master")
+        blocked_step.status = "blocked"
+        store.save_plan(plan)
+
+        resolved = store.resolve_blocked_step(
+            plan.plan_id,
+            "restart-master",
+            "inspect_runtime confirmed 102_m screen absent and port 5000 free",
+        )
+        rendered = render_plan(resolved)
+        loaded = store.load_plan(plan.plan_id)
+
+    statuses = _status_by_step(loaded)
+    assert loaded.status == "approved"
+    assert statuses["restart-master"] == "pending"
+    assert "next_step=restart-master" in rendered
+    assert "inspect_runtime confirmed 102_m screen absent and port 5000 free" in loaded.evidence
 
 
 def test_store_blocks_step_execution_when_previous_step_is_incomplete():
@@ -1245,6 +1281,58 @@ def test_executor_execute_ops_next_step_runs_current_plan_step():
 
     assert "execute_step=precheck-runtime" in result
     assert "result_status=completed" in result
+
+
+def test_executor_resolve_ops_blocked_step_resets_step_to_pending():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "resolve_ops_blocked_step",
+            },
+            memory_store=store,
+        )
+        created = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+                "operation_args": {"project_root": "/home/adminis/lht/102_project"},
+            },
+        )
+        plan_id = _extract_plan_id(created)
+        plan_store = executor._operation_plan_store()
+        plan = plan_store.load_plan(plan_id)
+        plan.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "blocked"
+        plan_store.save_plan(plan)
+
+        result = executor.run(
+            "resolve_ops_blocked_step",
+            {
+                "plan_id": plan_id,
+                "step_id": "restart-master",
+                "resolution_evidence": "inspect_runtime confirmed screen and port state refreshed",
+            },
+        )
+        loaded = plan_store.load_plan(plan_id)
+
+    assert "next_step=restart-master" in result
+    assert "restart-master" in result
+    assert "status=pending" in result
+    assert _status_by_step(loaded)["restart-master"] == "pending"
+    assert "inspect_runtime confirmed screen and port state refreshed" in loaded.evidence
 
 
 def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():

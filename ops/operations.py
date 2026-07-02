@@ -127,6 +127,22 @@ class OperationPlanStore:
         self.save_plan(plan)
         return plan
 
+    def resolve_blocked_step(self, plan_id: str, step_id: str, resolution_evidence: str) -> OperationPlan:
+        plan = self.load_plan(plan_id)
+        step = _find_step(plan, step_id)
+        if step.status != "blocked":
+            raise ValueError(f"operation step is not blocked: {step_id}")
+        evidence = _one_line(resolution_evidence, 300)
+        if not evidence:
+            raise ValueError("resolution_evidence is required")
+        step.status = "pending"
+        if plan.status == "failed":
+            plan.status = "approved"
+        plan.evidence.append(evidence)
+        plan.evidence = plan.evidence[-12:]
+        self.save_plan(plan)
+        return plan
+
     def execute_step(self, plan_id: str, step_id: str) -> str:
         plan = self.load_plan(plan_id)
         if plan.status != "approved":

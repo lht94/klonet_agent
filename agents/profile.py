@@ -53,6 +53,7 @@ OPS_OPERATION_TOOLS = {
     "approve_ops_operation_plan",
     "execute_ops_operation_step",
     "execute_ops_next_step",
+    "resolve_ops_blocked_step",
 }
 
 OPS_TOOLS = {

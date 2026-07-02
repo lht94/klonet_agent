@@ -394,6 +394,19 @@ TOOLS = [
         ["plan_id"],
     ),
     _tool(
+        "resolve_ops_blocked_step",
+        "Reset a blocked Ops OperationPlan step to pending after runtime reinspection evidence has been collected. This does not authorize execution; privileged steps still require confirm-step again.",
+        {
+            "plan_id": {"type": "string", "description": "Existing Ops operation plan id."},
+            "step_id": {"type": "string", "description": "Blocked step id to resolve."},
+            "resolution_evidence": {
+                "type": "string",
+                "description": "Evidence from the latest runtime reinspection explaining why the blocked step can be retried.",
+            },
+        },
+        ["plan_id", "step_id", "resolution_evidence"],
+    ),
+    _tool(
         "list_files",
         "列出当前 workspace 内的文件或目录。",
         {"path": {"type": "string", "description": "workspace 内相对路径，默认 ."}},

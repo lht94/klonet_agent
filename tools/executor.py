@@ -189,6 +189,15 @@ class ToolExecutor:
             store = self._operation_plan_store()
             return store.execute_next_step(tool_args["plan_id"])
 
+        if tool_name == "resolve_ops_blocked_step":
+            store = self._operation_plan_store()
+            plan = store.resolve_blocked_step(
+                tool_args["plan_id"],
+                tool_args["step_id"],
+                tool_args.get("resolution_evidence", ""),
+            )
+            return render_plan(plan)
+
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))
 
