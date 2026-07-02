@@ -44,6 +44,7 @@ class OperationStep:
 class RecipeExecutionResult:
     status: str
     output: str
+    next_required_action: str = ""
 
 
 @dataclass
@@ -197,6 +198,7 @@ class OperationPlanStore:
             previous_status=previous_status,
             result_status=step.status,
             execution_result=result.output,
+            next_required_action=result.next_required_action,
         )
 
     def execute_next_step(self, plan_id: str) -> str:

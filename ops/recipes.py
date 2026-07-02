@@ -101,14 +101,7 @@ class ControlledRecipeRunner:
             try:
                 output = self.command_runner(command)
             except subprocess.CalledProcessError as exc:
-                return RecipeExecutionResult(
-                    "failed",
-                    (
-                        f"helper_failed returncode={exc.returncode} "
-                        f"stderr={_one_line(exc.stderr)} "
-                        f"stdout={_one_line(exc.output)}"
-                    ),
-                )
+                return _helper_failure_result(exc)
             return RecipeExecutionResult(
                 "completed",
                 (
@@ -183,14 +176,7 @@ class ControlledRecipeRunner:
             try:
                 output = self.command_runner(command)
             except subprocess.CalledProcessError as exc:
-                return RecipeExecutionResult(
-                    "failed",
-                    (
-                        f"helper_failed returncode={exc.returncode} "
-                        f"stderr={_one_line(exc.stderr)} "
-                        f"stdout={_one_line(exc.output)}"
-                    ),
-                )
+                return _helper_failure_result(exc)
             return RecipeExecutionResult(
                 "completed",
                 (
@@ -249,14 +235,7 @@ class ControlledRecipeRunner:
             try:
                 output = self.command_runner(command)
             except subprocess.CalledProcessError as exc:
-                return RecipeExecutionResult(
-                    "failed",
-                    (
-                        f"helper_failed returncode={exc.returncode} "
-                        f"stderr={_one_line(exc.stderr)} "
-                        f"stdout={_one_line(exc.output)}"
-                    ),
-                )
+                return _helper_failure_result(exc)
             return RecipeExecutionResult(
                 "completed",
                 (
@@ -330,6 +309,23 @@ def _run_command(command: list) -> str:
         errors="replace",
     )
     return completed.stdout.strip()
+
+
+def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
+    stderr = _one_line(exc.stderr)
+    stdout = _one_line(exc.output)
+    output = (
+        f"helper_failed returncode={exc.returncode} "
+        f"stderr={stderr} "
+        f"stdout={stdout}"
+    )
+    if "environment_changed=unknown" in stderr:
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_environment_unknown {output}",
+            "inspect_runtime",
+        )
+    return RecipeExecutionResult("failed", output)
 
 
 def _one_line(text: str) -> str:

@@ -1016,6 +1016,68 @@ def test_restart_screen_component_recipe_execute_reports_helper_failure():
     assert loaded.status == "failed"
 
 
+def test_restart_recipe_unknown_environment_blocks_plan_until_reinspection():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    helper_stderr = "\n".join(
+        [
+            "klonet_agent_op",
+            "error=command_failed",
+            "failed_command=screen -dmS 102_m",
+            "returncode=1",
+            "environment_changed=unknown",
+        ]
+    )
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(1, command, output="", stderr=helper_stderr)
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102 master",
+            recipe_bindings={
+                "restart-master": {
+                    "recipe_id": "restart_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    statuses = _status_by_step(loaded)
+    assert "result_status=blocked" in result
+    assert "helper_environment_unknown" in result
+    assert "next_required_action=inspect_runtime" in result
+    assert loaded.status == "approved"
+    assert statuses["restart-master"] == "blocked"
+    assert statuses["precheck-runtime"] == "completed"
+
+
 def test_restart_screen_component_recipe_blocks_unknown_component():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
