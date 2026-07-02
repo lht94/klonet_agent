@@ -823,6 +823,10 @@ class AgentOrchestrator:
     def _format_tool_action(self, tool_name: str, tool_args: dict) -> str:
         """Return a deterministic action using only allowlisted arguments."""
 
+        plan_action = self._format_ops_plan_action(tool_name, tool_args)
+        if plan_action:
+            return plan_action
+
         actions = {
             "search_knowledge": ("正在检索知识库", "query"),
             "search_shared_ops_memory": ("正在检索历史诊断", "query"),
@@ -849,6 +853,34 @@ class AgentOrchestrator:
         if len(value) > 120:
             value = value[:117] + "..."
         return f"{action}：{value}" if value else action
+
+    def _format_ops_plan_action(self, tool_name: str, tool_args: dict) -> str:
+        """Return stable action text for controlled Ops operation-plan tools."""
+
+        if tool_name == "create_ops_operation_plan":
+            operation = self._safe_action_value(tool_args.get("operation"), 80)
+            target = self._safe_action_value(tool_args.get("target"), 80) or "unknown"
+            return f"Ops plan: create {operation or 'operation'} for {target}"
+        if tool_name == "approve_ops_operation_plan":
+            plan_id = self._safe_action_value(tool_args.get("plan_id"), 80) or "unknown"
+            scope = self._safe_action_value(tool_args.get("scope"), 20) or "plan"
+            return f"Ops plan: approve {scope} {plan_id}"
+        if tool_name == "execute_ops_next_step":
+            plan_id = self._safe_action_value(tool_args.get("plan_id"), 80) or "unknown"
+            return f"Ops plan: execute next step for {plan_id}"
+        if tool_name == "execute_ops_operation_step":
+            plan_id = self._safe_action_value(tool_args.get("plan_id"), 80) or "unknown"
+            step_id = self._safe_action_value(tool_args.get("step_id"), 80) or "unknown-step"
+            return f"Ops plan: execute {step_id} for {plan_id}"
+        return ""
+
+    def _safe_action_value(self, value, limit: int) -> str:
+        """Compact one tool argument for progress output."""
+
+        text = " ".join(str(value or "").split())
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
 
     def _print_tool_loop_observation(self, tool_name: str, result: str) -> None:
         """Print bounded real tool output as an Ops observation."""

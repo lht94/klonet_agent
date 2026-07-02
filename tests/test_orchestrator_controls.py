@@ -1223,6 +1223,36 @@ def test_ops_tool_action_uses_safe_arguments_only():
     ) == "正在执行工具：unknown_tool"
 
 
+def test_ops_operation_plan_actions_are_named_explicitly():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+
+    assert orchestrator._format_tool_action(
+        "create_ops_operation_plan",
+        {
+            "operation": "restart_platform",
+            "target": "102",
+            "secret": "hidden",
+        },
+    ) == "Ops plan: create restart_platform for 102"
+    assert orchestrator._format_tool_action(
+        "approve_ops_operation_plan",
+        {"plan_id": "restart-abc", "scope": "plan", "token": "hidden"},
+    ) == "Ops plan: approve plan restart-abc"
+    assert orchestrator._format_tool_action(
+        "execute_ops_next_step",
+        {"plan_id": "restart-abc", "password": "hidden"},
+    ) == "Ops plan: execute next step for restart-abc"
+    assert orchestrator._format_tool_action(
+        "execute_ops_operation_step",
+        {"plan_id": "restart-abc", "step_id": "restart-master"},
+    ) == "Ops plan: execute restart-master for restart-abc"
+
+
 def test_ops_observation_shows_three_real_lines_and_omission():
     from klonet_agent.agents import get_profile
     from klonet_agent.orchestrator import AgentOrchestrator
