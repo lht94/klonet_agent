@@ -219,9 +219,10 @@ def render_plan(plan: OperationPlan) -> str:
     for step in plan.steps:
         confirm = " step-confirm" if step.requires_step_confirmation else ""
         recipe = f" recipe={step.recipe_id}" if step.recipe_id else ""
+        recipe_args = _render_recipe_args(step.recipe_args)
         lines.append(
             f"  - {step.step_id}: {step.title} "
-            f"risk={step.risk}{confirm}{recipe} status={step.status}"
+            f"risk={step.risk}{confirm}{recipe}{recipe_args} status={step.status}"
         )
     lines.append(f"approve_plan_command=confirm {plan.plan_id}")
     lines.append(
@@ -337,6 +338,22 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
             return
         step.recipe_id = "stop_platform_screens"
         step.recipe_args = {"platform": _one_line(plan.target, 120)}
+
+
+def _render_recipe_args(recipe_args: dict) -> str:
+    if not isinstance(recipe_args, dict) or not recipe_args:
+        return ""
+    pairs = []
+    for key in sorted(recipe_args)[:6]:
+        if not key:
+            continue
+        pairs.append(
+            f"recipe_args.{_one_line(str(key), 40)}="
+            f"{_one_line(str(recipe_args[key]), 120)}"
+        )
+    if len(recipe_args) > 6:
+        pairs.append("recipe_args.omitted=...")
+    return " " + " ".join(pairs) if pairs else ""
 
 
 def _next_step_id(plan: OperationPlan) -> str:

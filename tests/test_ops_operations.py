@@ -128,6 +128,7 @@ def test_destroy_operation_plan_default_binds_stop_platform_recipe_without_execu
     assert step.recipe_args == {"platform": "102"}
     assert "stop-services" in rendered
     assert "recipe=stop_platform_screens" in rendered
+    assert "recipe_args.platform=102" in rendered
 
 
 def test_render_plan_includes_execution_state_and_next_step():
