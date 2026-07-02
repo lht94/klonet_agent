@@ -443,6 +443,34 @@ def test_start_platform_screens_helper_execute_rejects_listening_config_port(mon
     assert "environment_changed=false" in captured.err
 
 
+def test_start_platform_screens_helper_execute_rejects_missing_config_ports(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "missing_config_ports=vemu_config/config.py" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
 def test_configured_ports_reads_vemu_config_ports(tmp_path):
     helper = _load_helper_module()
     config_dir = tmp_path / "vemu_config"
