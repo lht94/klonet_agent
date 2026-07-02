@@ -497,6 +497,35 @@ def test_store_execute_next_step_reports_required_confirm_step_command():
     assert "next_required_action=confirm-step" in result
 
 
+def test_store_next_step_stops_at_blocked_step_until_resolved():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        blocked_step = next(item for item in plan.steps if item.step_id == "restart-master")
+        blocked_step.status = "blocked"
+        store.save_plan(plan)
+
+        rendered = render_plan(plan)
+        result = store.execute_next_step(plan.plan_id)
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "next_step=restart-master" in rendered
+    assert "result_status=blocked" in result
+    assert "execute_step=restart-master" in result
+    assert "execution_result=step is blocked; resolve required action before continuing" in result
+    assert _status_by_step(loaded)["restart-master"] == "blocked"
+
+
 def test_store_blocks_step_execution_when_previous_step_is_incomplete():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

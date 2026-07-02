@@ -139,6 +139,22 @@ class OperationPlanStore:
                 result_status="completed",
                 execution_result="step already completed; environment unchanged",
             )
+        if step.status == "blocked":
+            return _render_step_execution(
+                plan,
+                step,
+                result_status="blocked",
+                execution_result="step is blocked; resolve required action before continuing",
+                next_required_action="inspect_runtime_or_update_plan",
+            )
+        if step.status == "failed":
+            return _render_step_execution(
+                plan,
+                step,
+                result_status="failed",
+                execution_result="step already failed; create a new plan or repair state before continuing",
+                next_required_action="create_new_plan_or_recover_manually",
+            )
         if step.requires_step_confirmation and step.status != "approved":
             return (
                 "Error: step requires explicit confirm-step "
@@ -455,7 +471,7 @@ def _render_recipe_args(recipe_args: dict) -> str:
 
 def _next_step_id(plan: OperationPlan) -> str:
     for step in plan.steps:
-        if step.status not in {"completed", "blocked", "failed"}:
+        if step.status != "completed":
             return step.step_id
     return "none"
 
