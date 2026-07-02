@@ -334,6 +334,10 @@ def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
         plan_id = _extract_plan_id(created)
         executor.set_user_authorization_context(f"confirm {plan_id}")
         executor.run("approve_ops_operation_plan", {"plan_id": plan_id, "scope": "plan"})
+        executor.run(
+            "execute_ops_operation_step",
+            {"plan_id": plan_id, "step_id": "precheck-runtime"},
+        )
         executor.set_user_authorization_context(f"confirm-step {plan_id} restart-master")
         executor.run(
             "approve_ops_operation_plan",
@@ -353,9 +357,63 @@ def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
     assert "execution_result=no_recipe_attached; environment unchanged" in blocked
     statuses = _status_by_step(loaded_after_execute)
     assert statuses["restart-master"] == "blocked"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
+
+
+def test_store_completes_normal_unbound_step_as_readonly_checkpoint():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "precheck-runtime")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=precheck-runtime" in result
+    assert "result_status=completed" in result
+    assert "execution_result=readonly_or_manual_checkpoint_completed; environment unchanged" in result
+    assert _status_by_step(loaded)["precheck-runtime"] == "completed"
+
+
+def test_store_blocks_step_execution_when_previous_step_is_incomplete():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "restart-master")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert result.startswith("Error:")
+    assert "previous step must be completed first: precheck-runtime" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["restart-master"] == "approved"
 
 
 def test_store_executes_confirmed_allowlisted_recipe_and_persists_result():
@@ -383,6 +441,7 @@ def test_store_executes_confirmed_allowlisted_recipe_and_persists_result():
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
         step.recipe_id = "test-restart"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -396,7 +455,7 @@ def test_store_executes_confirmed_allowlisted_recipe_and_persists_result():
     assert "recipe=test-restart" in rendered
     statuses = _status_by_step(loaded)
     assert statuses["restart-master"] == "completed"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
 
@@ -416,6 +475,7 @@ def test_store_blocks_bound_recipe_when_runner_is_not_configured():
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
         step.recipe_id = "test-restart"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -425,7 +485,7 @@ def test_store_blocks_bound_recipe_when_runner_is_not_configured():
     assert "execution_result=recipe_runner_unavailable; environment unchanged" in result
     statuses = _status_by_step(loaded)
     assert statuses["restart-master"] == "blocked"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
 
@@ -448,6 +508,7 @@ def test_store_marks_recipe_exception_as_failed_and_fails_plan():
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
         step.recipe_id = "test-restart"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -458,7 +519,7 @@ def test_store_marks_recipe_exception_as_failed_and_fails_plan():
     assert loaded.status == "failed"
     statuses = _status_by_step(loaded)
     assert statuses["restart-master"] == "failed"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
 
@@ -492,6 +553,7 @@ def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -507,7 +569,7 @@ def test_restart_screen_component_recipe_dry_run_generates_safe_preview():
     assert "--project-root /home/adminis/lht/102_project" in result
     statuses = _status_by_step(loaded)
     assert statuses["restart-master"] == "completed"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
 
@@ -539,6 +601,7 @@ def test_start_platform_screens_recipe_dry_run_generates_safe_preview():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "start-services")
         step.status = "approved"
+        _complete_steps_before(plan, "start-services")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "start-services")
@@ -552,8 +615,8 @@ def test_start_platform_screens_recipe_dry_run_generates_safe_preview():
     assert "--project-root /home/adminis/lht/103_project/vemu_uestc" in result
     statuses = _status_by_step(loaded)
     assert statuses["start-services"] == "completed"
-    assert statuses["precheck"] == "pending"
-    assert statuses["prepare-files"] == "pending"
+    assert statuses["precheck"] == "completed"
+    assert statuses["prepare-files"] == "completed"
 
 
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
@@ -584,6 +647,7 @@ def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "stop-services")
         step.status = "approved"
+        _complete_steps_before(plan, "stop-services")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "stop-services")
@@ -598,7 +662,7 @@ def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     assert "--screen 102_m" in result
     statuses = _status_by_step(loaded)
     assert statuses["stop-services"] == "completed"
-    assert statuses["identify-owned-resources"] == "pending"
+    assert statuses["identify-owned-resources"] == "completed"
     assert statuses["cleanup-owned-resources"] == "pending"
 
 
@@ -628,6 +692,7 @@ def test_stop_platform_screens_recipe_dry_run_generates_safe_preview():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "stop-services")
         step.status = "approved"
+        _complete_steps_before(plan, "stop-services")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "stop-services")
@@ -640,7 +705,7 @@ def test_stop_platform_screens_recipe_dry_run_generates_safe_preview():
     assert "--platform 102" in result
     statuses = _status_by_step(loaded)
     assert statuses["stop-services"] == "completed"
-    assert statuses["identify-owned-resources"] == "pending"
+    assert statuses["identify-owned-resources"] == "completed"
     assert statuses["cleanup-owned-resources"] == "pending"
 
 
@@ -682,6 +747,7 @@ def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -707,7 +773,7 @@ def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     assert "helper stdout ok" in result
     statuses = _status_by_step(loaded)
     assert statuses["restart-master"] == "completed"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
 
@@ -749,6 +815,7 @@ def test_restart_screen_component_recipe_execute_reports_helper_failure():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -789,6 +856,7 @@ def test_restart_screen_component_recipe_blocks_unknown_component():
         plan.status = "approved"
         step = next(item for item in plan.steps if item.step_id == "restart-master")
         step.status = "approved"
+        _complete_steps_before(plan, "restart-master")
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "restart-master")
@@ -798,7 +866,7 @@ def test_restart_screen_component_recipe_blocks_unknown_component():
     assert "unsupported_component=database" in result
     statuses = _status_by_step(loaded)
     assert statuses["restart-master"] == "blocked"
-    assert statuses["precheck-runtime"] == "pending"
+    assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
 
@@ -843,6 +911,10 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
         plan_id = _extract_plan_id(created)
         executor.set_user_authorization_context(f"confirm {plan_id}")
         executor.run("approve_ops_operation_plan", {"plan_id": plan_id, "scope": "plan"})
+        executor.run(
+            "execute_ops_operation_step",
+            {"plan_id": plan_id, "step_id": "precheck-runtime"},
+        )
         executor.set_user_authorization_context(f"confirm-step {plan_id} restart-master")
         executor.run(
             "approve_ops_operation_plan",
@@ -930,3 +1002,10 @@ def _extract_plan_id(text: str) -> str:
 
 def _status_by_step(plan):
     return {step.step_id: step.status for step in plan.steps}
+
+
+def _complete_steps_before(plan, step_id):
+    for step in plan.steps:
+        if step.step_id == step_id:
+            return
+        step.status = "completed"

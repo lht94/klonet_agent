@@ -143,8 +143,23 @@ class OperationPlanStore:
                 "Error: step requires explicit confirm-step "
                 f"{plan.plan_id} {step.step_id} before execution."
             )
+        previous_incomplete = _previous_incomplete_step(plan, step.step_id)
+        if previous_incomplete:
+            return f"Error: previous step must be completed first: {previous_incomplete.step_id}"
         previous_status = step.status
         if not step.recipe_id:
+            if not step.requires_step_confirmation and step.risk == "normal":
+                step.status = "completed"
+                if _all_steps_completed(plan):
+                    plan.status = "completed"
+                self.save_plan(plan)
+                return _render_step_execution(
+                    plan,
+                    step,
+                    previous_status=previous_status,
+                    result_status="completed",
+                    execution_result="readonly_or_manual_checkpoint_completed; environment unchanged",
+                )
             step.status = "blocked"
             self.save_plan(plan)
             return _render_step_execution(
@@ -407,6 +422,15 @@ def _next_step_id(plan: OperationPlan) -> str:
         if step.status not in {"completed", "blocked", "failed"}:
             return step.step_id
     return "none"
+
+
+def _previous_incomplete_step(plan: OperationPlan, step_id: str) -> Optional[OperationStep]:
+    for step in plan.steps:
+        if step.step_id == step_id:
+            return None
+        if step.status != "completed":
+            return step
+    return None
 
 
 def _recipe_status(status: str) -> str:
