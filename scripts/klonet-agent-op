@@ -124,6 +124,10 @@ def _stop_screen_component(args) -> int:
         _print_error(problem)
         return 2
     if args.execute:
+        existing = existing_screen_sessions([args.screen_session])
+        if not existing:
+            _print_error(f"screen_session_not_found={args.screen_session}")
+            return 2
         for command in _stop_commands(args.screen_session):
             run_checked(command)
     print("klonet_agent_op")
@@ -140,14 +144,19 @@ def _stop_platform_screens(args) -> int:
     if not _safe_name(args.platform):
         _print_error(f"invalid_platform={args.platform or 'missing'}")
         return 2
+    screen_sessions = _start_screen_sessions(args.platform)
     if args.execute:
-        for command in _stop_platform_commands(args.platform):
+        existing = existing_screen_sessions(screen_sessions)
+        if not existing:
+            _print_error(f"screen_session_not_found={','.join(screen_sessions)}")
+            return 2
+        for command in _stop_commands_for_sessions(existing):
             run_checked(command)
     print("klonet_agent_op")
     print("action=stop-platform-screens")
     print(f"dry_run={str(args.dry_run).lower()}")
     print(f"platform={args.platform}")
-    print(f"screen_sessions={','.join(_start_screen_sessions(args.platform))}")
+    print(f"screen_sessions={','.join(screen_sessions)}")
     print(f"environment_changed={str(args.execute).lower()}")
     return 0
 
@@ -250,9 +259,13 @@ def _stop_commands(screen_session: str) -> list:
 
 
 def _stop_platform_commands(platform: str) -> list:
+    return _stop_commands_for_sessions(_start_screen_sessions(platform))
+
+
+def _stop_commands_for_sessions(screen_sessions: list) -> list:
     return [
         command
-        for screen_session in _start_screen_sessions(platform)
+        for screen_session in screen_sessions
         for command in _stop_commands(screen_session)
     ]
 

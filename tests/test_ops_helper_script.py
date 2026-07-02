@@ -159,6 +159,11 @@ def test_stop_platform_screens_helper_execute_uses_fixed_screen_quits(monkeypatc
     commands = []
 
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(
+        helper,
+        "existing_screen_sessions",
+        lambda sessions: ["102_m", "102_c", "102_web", "102_w"],
+    )
 
     code = helper.main(
         [
@@ -186,6 +191,7 @@ def test_stop_screen_component_helper_execute_uses_fixed_screen_quit(monkeypatch
     commands = []
 
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: ["102_m"])
 
     code = helper.main(
         [
@@ -204,6 +210,82 @@ def test_stop_screen_component_helper_execute_uses_fixed_screen_quit(monkeypatch
     assert code == 0
     assert commands == [["screen", "-S", "102_m", "-X", "quit"]]
     assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_stop_screen_component_helper_execute_rejects_missing_screen(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+
+    code = helper.main(
+        [
+            "stop-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "screen_session_not_found=102_m" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
+def test_stop_platform_screens_helper_execute_rejects_when_no_platform_screens_exist(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+
+    code = helper.main(
+        [
+            "stop-platform-screens",
+            "--execute",
+            "--platform",
+            "102",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "screen_session_not_found=102_m,102_c,102_web,102_w" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
+def test_stop_platform_screens_helper_execute_stops_only_existing_platform_screens(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: ["102_m", "102_w"])
+
+    code = helper.main(
+        [
+            "stop-platform-screens",
+            "--execute",
+            "--platform",
+            "102",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [
+        ["screen", "-S", "102_m", "-X", "quit"],
+        ["screen", "-S", "102_w", "-X", "quit"],
+    ]
+    assert "screen_sessions=102_m,102_c,102_web,102_w" in captured.out
     assert "environment_changed=true" in captured.out
 
 
