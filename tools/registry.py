@@ -253,6 +253,28 @@ TOOLS = [
         [],
     ),
     _tool(
+        "inspect_process_detail",
+        "只读精确确认端口、PID 或进程关键词对应的进程证据，返回 port/pid/ppid/user/cmd/cwd。用于 address already in use、确认端口占用者、核对运行源码 cwd；不修改环境。",
+        {
+            "ports": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "要精确确认占用者的监听端口，例如 [5045]。",
+            },
+            "pids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "要读取 cmd/cwd/ppid/user 的进程 PID 列表。",
+            },
+            "process_keywords": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "按进程命令关键词查找 PID 后读取详情，例如 web_terminal_main.py。",
+            },
+        },
+        [],
+    ),
+    _tool(
         "read_klonet_logs",
         "只读读取安全日志文件尾部并脱敏，返回 resolved_path、mtime、size_bytes 以确认日志来源。旧日志里的历史错误不能单独证明当前仍然故障；需要结合进程、端口或 screen 输出判断当前状态。拒绝 .env、私钥、token、密码和非日志后缀文件。",
         {

@@ -73,6 +73,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_platform_instances" in tool_names
     assert "inspect_system_environment" in tool_names
     assert "inspect_klonet_runtime" in tool_names
+    assert "inspect_process_detail" in tool_names
     assert "read_ops_file" in tool_names
     assert "read_klonet_logs" in tool_names
     assert "inspect_screen_session" in tool_names
@@ -102,6 +103,7 @@ def test_ops_profile_allows_screen_inspection():
     assert "inspect_screen_session" in profile.allowed_tools
     assert "inspect_platform_instances" in profile.allowed_tools
     assert "inspect_ops_context" in profile.allowed_tools
+    assert "inspect_process_detail" in profile.allowed_tools
     assert "read_ops_file" in profile.allowed_tools
 
 
@@ -371,6 +373,52 @@ def test_runtime_port_owner_returns_target_pid_cmd_and_cwd(monkeypatch):
     assert any(call[:2] == ["ss", "-ltnp"] for call in calls)
 
 
+def test_process_detail_tool_returns_target_pid_cmd_and_cwd(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout='LISTEN 0 128 0.0.0.0:5045 0.0.0.0:* users:(("python3.8",pid=1467095,fd=7))',
+                stderr="",
+            )
+        if command[:2] == ["ps", "-p"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_text",
+        lambda path: "python3.8 web_terminal_main.py"
+        if path.endswith("/cmdline")
+        else "",
+    )
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_link",
+        lambda path: "/home/adminis/lht/102_project",
+    )
+
+    result = environment.inspect_process_detail({"ports": [5045]})
+
+    assert "inspect_process_detail" in result
+    assert "port_owner: detected" in result
+    assert "port=5045" in result
+    assert "pid=1467095" in result
+    assert "cmd=python3.8 web_terminal_main.py" in result
+    assert "cwd=/home/adminis/lht/102_project" in result
+
+
 def test_executor_dispatches_environment_tool():
     from klonet_agent.tools.executor import ToolExecutor
 
@@ -381,6 +429,18 @@ def test_executor_dispatches_environment_tool():
 
     assert "inspect_system_environment" in result
     assert any(status in result for status in ("detected", "missing", "unchecked"))
+
+
+def test_executor_dispatches_process_detail_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_process_detail"}).run(
+        "inspect_process_detail",
+        {},
+    )
+
+    assert "inspect_process_detail" in result
+    assert "process_detail: unchecked" in result
 
 
 def test_executor_dispatches_screen_inspection_tool():

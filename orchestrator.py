@@ -1295,7 +1295,7 @@ class AgentOrchestrator:
             for tool in TOOLS
             if tool["function"]["name"] in self.profile.allowed_tools
         ]
-        if self._query_route.scope == "general":
+        if self.profile.name != "ops" and self._query_route.scope == "general":
             tools = [
                 tool
                 for tool in tools
@@ -1319,6 +1319,19 @@ class AgentOrchestrator:
         ]
         return dialogue[-limit:]
 
+    def _ops_route_key(self, route: OpsRoute) -> str:
+        """Return a stable English key for Ops tool routing."""
+
+        if route.action in {"restart", "deploy", "destroy", "stop"}:
+            return f"controlled_{route.action}"
+        if "inspect_process_detail" in route.recommended_tools and route.ports:
+            return "port_conflict"
+        if "read_klonet_logs" in route.recommended_tools:
+            return "log_diagnosis"
+        if "inspect_ops_context" in route.recommended_tools:
+            return "runtime_inventory"
+        return "ops_diagnosis"
+
     def _build_turn_scope_message(self, user_input: str) -> dict:
         """构建只在当前工具循环中生效的问题范围约束。"""
 
@@ -1330,6 +1343,22 @@ class AgentOrchestrator:
             f"- original_user_input: {user_input}",
             "- 本轮范围由原始用户输入确定，后续查询改写不得改变。",
         ]
+        if self.profile.name == "ops" and self._ops_route is not None:
+            ops_route = self._ops_route
+            rules.extend(
+                [
+                    "【Ops tool routing】",
+                    f"- goal: {self._ops_route_key(ops_route)}",
+                    f"- mode: {ops_route.mode}",
+                    f"- action: {ops_route.action}",
+                    f"- risk: {ops_route.risk}",
+                    f"- ports: {', '.join(str(port) for port in ops_route.ports) or 'none'}",
+                    f"- paths: {', '.join(ops_route.paths[:3]) or 'none'}",
+                    f"- components: {', '.join(ops_route.components[:5]) or 'none'}",
+                    f"- recommended_tools: {', '.join(ops_route.recommended_tools) or 'none'}",
+                    "- Ops must treat these as tool-routing hints, not as final diagnosis.",
+                ]
+            )
         if self._turn_intent is not None:
             rules.extend(
                 [

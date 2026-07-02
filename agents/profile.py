@@ -41,6 +41,7 @@ ENVIRONMENT_TOOLS = {
     "inspect_platform_instances",
     "inspect_system_environment",
     "inspect_klonet_runtime",
+    "inspect_process_detail",
     "read_klonet_logs",
     "read_ops_file",
     "inspect_screen_session",

@@ -179,6 +179,26 @@ def inspect_klonet_runtime(args: Optional[dict] = None) -> str:
     return _render_tool_result("inspect_klonet_runtime", results)
 
 
+def inspect_process_detail(args: Optional[dict] = None) -> str:
+    """Inspect precise process ownership evidence for ports, PIDs or keywords."""
+
+    args = args or {}
+    results = []
+    if args.get("ports"):
+        results.extend(_inspect_port_owners(args))
+    if args.get("pids") or args.get("process_keywords"):
+        results.extend(_inspect_process_details(args))
+    if not results:
+        results.append(
+            ProbeResult(
+                "process_detail",
+                STATUS_UNCHECKED,
+                "ports, pids or process_keywords is required",
+            )
+        )
+    return _render_tool_result("inspect_process_detail", results)
+
+
 def inspect_ops_context(args: Optional[dict] = None) -> str:
     """Collect Ops baseline, runtime and deployment-asset context in one pass."""
 

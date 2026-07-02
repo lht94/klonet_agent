@@ -1153,6 +1153,54 @@ def test_ops_progress_uses_route_summary_not_generic_task_type(capsys):
     assert "已识别：code_lookup" not in output
 
 
+def test_ops_visible_tools_are_not_narrowed_by_generic_scope():
+    """Ops should route by operational tools, not by Mentor-style general scope."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.knowledge import route_query
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator._query_route = route_query("hello")
+
+    tool_names = {
+        tool["function"]["name"]
+        for tool in orchestrator._visible_tools()
+    }
+
+    assert "inspect_klonet_runtime" in tool_names
+    assert "inspect_process_detail" in tool_names
+    assert "read_project_journal" in tool_names
+
+
+def test_ops_scope_message_injects_tool_routing_plan():
+    """Ops scope message should expose deterministic tool routing hints."""
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.knowledge import route_query
+    from klonet_agent.ops.routing import route_ops_request
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    user_input = (
+        "我在 `/home/adminis/lht/102_project` 里再次启动 `web_terminal_main.py`，"
+        "报 address already in use。请精确确认占用 5045 的 PID、命令和 cwd。"
+    )
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator._query_route = route_query(user_input)
+    orchestrator._turn_intent = None
+    orchestrator._intent_decision = None
+    orchestrator._ops_route = route_ops_request(user_input)
+
+    content = orchestrator._build_turn_scope_message(user_input)["content"]
+
+    assert "Ops tool routing" in content
+    assert "goal:" in content
+    assert "port_conflict" in content
+    assert "recommended_tools: inspect_klonet_runtime, inspect_process_detail" in content
+
+
 def test_ops_tool_action_uses_safe_arguments_only():
     from klonet_agent.agents import get_profile
     from klonet_agent.orchestrator import AgentOrchestrator

@@ -23,6 +23,7 @@ from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
     inspect_platform_instances,
+    inspect_process_detail,
     inspect_screen_session,
     inspect_klonet_runtime,
     inspect_ops_context,
@@ -142,6 +143,9 @@ class ToolExecutor:
 
         if tool_name == "inspect_klonet_runtime":
             return inspect_klonet_runtime(tool_args)
+
+        if tool_name == "inspect_process_detail":
+            return inspect_process_detail(tool_args)
 
         if tool_name == "read_klonet_logs":
             return read_klonet_logs(tool_args)
