@@ -137,6 +137,12 @@ def _start_platform_screens(args) -> int:
     if problem:
         _print_error(problem)
         return 2
+    screen_sessions = _start_screen_sessions(args.platform)
+    if args.execute:
+        existing = existing_screen_sessions(screen_sessions)
+        if existing:
+            _print_error(f"screen_session_already_exists={','.join(existing)}")
+            return 2
     if args.execute:
         for command in _start_platform_commands(args.platform, args.project_root):
             run_checked(command)
@@ -145,7 +151,7 @@ def _start_platform_screens(args) -> int:
     print(f"dry_run={str(args.dry_run).lower()}")
     print(f"platform={args.platform}")
     print(f"project_root={args.project_root}")
-    print(f"screen_sessions={','.join(_start_screen_sessions(args.platform))}")
+    print(f"screen_sessions={','.join(screen_sessions)}")
     print(f"environment_changed={str(args.execute).lower()}")
     return 0
 
@@ -230,6 +236,26 @@ def _start_screen_sessions(platform: str) -> list:
         f"{platform}_web",
         f"{platform}_w",
     ]
+
+
+def existing_screen_sessions(screen_sessions: list) -> list:
+    try:
+        completed = subprocess.run(
+            ["screen", "-ls"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return []
+    output = f"{completed.stdout}\n{completed.stderr}"
+    existing = []
+    for session in screen_sessions:
+        if re.search(rf"(?:^|\s|\.){re.escape(session)}(?:\s|$)", output):
+            existing.append(session)
+    return existing
 
 
 def _start_platform_commands(platform: str, project_root: str) -> list:

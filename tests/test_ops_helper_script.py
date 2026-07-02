@@ -264,6 +264,36 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
     assert "environment_changed=true" in captured.out
 
 
+def test_start_platform_screens_helper_execute_rejects_existing_screen_session(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(
+        helper,
+        "existing_screen_sessions",
+        lambda sessions: ["103_m"],
+        raising=False,
+    )
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "screen_session_already_exists=103_m" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
 def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []
