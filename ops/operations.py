@@ -141,7 +141,8 @@ class OperationPlanStore:
         if step.requires_step_confirmation and step.status != "approved":
             return (
                 "Error: step requires explicit confirm-step "
-                f"{plan.plan_id} {step.step_id} before execution."
+                f"{plan.plan_id} {step.step_id} before execution.\n"
+                f"next_required_action=confirm-step {plan.plan_id} {step.step_id}"
             )
         previous_incomplete = _previous_incomplete_step(plan, step.step_id)
         if previous_incomplete:

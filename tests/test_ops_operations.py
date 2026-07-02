@@ -473,6 +473,30 @@ def test_store_execute_next_step_uses_current_execution_order():
     assert _status_by_step(loaded)["precheck-runtime"] == "completed"
 
 
+def test_store_execute_next_step_reports_required_confirm_step_command():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        store.execute_next_step(plan.plan_id)
+        result = store.execute_next_step(plan.plan_id)
+
+    assert result.startswith("Error:")
+    assert "step requires explicit confirm-step" in result
+    assert f"confirm-step {plan.plan_id} restart-master" in result
+    assert "next_required_action=confirm-step" in result
+
+
 def test_store_blocks_step_execution_when_previous_step_is_incomplete():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
