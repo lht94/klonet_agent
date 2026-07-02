@@ -332,6 +332,7 @@ def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(mon
     commands = []
 
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
 
     code = helper.main(
         [
@@ -370,6 +371,7 @@ def test_restart_web_terminal_helper_uses_server_python_path(monkeypatch):
     commands = []
 
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
 
     code = helper.main(
         [
@@ -395,6 +397,39 @@ def test_restart_web_terminal_helper_uses_server_python_path(monkeypatch):
         "-lc",
         "cd /home/adminis/lht/102_project && /usr/local/python3/bin/python3.8 web_terminal_main.py",
     ]
+
+
+def test_restart_screen_component_helper_execute_rejects_missing_project_entry_files(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(
+        helper,
+        "project_entry_files_missing",
+        lambda project_root: ["master_main.py"],
+    )
+
+    code = helper.main(
+        [
+            "restart-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "missing_project_entry_files=master_main.py" in captured.err
+    assert "environment_changed=false" in captured.err
 
 
 def test_restart_screen_component_helper_rejects_screen_platform_mismatch():
