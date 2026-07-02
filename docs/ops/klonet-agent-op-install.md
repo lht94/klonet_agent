@@ -143,7 +143,7 @@ worker_main.py
 
 真实执行 `start-platform-screens --execute` 前，helper 还会执行只读 `screen -ls` 检查。如果目标 screen 名（例如 `103_m`、`103_c`、`103_web`、`103_w`）已经存在，helper 会拒绝启动并返回 `screen_session_already_exists=...`，避免重复创建同名平台进程。
 
-真实执行 `stop-screen-component --execute` 前，helper 会确认目标 screen 仍然存在；如果不存在，会返回 `screen_session_not_found=...` 并拒绝宣称环境已修改。真实执行 `stop-platform-screens --execute` 前，helper 会先找出目标平台实际存在的 screen；如果一个都不存在，会返回 `screen_session_not_found=...`，如果只存在部分 screen，则只停止实际存在的目标 screen。
+真实执行 `restart-screen-component --execute` 或 `stop-screen-component --execute` 前，helper 会确认目标 screen 仍然存在；如果不存在，会返回 `screen_session_not_found=...` 并拒绝宣称环境已修改。真实执行 `stop-platform-screens --execute` 前，helper 会先找出目标平台实际存在的 screen；如果一个都不存在，会返回 `screen_session_not_found=...`，如果只存在部分 screen，则只停止实际存在的目标 screen。
 
 `start-platform-screens --execute` 和 `restart-screen-component --execute` 都会在 helper 层再次检查这些启动文件是否存在；如果缺失，会返回 `missing_project_entry_files=...` 并拒绝创建或重启 screen。这是为了防止绕过 Agent 侧 `precheck` 时误启动到错误目录。
 

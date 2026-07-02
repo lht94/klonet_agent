@@ -97,6 +97,10 @@ def _restart_screen_component(args) -> int:
         _print_error(problem)
         return 2
     if args.execute:
+        existing = existing_screen_sessions([args.screen_session])
+        if not existing:
+            _print_error(f"screen_session_not_found={args.screen_session}")
+            return 2
         missing = project_entry_files_missing(args.project_root)
         if missing:
             _print_error(f"missing_project_entry_files={','.join(missing)}")
