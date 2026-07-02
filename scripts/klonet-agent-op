@@ -24,6 +24,14 @@ COMPONENT_COMMANDS = {
     "celery": "/usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
     "web_terminal": "/usr/local/python3/bin/python3.8 web_terminal_main.py",
 }
+CONFIG_PORT_NAMES = (
+    "master_port",
+    "worker_port",
+    "public_port",
+    "web_terminal_port",
+    "terminal_port",
+    "data_server_port",
+)
 REQUIRED_PROJECT_ENTRY_FILES = (
     "gun.py",
     "master_main.py",
@@ -159,6 +167,10 @@ def _start_platform_screens(args) -> int:
         if missing:
             _print_error(f"missing_project_entry_files={','.join(missing)}")
             return 2
+        occupied_ports = listening_ports(configured_ports(args.project_root))
+        if occupied_ports:
+            _print_error(f"port_already_listening={','.join(str(port) for port in occupied_ports)}")
+            return 2
     if args.execute:
         for command in _start_platform_commands(args.platform, args.project_root):
             run_checked(command)
@@ -281,6 +293,47 @@ def project_entry_files_missing(project_root: str) -> list:
         for filename in REQUIRED_PROJECT_ENTRY_FILES
         if not (root / filename).is_file()
     ]
+
+
+def configured_ports(project_root: str) -> list:
+    config_path = Path(project_root) / "vemu_config" / "config.py"
+    if not config_path.is_file():
+        return []
+    try:
+        content = config_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    pattern = re.compile(
+        rf"\b({'|'.join(re.escape(name) for name in CONFIG_PORT_NAMES)})\s*=\s*['\"]?(\d+)['\"]?"
+    )
+    ports = []
+    for match in pattern.finditer(content):
+        port = int(match.group(2))
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def listening_ports(ports: list) -> list:
+    if not ports:
+        return []
+    try:
+        completed = subprocess.run(
+            ["ss", "-ltn"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return []
+    output = f"{completed.stdout}\n{completed.stderr}"
+    occupied = []
+    for port in ports:
+        if re.search(rf"(?<!\d):{port}\b", output):
+            occupied.append(port)
+    return occupied
 
 
 def _start_platform_commands(platform: str, project_root: str) -> list:

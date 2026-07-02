@@ -214,6 +214,8 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
     monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
     monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
 
     code = helper.main(
         [
@@ -278,6 +280,8 @@ def test_start_platform_screens_helper_execute_rejects_existing_screen_session(m
         raising=False,
     )
     monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
 
     code = helper.main(
         [
@@ -308,6 +312,8 @@ def test_start_platform_screens_helper_execute_rejects_missing_project_entry_fil
         "project_entry_files_missing",
         lambda project_root: ["master_main.py", "worker_main.py"],
     )
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
 
     code = helper.main(
         [
@@ -325,6 +331,54 @@ def test_start_platform_screens_helper_execute_rejects_missing_project_entry_fil
     assert commands == []
     assert "missing_project_entry_files=master_main.py,worker_main.py" in captured.err
     assert "environment_changed=false" in captured.err
+
+
+def test_start_platform_screens_helper_execute_rejects_listening_config_port(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5045])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [5045])
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "port_already_listening=5045" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
+def test_configured_ports_reads_vemu_config_ports(tmp_path):
+    helper = _load_helper_module()
+    config_dir = tmp_path / "vemu_config"
+    config_dir.mkdir()
+    (config_dir / "config.py").write_text(
+        "\n".join(
+            [
+                "master_port = 5000",
+                "worker_port='5001'",
+                "public_port = 8080",
+                "web_terminal_port = 5045",
+                "unused_port = 6000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert helper.configured_ports(str(tmp_path)) == [5000, 5001, 8080, 5045]
 
 
 def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):
