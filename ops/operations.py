@@ -20,6 +20,12 @@ _UTC8 = timezone(timedelta(hours=8))
 VALID_OPERATIONS = {"deploy_platform", "restart_platform", "destroy_platform"}
 VALID_PLAN_STATUS = {"pending", "approved", "aborted", "completed", "failed"}
 VALID_STEP_STATUS = {"pending", "approved", "running", "completed", "failed", "blocked"}
+RESTART_STEP_COMPONENTS = {
+    "restart-master": ("master", "m"),
+    "restart-worker": ("worker", "w"),
+    "restart-celery": ("celery", "c"),
+    "restart-web-terminal": ("web_terminal", "web"),
+}
 
 
 @dataclass
@@ -334,6 +340,21 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
 
 
 def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
+    if plan.operation == "restart_platform" and plan.target:
+        project_root = str(plan.operation_args.get("project_root") or "").strip()
+        if project_root:
+            for step_id, (component, screen_suffix) in RESTART_STEP_COMPONENTS.items():
+                try:
+                    step = _find_step(plan, step_id)
+                except ValueError:
+                    continue
+                step.recipe_id = "restart_screen_component"
+                step.recipe_args = {
+                    "platform": _one_line(plan.target, 120),
+                    "component": component,
+                    "screen_session": _one_line(f"{plan.target}_{screen_suffix}", 120),
+                    "project_root": _one_line(project_root, 300),
+                }
     if plan.operation == "deploy_platform" and plan.target:
         project_root = str(plan.operation_args.get("project_root") or "").strip()
         if project_root:

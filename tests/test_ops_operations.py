@@ -109,6 +109,45 @@ def test_restart_operation_plan_has_component_restart_steps():
     }
 
 
+def test_restart_operation_plan_default_binds_component_recipes_when_project_root_is_explicit():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={
+                "project_root": "/home/adminis/lht/102_project",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    expected = {
+        "restart-master": ("master", "102_m"),
+        "restart-worker": ("worker", "102_w"),
+        "restart-celery": ("celery", "102_c"),
+        "restart-web-terminal": ("web_terminal", "102_web"),
+    }
+    for step_id, (component, screen_session) in expected.items():
+        step = next(item for item in loaded.steps if item.step_id == step_id)
+        assert step.status == "pending"
+        assert step.recipe_id == "restart_screen_component"
+        assert step.recipe_args == {
+            "platform": "102",
+            "component": component,
+            "screen_session": screen_session,
+            "project_root": "/home/adminis/lht/102_project",
+        }
+    assert "recipe=restart_screen_component" in rendered
+    assert "recipe_args.project_root=/home/adminis/lht/102_project" in rendered
+    assert "recipe_args.screen_session=102_m" in rendered
+    assert "recipe_args.screen_session=102_web" in rendered
+
+
 def test_destroy_operation_plan_default_binds_stop_platform_recipe_without_execution():
     from klonet_agent.ops.operations import OperationPlanStore, render_plan
     from tests.helpers import local_temp_dir
