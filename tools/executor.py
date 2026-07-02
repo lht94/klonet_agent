@@ -164,6 +164,7 @@ class ToolExecutor:
                 target=tool_args.get("target", ""),
                 objective=tool_args.get("objective", ""),
                 constraints=tool_args.get("constraints", ""),
+                operation_args=tool_args.get("operation_args"),
                 recipe_bindings=tool_args.get("recipe_bindings"),
                 evidence=[
                     str(item)

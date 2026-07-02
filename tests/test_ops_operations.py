@@ -40,6 +40,7 @@ def test_create_operation_plan_schema_exposes_recipe_bindings_without_execution(
     description = tool["function"]["description"]
 
     assert "recipe_bindings" in properties
+    assert "operation_args" in properties
     assert "只保存" in description
     assert "确认后才能执行" in description
 
@@ -129,6 +130,35 @@ def test_destroy_operation_plan_default_binds_stop_platform_recipe_without_execu
     assert "stop-services" in rendered
     assert "recipe=stop_platform_screens" in rendered
     assert "recipe_args.platform=102" in rendered
+
+
+def test_deploy_operation_plan_default_binds_start_platform_recipe_when_project_root_is_explicit():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    step = next(item for item in loaded.steps if item.step_id == "start-services")
+    assert step.status == "pending"
+    assert step.recipe_id == "start_platform_screens"
+    assert step.recipe_args == {
+        "platform": "103",
+        "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+    }
+    assert "recipe=start_platform_screens" in rendered
+    assert "recipe_args.platform=103" in rendered
+    assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
 
 def test_render_plan_includes_execution_state_and_next_step():
@@ -788,6 +818,37 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
     assert "dry_run=true" in result
     assert "recipe_id=restart_screen_component" in result
     assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
+
+
+def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={"create_ops_operation_plan"},
+            memory_store=store,
+        )
+        result = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "deploy_platform",
+                "target": "103",
+                "objective": "deploy platform 103",
+                "operation_args": {
+                    "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+                },
+            },
+        )
+
+    assert "recipe=start_platform_screens" in result
+    assert "recipe_args.platform=103" in result
+    assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in result
 
 
 def test_executor_operation_plan_store_defaults_to_dry_run_recipe_runner():

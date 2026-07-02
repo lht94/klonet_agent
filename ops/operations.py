@@ -49,6 +49,7 @@ class OperationPlan:
     status: str = "pending"
     created_at: str = ""
     constraints: str = ""
+    operation_args: dict = field(default_factory=dict)
     evidence: List[str] = field(default_factory=list)
     steps: List[OperationStep] = field(default_factory=list)
 
@@ -69,6 +70,7 @@ class OperationPlanStore:
         evidence: Optional[List[str]] = None,
         objective: str = "",
         constraints: str = "",
+        operation_args: Optional[dict] = None,
         recipe_bindings: Optional[dict] = None,
     ) -> OperationPlan:
         operation = operation if operation in VALID_OPERATIONS else "restart_platform"
@@ -79,6 +81,7 @@ class OperationPlanStore:
             objective=_one_line(objective or _default_objective(operation, target), 260),
             created_at=datetime.now(_UTC8).isoformat(timespec="seconds"),
             constraints=str(constraints or "").strip(),
+            operation_args=_clean_operation_args(operation_args or {}),
             evidence=[_one_line(item, 300) for item in (evidence or [])[:12]],
             steps=_default_steps(operation),
         )
@@ -331,6 +334,18 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
 
 
 def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
+    if plan.operation == "deploy_platform" and plan.target:
+        project_root = str(plan.operation_args.get("project_root") or "").strip()
+        if project_root:
+            try:
+                step = _find_step(plan, "start-services")
+            except ValueError:
+                return
+            step.recipe_id = "start_platform_screens"
+            step.recipe_args = {
+                "platform": _one_line(plan.target, 120),
+                "project_root": _one_line(project_root, 300),
+            }
     if plan.operation == "destroy_platform" and plan.target:
         try:
             step = _find_step(plan, "stop-services")
@@ -338,6 +353,16 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
             return
         step.recipe_id = "stop_platform_screens"
         step.recipe_args = {"platform": _one_line(plan.target, 120)}
+
+
+def _clean_operation_args(args: dict) -> dict:
+    if not isinstance(args, dict):
+        return {}
+    return {
+        _one_line(str(key), 80): _one_line(str(value), 300)
+        for key, value in args.items()
+        if key and value is not None
+    }
 
 
 def _render_recipe_args(recipe_args: dict) -> str:
@@ -398,6 +423,7 @@ def _plan_from_mapping(raw: dict) -> OperationPlan:
         status=status,
         created_at=str(raw.get("created_at") or ""),
         constraints=str(raw.get("constraints") or ""),
+        operation_args=_clean_operation_args(raw.get("operation_args") or {}),
         evidence=[str(item) for item in raw.get("evidence", []) if item],
         steps=steps,
     )

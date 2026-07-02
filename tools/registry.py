@@ -326,6 +326,10 @@ TOOLS = [
                 "items": {"type": "string"},
                 "description": "本轮只读工具或知识库证据摘要。",
             },
+            "operation_args": {
+                "type": "object",
+                "description": "可选：计划级结构化参数，例如 deploy_platform 的 {\"project_root\":\"/home/adminis/lht/103_project/vemu_uestc\"}。只保存并用于生成受控默认 recipe，不执行。",
+            },
             "recipe_bindings": {
                 "type": "object",
                 "description": "可选：按 step_id 绑定受控 recipe，例如 {\"restart-master\":{\"recipe_id\":\"restart_screen_component\",\"args\":{\"platform\":\"102\",\"component\":\"master\",\"screen_session\":\"102_m\",\"project_root\":\"/home/adminis/lht/102_project\"}}}。只保存绑定，不执行。",
