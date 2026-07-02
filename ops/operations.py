@@ -82,6 +82,7 @@ class OperationPlanStore:
             evidence=[_one_line(item, 300) for item in (evidence or [])[:12]],
             steps=_default_steps(operation),
         )
+        _apply_default_recipe_bindings(plan)
         _apply_recipe_bindings(plan, recipe_bindings or {})
         self.save_plan(plan)
         return plan
@@ -326,6 +327,16 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
                 for key, value in args.items()
                 if key and value is not None
             }
+
+
+def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
+    if plan.operation == "destroy_platform" and plan.target:
+        try:
+            step = _find_step(plan, "stop-services")
+        except ValueError:
+            return
+        step.recipe_id = "stop_platform_screens"
+        step.recipe_args = {"platform": _one_line(plan.target, 120)}
 
 
 def _next_step_id(plan: OperationPlan) -> str:

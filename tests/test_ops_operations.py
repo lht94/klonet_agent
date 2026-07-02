@@ -108,6 +108,28 @@ def test_restart_operation_plan_has_component_restart_steps():
     }
 
 
+def test_destroy_operation_plan_default_binds_stop_platform_recipe_without_execution():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="destroy_platform",
+            target="102",
+            objective="destroy platform 102",
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    step = next(item for item in loaded.steps if item.step_id == "stop-services")
+    assert step.status == "pending"
+    assert step.recipe_id == "stop_platform_screens"
+    assert step.recipe_args == {"platform": "102"}
+    assert "stop-services" in rendered
+    assert "recipe=stop_platform_screens" in rendered
+
+
 def test_render_plan_includes_execution_state_and_next_step():
     from klonet_agent.ops.operations import OperationPlanStore, render_plan
     from tests.helpers import local_temp_dir
