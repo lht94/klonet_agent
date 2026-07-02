@@ -20,7 +20,16 @@ MANUAL_CHECKPOINT = "manual_checkpoint"
 STOP_SCREEN_COMPONENT = "stop_screen_component"
 STOP_PLATFORM_SCREENS = "stop_platform_screens"
 START_PLATFORM_SCREENS = "start_platform_screens"
+VALIDATE_PROJECT_FILES = "validate_project_files"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
+REQUIRED_PROJECT_ENTRY_FILES = (
+    "gun.py",
+    "master_main.py",
+    "celery_worker.py",
+    "web_terminal_main.py",
+    "worker_gun.py",
+    "worker_main.py",
+)
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 
 
@@ -49,6 +58,8 @@ class ControlledRecipeRunner:
             return self._stop_platform_screens(plan, step)
         if step.recipe_id == START_PLATFORM_SCREENS:
             return self._start_platform_screens(plan, step)
+        if step.recipe_id == VALIDATE_PROJECT_FILES:
+            return self._validate_project_files(step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
@@ -195,6 +206,40 @@ class ControlledRecipeRunner:
                 f"dry_run={str(self.dry_run).lower()} "
                 f"recipe_id={START_PLATFORM_SCREENS} "
                 f"command_preview={_format_command(command)} "
+                "environment unchanged"
+            ),
+        )
+
+    def _validate_project_files(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        project_root = str(args.get("project_root") or "").strip()
+        if not project_root or _looks_unsafe_path(project_root):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={VALIDATE_PROJECT_FILES} invalid_project_root={project_root or 'missing'}; environment unchanged",
+            )
+        root = Path(project_root)
+        missing = [
+            filename
+            for filename in REQUIRED_PROJECT_ENTRY_FILES
+            if not (root / filename).is_file()
+        ]
+        if missing:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={VALIDATE_PROJECT_FILES} "
+                    f"project_root={_one_line(project_root)} "
+                    f"missing_files={','.join(missing)} "
+                    "environment unchanged"
+                ),
+            )
+        return RecipeExecutionResult(
+            "completed",
+            (
+                f"recipe_id={VALIDATE_PROJECT_FILES} "
+                f"project_root={_one_line(project_root)} "
+                f"found_files={','.join(REQUIRED_PROJECT_ENTRY_FILES)} "
                 "environment unchanged"
             ),
         )

@@ -125,3 +125,18 @@ environment_changed=false
 ```
 
 真实执行前，Ops Agent 还必须先通过只读工具确认目标平台、screen、进程和项目路径归属，不能只凭用户文字或历史记忆执行。
+
+## 部署前置检查
+
+`deploy_platform` 计划如果提供了 `operation_args.project_root`，第一步 `precheck` 会先执行只读 `validate_project_files` recipe，确认该目录下存在：
+
+```text
+gun.py
+master_main.py
+celery_worker.py
+web_terminal_main.py
+worker_gun.py
+worker_main.py
+```
+
+这些文件应位于实际启动目录，也就是项目根目录 `vemu_uestc` 下；如果仍只在 `mains/` 目录内，precheck 会阻断后续 `start-services`。

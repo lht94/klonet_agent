@@ -731,6 +731,83 @@ def test_start_platform_screens_recipe_dry_run_generates_safe_preview():
     assert statuses["prepare-files"] == "completed"
 
 
+def test_deploy_precheck_validates_required_project_entry_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        project_root.mkdir(parents=True)
+        for filename in required_files:
+            (project_root / filename).write_text("# entry\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="precheck deploy 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "precheck")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "recipe_id=validate_project_files" in result
+    assert "found_files=gun.py,master_main.py,celery_worker.py,web_terminal_main.py,worker_gun.py,worker_main.py" in result
+    assert "environment unchanged" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["precheck"] == "completed"
+    assert statuses["prepare-files"] == "pending"
+
+
+def test_deploy_precheck_blocks_when_required_project_entry_files_are_missing():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        project_root.mkdir(parents=True)
+        (project_root / "gun.py").write_text("# entry\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="precheck deploy 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "precheck")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "recipe_id=validate_project_files" in result
+    assert "missing_files=master_main.py,celery_worker.py,web_terminal_main.py,worker_gun.py,worker_main.py" in result
+    assert "environment unchanged" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["precheck"] == "blocked"
+    assert statuses["prepare-files"] == "pending"
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
