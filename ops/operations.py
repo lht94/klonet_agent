@@ -374,6 +374,15 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
         project_root = str(plan.operation_args.get("project_root") or "").strip()
         if project_root:
             try:
+                prepare_step = _find_step(plan, "prepare-files")
+                prepare_step.recipe_id = "manual_checkpoint"
+                prepare_step.recipe_args = {
+                    "reason": "project files and config prepared externally",
+                    "project_root": _one_line(project_root, 300),
+                }
+            except ValueError:
+                pass
+            try:
                 step = _find_step(plan, "start-services")
             except ValueError:
                 return

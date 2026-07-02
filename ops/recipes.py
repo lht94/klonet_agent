@@ -16,6 +16,7 @@ from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExec
 
 
 RESTART_SCREEN_COMPONENT = "restart_screen_component"
+MANUAL_CHECKPOINT = "manual_checkpoint"
 STOP_SCREEN_COMPONENT = "stop_screen_component"
 STOP_PLATFORM_SCREENS = "stop_platform_screens"
 START_PLATFORM_SCREENS = "start_platform_screens"
@@ -38,6 +39,8 @@ class ControlledRecipeRunner:
         self.command_runner = command_runner or _run_command
 
     def __call__(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
+        if step.recipe_id == MANUAL_CHECKPOINT:
+            return self._manual_checkpoint(step)
         if step.recipe_id == RESTART_SCREEN_COMPONENT:
             return self._restart_screen_component(plan, step)
         if step.recipe_id == STOP_SCREEN_COMPONENT:
@@ -47,6 +50,19 @@ class ControlledRecipeRunner:
         if step.recipe_id == START_PLATFORM_SCREENS:
             return self._start_platform_screens(plan, step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
+
+    def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        reason = _one_line(str(args.get("reason") or "manual checkpoint confirmed"))
+        project_root = _one_line(str(args.get("project_root") or ""))
+        parts = [
+            f"recipe_id={MANUAL_CHECKPOINT}",
+            f"reason={reason}",
+        ]
+        if project_root:
+            parts.append(f"project_root={project_root}")
+        parts.append("environment unchanged")
+        return RecipeExecutionResult("completed", " ".join(parts))
 
     def _restart_screen_component(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}

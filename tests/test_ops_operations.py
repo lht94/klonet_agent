@@ -200,6 +200,70 @@ def test_deploy_operation_plan_default_binds_start_platform_recipe_when_project_
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
 
+def test_deploy_operation_plan_default_binds_prepare_files_manual_checkpoint():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    step = next(item for item in loaded.steps if item.step_id == "prepare-files")
+    assert step.status == "pending"
+    assert step.requires_step_confirmation is True
+    assert step.recipe_id == "manual_checkpoint"
+    assert step.recipe_args == {
+        "reason": "project files and config prepared externally",
+        "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+    }
+    assert "prepare-files" in rendered
+    assert "recipe=manual_checkpoint" in rendered
+    assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
+
+
+def test_manual_checkpoint_recipe_completes_confirmed_step_without_environment_change():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        step.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=prepare-files" in result
+    assert "result_status=completed" in result
+    assert "recipe_id=manual_checkpoint" in result
+    assert "environment unchanged" in result
+    assert _status_by_step(loaded)["prepare-files"] == "completed"
+
+
 def test_render_plan_includes_execution_state_and_next_step():
     from klonet_agent.ops.operations import OperationPlanStore, render_plan
     from tests.helpers import local_temp_dir
