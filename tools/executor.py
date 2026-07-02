@@ -181,6 +181,10 @@ class ToolExecutor:
             store = self._operation_plan_store()
             return store.execute_step(tool_args["plan_id"], tool_args["step_id"])
 
+        if tool_name == "execute_ops_next_step":
+            store = self._operation_plan_store()
+            return store.execute_next_step(tool_args["plan_id"])
+
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))
 

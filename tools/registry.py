@@ -364,6 +364,14 @@ TOOLS = [
         ["plan_id", "step_id"],
     ),
     _tool(
+        "execute_ops_next_step",
+        "按 OperationPlan 的 execution_order 执行当前下一步。模型不需要也不应该猜 step_id；如果下一步是特权步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
+        {
+            "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
+        },
+        ["plan_id"],
+    ),
+    _tool(
         "list_files",
         "列出当前 workspace 内的文件或目录。",
         {"path": {"type": "string", "description": "workspace 内相对路径，默认 ."}},

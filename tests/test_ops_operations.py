@@ -22,9 +22,11 @@ def test_ops_operation_tools_are_registered_and_profile_allowed():
     assert "create_ops_operation_plan" in tool_names
     assert "approve_ops_operation_plan" in tool_names
     assert "execute_ops_operation_step" in tool_names
+    assert "execute_ops_next_step" in tool_names
     assert "create_ops_operation_plan" in profile.allowed_tools
     assert "approve_ops_operation_plan" in profile.allowed_tools
     assert "execute_ops_operation_step" in profile.allowed_tools
+    assert "execute_ops_next_step" in profile.allowed_tools
     assert "run_command" not in profile.allowed_tools
 
 
@@ -446,6 +448,28 @@ def test_store_completes_normal_unbound_step_as_readonly_checkpoint():
     assert "execute_step=precheck-runtime" in result
     assert "result_status=completed" in result
     assert "execution_result=readonly_or_manual_checkpoint_completed; environment unchanged" in result
+    assert _status_by_step(loaded)["precheck-runtime"] == "completed"
+
+
+def test_store_execute_next_step_uses_current_execution_order():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_next_step(plan.plan_id)
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=precheck-runtime" in result
+    assert "result_status=completed" in result
     assert _status_by_step(loaded)["precheck-runtime"] == "completed"
 
 
@@ -993,6 +1017,42 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
     assert "dry_run=true" in result
     assert "recipe_id=restart_screen_component" in result
     assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
+
+
+def test_executor_execute_ops_next_step_runs_current_plan_step():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "approve_ops_operation_plan",
+                "execute_ops_next_step",
+            },
+            memory_store=store,
+        )
+        created = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+            },
+        )
+        plan_id = _extract_plan_id(created)
+        executor.set_user_authorization_context(f"confirm {plan_id}")
+        executor.run("approve_ops_operation_plan", {"plan_id": plan_id, "scope": "plan"})
+
+        result = executor.run("execute_ops_next_step", {"plan_id": plan_id})
+
+    assert "execute_step=precheck-runtime" in result
+    assert "result_status=completed" in result
 
 
 def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():

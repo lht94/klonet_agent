@@ -198,6 +198,22 @@ class OperationPlanStore:
             execution_result=result.output,
         )
 
+    def execute_next_step(self, plan_id: str) -> str:
+        plan = self.load_plan(plan_id)
+        next_step_id = _next_step_id(plan)
+        if next_step_id == "none":
+            return (
+                "ops_operation_execution\n"
+                f"plan_id={plan.plan_id}\n"
+                f"operation={plan.operation}\n"
+                f"target={plan.target or 'unknown'}\n"
+                f"plan_status={plan.status}\n"
+                "execute_step=none\n"
+                "result_status=completed\n"
+                "execution_result=no remaining steps; environment unchanged"
+            )
+        return self.execute_step(plan_id, next_step_id)
+
     def _run_recipe(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         try:
             result = self.recipe_runner(plan, step)

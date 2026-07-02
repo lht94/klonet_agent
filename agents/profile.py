@@ -51,6 +51,7 @@ OPS_OPERATION_TOOLS = {
     "create_ops_operation_plan",
     "approve_ops_operation_plan",
     "execute_ops_operation_step",
+    "execute_ops_next_step",
 }
 
 OPS_TOOLS = {
