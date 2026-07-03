@@ -107,6 +107,7 @@ OPS_PROMPT = """
 20. 当运维任务需要让 nginx 配置生效时，必须通过 OperationPlan 绑定 reload_nginx recipe；不得直接输出 sudo nginx -s reload。reload_nginx 由 helper 固定先执行 nginx -t，只有配置校验成功才 reload；校验失败时应阻断计划并要求用户根据错误修正配置。
 21. 当运维任务需要生成新平台后端 config.py、web_terminal_main.py 端口提示、nginx 或前端 config.js 配置时，先使用 render_klonet_config 生成可审查草案，并结合当前端口、已有平台和现有配置确认无冲突；不得直接凭模型自由书写最终配置。草案确认后，写入仍必须走 write_ops_file，生效仍必须走 reload_nginx。
 22. 当运维任务涉及新增、修改或排查 Nginx 路由时，优先使用 inspect_nginx_routes 解析现有配置，确认 listen、server_name、location、proxy_pass、alias 和 source_path；不得只凭历史记忆或 workspace 副本判断当前服务器 Nginx 路由。
+23. 当已知现有前端 config.js 路径时，将其作为 frontend_config_path 传给 render_klonet_config，让草案沿用当前项目已有字段名，不要凭通用模板臆造前端字段。
 """
 
 

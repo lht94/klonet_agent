@@ -235,6 +235,7 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
     worker_port = _safe_port(args.get("worker_port"))
     public_port = _safe_port(args.get("public_port"))
     terminal_port = _safe_port(args.get("terminal_port") or args.get("web_terminal_port"))
+    frontend_config_path = str(args.get("frontend_config_path") or "").strip()
 
     problem = _validate_render_config_inputs(
         platform_name,
@@ -249,6 +250,15 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
     if problem:
         return "\n".join(["render_klonet_config", problem, "environment unchanged"])
 
+    frontend_source_path = ""
+    frontend_source_text = ""
+    if frontend_config_path:
+        frontend_source_path, frontend_source_text, frontend_problem = _load_frontend_config_source(
+            frontend_config_path
+        )
+        if frontend_problem:
+            return "\n".join(["render_klonet_config", frontend_problem, "environment unchanged"])
+
     nginx_block = _render_nginx_server_block(
         server_name=server_name,
         master_port=master_port,
@@ -260,6 +270,7 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
         server_name=server_name,
         public_port=public_port,
         terminal_port=terminal_port,
+        source_text=frontend_source_text,
     )
     backend_config = _render_backend_config_py(
         master_port=master_port,
@@ -268,23 +279,30 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
         terminal_port=terminal_port,
     )
     web_terminal_hint = _render_web_terminal_main_patch_hint(terminal_port)
-    return "\n".join(
-        [
-            "render_klonet_config",
-            f"platform={platform_name}",
-            "template_status=draft",
-            "environment unchanged",
-            "next_recipes=write_ops_file,reload_nginx",
-            "## nginx_server_block",
-            nginx_block,
-            "## backend_config_py",
-            backend_config,
-            "## web_terminal_main_py_patch_hint",
-            web_terminal_hint,
-            "## frontend_config_js",
-            frontend_config,
-        ]
-    )
+    lines = [
+        "render_klonet_config",
+        f"platform={platform_name}",
+        "template_status=draft",
+        "environment unchanged",
+        "next_recipes=write_ops_file,reload_nginx",
+        "## nginx_server_block",
+        nginx_block,
+        "## backend_config_py",
+        backend_config,
+        "## web_terminal_main_py_patch_hint",
+        web_terminal_hint,
+    ]
+    if frontend_source_path:
+        lines.extend(
+            [
+                "## frontend_config_js_patch_draft",
+                f"frontend_config_source={frontend_source_path}",
+                frontend_config,
+            ]
+        )
+    else:
+        lines.extend(["## frontend_config_js", frontend_config])
+    return "\n".join(lines)
 
 
 def inspect_platform_instances(args: Optional[dict] = None) -> str:
@@ -998,6 +1016,27 @@ def _looks_unsafe_ops_path(value: str) -> bool:
     return not (value.startswith("/") or Path(value).is_absolute())
 
 
+def _load_frontend_config_source(raw_path: str) -> tuple:
+    path = Path(raw_path).expanduser()
+    if _is_sensitive_path(path):
+        return "", "", f"refused_sensitive_path={path.name}"
+    if not _is_safe_ops_file_path(path):
+        return "", "", f"refused_unsupported_frontend_config={path.name}"
+    if path.suffix.lower() != ".js":
+        return "", "", f"refused_non_js_frontend_config={path.name}"
+    if not path.exists() or not path.is_file():
+        return "", "", f"frontend_config_missing={path}"
+    try:
+        resolved_path = str(path.resolve())
+    except OSError:
+        resolved_path = str(path)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return "", "", f"frontend_config_unreadable={exc}"
+    return resolved_path, text[-MAX_LOG_CHARS:], ""
+
+
 def _render_nginx_server_block(
     *,
     server_name: str,
@@ -1043,7 +1082,21 @@ def _render_nginx_server_block(
     )
 
 
-def _render_frontend_config_js(*, server_name: str, public_port: int, terminal_port: int) -> str:
+def _render_frontend_config_js(
+    *,
+    server_name: str,
+    public_port: int,
+    terminal_port: int,
+    source_text: str = "",
+) -> str:
+    if source_text:
+        aligned = _align_frontend_config_js(
+            source_text,
+            server_name=server_name,
+            public_port=public_port,
+            terminal_port=terminal_port,
+        )
+        return redact_sensitive_text(aligned)
     return "\n".join(
         [
             f"var backend_ip = \"{server_name}\";",
@@ -1051,6 +1104,68 @@ def _render_frontend_config_js(*, server_name: str, public_port: int, terminal_p
             f"var web_terminal_port = {terminal_port};",
         ]
     )
+
+
+def _align_frontend_config_js(
+    text: str,
+    *,
+    server_name: str,
+    public_port: int,
+    terminal_port: int,
+) -> str:
+    changed = False
+    lines = []
+    for line in str(text or "").splitlines():
+        updated, line_changed = _replace_frontend_config_assignment(
+            line,
+            server_name=server_name,
+            public_port=public_port,
+            terminal_port=terminal_port,
+        )
+        lines.append(updated)
+        changed = changed or line_changed
+    if changed:
+        return "\n".join(lines)
+    return "\n".join(
+        [
+            "// no recognizable existing frontend config fields; generic draft follows",
+            f"var backend_ip = \"{server_name}\";",
+            f"var backend_port = {public_port};",
+            f"var web_terminal_port = {terminal_port};",
+        ]
+    )
+
+
+def _replace_frontend_config_assignment(
+    line: str,
+    *,
+    server_name: str,
+    public_port: int,
+    terminal_port: int,
+) -> tuple:
+    match = re.match(
+        r"^(\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*=\s*)([^;]+)(;.*)$",
+        line,
+    )
+    if not match:
+        return line, False
+    prefix, name, value, suffix = match.groups()
+    lowered = name.lower()
+    if "terminal" in lowered and "port" in lowered:
+        return f"{prefix}{terminal_port}{suffix}", True
+    if "port" in lowered and "terminal" not in lowered:
+        return f"{prefix}{public_port}{suffix}", True
+    if any(key in lowered for key in ("ip", "host", "server")) and "port" not in lowered:
+        quote = _assignment_quote(value)
+        return f"{prefix}{quote}{server_name}{quote}{suffix}", True
+    return line, False
+
+
+def _assignment_quote(value: str) -> str:
+    stripped = str(value or "").strip()
+    if stripped.startswith("'") and stripped.endswith("'"):
+        return "'"
+    return "\""
 
 
 def _render_backend_config_py(*, master_port: int, worker_port: int, public_port: int, terminal_port: int) -> str:

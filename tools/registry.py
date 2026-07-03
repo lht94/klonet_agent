@@ -165,6 +165,7 @@ TOOLS = [
             "terminal_port": {"type": "integer", "description": "Web Terminal 端口。"},
             "frontend_alias": {"type": "string", "description": "Nginx 前端 location，例如 /VEMU2/ 或 /VEMU2-103/，必须以 / 开始。"},
             "frontend_path": {"type": "string", "description": "前端静态目录绝对路径，例如 /home/adminis/lht/103_project/vemu_frontend/VEMU2。"},
+            "frontend_config_path": {"type": "string", "description": "Optional existing frontend config.js absolute path; when provided, render_klonet_config aligns the draft to existing field names without writing files."},
         },
         ["platform", "server_name", "master_port", "worker_port", "public_port", "terminal_port", "frontend_alias", "frontend_path"],
     ),

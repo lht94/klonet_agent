@@ -82,6 +82,16 @@ def test_environment_tools_are_registered_for_llm():
     assert "search_shared_ops_memory" in tool_names
 
 
+def test_render_klonet_config_schema_exposes_optional_frontend_config_path():
+    from klonet_agent.tools.registry import TOOLS
+
+    tool = next(item for item in TOOLS if item["function"]["name"] == "render_klonet_config")
+    params = tool["function"]["parameters"]
+
+    assert "frontend_config_path" in params["properties"]
+    assert "frontend_config_path" not in params["required"]
+
+
 def test_log_tool_schema_warns_about_source_and_historical_errors():
     from klonet_agent.tools.registry import TOOLS
 
@@ -153,6 +163,75 @@ def test_render_klonet_config_outputs_nginx_and_frontend_templates():
     assert "20222" in result
     assert "5045" in result
     assert "next_recipes=write_ops_file,reload_nginx" in result
+    assert "environment unchanged" in result
+
+
+def test_render_klonet_config_aligns_existing_frontend_config_fields():
+    from klonet_agent.tools.environment import render_klonet_config
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        config = temp_dir / "config.js"
+        config.write_text(
+            "\n".join(
+                [
+                    'var server_ip = "10.0.0.1";',
+                    "var server_port = 10000;",
+                    "var terminal_port = 10001;",
+                    "var keep_me = true;",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = render_klonet_config(
+            {
+                "platform": "103",
+                "server_name": "192.168.1.33",
+                "master_port": 20220,
+                "worker_port": 20221,
+                "public_port": 20222,
+                "terminal_port": 5045,
+                "frontend_alias": "/VEMU2-103/",
+                "frontend_path": "/home/adminis/lht/103_project/vemu_frontend/VEMU2",
+                "frontend_config_path": str(config),
+            }
+        )
+
+    assert f"frontend_config_source={config.resolve()}" in result
+    assert "## frontend_config_js_patch_draft" in result
+    assert 'var server_ip = "192.168.1.33";' in result
+    assert "var server_port = 20222;" in result
+    assert "var terminal_port = 5045;" in result
+    assert "var keep_me = true;" in result
+    assert "var backend_ip" not in result
+    assert "environment unchanged" in result
+
+
+def test_render_klonet_config_rejects_sensitive_frontend_config_path():
+    from klonet_agent.tools.environment import render_klonet_config
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        secret = temp_dir / ".env"
+        secret.write_text("OPENAI_API_KEY=secret", encoding="utf-8")
+
+        result = render_klonet_config(
+            {
+                "platform": "103",
+                "server_name": "192.168.1.33",
+                "master_port": 20220,
+                "worker_port": 20221,
+                "public_port": 20222,
+                "terminal_port": 5045,
+                "frontend_alias": "/VEMU2-103/",
+                "frontend_path": "/home/adminis/lht/103_project/vemu_frontend/VEMU2",
+                "frontend_config_path": str(secret),
+            }
+        )
+
+    assert "render_klonet_config" in result
+    assert "refused_sensitive_path=.env" in result
     assert "environment unchanged" in result
 
 
