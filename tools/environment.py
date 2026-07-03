@@ -102,6 +102,9 @@ _SAFE_OPS_FILE_SUFFIXES = {
     ".yml",
 }
 _SAFE_SCREEN_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+_SAFE_PLATFORM_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+_SAFE_SERVER_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
+_SAFE_FRONTEND_ALIAS = re.compile(r"^/[A-Za-z0-9_./:-]{1,120}$")
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
@@ -218,6 +221,57 @@ def inspect_ops_context(args: Optional[dict] = None) -> str:
         lines.append("## assets")
         lines.extend(_scan_deployment_assets(args))
     return "\n".join(lines)
+
+
+def render_klonet_config(args: Optional[dict] = None) -> str:
+    """Render Klonet deployment config drafts without writing files."""
+
+    args = args or {}
+    platform_name = str(args.get("platform") or "").strip()
+    server_name = str(args.get("server_name") or "_").strip()
+    frontend_alias = _normalize_frontend_alias(str(args.get("frontend_alias") or "/VEMU2/").strip())
+    frontend_path = _normalize_frontend_path(str(args.get("frontend_path") or "").strip())
+    master_port = _safe_port(args.get("master_port"))
+    public_port = _safe_port(args.get("public_port"))
+    terminal_port = _safe_port(args.get("terminal_port") or args.get("web_terminal_port"))
+
+    problem = _validate_render_config_inputs(
+        platform_name,
+        server_name,
+        master_port,
+        public_port,
+        terminal_port,
+        frontend_alias,
+        frontend_path,
+    )
+    if problem:
+        return "\n".join(["render_klonet_config", problem, "environment unchanged"])
+
+    nginx_block = _render_nginx_server_block(
+        server_name=server_name,
+        master_port=master_port,
+        public_port=public_port,
+        frontend_alias=frontend_alias,
+        frontend_path=frontend_path,
+    )
+    frontend_config = _render_frontend_config_js(
+        server_name=server_name,
+        public_port=public_port,
+        terminal_port=terminal_port,
+    )
+    return "\n".join(
+        [
+            "render_klonet_config",
+            f"platform={platform_name}",
+            "template_status=draft",
+            "environment unchanged",
+            "next_recipes=write_ops_file,reload_nginx",
+            "## nginx_server_block",
+            nginx_block,
+            "## frontend_config_js",
+            frontend_config,
+        ]
+    )
 
 
 def inspect_platform_instances(args: Optional[dict] = None) -> str:
@@ -836,6 +890,118 @@ def _redact_match(match: re.Match) -> str:
     if match.lastindex:
         return f"{match.group(1)} [REDACTED]"
     return "[REDACTED]"
+
+
+def _validate_render_config_inputs(
+    platform_name: str,
+    server_name: str,
+    master_port: Optional[int],
+    public_port: Optional[int],
+    terminal_port: Optional[int],
+    frontend_alias: str,
+    frontend_path: str,
+) -> str:
+    if not _SAFE_PLATFORM_NAME.match(platform_name):
+        return f"invalid_platform={platform_name or 'missing'}"
+    if not _SAFE_SERVER_NAME.match(server_name):
+        return f"invalid_server_name={server_name or 'missing'}"
+    for name, port in (
+        ("master_port", master_port),
+        ("public_port", public_port),
+        ("terminal_port", terminal_port),
+    ):
+        if port is None:
+            return f"invalid_{name}=missing"
+    if len({master_port, public_port, terminal_port}) != 3:
+        return "invalid_ports=duplicate"
+    if not _SAFE_FRONTEND_ALIAS.match(frontend_alias) or not frontend_alias.endswith("/"):
+        return f"invalid_frontend_alias={frontend_alias or 'missing'}"
+    if not frontend_path or _looks_unsafe_ops_path(frontend_path):
+        return f"invalid_frontend_path={frontend_path or 'missing'}"
+    return ""
+
+
+def _normalize_frontend_alias(value: str) -> str:
+    if not value:
+        return "/VEMU2/"
+    if not value.startswith("/"):
+        return value
+    return value if value.endswith("/") else f"{value}/"
+
+
+def _normalize_frontend_path(value: str) -> str:
+    return value.rstrip("/") if value else ""
+
+
+def _safe_port(value) -> Optional[int]:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= port <= 65535:
+        return port
+    return None
+
+
+def _looks_unsafe_ops_path(value: str) -> bool:
+    if any(part in value for part in ("\x00", "\n", "\r")):
+        return True
+    return not (value.startswith("/") or Path(value).is_absolute())
+
+
+def _render_nginx_server_block(
+    *,
+    server_name: str,
+    master_port: int,
+    public_port: int,
+    frontend_alias: str,
+    frontend_path: str,
+) -> str:
+    frontend_alias = _normalize_frontend_alias(frontend_alias)
+    frontend_path = _normalize_frontend_path(frontend_path)
+    return "\n".join(
+        [
+            "server {",
+            f"    listen {public_port};",
+            f"    server_name {server_name};",
+            "    index index.html index.htm index.nginx-debian.html;",
+            "",
+            "    location /file/dload/ {",
+            f"        proxy_pass http://127.0.0.1:{master_port}/file/dload/;",
+            "    }",
+            "",
+            "    location /file/uload/ {",
+            f"        proxy_pass http://127.0.0.1:{master_port}/file/uload/;",
+            "    }",
+            "",
+            "    location /reallyload/ {",
+            f"        proxy_pass http://127.0.0.1:{master_port}/reallyload/;",
+            "    }",
+            "",
+            "    location /download/ {",
+            f"        proxy_pass http://127.0.0.1:{master_port}/download/;",
+            "    }",
+            "",
+            "    location / {",
+            f"        proxy_pass http://127.0.0.1:{master_port};",
+            "    }",
+            "",
+            f"    location {frontend_alias} {{",
+            f"        alias {frontend_path}/;",
+            "    }",
+            "}",
+        ]
+    )
+
+
+def _render_frontend_config_js(*, server_name: str, public_port: int, terminal_port: int) -> str:
+    return "\n".join(
+        [
+            f"var backend_ip = \"{server_name}\";",
+            f"var backend_port = {public_port};",
+            f"var web_terminal_port = {terminal_port};",
+        ]
+    )
 
 
 def _ops_probe_many(checks: Sequence[str]):

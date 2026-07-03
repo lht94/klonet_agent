@@ -154,6 +154,20 @@ TOOLS = [
         ["query", "intent"],
     ),
     _tool(
+        "render_klonet_config",
+        "只读生成 Klonet 新平台部署配置草案，不写文件。根据平台名、服务器名、master/public/web_terminal 端口、前端 alias 和前端目录，输出 nginx server block 与常见 frontend config.js 草案；写入必须再通过 OperationPlan 绑定 write_ops_file，生效必须再绑定 reload_nginx。",
+        {
+            "platform": {"type": "string", "description": "新平台或目标平台名，例如 103、lht2。"},
+            "server_name": {"type": "string", "description": "Nginx server_name 或前端访问主机/IP，例如 192.168.1.33。"},
+            "master_port": {"type": "integer", "description": "Master/Gunicorn 后端端口。"},
+            "public_port": {"type": "integer", "description": "Nginx 对外监听端口，也就是浏览器访问的 public_port。"},
+            "terminal_port": {"type": "integer", "description": "Web Terminal 端口。"},
+            "frontend_alias": {"type": "string", "description": "Nginx 前端 location，例如 /VEMU2/ 或 /VEMU2-103/，必须以 / 开始。"},
+            "frontend_path": {"type": "string", "description": "前端静态目录绝对路径，例如 /home/adminis/lht/103_project/vemu_frontend/VEMU2。"},
+        },
+        ["platform", "server_name", "master_port", "public_port", "terminal_port", "frontend_alias", "frontend_path"],
+    ),
+    _tool(
         "inspect_ops_context",
         "只读收集 Ops 全量环境上下文：baseline 适合半永久记录，runtime 需要按次刷新，assets 只扫描允许目录中的源码/Compose/Dockerfile/部署配置文件名。",
         {

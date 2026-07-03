@@ -32,6 +32,7 @@ from klonet_agent.tools.environment import (
     inspect_system_environment,
     read_klonet_logs,
     read_ops_file,
+    render_klonet_config,
 )
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
 from klonet_agent.tools.source_code import (
@@ -139,6 +140,9 @@ class ToolExecutor:
             if "## baseline" in result:
                 self.memory_store.write_shared_ops_baseline(result)
             return result
+
+        if tool_name == "render_klonet_config":
+            return render_klonet_config(tool_args)
 
         if tool_name == "inspect_platform_instances":
             return inspect_platform_instances(tool_args)

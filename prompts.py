@@ -105,6 +105,7 @@ OPS_PROMPT = """
 18. 当用户询问有哪些 OperationPlan、忘记 plan_id、想查看最近计划、只看某类状态/操作类型/目标平台的计划时，优先调用 list_ops_operation_plans，必要时使用 status、operation、target 过滤。当用户询问某个已有 OperationPlan 的当前状态、下一步、为什么 blocked 或确认命令时，优先调用 describe_ops_operation_plan 读取最新持久化状态，不得只凭对话上下文猜测。
 19. 当运维任务需要写入或覆盖配置、nginx 片段、部署脚本、文档等服务器文件时，必须通过 OperationPlan 绑定 write_ops_file recipe；不得使用 Coding 的 write_file，也不得输出任意 shell 写入命令。write_ops_file 在 dry-run 阶段只展示脱敏预览，真实执行会自动备份原文件，并拒绝 .env、密钥、token、password 等敏感路径。
 20. 当运维任务需要让 nginx 配置生效时，必须通过 OperationPlan 绑定 reload_nginx recipe；不得直接输出 sudo nginx -s reload。reload_nginx 由 helper 固定先执行 nginx -t，只有配置校验成功才 reload；校验失败时应阻断计划并要求用户根据错误修正配置。
+21. 当运维任务需要生成新平台 nginx 或前端 config.js 配置时，先使用 render_klonet_config 生成可审查草案，并结合当前端口、已有平台和现有配置确认无冲突；不得直接凭模型自由书写最终配置。草案确认后，写入仍必须走 write_ops_file，生效仍必须走 reload_nginx。
 """
 
 

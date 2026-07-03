@@ -69,6 +69,7 @@ def test_environment_tools_are_registered_for_llm():
 
     tool_names = {item["function"]["name"] for item in TOOLS}
 
+    assert "render_klonet_config" in tool_names
     assert "inspect_ops_context" in tool_names
     assert "inspect_platform_instances" in tool_names
     assert "inspect_system_environment" in tool_names
@@ -100,11 +101,90 @@ def test_ops_profile_allows_screen_inspection():
 
     profile = get_profile("ops")
 
+    assert "render_klonet_config" in profile.allowed_tools
     assert "inspect_screen_session" in profile.allowed_tools
     assert "inspect_platform_instances" in profile.allowed_tools
     assert "inspect_ops_context" in profile.allowed_tools
     assert "inspect_process_detail" in profile.allowed_tools
     assert "read_ops_file" in profile.allowed_tools
+
+
+def test_render_klonet_config_outputs_nginx_and_frontend_templates():
+    from klonet_agent.tools.environment import render_klonet_config
+
+    result = render_klonet_config(
+        {
+            "platform": "103",
+            "server_name": "192.168.1.33",
+            "master_port": 20220,
+            "public_port": 20222,
+            "terminal_port": 5045,
+            "frontend_alias": "/VEMU2-103/",
+            "frontend_path": "/home/adminis/lht/103_project/vemu_frontend/VEMU2",
+        }
+    )
+
+    assert "render_klonet_config" in result
+    assert "platform=103" in result
+    assert "## nginx_server_block" in result
+    assert "listen 20222;" in result
+    assert "server_name 192.168.1.33;" in result
+    assert "location /file/dload/" in result
+    assert "proxy_pass http://127.0.0.1:20220/file/dload/;" in result
+    assert "location /file/uload/" in result
+    assert "location /reallyload/" in result
+    assert "location /download/" in result
+    assert "location / {" in result
+    assert "proxy_pass http://127.0.0.1:20220;" in result
+    assert "location /VEMU2-103/" in result
+    assert "alias /home/adminis/lht/103_project/vemu_frontend/VEMU2/;" in result
+    assert "## frontend_config_js" in result
+    assert "192.168.1.33" in result
+    assert "20222" in result
+    assert "5045" in result
+    assert "next_recipes=write_ops_file,reload_nginx" in result
+    assert "environment unchanged" in result
+
+
+def test_render_klonet_config_rejects_unsafe_inputs():
+    from klonet_agent.tools.environment import render_klonet_config
+
+    result = render_klonet_config(
+        {
+            "platform": "bad;name",
+            "server_name": "example.com",
+            "master_port": 70000,
+            "public_port": 20222,
+            "terminal_port": 5045,
+            "frontend_alias": "VEMU2",
+            "frontend_path": "/tmp/frontend",
+        }
+    )
+
+    assert "render_klonet_config" in result
+    assert "invalid_platform=bad;name" in result
+    assert "environment unchanged" in result
+
+
+def test_executor_dispatches_render_klonet_config_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"render_klonet_config"}).run(
+        "render_klonet_config",
+        {
+            "platform": "103",
+            "server_name": "localhost",
+            "master_port": 12000,
+            "public_port": 12002,
+            "terminal_port": 12003,
+            "frontend_alias": "/VEMU2/",
+            "frontend_path": "/srv/vemu/VEMU2",
+        },
+    )
+
+    assert "render_klonet_config" in result
+    assert "listen 12002;" in result
+    assert "proxy_pass http://127.0.0.1:12000;" in result
 
 
 def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):
