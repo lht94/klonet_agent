@@ -232,6 +232,7 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
     frontend_alias = _normalize_frontend_alias(str(args.get("frontend_alias") or "/VEMU2/").strip())
     frontend_path = _normalize_frontend_path(str(args.get("frontend_path") or "").strip())
     master_port = _safe_port(args.get("master_port"))
+    worker_port = _safe_port(args.get("worker_port"))
     public_port = _safe_port(args.get("public_port"))
     terminal_port = _safe_port(args.get("terminal_port") or args.get("web_terminal_port"))
 
@@ -239,6 +240,7 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
         platform_name,
         server_name,
         master_port,
+        worker_port,
         public_port,
         terminal_port,
         frontend_alias,
@@ -259,6 +261,13 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
         public_port=public_port,
         terminal_port=terminal_port,
     )
+    backend_config = _render_backend_config_py(
+        master_port=master_port,
+        worker_port=worker_port,
+        public_port=public_port,
+        terminal_port=terminal_port,
+    )
+    web_terminal_hint = _render_web_terminal_main_patch_hint(terminal_port)
     return "\n".join(
         [
             "render_klonet_config",
@@ -268,6 +277,10 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
             "next_recipes=write_ops_file,reload_nginx",
             "## nginx_server_block",
             nginx_block,
+            "## backend_config_py",
+            backend_config,
+            "## web_terminal_main_py_patch_hint",
+            web_terminal_hint,
             "## frontend_config_js",
             frontend_config,
         ]
@@ -930,6 +943,7 @@ def _validate_render_config_inputs(
     platform_name: str,
     server_name: str,
     master_port: Optional[int],
+    worker_port: Optional[int],
     public_port: Optional[int],
     terminal_port: Optional[int],
     frontend_alias: str,
@@ -941,12 +955,13 @@ def _validate_render_config_inputs(
         return f"invalid_server_name={server_name or 'missing'}"
     for name, port in (
         ("master_port", master_port),
+        ("worker_port", worker_port),
         ("public_port", public_port),
         ("terminal_port", terminal_port),
     ):
         if port is None:
             return f"invalid_{name}=missing"
-    if len({master_port, public_port, terminal_port}) != 3:
+    if len({master_port, worker_port, public_port, terminal_port}) != 4:
         return "invalid_ports=duplicate"
     if not _SAFE_FRONTEND_ALIAS.match(frontend_alias) or not frontend_alias.endswith("/"):
         return f"invalid_frontend_alias={frontend_alias or 'missing'}"
@@ -1034,6 +1049,26 @@ def _render_frontend_config_js(*, server_name: str, public_port: int, terminal_p
             f"var backend_ip = \"{server_name}\";",
             f"var backend_port = {public_port};",
             f"var web_terminal_port = {terminal_port};",
+        ]
+    )
+
+
+def _render_backend_config_py(*, master_port: int, worker_port: int, public_port: int, terminal_port: int) -> str:
+    return "\n".join(
+        [
+            f"master_port = {master_port}",
+            f"worker_port = {worker_port}",
+            f"public_port = {public_port}",
+            f"web_terminal_port = {terminal_port}",
+        ]
+    )
+
+
+def _render_web_terminal_main_patch_hint(terminal_port: int) -> str:
+    return "\n".join(
+        [
+            "确认 mains/web_terminal_main.py 或已复制到项目根目录的 web_terminal_main.py 中监听端口一致：",
+            f"WSGIServer(('0.0.0.0', {terminal_port}), app, ...)",
         ]
     )
 

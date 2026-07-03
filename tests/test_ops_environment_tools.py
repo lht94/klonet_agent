@@ -119,6 +119,7 @@ def test_render_klonet_config_outputs_nginx_and_frontend_templates():
             "platform": "103",
             "server_name": "192.168.1.33",
             "master_port": 20220,
+            "worker_port": 20221,
             "public_port": 20222,
             "terminal_port": 5045,
             "frontend_alias": "/VEMU2-103/",
@@ -140,6 +141,13 @@ def test_render_klonet_config_outputs_nginx_and_frontend_templates():
     assert "proxy_pass http://127.0.0.1:20220;" in result
     assert "location /VEMU2-103/" in result
     assert "alias /home/adminis/lht/103_project/vemu_frontend/VEMU2/;" in result
+    assert "## backend_config_py" in result
+    assert "master_port = 20220" in result
+    assert "worker_port = 20221" in result
+    assert "public_port = 20222" in result
+    assert "web_terminal_port = 5045" in result
+    assert "## web_terminal_main_py_patch_hint" in result
+    assert "WSGIServer(('0.0.0.0', 5045)" in result
     assert "## frontend_config_js" in result
     assert "192.168.1.33" in result
     assert "20222" in result
@@ -156,6 +164,7 @@ def test_render_klonet_config_rejects_unsafe_inputs():
             "platform": "bad;name",
             "server_name": "example.com",
             "master_port": 70000,
+            "worker_port": 20221,
             "public_port": 20222,
             "terminal_port": 5045,
             "frontend_alias": "VEMU2",
@@ -177,6 +186,7 @@ def test_executor_dispatches_render_klonet_config_tool():
             "platform": "103",
             "server_name": "localhost",
             "master_port": 12000,
+            "worker_port": 12001,
             "public_port": 12002,
             "terminal_port": 12003,
             "frontend_alias": "/VEMU2/",
