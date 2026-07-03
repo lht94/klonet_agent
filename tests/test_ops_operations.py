@@ -1042,6 +1042,148 @@ def test_prepare_project_files_recipe_execute_copies_mains_entries():
     assert copied["master_main.py"] == "# master_main.py\n"
 
 
+def test_extract_archive_recipe_dry_run_lists_members_without_writing():
+    import tarfile
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        source_dir = temp_dir / "source"
+        source_dir.mkdir()
+        (source_dir / "base_requ_setup.sh").write_text("# setup\n", encoding="utf-8")
+        archive = temp_dir / "vemu_install_new_gen.tar"
+        with tarfile.open(archive, "w") as handle:
+            handle.add(source_dir / "base_requ_setup.sh", arcname="vemu_install_new_gen/base_requ_setup.sh")
+        destination = temp_dir / "extract"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="extract install bundle",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "extract_archive",
+                    "args": {
+                        "archive_path": str(archive),
+                        "destination_dir": str(destination),
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=extract_archive" in result
+    assert "archive_members=vemu_install_new_gen/base_requ_setup.sh" in result
+    assert not (destination / "vemu_install_new_gen" / "base_requ_setup.sh").exists()
+
+
+def test_extract_archive_recipe_execute_extracts_tar_members():
+    import tarfile
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        source_dir = temp_dir / "source"
+        source_dir.mkdir()
+        (source_dir / "docker_service.sh").write_text("# docker\n", encoding="utf-8")
+        archive = temp_dir / "vemu_install_new_gen.tar"
+        with tarfile.open(archive, "w") as handle:
+            handle.add(source_dir / "docker_service.sh", arcname="vemu_install_new_gen/docker_service.sh")
+        destination = temp_dir / "extract"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="extract install bundle",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "extract_archive",
+                    "args": {
+                        "archive_path": str(archive),
+                        "destination_dir": str(destination),
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+        extracted = (destination / "vemu_install_new_gen" / "docker_service.sh").read_text(encoding="utf-8")
+
+    assert "result_status=completed" in result
+    assert "dry_run=false" in result
+    assert "recipe_id=extract_archive" in result
+    assert extracted == "# docker\n"
+
+
+def test_extract_archive_recipe_blocks_path_traversal_members():
+    import tarfile
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        payload = temp_dir / "evil.py"
+        payload.write_text("bad\n", encoding="utf-8")
+        archive = temp_dir / "bad.tar"
+        with tarfile.open(archive, "w") as handle:
+            handle.add(payload, arcname="../evil.py")
+        destination = temp_dir / "extract"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="extract install bundle",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "extract_archive",
+                    "args": {
+                        "archive_path": str(archive),
+                        "destination_dir": str(destination),
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "unsafe_archive_member=../evil.py" in result
+    assert not (temp_dir / "evil.py.extracted").exists()
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

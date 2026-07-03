@@ -354,7 +354,7 @@ TOOLS = [
             },
             "recipe_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定受控 recipe，例如 {\"restart-master\":{\"recipe_id\":\"restart_screen_component\",\"args\":{\"platform\":\"102\",\"component\":\"master\",\"screen_session\":\"102_m\",\"project_root\":\"/home/adminis/lht/102_project\"}}}。只保存绑定，不执行。",
+                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、extract_archive。extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}。只保存绑定，不执行。",
             },
         },
         ["operation", "target"],

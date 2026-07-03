@@ -11,6 +11,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import tarfile
+import zipfile
 from pathlib import Path
 
 from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExecutionResult
@@ -23,6 +25,7 @@ STOP_PLATFORM_SCREENS = "stop_platform_screens"
 START_PLATFORM_SCREENS = "start_platform_screens"
 VALIDATE_PROJECT_FILES = "validate_project_files"
 PREPARE_PROJECT_FILES = "prepare_project_files"
+EXTRACT_ARCHIVE = "extract_archive"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 REQUIRED_PROJECT_ENTRY_FILES = (
     "gun.py",
@@ -64,6 +67,8 @@ class ControlledRecipeRunner:
             return self._validate_project_files(step)
         if step.recipe_id == PREPARE_PROJECT_FILES:
             return self._prepare_project_files(step)
+        if step.recipe_id == EXTRACT_ARCHIVE:
+            return self._extract_archive(step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
@@ -292,6 +297,72 @@ class ControlledRecipeRunner:
             ),
         )
 
+    def _extract_archive(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        archive_path = str(args.get("archive_path") or "").strip()
+        destination_dir = str(args.get("destination_dir") or "").strip()
+        if not archive_path or _looks_unsafe_path(archive_path):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={EXTRACT_ARCHIVE} invalid_archive_path={archive_path or 'missing'}; environment unchanged",
+            )
+        if not destination_dir or _looks_unsafe_path(destination_dir):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={EXTRACT_ARCHIVE} invalid_destination_dir={destination_dir or 'missing'}; environment unchanged",
+            )
+        archive = Path(archive_path)
+        destination = Path(destination_dir)
+        if not archive.is_file():
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={EXTRACT_ARCHIVE} archive_not_found={_one_line(archive_path)}; environment unchanged",
+            )
+        try:
+            members = _archive_members(archive)
+            unsafe_member = _first_unsafe_archive_member(destination, members)
+            if unsafe_member:
+                return RecipeExecutionResult(
+                    "blocked",
+                    f"recipe_id={EXTRACT_ARCHIVE} unsafe_archive_member={_one_line(unsafe_member)}; environment unchanged",
+                )
+            member_preview = ",".join(members[:50])
+            if self.dry_run:
+                return RecipeExecutionResult(
+                    "completed",
+                    (
+                        "dry_run=true "
+                        f"recipe_id={EXTRACT_ARCHIVE} "
+                        f"archive_path={_one_line(archive_path)} "
+                        f"destination_dir={_one_line(destination_dir)} "
+                        f"archive_members={member_preview} "
+                        "environment unchanged"
+                    ),
+                )
+            destination.mkdir(parents=True, exist_ok=True)
+            _extract_archive_to(archive, destination)
+        except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={EXTRACT_ARCHIVE} "
+                    f"extract_failed={_one_line(str(exc))} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        return RecipeExecutionResult(
+            "completed",
+            (
+                "dry_run=false "
+                f"recipe_id={EXTRACT_ARCHIVE} "
+                f"archive_path={_one_line(archive_path)} "
+                f"destination_dir={_one_line(destination_dir)} "
+                f"extracted_members={len(members)} "
+                "environment_changed=true"
+            ),
+        )
+
     def _helper_result(self, recipe_id: str, command: list) -> RecipeExecutionResult:
         if not self.dry_run:
             try:
@@ -359,6 +430,53 @@ def _project_entry_file_sources(root: Path) -> dict:
         elif (root / "mains" / filename).is_file():
             found[filename] = f"mains/{filename}"
     return found
+
+
+def _archive_members(archive: Path) -> list:
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as handle:
+            return [name for name in handle.namelist() if name and not name.endswith("/")]
+    if tarfile.is_tarfile(archive):
+        with tarfile.open(archive) as handle:
+            return [member.name for member in handle.getmembers() if member.name and member.isfile()]
+    raise OSError(f"unsupported_archive={archive.name}")
+
+
+def _extract_archive_to(archive: Path, destination: Path) -> None:
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as handle:
+            handle.extractall(destination)
+        return
+    with tarfile.open(archive) as handle:
+        for member in handle.getmembers():
+            if not member.isfile():
+                continue
+            source = handle.extractfile(member)
+            if source is None:
+                continue
+            target = destination / member.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+def _first_unsafe_archive_member(destination: Path, members: list) -> str:
+    destination_root = destination.resolve()
+    for member in members:
+        if Path(member).is_absolute():
+            return member
+        target = (destination / member).resolve()
+        if not _path_is_relative_to(target, destination_root):
+            return member
+    return ""
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _looks_unsafe_path(value: str) -> bool:
