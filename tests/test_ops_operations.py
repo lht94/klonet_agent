@@ -1184,6 +1184,140 @@ def test_extract_archive_recipe_blocks_path_traversal_members():
     assert not (temp_dir / "evil.py.extracted").exists()
 
 
+def test_run_install_script_recipe_dry_run_previews_allowlisted_script():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        script_dir = temp_dir / "vemu_install_new_gen"
+        script_dir.mkdir()
+        (script_dir / "base_requ_setup.sh").write_text("# setup\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="run base setup",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "run_install_script",
+                    "args": {
+                        "script_dir": str(script_dir),
+                        "script_name": "base_requ_setup.sh",
+                        "script_args": "NORMAL",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=run_install_script" in result
+    assert "command_preview=" in result
+    assert "base_requ_setup.sh NORMAL" in result
+    assert "environment unchanged" in result
+
+
+def test_run_install_script_recipe_execute_calls_fixed_command():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_runner(command):
+        calls.append(command)
+        return "script ok"
+
+    with local_temp_dir() as temp_dir:
+        script_dir = temp_dir / "vemu_install_new_gen"
+        script_dir.mkdir()
+        (script_dir / "docker_service.sh").write_text("# docker\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=fake_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="run docker service",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "run_install_script",
+                    "args": {
+                        "script_dir": str(script_dir),
+                        "script_name": "docker_service.sh",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=completed" in result
+    assert "dry_run=false" in result
+    assert "recipe_id=run_install_script" in result
+    assert "script ok" in result
+    assert len(calls) == 1
+    assert calls[0][0:2] == ["bash", "-lc"]
+    assert "docker_service.sh" in calls[0][2]
+
+
+def test_run_install_script_recipe_blocks_unsupported_script():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        script_dir = temp_dir / "vemu_install_new_gen"
+        script_dir.mkdir()
+        (script_dir / "rm_everything.sh").write_text("# nope\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="run unsafe script",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "run_install_script",
+                    "args": {
+                        "script_dir": str(script_dir),
+                        "script_name": "rm_everything.sh",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "unsupported_script=rm_everything.sh" in result
+    assert "environment unchanged" in result
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

@@ -26,7 +26,12 @@ START_PLATFORM_SCREENS = "start_platform_screens"
 VALIDATE_PROJECT_FILES = "validate_project_files"
 PREPARE_PROJECT_FILES = "prepare_project_files"
 EXTRACT_ARCHIVE = "extract_archive"
+RUN_INSTALL_SCRIPT = "run_install_script"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
+ALLOWED_INSTALL_SCRIPTS = {
+    "base_requ_setup.sh": ("NORMAL",),
+    "docker_service.sh": (),
+}
 REQUIRED_PROJECT_ENTRY_FILES = (
     "gun.py",
     "master_main.py",
@@ -69,6 +74,8 @@ class ControlledRecipeRunner:
             return self._prepare_project_files(step)
         if step.recipe_id == EXTRACT_ARCHIVE:
             return self._extract_archive(step)
+        if step.recipe_id == RUN_INSTALL_SCRIPT:
+            return self._run_install_script(step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
@@ -363,6 +370,63 @@ class ControlledRecipeRunner:
             ),
         )
 
+    def _run_install_script(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        script_dir = str(args.get("script_dir") or "").strip()
+        script_name = str(args.get("script_name") or "").strip()
+        script_args = _split_script_args(args.get("script_args"))
+        if not script_dir or _looks_unsafe_path(script_dir):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_INSTALL_SCRIPT} invalid_script_dir={script_dir or 'missing'}; environment unchanged",
+            )
+        if script_name not in ALLOWED_INSTALL_SCRIPTS:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_INSTALL_SCRIPT} unsupported_script={script_name or 'missing'}; environment unchanged",
+            )
+        allowed_args = ALLOWED_INSTALL_SCRIPTS[script_name]
+        if tuple(script_args) != allowed_args:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={RUN_INSTALL_SCRIPT} "
+                    f"unsupported_script_args={','.join(script_args) or 'none'} "
+                    "environment unchanged"
+                ),
+            )
+        script_path = Path(script_dir) / script_name
+        if not script_path.is_file():
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_INSTALL_SCRIPT} script_not_found={_one_line(str(script_path))}; environment unchanged",
+            )
+        command = _install_script_command(script_dir, script_name, script_args)
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={RUN_INSTALL_SCRIPT} "
+                    f"command_preview={_format_command(command)} "
+                    "environment unchanged"
+                ),
+            )
+        try:
+            output = self.command_runner(command)
+        except subprocess.CalledProcessError as exc:
+            return _script_failure_result(exc)
+        return RecipeExecutionResult(
+            "completed",
+            (
+                "dry_run=false "
+                f"recipe_id={RUN_INSTALL_SCRIPT} "
+                f"command={_format_command(command)} "
+                f"script_output={_one_line(output)} "
+                "environment_changed=true"
+            ),
+        )
+
     def _helper_result(self, recipe_id: str, command: list) -> RecipeExecutionResult:
         if not self.dry_run:
             try:
@@ -460,6 +524,23 @@ def _extract_archive_to(archive: Path, destination: Path) -> None:
                 shutil.copyfileobj(source, output)
 
 
+def _split_script_args(value) -> list:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    if not text:
+        return []
+    return shlex.split(text)
+
+
+def _install_script_command(script_dir: str, script_name: str, script_args: list) -> list:
+    args = " ".join(shlex.quote(item) for item in script_args)
+    command = f"cd {shlex.quote(script_dir)} && bash ./{shlex.quote(script_name)}"
+    if args:
+        command = f"{command} {args}"
+    return ["bash", "-lc", command]
+
+
 def _first_unsafe_archive_member(destination: Path, members: list) -> str:
     destination_root = destination.resolve()
     for member in members:
@@ -516,6 +597,21 @@ def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
             "inspect_runtime",
         )
     return RecipeExecutionResult("failed", output)
+
+
+def _script_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
+    stderr = _one_line(exc.stderr)
+    stdout = _one_line(exc.output)
+    return RecipeExecutionResult(
+        "blocked",
+        (
+            f"script_failed returncode={exc.returncode} "
+            f"stderr={stderr} "
+            f"stdout={stdout} "
+            "environment_changed=unknown"
+        ),
+        "inspect_runtime",
+    )
 
 
 def _one_line(text: str) -> str:

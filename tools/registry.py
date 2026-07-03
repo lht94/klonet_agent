@@ -354,7 +354,7 @@ TOOLS = [
             },
             "recipe_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、extract_archive。extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}。只保存绑定，不执行。",
+                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、extract_archive、run_install_script。extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}；run_install_script 只允许 base_requ_setup.sh NORMAL 或 docker_service.sh，参数为 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"}。只保存绑定，不执行。",
             },
         },
         ["operation", "target"],
