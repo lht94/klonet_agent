@@ -1355,9 +1355,11 @@ def test_executor_resolve_ops_blocked_step_resets_step_to_pending():
         )
         loaded = plan_store.load_plan(plan_id)
 
-    assert "next_step=restart-master" in result
+    assert "ops_operation_resolution" in result
+    assert "result_status=resolved" in result
+    assert "step_status=pending" in result
+    assert "next_required_action=confirm-step" in result
     assert "restart-master" in result
-    assert "status=pending" in result
     assert _status_by_step(loaded)["restart-master"] == "pending"
     assert "inspect_runtime confirmed screen and port state refreshed" in loaded.evidence
 

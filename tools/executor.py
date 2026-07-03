@@ -17,6 +17,7 @@ from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.ops.operations import (
     OperationPlanStore,
     render_plan,
+    render_step_resolution,
 )
 from klonet_agent.ops.recipes import ControlledRecipeRunner
 from klonet_agent.session import AgentSession
@@ -191,12 +192,13 @@ class ToolExecutor:
 
         if tool_name == "resolve_ops_blocked_step":
             store = self._operation_plan_store()
+            evidence = tool_args.get("resolution_evidence", "")
             plan = store.resolve_blocked_step(
                 tool_args["plan_id"],
                 tool_args["step_id"],
-                tool_args.get("resolution_evidence", ""),
+                evidence,
             )
-            return render_plan(plan)
+            return render_step_resolution(plan, tool_args["step_id"], evidence)
 
         if tool_name == "list_files":
             return list_files(self.session, tool_args.get("path", "."))

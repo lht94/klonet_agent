@@ -313,6 +313,27 @@ def render_plan(plan: OperationPlan) -> str:
     return "\n".join(lines)
 
 
+def render_step_resolution(plan: OperationPlan, step_id: str, resolution_evidence: str) -> str:
+    step = _find_step(plan, step_id)
+    lines = [
+        "ops_operation_resolution",
+        f"plan_id={plan.plan_id}",
+        f"operation={plan.operation}",
+        f"target={plan.target or 'unknown'}",
+        f"plan_status={plan.status}",
+        f"resolved_step={step.step_id}",
+        f"step_status={step.status}",
+        "result_status=resolved",
+        f"resolution_evidence={_one_line(resolution_evidence, 300)}",
+        f"next_step={_next_step_id(plan)}",
+    ]
+    if step.requires_step_confirmation:
+        lines.append(f"next_required_action=confirm-step {plan.plan_id} {step.step_id}")
+    else:
+        lines.append(f"next_required_action=execute_ops_next_step {plan.plan_id}")
+    return "\n".join(lines)
+
+
 def execute_step_preview(plan: OperationPlan, step_id: str) -> str:
     """Return the current execution decision for a step.
 
