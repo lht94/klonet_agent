@@ -29,6 +29,7 @@ OPS_BASELINE_CHECKS = (
     "disk",
     "virtualization",
     "python",
+    "system_python",
     "rust",
     "docker_version",
     "compose_version",
@@ -144,6 +145,8 @@ def inspect_system_environment(args: Optional[dict] = None) -> str:
         )
     if "python" in requested:
         results.append(ProbeResult("python", STATUS_DETECTED, platform.python_version()))
+    if "system_python" in requested:
+        results.append(run_read_only_probe("system_python"))
     if "disk" in requested:
         results.append(_disk_usage_probe())
     if "virtualization" in requested:
@@ -951,6 +954,18 @@ def _posix_probe_command(name: str) -> Optional[list]:
                 "command -v gunicorn 2>/dev/null || true; command -v celery 2>/dev/null || true"
             ),
         ],
+        "system_python": [
+            "sh",
+            "-c",
+            (
+                "printf 'PATH python: '; command -v python 2>/dev/null || true; "
+                "printf 'PATH python3: '; command -v python3 2>/dev/null || true; "
+                "printf '/usr/bin/python: '; /usr/bin/python --version 2>&1 || true; "
+                "printf '/usr/bin/python3: '; /usr/bin/python3 --version 2>&1 || true; "
+                "ls -l /usr/bin/python /usr/bin/python3 /usr/bin/python3.* 2>/dev/null || true; "
+                "dpkg-query -W -f='${Package} ${Version}\\n' 'python3*' 2>/dev/null | head -20 || true"
+            ),
+        ],
         "rust": [
             "sh",
             "-c",
@@ -1015,6 +1030,7 @@ def _windows_probe_command(name: str) -> Optional[list]:
         "memory": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory"],
         "virtualization": ["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Processor | Select-Object -ExpandProperty VirtualizationFirmwareEnabled"],
         "python": ["powershell", "-NoProfile", "-Command", "python --version; py -3.8 --version 2>$null"],
+        "system_python": ["powershell", "-NoProfile", "-Command", "py -0p 2>$null; where.exe python 2>$null; python --version 2>$null"],
         "rust": ["powershell", "-NoProfile", "-Command", "rustc --version 2>$null; cargo --version 2>$null"],
         "docker_version": ["powershell", "-NoProfile", "-Command", "docker version --format '{{.Server.Version}}' 2>$null"],
         "compose_version": ["powershell", "-NoProfile", "-Command", "docker compose version 2>$null; docker-compose --version 2>$null"],

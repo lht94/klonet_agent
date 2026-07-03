@@ -10,6 +10,42 @@
 
 ---
 
+## 2026-07-03 Extension: Ops Tool Expansion
+
+User feedback from real server tests shows that Ops still lacks several
+operator-grade capabilities. Add the following directions to the remaining
+work:
+
+1. **Archive and prepare-file recipes.** `prepare-files` must not be blocked by
+   `no_recipe_attached`. Add allowlisted recipes for extracting a Klonet install
+   bundle, validating the extracted directory, copying `mains/` entry files into
+   the project root, and then running higher-risk setup scripts only through
+   confirmed OperationPlan steps.
+2. **Wider read-only system probes.** Questions about system Python, command
+   paths, package manager records, mounts, users/groups, sudo availability, and
+   service versions should use fixed read-only probes instead of `read_ops_file`.
+   Reading `/usr/bin/python3` as a file is the wrong abstraction; use
+   `inspect_system_environment` or a future command/path inspection tool.
+3. **Controlled write tools.** Ops needs write capability for operational
+   artifacts such as generated notes, config drafts, Nginx draft files, and
+   planned file edits. These must be scoped by OperationPlan, use allowlisted
+   target directories or explicit project roots, write backups when overwriting,
+   redact secrets in previews, and require confirmation before changing runtime
+   files.
+4. **Runbook-derived tool backlog.** Based on the Klonet runbooks, future tools
+   should cover: archive listing/extraction, checksum and file inventory,
+   `mains/` entry-file copy validation, `base_requ_setup.sh` and
+   `docker_service.sh` controlled execution, Docker daemon config backup/merge
+   preview, Redis availability checks, Nginx syntax/reload workflow, frontend
+   config validation, screen lifecycle operations, port/process ownership,
+   service health checks, and safe log/screen evidence capture.
+
+Implementation should stay incremental: every new modifying capability starts as
+dry-run, then requires exact plan confirmation and step confirmation before real
+execution.
+
+---
+
 ## File Structure
 
 - `agents/profile.py`: add `ops` profile and tool allowlist.

@@ -185,9 +185,9 @@ TOOLS = [
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["os", "python", "disk", "virtualization"],
+                    "enum": ["os", "python", "system_python", "disk", "virtualization"],
                 },
-                "description": "可选检查项；默认检查 os、python、disk、virtualization",
+                "description": "可选检查项；默认检查 os、python、disk、virtualization。system_python 用于确认 /usr/bin 等系统自带 Python 路径和版本，不读取二进制文件。",
             }
         },
         [],

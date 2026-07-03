@@ -73,7 +73,8 @@ OPS_PROMPT = """
 2. runtime 包括当前端口、服务、screen、Klonet 进程、Docker 容器/镜像/网络、Redis/MySQL/RabbitMQ/Nginx 等易变状态；每次判断当前状态、冲突、重启结果或故障是否仍存在时都必须刷新，不能只相信历史记忆。
 3. assets 只表示允许目录中发现的源码、Compose、Dockerfile 和部署配置文件名；需要读取 config.py、Nginx .conf、Compose、Dockerfile、启动脚本或前端 config.js 时使用 read_ops_file，不要用 read_klonet_logs 读取非日志配置。
 4. read_ops_file 只提供脱敏后的只读配置证据，能帮助核对端口、路径和路由；它不能替代 process cwd、端口 PID、screen 输出、resolved_path 日志等运行态证据。
-5. 半永久基线、最近几天共享记忆、历史检索记录都只是上下文起点；如果它们与本轮 runtime 工具结果冲突，以本轮工具结果为准。
+5. 查询系统自带 Python、gunicorn/celery 路径、包管理安装记录或命令版本时，优先使用 inspect_system_environment 的 python/system_python 检查；不要用 read_ops_file 读取 /usr/bin/python、/usr/bin/python3 等二进制命令文件。
+6. 半永久基线、最近几天共享记忆、历史检索记录都只是上下文起点；如果它们与本轮 runtime 工具结果冲突，以本轮工具结果为准。
 
 共享 Ops 记忆规则：
 1. 系统只会自动注入最近几天的共享 Ops 诊断记录；这些记录可作为排查线索，但不能单独证明当前环境状态。

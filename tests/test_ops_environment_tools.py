@@ -431,6 +431,41 @@ def test_executor_dispatches_environment_tool():
     assert any(status in result for status in ("detected", "missing", "unchecked"))
 
 
+def test_system_environment_can_probe_system_python_without_reading_binaries(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+    from klonet_agent.tools.registry import TOOLS
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="/usr/bin/python3\nPython 3.8.10\nlrwxrwxrwx /usr/bin/python3 -> python3.8\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+
+    result = environment.inspect_system_environment({"checks": ["system_python"]})
+    system_tool = next(
+        item
+        for item in TOOLS
+        if item["function"]["name"] == "inspect_system_environment"
+    )
+    checks = system_tool["function"]["parameters"]["properties"]["checks"]["items"]["enum"]
+
+    assert "system_python" in checks
+    assert "system_python: detected" in result
+    assert "/usr/bin/python3" in result
+    assert "Python 3.8.10" in result
+    assert any("/usr/bin/python3" in " ".join(call) for call in calls)
+
+
 def test_executor_dispatches_process_detail_tool():
     from klonet_agent.tools.executor import ToolExecutor
 
