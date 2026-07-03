@@ -372,6 +372,15 @@ TOOLS = [
                 "enum": ["pending", "approved", "aborted", "completed", "failed"],
                 "description": "Optional plan status filter.",
             },
+            "operation": {
+                "type": "string",
+                "enum": ["deploy_platform", "restart_platform", "destroy_platform"],
+                "description": "Optional operation type filter.",
+            },
+            "target": {
+                "type": "string",
+                "description": "Optional exact target/platform filter.",
+            },
         },
         [],
     ),

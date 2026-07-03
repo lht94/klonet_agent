@@ -184,6 +184,8 @@ class ToolExecutor:
             plans = self._operation_plan_store().list_plans(
                 tool_args.get("limit", 10),
                 tool_args.get("status", ""),
+                tool_args.get("operation", ""),
+                tool_args.get("target", ""),
             )
             return render_plan_list(plans)
 

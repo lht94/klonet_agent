@@ -1503,6 +1503,63 @@ def test_executor_list_ops_operation_plans_filters_by_status():
     assert "status=pending" not in result
 
 
+def test_executor_list_ops_operation_plans_filters_by_target_and_operation():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "list_ops_operation_plans",
+            },
+            memory_store=store,
+        )
+        restart_102 = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+            },
+        )
+        deploy_102 = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "deploy_platform",
+                "target": "102",
+                "objective": "deploy platform 102",
+            },
+        )
+        restart_103 = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "103",
+                "objective": "restart platform 103",
+            },
+        )
+        restart_102_id = _extract_plan_id(restart_102)
+        deploy_102_id = _extract_plan_id(deploy_102)
+        restart_103_id = _extract_plan_id(restart_103)
+
+        result = executor.run(
+            "list_ops_operation_plans",
+            {"target": "102", "operation": "restart_platform", "limit": 10},
+        )
+
+    assert f"plan_id={restart_102_id}" in result
+    assert "target=102" in result
+    assert "operation=restart_platform" in result
+    assert f"plan_id={deploy_102_id}" not in result
+    assert f"plan_id={restart_103_id}" not in result
+
+
 def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession

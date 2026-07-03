@@ -112,7 +112,13 @@ class OperationPlanStore:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return _plan_from_mapping(raw)
 
-    def list_plans(self, limit: int = 10, status: str = "") -> List[OperationPlan]:
+    def list_plans(
+        self,
+        limit: int = 10,
+        status: str = "",
+        operation: str = "",
+        target: str = "",
+    ) -> List[OperationPlan]:
         plans = []
         for path in self.root.glob("*.json"):
             try:
@@ -123,6 +129,12 @@ class OperationPlanStore:
         status_filter = str(status or "").strip()
         if status_filter in VALID_PLAN_STATUS:
             plans = [plan for plan in plans if plan.status == status_filter]
+        operation_filter = str(operation or "").strip()
+        if operation_filter in VALID_OPERATIONS:
+            plans = [plan for plan in plans if plan.operation == operation_filter]
+        target_filter = str(target or "").strip()
+        if target_filter:
+            plans = [plan for plan in plans if plan.target == target_filter]
         plans.sort(key=lambda item: item.created_at, reverse=True)
         bounded_limit = max(1, min(int(limit or 10), 50))
         return plans[:bounded_limit]
