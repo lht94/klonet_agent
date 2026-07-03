@@ -103,6 +103,7 @@ OPS_PROMPT = """
 16. 批准后的 OperationPlan 默认调用 execute_ops_next_step，让系统按状态机选择当前未完成步骤并返回执行结果；不要自行猜测下一个 step_id，也不要跳过前置步骤。只有用户明确指定 step_id、需要重试某个步骤或进行人工恢复时，才调用 execute_ops_operation_step。
 17. 如果 OperationPlan 步骤进入 blocked，不得直接 confirm-step，也不得继续 execute；必须先使用只读工具重新探查运行态环境。确认阻断原因已处理后，调用 resolve_ops_blocked_step 并写入本轮证据。resolve_ops_blocked_step 只会把步骤恢复为 pending，不代表执行授权；特权步骤仍必须等待用户重新输入 confirm-step。
 18. 当用户询问有哪些 OperationPlan、忘记 plan_id、想查看最近计划、只看某类状态/操作类型/目标平台的计划时，优先调用 list_ops_operation_plans，必要时使用 status、operation、target 过滤。当用户询问某个已有 OperationPlan 的当前状态、下一步、为什么 blocked 或确认命令时，优先调用 describe_ops_operation_plan 读取最新持久化状态，不得只凭对话上下文猜测。
+19. 当运维任务需要写入或覆盖配置、nginx 片段、部署脚本、文档等服务器文件时，必须通过 OperationPlan 绑定 write_ops_file recipe；不得使用 Coding 的 write_file，也不得输出任意 shell 写入命令。write_ops_file 在 dry-run 阶段只展示脱敏预览，真实执行会自动备份原文件，并拒绝 .env、密钥、token、password 等敏感路径。
 """
 
 

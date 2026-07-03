@@ -1318,6 +1318,132 @@ def test_run_install_script_recipe_blocks_unsupported_script():
     assert "environment unchanged" in result
 
 
+def test_write_ops_file_recipe_dry_run_redacts_preview_without_writing():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / "nginx.conf"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write nginx draft",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "content": "proxy_pass http://127.0.0.1:5000;\napi_key=secret-token\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=write_ops_file" in result
+    assert "proxy_pass http://127.0.0.1:5000;" in result
+    assert "secret-token" not in result
+    assert "[REDACTED]" in result
+    assert not target.exists()
+
+
+def test_write_ops_file_recipe_execute_writes_file_and_backs_up_existing_content():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / "config.py"
+        target.write_text("master_port = 5000\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write config",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "content": "master_port = 5100\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+        backups = list(temp_dir.glob("config.py.bak.*"))
+        new_content = target.read_text(encoding="utf-8")
+        old_content = backups[0].read_text(encoding="utf-8") if backups else ""
+
+    assert "result_status=completed" in result
+    assert "dry_run=false" in result
+    assert "recipe_id=write_ops_file" in result
+    assert "backup_path=" in result
+    assert new_content == "master_port = 5100\n"
+    assert old_content == "master_port = 5000\n"
+
+
+def test_write_ops_file_recipe_blocks_sensitive_paths():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / ".env"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write env",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "content": "OPENAI_API_KEY=secret\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "refused_sensitive_path=.env" in result
+    assert not target.exists()
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tarfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExecutionResult
@@ -27,6 +28,7 @@ VALIDATE_PROJECT_FILES = "validate_project_files"
 PREPARE_PROJECT_FILES = "prepare_project_files"
 EXTRACT_ARCHIVE = "extract_archive"
 RUN_INSTALL_SCRIPT = "run_install_script"
+WRITE_OPS_FILE = "write_ops_file"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -40,7 +42,60 @@ REQUIRED_PROJECT_ENTRY_FILES = (
     "worker_gun.py",
     "worker_main.py",
 )
+SAFE_OPS_WRITE_SUFFIXES = {
+    ".py",
+    ".conf",
+    ".cfg",
+    ".ini",
+    ".json",
+    ".js",
+    ".md",
+    ".service",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+SAFE_OPS_WRITE_NAMES = {
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    "compose.yml",
+    "compose.yaml",
+    "dockerfile",
+    "gun.py",
+    "worker_gun.py",
+    "master_main.py",
+    "worker_main.py",
+    "web_terminal_main.py",
+    "celery_worker.py",
+    "config.py",
+    "nginx.conf",
+}
+SENSITIVE_OPS_WRITE_NAME_PARTS = (
+    ".env",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "private_key",
+    "secret",
+    "token",
+    "credential",
+    "password",
+)
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+_SECRET_PATTERNS = (
+    re.compile(
+        r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
+    ),
+    re.compile(
+        r"(?i)(--(?:password|passwd|pwd|api-key|api_key|secret|token)(?:=|\s+))([^\s]+)"
+    ),
+    re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+([^\s]+)"),
+    re.compile(r"(?i)\b(cookie\s*:\s*)(.+)$", re.MULTILINE),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
+)
 
 
 class ControlledRecipeRunner:
@@ -76,6 +131,8 @@ class ControlledRecipeRunner:
             return self._extract_archive(step)
         if step.recipe_id == RUN_INSTALL_SCRIPT:
             return self._run_install_script(step)
+        if step.recipe_id == WRITE_OPS_FILE:
+            return self._write_ops_file(step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
@@ -427,6 +484,68 @@ class ControlledRecipeRunner:
             ),
         )
 
+    def _write_ops_file(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        raw_path = str(args.get("path") or "").strip()
+        content = str(args.get("content") or "")
+        if not raw_path or _looks_unsafe_path(raw_path):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={WRITE_OPS_FILE} invalid_path={raw_path or 'missing'}; environment unchanged",
+            )
+        path = Path(raw_path)
+        if _is_sensitive_ops_write_path(path):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={WRITE_OPS_FILE} refused_sensitive_path={path.name}; environment unchanged",
+            )
+        if not _is_supported_ops_write_path(path):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={WRITE_OPS_FILE} unsupported_file_type={path.name or raw_path}; environment unchanged",
+            )
+
+        preview = _one_line(_redact_sensitive_text(content))
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={WRITE_OPS_FILE} "
+                    f"path={_one_line(raw_path)} "
+                    f"preview={preview} "
+                    "environment unchanged"
+                ),
+            )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path = ""
+            if path.exists():
+                backup = _ops_backup_path(path)
+                shutil.copy2(path, backup)
+                backup_path = str(backup)
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={WRITE_OPS_FILE} "
+                    f"write_failed={_one_line(str(exc))} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        parts = [
+            "dry_run=false",
+            f"recipe_id={WRITE_OPS_FILE}",
+            f"path={_one_line(raw_path)}",
+            f"bytes_written={len(content.encode('utf-8'))}",
+        ]
+        if backup_path:
+            parts.append(f"backup_path={_one_line(backup_path)}")
+        parts.append("environment_changed=true")
+        return RecipeExecutionResult("completed", " ".join(parts))
+
     def _helper_result(self, recipe_id: str, command: list) -> RecipeExecutionResult:
         if not self.dry_run:
             try:
@@ -564,6 +683,36 @@ def _looks_unsafe_path(value: str) -> bool:
     if any(part in value for part in ("\x00", "\n", "\r")):
         return True
     return not (value.startswith("/") or Path(value).is_absolute())
+
+
+def _redact_sensitive_text(text: str) -> str:
+    redacted = text or ""
+    for pattern in _SECRET_PATTERNS:
+        redacted = pattern.sub(_redact_match, redacted)
+    return redacted
+
+
+def _redact_match(match: re.Match) -> str:
+    if match.lastindex:
+        return f"{match.group(1)} [REDACTED]"
+    return "[REDACTED]"
+
+
+def _is_sensitive_ops_write_path(path: Path) -> bool:
+    lower_name = path.name.lower()
+    return any(part in lower_name for part in SENSITIVE_OPS_WRITE_NAME_PARTS)
+
+
+def _is_supported_ops_write_path(path: Path) -> bool:
+    lower_name = path.name.lower()
+    if lower_name in SAFE_OPS_WRITE_NAMES or lower_name.startswith("dockerfile"):
+        return True
+    return path.suffix.lower() in SAFE_OPS_WRITE_SUFFIXES
+
+
+def _ops_backup_path(path: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    return path.with_name(f"{path.name}.bak.{stamp}")
 
 
 def _format_command(command: list) -> str:

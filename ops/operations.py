@@ -26,6 +26,7 @@ RESTART_STEP_COMPONENTS = {
     "restart-celery": ("celery", "c"),
     "restart-web-terminal": ("web_terminal", "web"),
 }
+MAX_RECIPE_CONTENT_CHARS = 20000
 
 
 @dataclass
@@ -470,11 +471,15 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
         step.recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
         args = binding.get("args")
         if isinstance(args, dict):
-            step.recipe_args = {
-                _one_line(str(key), 80): _one_line(str(value), 300)
-                for key, value in args.items()
-                if key and value is not None
-            }
+            step.recipe_args = {}
+            for key, value in args.items():
+                if not key or value is None:
+                    continue
+                normalized_key = _one_line(str(key), 80)
+                if step.recipe_id == "write_ops_file" and normalized_key == "content":
+                    step.recipe_args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+                    continue
+                step.recipe_args[normalized_key] = _one_line(str(value), 300)
 
 
 def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
@@ -546,6 +551,9 @@ def _render_recipe_args(recipe_args: dict) -> str:
     pairs = []
     for key in sorted(recipe_args)[:6]:
         if not key:
+            continue
+        if str(key) == "content":
+            pairs.append(f"recipe_args.content=<{len(str(recipe_args[key]))} chars>")
             continue
         pairs.append(
             f"recipe_args.{_one_line(str(key), 40)}="
