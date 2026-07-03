@@ -73,6 +73,10 @@ def main(argv=None) -> int:
     start_mode.add_argument("--execute", action="store_true")
     start.add_argument("--platform", required=True)
     start.add_argument("--project-root", required=True)
+    reload_nginx = subcommands.add_parser("reload-nginx")
+    reload_nginx_mode = reload_nginx.add_mutually_exclusive_group(required=True)
+    reload_nginx_mode.add_argument("--dry-run", action="store_true")
+    reload_nginx_mode.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
@@ -82,6 +86,8 @@ def main(argv=None) -> int:
         return _stop_platform_screens(args)
     if args.action == "start-platform-screens":
         return _start_platform_screens(args)
+    if args.action == "reload-nginx":
+        return _reload_nginx(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
 
@@ -201,6 +207,30 @@ def _start_platform_screens(args) -> int:
     return 0
 
 
+def _reload_nginx(args) -> int:
+    if args.execute:
+        try:
+            run_checked(["nginx", "-t"])
+        except subprocess.CalledProcessError as exc:
+            _print_nginx_test_failure(exc)
+            return 1
+        except OSError as exc:
+            _print_nginx_test_failure(exc)
+            return 1
+        if not _run_commands([["nginx", "-s", "reload"]]):
+            return 1
+    print("klonet_agent_op")
+    print("action=reload-nginx")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print("test_command=nginx -t")
+    print("reload_command=nginx -s reload")
+    if args.execute:
+        print("nginx_test=ok")
+        print("nginx_reload=ok")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
 def _validate_restart_args(platform: str, component: str, screen_session: str, project_root: str) -> str:
     problem = _validate_screen_component_args(platform, component, screen_session)
     if problem:
@@ -257,6 +287,22 @@ def _print_command_failure(command: list, exc: Exception) -> None:
     else:
         print(f"exception={exc.__class__.__name__}", file=sys.stderr)
     print("environment_changed=unknown", file=sys.stderr)
+
+
+def _print_nginx_test_failure(exc: Exception) -> None:
+    print("klonet_agent_op", file=sys.stderr)
+    print("error=nginx_test_failed", file=sys.stderr)
+    if isinstance(exc, subprocess.CalledProcessError):
+        print(f"nginx_test_failed returncode={exc.returncode}", file=sys.stderr)
+        stderr = _one_line(getattr(exc, "stderr", "") or "")
+        stdout = _one_line(getattr(exc, "output", "") or "")
+        if stderr:
+            print(f"stderr={stderr}", file=sys.stderr)
+        if stdout:
+            print(f"stdout={stdout}", file=sys.stderr)
+    else:
+        print(f"nginx_test_failed exception={exc.__class__.__name__}", file=sys.stderr)
+    print("environment_changed=false", file=sys.stderr)
 
 
 def _run_commands(commands: list) -> bool:
@@ -395,6 +441,10 @@ def _start_platform_commands(platform: str, project_root: str) -> list:
 
 def run_checked(command: list) -> None:
     subprocess.run(command, check=True)
+
+
+def _one_line(text: str) -> str:
+    return " ".join(str(text or "").split())[:500]
 
 
 if __name__ == "__main__":

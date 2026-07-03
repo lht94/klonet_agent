@@ -15,12 +15,14 @@ def test_sudoers_template_only_allows_fixed_helper_entrypoint():
     assert "/usr/local/bin/klonet-agent-op stop-screen-component --execute" in text
     assert "/usr/local/bin/klonet-agent-op stop-platform-screens --execute" in text
     assert "/usr/local/bin/klonet-agent-op start-platform-screens --execute" in text
+    assert "/usr/local/bin/klonet-agent-op reload-nginx --execute" in text
     assert "NOPASSWD:" in text
     assert "/bin/bash" not in text
     assert "/usr/bin/screen" not in text
     assert "/usr/bin/kill" not in text
     assert "/usr/bin/python" not in text
     assert "/usr/local/python3/bin/python3.8" not in text
+    assert "/usr/sbin/nginx" not in text
 
 
 def test_install_doc_requires_root_owned_helper_and_visudo_validation():
@@ -31,4 +33,5 @@ def test_install_doc_requires_root_owned_helper_and_visudo_validation():
     assert "visudo -cf /etc/sudoers.d/klonet-agent-op" in text
     assert "Agent 侧默认仍然 dry-run" in text
     assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" in text
-    assert "不要直接放行 screen、kill、bash、python" in text
+    assert "不要直接放行 screen、kill、bash、python、nginx" in text
+    assert "reload-nginx --dry-run" in text

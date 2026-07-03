@@ -127,6 +127,72 @@ def test_stop_platform_screens_helper_dry_run_outputs_command_contract():
     assert "environment_changed=false" in result.stdout
 
 
+def test_reload_nginx_helper_dry_run_outputs_command_contract():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "reload-nginx",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "klonet_agent_op" in result.stdout
+    assert "action=reload-nginx" in result.stdout
+    assert "dry_run=true" in result.stdout
+    assert "test_command=nginx -t" in result.stdout
+    assert "reload_command=nginx -s reload" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
+def test_reload_nginx_helper_execute_tests_config_before_reload(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+
+    code = helper.main(["reload-nginx", "--execute"])
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [["nginx", "-t"], ["nginx", "-s", "reload"]]
+    assert "action=reload-nginx" in captured.out
+    assert "dry_run=false" in captured.out
+    assert "nginx_test=ok" in captured.out
+    assert "nginx_reload=ok" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_reload_nginx_helper_execute_stops_when_config_test_fails(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    def fail_test(command):
+        commands.append(command)
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output="",
+            stderr="nginx: configuration file /etc/nginx/nginx.conf test failed",
+        )
+
+    monkeypatch.setattr(helper, "run_checked", fail_test)
+
+    code = helper.main(["reload-nginx", "--execute"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert commands == [["nginx", "-t"]]
+    assert "nginx_test_failed returncode=1" in captured.err
+    assert "test failed" in captured.err
+    assert "environment_changed=false" in captured.err
+
+
 def test_restart_screen_component_helper_rejects_unknown_component():
     result = subprocess.run(
         [

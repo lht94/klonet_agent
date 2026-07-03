@@ -29,6 +29,7 @@ PREPARE_PROJECT_FILES = "prepare_project_files"
 EXTRACT_ARCHIVE = "extract_archive"
 RUN_INSTALL_SCRIPT = "run_install_script"
 WRITE_OPS_FILE = "write_ops_file"
+RELOAD_NGINX = "reload_nginx"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -133,6 +134,8 @@ class ControlledRecipeRunner:
             return self._run_install_script(step)
         if step.recipe_id == WRITE_OPS_FILE:
             return self._write_ops_file(step)
+        if step.recipe_id == RELOAD_NGINX:
+            return self._reload_nginx()
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
@@ -546,6 +549,36 @@ class ControlledRecipeRunner:
         parts.append("environment_changed=true")
         return RecipeExecutionResult("completed", " ".join(parts))
 
+    def _reload_nginx(self) -> RecipeExecutionResult:
+        command = [
+            self.helper_path,
+            "reload-nginx",
+            "--dry-run" if self.dry_run else "--execute",
+        ]
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={RELOAD_NGINX} "
+                    f"command_preview={_format_command(command)} "
+                    "environment unchanged"
+                ),
+            )
+        try:
+            output = self.command_runner(command)
+        except subprocess.CalledProcessError as exc:
+            return _nginx_helper_failure_result(exc)
+        return RecipeExecutionResult(
+            "completed",
+            (
+                "dry_run=false "
+                f"recipe_id={RELOAD_NGINX} "
+                f"command={_format_command(command)} "
+                f"helper_output={_one_line(output)}"
+            ),
+        )
+
     def _helper_result(self, recipe_id: str, command: list) -> RecipeExecutionResult:
         if not self.dry_run:
             try:
@@ -745,6 +778,21 @@ def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
             f"helper_environment_unknown {output}",
             "inspect_runtime",
         )
+    return RecipeExecutionResult("failed", output)
+
+
+def _nginx_helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
+    stderr = _one_line(exc.stderr)
+    stdout = _one_line(exc.output)
+    output = (
+        f"nginx_helper_failed returncode={exc.returncode} "
+        f"stderr={stderr} "
+        f"stdout={stdout}"
+    )
+    if "nginx_test_failed" in stderr or "environment_changed=false" in stderr:
+        return RecipeExecutionResult("blocked", output)
+    if "environment_changed=unknown" in stderr:
+        return RecipeExecutionResult("blocked", output, "inspect_runtime")
     return RecipeExecutionResult("failed", output)
 
 

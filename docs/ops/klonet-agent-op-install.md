@@ -25,13 +25,14 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 
 ## 安全边界
 
-不要直接放行 screen、kill、bash、python。sudoers 只允许：
+不要直接放行 screen、kill、bash、python、nginx。sudoers 只允许：
 
 ```text
 /usr/local/bin/klonet-agent-op restart-screen-component --execute *
 /usr/local/bin/klonet-agent-op stop-screen-component --execute *
 /usr/local/bin/klonet-agent-op stop-platform-screens --execute *
 /usr/local/bin/klonet-agent-op start-platform-screens --execute *
+/usr/local/bin/klonet-agent-op reload-nginx --execute *
 ```
 
 原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护、启动命令模板都在 helper 内完成。放行底层命令会绕过这些校验。
@@ -124,6 +125,23 @@ dry_run=true
 environment_changed=false
 ```
 
+Nginx 配置校验与 reload 的 dry-run 验证：
+
+```bash
+/usr/local/bin/klonet-agent-op reload-nginx --dry-run
+```
+
+输出中应包含：
+
+```text
+klonet_agent_op
+action=reload-nginx
+test_command=nginx -t
+reload_command=nginx -s reload
+dry_run=true
+environment_changed=false
+```
+
 真实执行前，Ops Agent 还必须先通过只读工具确认目标平台、screen、进程和项目路径归属，不能只凭用户文字或历史记忆执行。
 
 ## 部署前置检查
@@ -148,5 +166,7 @@ worker_main.py
 `start-platform-screens --execute` 和 `restart-screen-component --execute` 都会在 helper 层再次检查这些启动文件是否存在；如果缺失，会返回 `missing_project_entry_files=...` 并拒绝创建或重启 screen。这是为了防止绕过 Agent 侧 `precheck` 时误启动到错误目录。
 
 真实执行 `start-platform-screens --execute` 前，helper 还会读取项目根目录下的 `vemu_config/config.py`，提取 `master_port`、`worker_port`、`public_port`、`web_terminal_port` 等平台端口；如果读不到可识别端口，会返回 `missing_config_ports=vemu_config/config.py` 并拒绝启动。读取到端口后，helper 会通过只读 `ss -ltn` 检查是否已经被监听；如果冲突，会返回 `port_already_listening=...` 并拒绝创建新平台 screen。
+
+真实执行 `reload-nginx --execute` 时，helper 会先执行 `nginx -t`；只有配置测试成功才继续执行 `nginx -s reload`。如果配置测试失败，会返回 `nginx_test_failed` 和 `environment_changed=false`，计划执行层会阻断该步骤，但不会要求重新确认运行态是否未知。
 
 如果真实执行阶段的底层命令失败，helper 会返回非零退出码并输出 `error=command_failed`、`failed_command=...` 和 `environment_changed=unknown`。这表示命令可能已经执行到中途；计划执行层会把该步骤标记为 `blocked` 而不是 `failed`，并要求先重新读取运行态环境后再决定是否继续计划。

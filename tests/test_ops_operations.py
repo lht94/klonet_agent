@@ -1444,6 +1444,146 @@ def test_write_ops_file_recipe_blocks_sensitive_paths():
     assert not target.exists()
 
 
+def test_reload_nginx_recipe_dry_run_generates_fixed_preview():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="validate and reload nginx",
+            recipe_bindings={
+                "start-services": {
+                    "recipe_id": "reload_nginx",
+                    "args": {},
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "start-services")
+        step.status = "approved"
+        _complete_steps_before(plan, "start-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-services")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=reload_nginx" in result
+    assert "command_preview=/usr/local/bin/klonet-agent-op reload-nginx --dry-run" in result
+    assert "environment unchanged" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["start-services"] == "completed"
+
+
+def test_reload_nginx_recipe_execute_tests_config_before_reload():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return "nginx_test=ok nginx_reload=ok environment_changed=true"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="reload nginx",
+            recipe_bindings={
+                "start-services": {
+                    "recipe_id": "reload_nginx",
+                    "args": {},
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "start-services")
+        step.status = "approved"
+        _complete_steps_before(plan, "start-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-services")
+
+    assert calls == [["/usr/local/bin/klonet-agent-op", "reload-nginx", "--execute"]]
+    assert "result_status=completed" in result
+    assert "dry_run=false" in result
+    assert "recipe_id=reload_nginx" in result
+    assert "nginx_test=ok" in result
+    assert "nginx_reload=ok" in result
+    assert "environment_changed=true" in result
+
+
+def test_reload_nginx_recipe_blocks_when_config_test_fails_without_reload():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output="",
+            stderr="nginx_test_failed returncode=1 stderr=nginx: configuration file /etc/nginx/nginx.conf test failed environment_changed=false",
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="reload nginx",
+            recipe_bindings={
+                "start-services": {
+                    "recipe_id": "reload_nginx",
+                    "args": {},
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "start-services")
+        step.status = "approved"
+        _complete_steps_before(plan, "start-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-services")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert calls == [["/usr/local/bin/klonet-agent-op", "reload-nginx", "--execute"]]
+    assert "result_status=blocked" in result
+    assert "nginx_test_failed returncode=1" in result
+    assert "test failed" in result
+    assert "environment_changed=false" in result
+    assert loaded.status == "approved"
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
