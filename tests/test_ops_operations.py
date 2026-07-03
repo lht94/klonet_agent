@@ -529,6 +529,33 @@ def test_store_next_step_stops_at_blocked_step_until_resolved():
     assert _status_by_step(loaded)["restart-master"] == "blocked"
 
 
+def test_store_does_not_approve_blocked_step_without_resolution_evidence():
+    import pytest
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        blocked_step = next(item for item in plan.steps if item.step_id == "restart-master")
+        blocked_step.status = "blocked"
+        store.save_plan(plan)
+
+        with pytest.raises(ValueError, match="resolve_ops_blocked_step"):
+            store.approve_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert _status_by_step(loaded)["restart-master"] == "blocked"
+
+
 def test_store_resolves_blocked_step_after_runtime_reinspection():
     from klonet_agent.ops.operations import OperationPlanStore, render_plan
     from tests.helpers import local_temp_dir

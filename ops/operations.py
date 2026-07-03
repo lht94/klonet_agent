@@ -123,6 +123,12 @@ class OperationPlanStore:
         if plan.status != "approved":
             raise ValueError("plan must be approved before approving a step")
         step = _find_step(plan, step_id)
+        if step.status == "blocked":
+            raise ValueError(
+                "blocked step must be resolved with resolve_ops_blocked_step before confirm-step"
+            )
+        if step.status == "failed":
+            raise ValueError("failed step cannot be approved; create a new plan or recover manually")
         step.status = "approved"
         self.save_plan(plan)
         return plan
