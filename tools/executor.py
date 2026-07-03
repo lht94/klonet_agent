@@ -181,7 +181,10 @@ class ToolExecutor:
             return render_plan(plan)
 
         if tool_name == "list_ops_operation_plans":
-            plans = self._operation_plan_store().list_plans(tool_args.get("limit", 10))
+            plans = self._operation_plan_store().list_plans(
+                tool_args.get("limit", 10),
+                tool_args.get("status", ""),
+            )
             return render_plan_list(plans)
 
         if tool_name == "describe_ops_operation_plan":

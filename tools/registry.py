@@ -367,6 +367,11 @@ TOOLS = [
                 "type": "integer",
                 "description": "Maximum number of plans to return, default 10 and capped at 50.",
             },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "approved", "aborted", "completed", "failed"],
+                "description": "Optional plan status filter.",
+            },
         },
         [],
     ),

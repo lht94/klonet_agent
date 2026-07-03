@@ -112,7 +112,7 @@ class OperationPlanStore:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return _plan_from_mapping(raw)
 
-    def list_plans(self, limit: int = 10) -> List[OperationPlan]:
+    def list_plans(self, limit: int = 10, status: str = "") -> List[OperationPlan]:
         plans = []
         for path in self.root.glob("*.json"):
             try:
@@ -120,6 +120,9 @@ class OperationPlanStore:
                 plans.append(_plan_from_mapping(raw))
             except (OSError, ValueError, json.JSONDecodeError, TypeError):
                 continue
+        status_filter = str(status or "").strip()
+        if status_filter in VALID_PLAN_STATUS:
+            plans = [plan for plan in plans if plan.status == status_filter]
         plans.sort(key=lambda item: item.created_at, reverse=True)
         bounded_limit = max(1, min(int(limit or 10), 50))
         return plans[:bounded_limit]

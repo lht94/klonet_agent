@@ -1455,6 +1455,54 @@ def test_executor_list_ops_operation_plans_returns_recent_plan_summaries():
     assert "next_step=precheck" in result
 
 
+def test_executor_list_ops_operation_plans_filters_by_status():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "list_ops_operation_plans",
+            },
+            memory_store=store,
+        )
+        pending = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+            },
+        )
+        approved = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "deploy_platform",
+                "target": "103",
+                "objective": "deploy platform 103",
+            },
+        )
+        pending_id = _extract_plan_id(pending)
+        approved_id = _extract_plan_id(approved)
+        plan_store = executor._operation_plan_store()
+        approved_plan = plan_store.load_plan(approved_id)
+        approved_plan.status = "approved"
+        plan_store.save_plan(approved_plan)
+
+        result = executor.run("list_ops_operation_plans", {"status": "approved", "limit": 5})
+
+    assert f"plan_id={approved_id}" in result
+    assert "status=approved" in result
+    assert f"plan_id={pending_id}" not in result
+    assert "status=pending" not in result
+
+
 def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
