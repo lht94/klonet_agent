@@ -168,6 +168,22 @@ TOOLS = [
         ["platform", "server_name", "master_port", "public_port", "terminal_port", "frontend_alias", "frontend_path"],
     ),
     _tool(
+        "inspect_nginx_routes",
+        "只读解析 Nginx 配置文件中的 listen、server_name、location、proxy_pass 和 alias，并返回 source_path。用于新平台部署前判断 public_port、frontend alias、反代后端端口是否与已有平台冲突；不执行 nginx -T、不 reload、不修改环境。",
+        {
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "要解析的 nginx 配置文件路径列表，例如 /etc/nginx/sites-available/default；省略时尝试默认路径。",
+            },
+            "max_files": {
+                "type": "integer",
+                "description": "最多解析多少个配置文件，默认 20。",
+            },
+        },
+        [],
+    ),
+    _tool(
         "inspect_ops_context",
         "只读收集 Ops 全量环境上下文：baseline 适合半永久记录，runtime 需要按次刷新，assets 只扫描允许目录中的源码/Compose/Dockerfile/部署配置文件名。",
         {

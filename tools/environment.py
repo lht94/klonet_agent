@@ -421,6 +421,40 @@ def read_ops_file(args: Optional[dict] = None) -> str:
     )
 
 
+def inspect_nginx_routes(args: Optional[dict] = None) -> str:
+    """Parse safe nginx config files into route evidence."""
+
+    args = args or {}
+    raw_paths = args.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raw_paths = ["/etc/nginx/sites-available/default"]
+    max_files = _safe_int(args.get("max_files"), 20)
+    results = []
+    for raw_path in raw_paths[:max_files]:
+        path = Path(str(raw_path or "").strip()).expanduser()
+        if _is_sensitive_path(path):
+            results.append(ProbeResult("nginx_routes", STATUS_UNCHECKED, f"refused_sensitive_path={path.name}"))
+            continue
+        if not _is_safe_ops_file_path(path):
+            results.append(ProbeResult("nginx_routes", STATUS_UNCHECKED, f"refused_unsupported_path={path.name}"))
+            continue
+        if not path.exists() or not path.is_file():
+            results.append(ProbeResult("nginx_routes", STATUS_UNCHECKED, f"source_path={path} file does not exist or is not a file"))
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            results.append(ProbeResult("nginx_routes", STATUS_UNCHECKED, f"source_path={path} {exc}"))
+            continue
+        resolved_path = path.resolve()
+        routes = _parse_nginx_routes(text, str(resolved_path))
+        if routes:
+            results.extend(routes)
+        else:
+            results.append(ProbeResult("nginx_routes", STATUS_MISSING, f"source_path={resolved_path} no routes found"))
+    return _render_tool_result("inspect_nginx_routes", results)
+
+
 def inspect_screen_session(args: Optional[dict] = None) -> str:
     """Capture a read-only snapshot of a detached screen session scrollback."""
 
@@ -1002,6 +1036,83 @@ def _render_frontend_config_js(*, server_name: str, public_port: int, terminal_p
             f"var web_terminal_port = {terminal_port};",
         ]
     )
+
+
+def _parse_nginx_routes(text: str, source_path: str) -> list:
+    clean = _strip_nginx_comments(text)
+    results = []
+    for block in _extract_named_blocks(clean, "server"):
+        listens = _nginx_values(block, "listen") or ["unchecked"]
+        server_names = _nginx_values(block, "server_name") or ["unchecked"]
+        for location, location_body in _extract_location_blocks(block):
+            proxy_passes = _nginx_values(location_body, "proxy_pass") or ["unchecked"]
+            aliases = _nginx_values(location_body, "alias") or ["unchecked"]
+            detail = (
+                f"source_path={source_path} "
+                f"listen={','.join(listens)} "
+                f"server_name={','.join(server_names)} "
+                f"location={location} "
+                f"proxy_pass={','.join(proxy_passes)} "
+                f"alias={','.join(aliases)}"
+            )
+            results.append(ProbeResult("nginx_route", STATUS_DETECTED, redact_sensitive_text(detail)))
+    return results
+
+
+def _strip_nginx_comments(text: str) -> str:
+    lines = []
+    for line in str(text or "").splitlines():
+        head = line.split("#", 1)[0].strip()
+        if head:
+            lines.append(head)
+    return "\n".join(lines)
+
+
+def _extract_named_blocks(text: str, name: str) -> list:
+    blocks = []
+    pattern = re.compile(rf"\b{re.escape(name)}\s*\{{")
+    for match in pattern.finditer(text or ""):
+        open_brace = match.end() - 1
+        end = _matching_brace(text, open_brace)
+        if end > open_brace:
+            blocks.append(text[open_brace + 1 : end])
+    return blocks
+
+
+def _extract_location_blocks(server_block: str) -> list:
+    locations = []
+    pattern = re.compile(r"\blocation\s+([^\s{]+)\s*\{")
+    for match in pattern.finditer(server_block or ""):
+        location = match.group(1).strip()
+        open_brace = match.end() - 1
+        end = _matching_brace(server_block, open_brace)
+        if end > open_brace:
+            locations.append((location, server_block[open_brace + 1 : end]))
+    return locations
+
+
+def _matching_brace(text: str, open_brace: int) -> int:
+    depth = 0
+    for index in range(open_brace, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _nginx_values(block: str, directive: str) -> list:
+    values = []
+    for match in re.finditer(rf"\b{re.escape(directive)}\s+([^;]+);", block or ""):
+        value = " ".join(match.group(1).split())
+        if directive == "listen":
+            value = value.split()[0]
+        if value and value not in values:
+            values.append(value)
+    return values
 
 
 def _ops_probe_many(checks: Sequence[str]):

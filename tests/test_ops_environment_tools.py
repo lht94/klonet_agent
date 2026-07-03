@@ -78,6 +78,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "read_ops_file" in tool_names
     assert "read_klonet_logs" in tool_names
     assert "inspect_screen_session" in tool_names
+    assert "inspect_nginx_routes" in tool_names
     assert "search_shared_ops_memory" in tool_names
 
 
@@ -106,6 +107,7 @@ def test_ops_profile_allows_screen_inspection():
     assert "inspect_platform_instances" in profile.allowed_tools
     assert "inspect_ops_context" in profile.allowed_tools
     assert "inspect_process_detail" in profile.allowed_tools
+    assert "inspect_nginx_routes" in profile.allowed_tools
     assert "read_ops_file" in profile.allowed_tools
 
 
@@ -185,6 +187,76 @@ def test_executor_dispatches_render_klonet_config_tool():
     assert "render_klonet_config" in result
     assert "listen 12002;" in result
     assert "proxy_pass http://127.0.0.1:12000;" in result
+
+
+def test_inspect_nginx_routes_extracts_routes_from_config_file():
+    from klonet_agent.tools.environment import inspect_nginx_routes
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        conf = temp_dir / "default.conf"
+        conf.write_text(
+            """
+server {
+    listen 20222;
+    server_name 192.168.1.33;
+
+    location /file/dload/ {
+        proxy_pass http://127.0.0.1:20220/file/dload/;
+    }
+
+    location /VEMU2-103/ {
+        alias /home/adminis/lht/103_project/vemu_frontend/VEMU2/;
+    }
+}
+""",
+            encoding="utf-8",
+        )
+
+        result = inspect_nginx_routes({"paths": [str(conf)]})
+
+    assert "inspect_nginx_routes" in result
+    assert f"source_path={conf}" in result
+    assert "listen=20222" in result
+    assert "server_name=192.168.1.33" in result
+    assert "location=/file/dload/" in result
+    assert "proxy_pass=http://127.0.0.1:20220/file/dload/" in result
+    assert "location=/VEMU2-103/" in result
+    assert "alias=/home/adminis/lht/103_project/vemu_frontend/VEMU2/" in result
+
+
+def test_inspect_nginx_routes_rejects_sensitive_or_unsupported_paths():
+    from klonet_agent.tools.environment import inspect_nginx_routes
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        env_file = temp_dir / ".env"
+        env_file.write_text("SECRET=1\n", encoding="utf-8")
+
+        result = inspect_nginx_routes({"paths": [str(env_file)]})
+
+    assert "inspect_nginx_routes" in result
+    assert "refused_sensitive_path=.env" in result
+
+
+def test_executor_dispatches_inspect_nginx_routes_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        conf = temp_dir / "nginx.conf"
+        conf.write_text(
+            "server { listen 12002; server_name localhost; location / { proxy_pass http://127.0.0.1:12000; } }",
+            encoding="utf-8",
+        )
+        result = ToolExecutor(allowed_tools={"inspect_nginx_routes"}).run(
+            "inspect_nginx_routes",
+            {"paths": [str(conf)]},
+        )
+
+    assert "inspect_nginx_routes" in result
+    assert "listen=12002" in result
+    assert "proxy_pass=http://127.0.0.1:12000" in result
 
 
 def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):
