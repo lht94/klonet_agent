@@ -506,9 +506,8 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
                 pass
             try:
                 prepare_step = _find_step(plan, "prepare-files")
-                prepare_step.recipe_id = "manual_checkpoint"
+                prepare_step.recipe_id = "prepare_project_files"
                 prepare_step.recipe_args = {
-                    "reason": "project files and config prepared externally",
                     "project_root": _one_line(project_root, 300),
                 }
             except ValueError:

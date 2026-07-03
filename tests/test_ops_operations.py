@@ -211,7 +211,7 @@ def test_deploy_operation_plan_default_binds_start_platform_recipe_when_project_
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
 
-def test_deploy_operation_plan_default_binds_prepare_files_manual_checkpoint():
+def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
     from klonet_agent.ops.operations import OperationPlanStore, render_plan
     from tests.helpers import local_temp_dir
 
@@ -231,13 +231,12 @@ def test_deploy_operation_plan_default_binds_prepare_files_manual_checkpoint():
     step = next(item for item in loaded.steps if item.step_id == "prepare-files")
     assert step.status == "pending"
     assert step.requires_step_confirmation is True
-    assert step.recipe_id == "manual_checkpoint"
+    assert step.recipe_id == "prepare_project_files"
     assert step.recipe_args == {
-        "reason": "project files and config prepared externally",
         "project_root": "/home/adminis/lht/103_project/vemu_uestc",
     }
     assert "prepare-files" in rendered
-    assert "recipe=manual_checkpoint" in rendered
+    assert "recipe=prepare_project_files" in rendered
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
 
@@ -257,6 +256,15 @@ def test_manual_checkpoint_recipe_completes_confirmed_step_without_environment_c
             objective="deploy platform 103",
             operation_args={
                 "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "manual_checkpoint",
+                    "args": {
+                        "reason": "project files and config prepared externally",
+                        "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+                    },
+                }
             },
         )
         plan.status = "approved"
@@ -904,6 +912,134 @@ def test_deploy_precheck_blocks_when_required_project_entry_files_are_missing():
     statuses = _status_by_step(loaded)
     assert statuses["precheck"] == "blocked"
     assert statuses["prepare-files"] == "pending"
+
+
+def test_deploy_precheck_accepts_entry_files_in_mains_before_prepare_step():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        for filename in required_files:
+            (mains / filename).write_text("# entry\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="precheck deploy 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "precheck")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "recipe_id=validate_project_files" in result
+    assert "found_files=mains/gun.py,mains/master_main.py,mains/celery_worker.py,mains/web_terminal_main.py,mains/worker_gun.py,mains/worker_main.py" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["precheck"] == "completed"
+    assert statuses["prepare-files"] == "pending"
+
+
+def test_prepare_project_files_recipe_dry_run_previews_mains_copy_without_writing():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        (mains / "gun.py").write_text("# gun\n", encoding="utf-8")
+        (mains / "master_main.py").write_text("# master\n", encoding="utf-8")
+        (mains / "celery_worker.py").write_text("# celery\n", encoding="utf-8")
+        (mains / "web_terminal_main.py").write_text("# web\n", encoding="utf-8")
+        (mains / "worker_gun.py").write_text("# worker gun\n", encoding="utf-8")
+        (mains / "worker_main.py").write_text("# worker\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="prepare deploy 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=completed" in result
+    assert "dry_run=true" in result
+    assert "recipe_id=prepare_project_files" in result
+    assert "copy_preview=mains/gun.py->gun.py" in result
+    assert not (project_root / "gun.py").exists()
+
+
+def test_prepare_project_files_recipe_execute_copies_mains_entries():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        for filename in required_files:
+            (mains / filename).write_text(f"# {filename}\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="prepare deploy 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+        copied = {filename: (project_root / filename).read_text(encoding="utf-8") for filename in required_files}
+
+    assert "result_status=completed" in result
+    assert "dry_run=false" in result
+    assert "recipe_id=prepare_project_files" in result
+    assert copied["master_main.py"] == "# master_main.py\n"
 
 
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():

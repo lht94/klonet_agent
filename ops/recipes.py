@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,7 @@ STOP_SCREEN_COMPONENT = "stop_screen_component"
 STOP_PLATFORM_SCREENS = "stop_platform_screens"
 START_PLATFORM_SCREENS = "start_platform_screens"
 VALIDATE_PROJECT_FILES = "validate_project_files"
+PREPARE_PROJECT_FILES = "prepare_project_files"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 REQUIRED_PROJECT_ENTRY_FILES = (
     "gun.py",
@@ -60,6 +62,8 @@ class ControlledRecipeRunner:
             return self._start_platform_screens(plan, step)
         if step.recipe_id == VALIDATE_PROJECT_FILES:
             return self._validate_project_files(step)
+        if step.recipe_id == PREPARE_PROJECT_FILES:
+            return self._prepare_project_files(step)
         return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
@@ -205,11 +209,8 @@ class ControlledRecipeRunner:
                 f"recipe_id={VALIDATE_PROJECT_FILES} invalid_project_root={project_root or 'missing'}; environment unchanged",
             )
         root = Path(project_root)
-        missing = [
-            filename
-            for filename in REQUIRED_PROJECT_ENTRY_FILES
-            if not (root / filename).is_file()
-        ]
+        found = _project_entry_file_sources(root)
+        missing = [filename for filename in REQUIRED_PROJECT_ENTRY_FILES if filename not in found]
         if missing:
             return RecipeExecutionResult(
                 "blocked",
@@ -225,8 +226,69 @@ class ControlledRecipeRunner:
             (
                 f"recipe_id={VALIDATE_PROJECT_FILES} "
                 f"project_root={_one_line(project_root)} "
-                f"found_files={','.join(REQUIRED_PROJECT_ENTRY_FILES)} "
+                f"found_files={','.join(found[filename] for filename in REQUIRED_PROJECT_ENTRY_FILES)} "
                 "environment unchanged"
+            ),
+        )
+
+    def _prepare_project_files(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        project_root = str(args.get("project_root") or "").strip()
+        if not project_root or _looks_unsafe_path(project_root):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={PREPARE_PROJECT_FILES} invalid_project_root={project_root or 'missing'}; environment unchanged",
+            )
+        root = Path(project_root)
+        mains = root / "mains"
+        missing_sources = [
+            filename
+            for filename in REQUIRED_PROJECT_ENTRY_FILES
+            if not (mains / filename).is_file()
+        ]
+        if missing_sources:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={PREPARE_PROJECT_FILES} "
+                    f"project_root={_one_line(project_root)} "
+                    f"missing_sources={','.join('mains/' + filename for filename in missing_sources)} "
+                    "environment unchanged"
+                ),
+            )
+        previews = [f"mains/{filename}->{filename}" for filename in REQUIRED_PROJECT_ENTRY_FILES]
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={PREPARE_PROJECT_FILES} "
+                    f"project_root={_one_line(project_root)} "
+                    f"copy_preview={','.join(previews)} "
+                    "environment unchanged"
+                ),
+            )
+        try:
+            for filename in REQUIRED_PROJECT_ENTRY_FILES:
+                shutil.copy2(mains / filename, root / filename)
+        except OSError as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={PREPARE_PROJECT_FILES} "
+                    f"copy_failed={_one_line(str(exc))} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        return RecipeExecutionResult(
+            "completed",
+            (
+                "dry_run=false "
+                f"recipe_id={PREPARE_PROJECT_FILES} "
+                f"project_root={_one_line(project_root)} "
+                f"copied_files={','.join(REQUIRED_PROJECT_ENTRY_FILES)} "
+                "environment_changed=true"
             ),
         )
 
@@ -287,6 +349,16 @@ def _validate_start_platform_args(platform: str, project_root: str) -> str:
 
 def _safe_token(value: str) -> bool:
     return bool(value and _SAFE_NAME.match(value))
+
+
+def _project_entry_file_sources(root: Path) -> dict:
+    found = {}
+    for filename in REQUIRED_PROJECT_ENTRY_FILES:
+        if (root / filename).is_file():
+            found[filename] = filename
+        elif (root / "mains" / filename).is_file():
+            found[filename] = f"mains/{filename}"
+    return found
 
 
 def _looks_unsafe_path(value: str) -> bool:
