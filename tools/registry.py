@@ -360,6 +360,14 @@ TOOLS = [
         ["operation", "target"],
     ),
     _tool(
+        "describe_ops_operation_plan",
+        "Read and render the current state of an existing Ops OperationPlan. This is read-only and never approves or executes steps.",
+        {
+            "plan_id": {"type": "string", "description": "Existing Ops operation plan id."},
+        },
+        ["plan_id"],
+    ),
+    _tool(
         "approve_ops_operation_plan",
         "记录用户对 Ops 操作计划或单个特权步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>，模型不能自行授权。",
         {

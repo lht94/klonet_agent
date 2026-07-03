@@ -179,6 +179,10 @@ class ToolExecutor:
             )
             return render_plan(plan)
 
+        if tool_name == "describe_ops_operation_plan":
+            plan = self._operation_plan_store().load_plan(tool_args["plan_id"])
+            return render_plan(plan)
+
         if tool_name == "approve_ops_operation_plan":
             return self._approve_ops_operation_plan(tool_args)
 

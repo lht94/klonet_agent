@@ -20,11 +20,13 @@ def test_ops_operation_tools_are_registered_and_profile_allowed():
     profile = get_profile("ops")
 
     assert "create_ops_operation_plan" in tool_names
+    assert "describe_ops_operation_plan" in tool_names
     assert "approve_ops_operation_plan" in tool_names
     assert "execute_ops_operation_step" in tool_names
     assert "execute_ops_next_step" in tool_names
     assert "resolve_ops_blocked_step" in tool_names
     assert "create_ops_operation_plan" in profile.allowed_tools
+    assert "describe_ops_operation_plan" in profile.allowed_tools
     assert "approve_ops_operation_plan" in profile.allowed_tools
     assert "execute_ops_operation_step" in profile.allowed_tools
     assert "execute_ops_next_step" in profile.allowed_tools
@@ -55,6 +57,7 @@ def test_mentor_profile_cannot_create_or_approve_operation_plans():
     profile = get_profile("mentor")
 
     assert "create_ops_operation_plan" not in profile.allowed_tools
+    assert "describe_ops_operation_plan" not in profile.allowed_tools
     assert "approve_ops_operation_plan" not in profile.allowed_tools
     assert "execute_ops_operation_step" not in profile.allowed_tools
     assert "resolve_ops_blocked_step" not in profile.allowed_tools
@@ -1362,6 +1365,42 @@ def test_executor_resolve_ops_blocked_step_resets_step_to_pending():
     assert "restart-master" in result
     assert _status_by_step(loaded)["restart-master"] == "pending"
     assert "inspect_runtime confirmed screen and port state refreshed" in loaded.evidence
+
+
+def test_executor_describe_ops_operation_plan_returns_current_state():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "describe_ops_operation_plan",
+            },
+            memory_store=store,
+        )
+        created = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+                "operation_args": {"project_root": "/home/adminis/lht/102_project"},
+            },
+        )
+        plan_id = _extract_plan_id(created)
+
+        result = executor.run("describe_ops_operation_plan", {"plan_id": plan_id})
+
+    assert result.startswith("ops_operation_plan")
+    assert f"plan_id={plan_id}" in result
+    assert "operation=restart_platform" in result
+    assert "next_step=precheck-runtime" in result
 
 
 def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
