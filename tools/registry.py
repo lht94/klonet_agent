@@ -360,6 +360,17 @@ TOOLS = [
         ["operation", "target"],
     ),
     _tool(
+        "list_ops_operation_plans",
+        "List recent Ops OperationPlans with status and next_step summaries. This is read-only and never approves or executes steps.",
+        {
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of plans to return, default 10 and capped at 50.",
+            },
+        },
+        [],
+    ),
+    _tool(
         "describe_ops_operation_plan",
         "Read and render the current state of an existing Ops OperationPlan. This is read-only and never approves or executes steps.",
         {

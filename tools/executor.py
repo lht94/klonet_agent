@@ -17,6 +17,7 @@ from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.ops.operations import (
     OperationPlanStore,
     render_plan,
+    render_plan_list,
     render_step_resolution,
 )
 from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -178,6 +179,10 @@ class ToolExecutor:
                 ],
             )
             return render_plan(plan)
+
+        if tool_name == "list_ops_operation_plans":
+            plans = self._operation_plan_store().list_plans(tool_args.get("limit", 10))
+            return render_plan_list(plans)
 
         if tool_name == "describe_ops_operation_plan":
             plan = self._operation_plan_store().load_plan(tool_args["plan_id"])

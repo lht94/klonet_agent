@@ -20,12 +20,14 @@ def test_ops_operation_tools_are_registered_and_profile_allowed():
     profile = get_profile("ops")
 
     assert "create_ops_operation_plan" in tool_names
+    assert "list_ops_operation_plans" in tool_names
     assert "describe_ops_operation_plan" in tool_names
     assert "approve_ops_operation_plan" in tool_names
     assert "execute_ops_operation_step" in tool_names
     assert "execute_ops_next_step" in tool_names
     assert "resolve_ops_blocked_step" in tool_names
     assert "create_ops_operation_plan" in profile.allowed_tools
+    assert "list_ops_operation_plans" in profile.allowed_tools
     assert "describe_ops_operation_plan" in profile.allowed_tools
     assert "approve_ops_operation_plan" in profile.allowed_tools
     assert "execute_ops_operation_step" in profile.allowed_tools
@@ -57,6 +59,7 @@ def test_mentor_profile_cannot_create_or_approve_operation_plans():
     profile = get_profile("mentor")
 
     assert "create_ops_operation_plan" not in profile.allowed_tools
+    assert "list_ops_operation_plans" not in profile.allowed_tools
     assert "describe_ops_operation_plan" not in profile.allowed_tools
     assert "approve_ops_operation_plan" not in profile.allowed_tools
     assert "execute_ops_operation_step" not in profile.allowed_tools
@@ -1401,6 +1404,55 @@ def test_executor_describe_ops_operation_plan_returns_current_state():
     assert f"plan_id={plan_id}" in result
     assert "operation=restart_platform" in result
     assert "next_step=precheck-runtime" in result
+
+
+def test_executor_list_ops_operation_plans_returns_recent_plan_summaries():
+    from klonet_agent.memory.store import MemoryStore
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
+        executor = ToolExecutor(
+            session=session,
+            allowed_tools={
+                "create_ops_operation_plan",
+                "list_ops_operation_plans",
+            },
+            memory_store=store,
+        )
+        first = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "restart_platform",
+                "target": "102",
+                "objective": "restart platform 102",
+            },
+        )
+        second = executor.run(
+            "create_ops_operation_plan",
+            {
+                "operation": "deploy_platform",
+                "target": "103",
+                "objective": "deploy platform 103",
+            },
+        )
+        first_id = _extract_plan_id(first)
+        second_id = _extract_plan_id(second)
+
+        result = executor.run("list_ops_operation_plans", {"limit": 5})
+
+    assert result.startswith("ops_operation_plan_list")
+    assert f"plan_id={first_id}" in result
+    assert f"plan_id={second_id}" in result
+    assert "operation=restart_platform" in result
+    assert "operation=deploy_platform" in result
+    assert "target=102" in result
+    assert "target=103" in result
+    assert "next_step=precheck-runtime" in result
+    assert "next_step=precheck" in result
 
 
 def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():

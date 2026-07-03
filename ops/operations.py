@@ -112,6 +112,18 @@ class OperationPlanStore:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return _plan_from_mapping(raw)
 
+    def list_plans(self, limit: int = 10) -> List[OperationPlan]:
+        plans = []
+        for path in self.root.glob("*.json"):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                plans.append(_plan_from_mapping(raw))
+            except (OSError, ValueError, json.JSONDecodeError, TypeError):
+                continue
+        plans.sort(key=lambda item: item.created_at, reverse=True)
+        bounded_limit = max(1, min(int(limit or 10), 50))
+        return plans[:bounded_limit]
+
     def approve_plan(self, plan_id: str) -> OperationPlan:
         plan = self.load_plan(plan_id)
         plan.status = "approved"
@@ -310,6 +322,24 @@ def render_plan(plan: OperationPlan) -> str:
         "approve_step_command=confirm-step "
         f"{plan.plan_id} <step_id>"
     )
+    return "\n".join(lines)
+
+
+def render_plan_list(plans: List[OperationPlan]) -> str:
+    lines = [
+        "ops_operation_plan_list",
+        f"count={len(plans)}",
+    ]
+    for plan in plans:
+        lines.append(
+            "plan "
+            f"plan_id={plan.plan_id} "
+            f"operation={plan.operation} "
+            f"target={plan.target or 'unknown'} "
+            f"status={plan.status} "
+            f"next_step={_next_step_id(plan)} "
+            f"created_at={plan.created_at or 'unknown'}"
+        )
     return "\n".join(lines)
 
 

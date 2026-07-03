@@ -95,6 +95,7 @@ def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
 
     assert "execute_ops_next_step" in OPS_PROMPT
     assert "execute_ops_operation_step" in OPS_PROMPT
+    assert "list_ops_operation_plans" in OPS_PROMPT
     assert "describe_ops_operation_plan" in OPS_PROMPT
     assert "resolve_ops_blocked_step" in OPS_PROMPT
     assert "blocked" in OPS_PROMPT
