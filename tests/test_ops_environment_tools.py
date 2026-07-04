@@ -77,6 +77,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_process_detail" in tool_names
     assert "read_ops_file" in tool_names
     assert "read_klonet_logs" in tool_names
+    assert "inspect_archive" in tool_names
     assert "inspect_screen_session" in tool_names
     assert "inspect_nginx_routes" in tool_names
     assert "search_shared_ops_memory" in tool_names
@@ -346,6 +347,59 @@ def test_executor_dispatches_inspect_nginx_routes_tool():
     assert "inspect_nginx_routes" in result
     assert "listen=12002" in result
     assert "proxy_pass=http://127.0.0.1:12000" in result
+
+
+def test_archive_inspection_lists_members_without_extracting():
+    import zipfile
+
+    from klonet_agent.tools.environment import inspect_archive
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        archive = temp_dir / "vemu_install_new_gen.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("vemu_install_new_gen/base_requ_setup.sh", "echo setup")
+            handle.writestr("vemu_install_new_gen/docker_service.sh", "echo docker")
+
+        result = inspect_archive({"path": str(archive), "max_members": 10})
+
+    assert "inspect_archive" in result
+    assert "archive_type=zip" in result
+    assert "member_count=2" in result
+    assert "vemu_install_new_gen/base_requ_setup.sh" in result
+    assert "unsafe_members=none" in result
+    assert "environment unchanged" in result
+    assert not (temp_dir / "vemu_install_new_gen").exists()
+
+
+def test_archive_inspection_reports_path_traversal_members():
+    import zipfile
+
+    from klonet_agent.tools.environment import inspect_archive
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        archive = temp_dir / "bad.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("../escape.sh", "echo bad")
+
+        result = inspect_archive({"path": str(archive)})
+
+    assert "inspect_archive" in result
+    assert "unsafe_members=../escape.sh" in result
+    assert "environment unchanged" in result
+
+
+def test_executor_dispatches_archive_inspection_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_archive"}).run(
+        "inspect_archive",
+        {"path": "/tmp/missing.zip"},
+    )
+
+    assert "inspect_archive" in result
+    assert "archive_missing=/tmp/missing.zip" in result
 
 
 def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):
@@ -705,6 +759,44 @@ def test_system_environment_can_probe_system_python_without_reading_binaries(mon
     assert "/usr/bin/python3" in result
     assert "Python 3.8.10" in result
     assert any("/usr/bin/python3" in " ".join(call) for call in calls)
+
+
+def test_system_environment_can_probe_allowlisted_command_paths(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+    from klonet_agent.tools.registry import TOOLS
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="/usr/local/bin/gunicorn\ngunicorn (version 20.1.0)\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+
+    result = environment.inspect_system_environment(
+        {"checks": ["command_paths"], "commands": ["gunicorn", "celery", "bad;rm"]}
+    )
+    system_tool = next(
+        item
+        for item in TOOLS
+        if item["function"]["name"] == "inspect_system_environment"
+    )
+    checks = system_tool["function"]["parameters"]["properties"]["checks"]["items"]["enum"]
+
+    assert "command_paths" in checks
+    assert "command_paths: detected" in result
+    assert "gunicorn" in result
+    assert "celery" in result
+    assert "bad;rm" not in result
+    assert any("command -v gunicorn" in " ".join(call) for call in calls)
 
 
 def test_executor_dispatches_process_detail_tool():

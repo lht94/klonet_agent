@@ -7,7 +7,9 @@ import platform
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -105,6 +107,7 @@ _SAFE_SCREEN_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _SAFE_PLATFORM_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _SAFE_SERVER_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
 _SAFE_FRONTEND_ALIAS = re.compile(r"^/[A-Za-z0-9_./:-]{1,120}$")
+_SAFE_COMMAND_NAME = re.compile(r"^[A-Za-z0-9_.+-]{1,80}$")
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
@@ -150,6 +153,8 @@ def inspect_system_environment(args: Optional[dict] = None) -> str:
         results.append(ProbeResult("python", STATUS_DETECTED, platform.python_version()))
     if "system_python" in requested:
         results.append(run_read_only_probe("system_python"))
+    if "command_paths" in requested:
+        results.append(_inspect_command_paths(args or {}))
     if "disk" in requested:
         results.append(_disk_usage_probe())
     if "virtualization" in requested:
@@ -486,6 +491,46 @@ def inspect_nginx_routes(args: Optional[dict] = None) -> str:
     return _render_tool_result("inspect_nginx_routes", results)
 
 
+def inspect_archive(args: Optional[dict] = None) -> str:
+    """Inspect an archive without extracting it."""
+
+    args = args or {}
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return "Error: path is required"
+    path = Path(raw_path).expanduser()
+    if _is_sensitive_path(path):
+        return "\n".join(["inspect_archive", f"refused_sensitive_path={path.name}", "environment unchanged"])
+    if not path.exists() or not path.is_file():
+        return "\n".join(["inspect_archive", f"archive_missing={raw_path}", "environment unchanged"])
+    max_members = _safe_int(args.get("max_members"), 50)
+    try:
+        archive_type, members = _read_archive_members(path)
+    except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
+        return "\n".join(
+            [
+                "inspect_archive",
+                f"archive_unreadable={_single_line(str(exc), max_chars=300)}",
+                "environment unchanged",
+            ]
+        )
+    unsafe_members = _unsafe_archive_members(members)
+    preview = members[:max_members]
+    lines = [
+        "inspect_archive",
+        f"resolved_path={path.resolve()}",
+        f"archive_type={archive_type}",
+        f"member_count={len(members)}",
+        f"unsafe_members={','.join(unsafe_members[:20]) if unsafe_members else 'none'}",
+        "members:",
+    ]
+    lines.extend(f"  - {_single_line(member, max_chars=260)}" for member in preview)
+    if len(members) > len(preview):
+        lines.append(f"  - omitted={len(members) - len(preview)}")
+    lines.append("environment unchanged")
+    return "\n".join(lines)
+
+
 def inspect_screen_session(args: Optional[dict] = None) -> str:
     """Capture a read-only snapshot of a detached screen session scrollback."""
 
@@ -764,6 +809,75 @@ def run_read_only_probe(name: str) -> ProbeResult:
         return ProbeResult(normalized, STATUS_MISSING, "no output")
     max_chars = 1800 if normalized == "processes" else 600
     return ProbeResult(normalized, STATUS_DETECTED, _single_line(output, max_chars=max_chars))
+
+
+def _inspect_command_paths(args: dict) -> ProbeResult:
+    commands = []
+    for raw_command in args.get("commands", []):
+        command = str(raw_command or "").strip()
+        if command and _SAFE_COMMAND_NAME.match(command) and command not in commands:
+            commands.append(command)
+    if not commands:
+        return ProbeResult("command_paths", STATUS_UNCHECKED, "commands is required")
+    if os.name == "nt":
+        shell_lines = []
+        for command in commands[:20]:
+            shell_lines.append(f"Write-Output '## {command}'")
+            shell_lines.append(f"where.exe {command} 2>$null")
+            shell_lines.append(f"{command} --version 2>$null | Select-Object -First 2")
+        probe = ["powershell", "-NoProfile", "-Command", "; ".join(shell_lines)]
+    else:
+        shell_lines = []
+        for command in commands[:20]:
+            shell_lines.append(
+                "printf '## %s\\n' "
+                f"{command}; command -v {command} 2>/dev/null || true; "
+                f"{command} --version 2>&1 | head -2 || true"
+            )
+        probe = ["sh", "-c", "; ".join(shell_lines)]
+    if probe and shutil.which(probe[0]) is None:
+        return ProbeResult("command_paths", STATUS_UNCHECKED, f"{probe[0]} not found")
+    try:
+        result = subprocess.run(
+            probe,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return ProbeResult("command_paths", STATUS_UNCHECKED, "probe timed out")
+    except OSError as exc:
+        return ProbeResult("command_paths", STATUS_UNCHECKED, str(exc))
+    output = redact_sensitive_text((result.stdout or result.stderr or "").strip())
+    if result.returncode != 0:
+        return ProbeResult("command_paths", STATUS_UNCHECKED, output or f"exit {result.returncode}")
+    detail = f"accepted_commands={','.join(commands[:20])}"
+    if output:
+        detail = f"{detail} {_single_line(output, max_chars=1800)}"
+    return ProbeResult("command_paths", STATUS_DETECTED, detail)
+
+
+def _read_archive_members(path: Path) -> tuple:
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as handle:
+            members = [name for name in handle.namelist() if name and not name.endswith("/")]
+        return "zip", members
+    if tarfile.is_tarfile(path):
+        with tarfile.open(path) as handle:
+            members = [member.name for member in handle.getmembers() if member.name and member.isfile()]
+        return "tar", members
+    raise OSError(f"unsupported_archive={path.name}")
+
+
+def _unsafe_archive_members(members: list) -> list:
+    unsafe = []
+    for member in members:
+        member_path = Path(str(member))
+        if member_path.is_absolute() or ".." in member_path.parts:
+            unsafe.append(str(member))
+    return unsafe
 
 
 def _inspect_port_owners(args: dict) -> list:

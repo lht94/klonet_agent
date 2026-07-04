@@ -108,6 +108,7 @@ OPS_PROMPT = """
 21. 当运维任务需要生成新平台后端 config.py、web_terminal_main.py 端口提示、nginx 或前端 config.js 配置时，先使用 render_klonet_config 生成可审查草案，并结合当前端口、已有平台和现有配置确认无冲突；不得直接凭模型自由书写最终配置。草案确认后，写入仍必须走 write_ops_file，生效仍必须走 reload_nginx。
 22. 当运维任务涉及新增、修改或排查 Nginx 路由时，优先使用 inspect_nginx_routes 解析现有配置，确认 listen、server_name、location、proxy_pass、alias 和 source_path；不得只凭历史记忆或 workspace 副本判断当前服务器 Nginx 路由。
 23. 当已知现有前端 config.js 路径时，将其作为 frontend_config_path 传给 render_klonet_config，让草案沿用当前项目已有字段名，不要凭通用模板臆造前端字段。
+24. 当部署准备涉及 zip/tar 安装包时，先用 inspect_archive 只读查看包结构和 unsafe_members；真正解压必须进入 OperationPlan 并绑定 extract_archive recipe，不得输出任意 unzip/tar 命令。
 """
 
 

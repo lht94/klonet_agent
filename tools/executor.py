@@ -24,6 +24,7 @@ from klonet_agent.ops.recipes import ControlledRecipeRunner
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
+    inspect_archive,
     inspect_nginx_routes,
     inspect_platform_instances,
     inspect_process_detail,
@@ -147,6 +148,9 @@ class ToolExecutor:
 
         if tool_name == "inspect_nginx_routes":
             return inspect_nginx_routes(tool_args)
+
+        if tool_name == "inspect_archive":
+            return inspect_archive(tool_args)
 
         if tool_name == "inspect_platform_instances":
             return inspect_platform_instances(tool_args)

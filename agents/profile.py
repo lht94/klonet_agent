@@ -38,6 +38,7 @@ MENTOR_TOOLS = {
 
 ENVIRONMENT_TOOLS = {
     "render_klonet_config",
+    "inspect_archive",
     "inspect_nginx_routes",
     "inspect_ops_context",
     "inspect_platform_instances",

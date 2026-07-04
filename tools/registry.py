@@ -217,10 +217,15 @@ TOOLS = [
                 "type": "array",
                 "items": {
                     "type": "string",
-                    "enum": ["os", "python", "system_python", "disk", "virtualization"],
+                    "enum": ["os", "python", "system_python", "command_paths", "disk", "virtualization"],
                 },
                 "description": "可选检查项；默认检查 os、python、disk、virtualization。system_python 用于确认 /usr/bin 等系统自带 Python 路径和版本，不读取二进制文件。",
-            }
+            },
+            "commands": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "当 checks 包含 command_paths 时，按命令名只读探查 command -v 与 --version，例如 python3、gunicorn、celery、docker；不接受参数。",
+            },
         },
         [],
     ),
@@ -324,6 +329,15 @@ TOOLS = [
                 "description": "要读取的配置/源码/部署文件路径，可为服务器绝对路径；支持常见 .py/.conf/.yml/.yaml/.json/.ini/.service/.sh/.js 等运维文本文件。",
             },
             "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
+        },
+        ["path"],
+    ),
+    _tool(
+        "inspect_archive",
+        "只读查看 zip/tar 安装包内容，不解压、不写文件。返回 archive_type、member_count、成员预览和 unsafe_members；真正解压必须走 OperationPlan 的 extract_archive recipe。",
+        {
+            "path": {"type": "string", "description": "要查看的 zip/tar/tar.gz/tgz 等安装包绝对路径。"},
+            "max_members": {"type": "integer", "description": "最多展示多少个成员，默认 50。"},
         },
         ["path"],
     ),
