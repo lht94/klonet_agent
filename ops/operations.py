@@ -500,6 +500,11 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
                 }
     if plan.operation == "deploy_platform" and plan.target:
         project_root = str(plan.operation_args.get("project_root") or "").strip()
+        archive_path = str(plan.operation_args.get("archive_path") or "").strip()
+        destination_dir = str(plan.operation_args.get("destination_dir") or "").strip()
+        script_dir = str(plan.operation_args.get("script_dir") or "").strip()
+        script_name = str(plan.operation_args.get("script_name") or "").strip()
+        script_args = str(plan.operation_args.get("script_args") or "").strip()
         if project_root:
             try:
                 precheck_step = _find_step(plan, "precheck")
@@ -526,6 +531,26 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
                 "platform": _one_line(plan.target, 120),
                 "project_root": _one_line(project_root, 300),
             }
+            return
+        try:
+            prepare_step = _find_step(plan, "prepare-files")
+        except ValueError:
+            prepare_step = None
+        if prepare_step and archive_path and destination_dir:
+            prepare_step.recipe_id = "extract_archive"
+            prepare_step.recipe_args = {
+                "archive_path": _one_line(archive_path, 300),
+                "destination_dir": _one_line(destination_dir, 300),
+            }
+            return
+        if prepare_step and script_dir and script_name:
+            prepare_step.recipe_id = "run_install_script"
+            prepare_step.recipe_args = {
+                "script_dir": _one_line(script_dir, 300),
+                "script_name": _one_line(script_name, 120),
+            }
+            if script_args:
+                prepare_step.recipe_args["script_args"] = _one_line(script_args, 300)
     if plan.operation == "destroy_platform" and plan.target:
         try:
             step = _find_step(plan, "stop-services")

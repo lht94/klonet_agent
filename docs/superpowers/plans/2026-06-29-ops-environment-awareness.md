@@ -87,6 +87,11 @@ Implemented substrate so far:
 - controlled recipes: `extract_archive`, `prepare_project_files`,
   `run_install_script`, `write_ops_file`, `reload_nginx`,
   `start_platform_screens`, stop/restart screen recipes.
+- default prepare-files bindings: deploy plans with `archive_path` and
+  `destination_dir` now bind `prepare-files` to `extract_archive`; deploy plans
+  with `script_dir`, `script_name` and optional `script_args` bind
+  `prepare-files` to `run_install_script`, so Ops should not fall back to
+  manual terminal instructions for allowlisted install preparation.
 
 Remaining high-value tools:
 

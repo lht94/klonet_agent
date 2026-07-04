@@ -240,6 +240,67 @@ def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
 
+def test_deploy_operation_plan_default_binds_extract_archive_recipe_for_prepare_files():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="env-setup",
+            objective="extract Klonet install bundle",
+            operation_args={
+                "archive_path": "/home/adminis/vemu_install_2024_12_5.tar",
+                "destination_dir": "/root",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    step = next(item for item in loaded.steps if item.step_id == "prepare-files")
+    assert step.recipe_id == "extract_archive"
+    assert step.recipe_args == {
+        "archive_path": "/home/adminis/vemu_install_2024_12_5.tar",
+        "destination_dir": "/root",
+    }
+    assert "recipe=extract_archive" in rendered
+    assert "recipe_args.archive_path=/home/adminis/vemu_install_2024_12_5.tar" in rendered
+    assert "recipe_args.destination_dir=/root" in rendered
+
+
+def test_deploy_operation_plan_default_binds_run_install_script_recipe_for_prepare_files():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="env-setup",
+            objective="run base requirements setup",
+            operation_args={
+                "script_dir": "/root/vemu_install_new_gen",
+                "script_name": "base_requ_setup.sh",
+                "script_args": "NORMAL",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    step = next(item for item in loaded.steps if item.step_id == "prepare-files")
+    assert step.recipe_id == "run_install_script"
+    assert step.recipe_args == {
+        "script_dir": "/root/vemu_install_new_gen",
+        "script_name": "base_requ_setup.sh",
+        "script_args": "NORMAL",
+    }
+    assert "recipe=run_install_script" in rendered
+    assert "recipe_args.script_dir=/root/vemu_install_new_gen" in rendered
+    assert "recipe_args.script_name=base_requ_setup.sh" in rendered
+    assert "recipe_args.script_args=NORMAL" in rendered
+
+
 def test_manual_checkpoint_recipe_completes_confirmed_step_without_environment_change():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
