@@ -30,6 +30,7 @@ from klonet_agent.tools.environment import (
     inspect_process_detail,
     inspect_screen_session,
     inspect_klonet_runtime,
+    inspect_install_scripts,
     inspect_ops_context,
     inspect_service_health,
     inspect_system_environment,
@@ -147,6 +148,9 @@ class ToolExecutor:
 
         if tool_name == "inspect_service_health":
             return inspect_service_health(tool_args)
+
+        if tool_name == "inspect_install_scripts":
+            return inspect_install_scripts(tool_args)
 
         if tool_name == "render_klonet_config":
             return render_klonet_config(tool_args)

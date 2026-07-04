@@ -80,6 +80,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "read_klonet_logs" in tool_names
     assert "render_docker_daemon_config" in tool_names
     assert "inspect_archive" in tool_names
+    assert "inspect_install_scripts" in tool_names
     assert "inspect_screen_session" in tool_names
     assert "inspect_nginx_routes" in tool_names
     assert "search_shared_ops_memory" in tool_names
@@ -531,6 +532,69 @@ def test_executor_dispatches_service_health_tool():
 
     assert "inspect_service_health" in result
     assert "environment unchanged" in result
+
+
+def test_install_script_inspection_reports_allowed_scripts_and_risks():
+    from klonet_agent.tools.environment import inspect_install_scripts
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        install_dir = temp_dir / "vemu_install_new_gen"
+        install_dir.mkdir()
+        setup = install_dir / "base_requ_setup.sh"
+        setup.write_text(
+            "#!/usr/bin/env bash\n"
+            "apt-get update\n"
+            "systemctl restart docker\n",
+            encoding="utf-8",
+        )
+        docker = install_dir / "docker_service.sh"
+        docker.write_text(
+            "#!/bin/bash\n"
+            "docker run --name redis-celery redis\n",
+            encoding="utf-8",
+        )
+
+        result = inspect_install_scripts({"script_dir": str(install_dir)})
+
+    assert "inspect_install_scripts" in result
+    assert "script=base_requ_setup.sh status=detected" in result
+    assert "script=docker_service.sh status=detected" in result
+    assert "shebang=#!/usr/bin/env bash" in result
+    assert "recommended_recipe=run_install_script" in result
+    assert "allowed_args=NORMAL" in result
+    assert "risk_markers=apt-get,systemctl" in result
+    assert "risk_markers=docker" in result
+    assert "environment unchanged" in result
+
+
+def test_install_script_inspection_blocks_missing_required_script():
+    from klonet_agent.tools.environment import inspect_install_scripts
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        install_dir = temp_dir / "vemu_install_new_gen"
+        install_dir.mkdir()
+        (install_dir / "base_requ_setup.sh").write_text("# setup\n", encoding="utf-8")
+
+        result = inspect_install_scripts({"script_dir": str(install_dir)})
+
+    assert "inspect_install_scripts" in result
+    assert "script=docker_service.sh status=missing" in result
+    assert "preflight_status=blocked" in result
+    assert "environment unchanged" in result
+
+
+def test_executor_dispatches_install_script_inspection_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_install_scripts"}).run(
+        "inspect_install_scripts",
+        {"script_dir": "/tmp/missing"},
+    )
+
+    assert "inspect_install_scripts" in result
+    assert "script_dir_missing=/tmp/missing" in result
 
 
 def test_executor_dispatches_docker_daemon_config_renderer():

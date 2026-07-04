@@ -111,6 +111,7 @@ OPS_PROMPT = """
 24. 当部署准备涉及 zip/tar 安装包时，先用 inspect_archive 只读查看包结构和 unsafe_members；真正解压必须进入 OperationPlan 并绑定 extract_archive recipe，不得输出任意 unzip/tar 命令。
 25. 当需要修改 Docker daemon.json 的 insecure-registries 时，先用 render_docker_daemon_config 基于现有 JSON 生成合并草案，保留 registry-mirrors、dns、runtimes 等已有字段；写入走 write_ops_file，重启 Docker 属于高影响操作，必须二次确认。
 26. 当问题涉及 Redis、MySQL、RabbitMQ、Nginx 或 Docker 基础容器是否需要启动/复用时，优先使用 inspect_service_health 形成服务健康摘要；已检测到运行中的共享服务时默认建议复用，不要重复执行 docker_service.sh 或重复创建 Redis。
+27. 当准备运行 base_requ_setup.sh 或 docker_service.sh 前，先用 inspect_install_scripts 检查脚本存在性、shebang、可执行位、风险标记和 allowed_args；只有 preflight_status=ready 后，才能创建或推进绑定 run_install_script 的 OperationPlan。
 """
 
 

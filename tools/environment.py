@@ -60,6 +60,22 @@ OPS_SERVICE_HEALTH_CHECKS = (
     "rabbitmq",
     "nginx",
 )
+INSTALL_SCRIPT_ALLOWLIST = {
+    "base_requ_setup.sh": ("NORMAL",),
+    "docker_service.sh": (),
+}
+INSTALL_SCRIPT_RISK_MARKERS = (
+    "apt-get",
+    "yum",
+    "docker",
+    "systemctl",
+    "service ",
+    "redis-server",
+    "mysql",
+    "rabbitmq",
+    "ovs-",
+    "modprobe",
+)
 OPS_CONTEXT_SECTIONS = ("baseline", "runtime", "assets")
 DEPLOYMENT_ASSET_NAMES = {
     "docker-compose.yml",
@@ -271,6 +287,69 @@ def inspect_service_health(args: Optional[dict] = None) -> str:
         lines.append("missing_services_require_plan=true")
     if has_unchecked:
         lines.append("unchecked_services_require_more_evidence=true")
+    lines.append("environment unchanged")
+    return "\n".join(lines)
+
+
+def inspect_install_scripts(args: Optional[dict] = None) -> str:
+    """Inspect allowlisted Klonet install scripts without executing them."""
+
+    args = args or {}
+    raw_dir = str(args.get("script_dir") or "").strip()
+    if not raw_dir:
+        return "Error: script_dir is required"
+    script_dir = Path(raw_dir).expanduser()
+    if _is_sensitive_path(script_dir):
+        return "\n".join(
+            ["inspect_install_scripts", f"refused_sensitive_path={script_dir.name}", "environment unchanged"]
+        )
+    if not script_dir.exists() or not script_dir.is_dir():
+        return "\n".join(["inspect_install_scripts", f"script_dir_missing={raw_dir}", "environment unchanged"])
+    raw_scripts = args.get("scripts")
+    if isinstance(raw_scripts, list) and raw_scripts:
+        scripts = [
+            str(item).strip()
+            for item in raw_scripts
+            if str(item).strip() in INSTALL_SCRIPT_ALLOWLIST
+        ]
+    else:
+        scripts = list(INSTALL_SCRIPT_ALLOWLIST)
+    if not scripts:
+        scripts = list(INSTALL_SCRIPT_ALLOWLIST)
+    lines = [
+        "inspect_install_scripts",
+        f"script_dir={script_dir.resolve()}",
+    ]
+    blocked = False
+    for script_name in scripts:
+        path = script_dir / script_name
+        if not path.is_file():
+            blocked = True
+            lines.append(f"- script={script_name} status=missing recommendation=do_not_bind_recipe")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            blocked = True
+            lines.append(
+                f"- script={script_name} status=unchecked error={_single_line(str(exc), max_chars=220)}"
+            )
+            continue
+        shebang = _script_shebang(text)
+        executable = _is_executable_file(path)
+        risk_markers = _script_risk_markers(text)
+        allowed_args = INSTALL_SCRIPT_ALLOWLIST[script_name]
+        lines.append(
+            (
+                f"- script={script_name} status=detected "
+                f"executable={str(executable).lower()} "
+                f"shebang={shebang or 'missing'} "
+                f"recommended_recipe=run_install_script "
+                f"allowed_args={','.join(allowed_args) if allowed_args else 'none'} "
+                f"risk_markers={','.join(risk_markers) if risk_markers else 'none'}"
+            )
+        )
+    lines.append(f"preflight_status={'blocked' if blocked else 'ready'}")
     lines.append("environment unchanged")
     return "\n".join(lines)
 
@@ -1553,6 +1632,32 @@ def _service_detail_looks_inactive(detail: str) -> bool:
         "no output",
     )
     return any(marker in detail for marker in inactive_markers)
+
+
+def _script_shebang(text: str) -> str:
+    lines = (text or "").splitlines()
+    first_line = lines[0] if lines else ""
+    return first_line.strip() if first_line.startswith("#!") else ""
+
+
+def _script_risk_markers(text: str) -> list:
+    lowered = (text or "").lower()
+    result = []
+    for marker in INSTALL_SCRIPT_RISK_MARKERS:
+        normalized = marker.strip()
+        if marker == "docker":
+            found = re.search(r"(?m)^\s*(?:sudo\s+)?docker\b", lowered) is not None
+        else:
+            found = marker in lowered
+        if found and normalized not in result:
+            result.append(normalized)
+    return result
+
+
+def _is_executable_file(path: Path) -> bool:
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
 
 
 def _scan_deployment_assets(args: dict):

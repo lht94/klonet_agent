@@ -357,6 +357,25 @@ TOOLS = [
         ["path"],
     ),
     _tool(
+        "inspect_install_scripts",
+        "Read-only preflight for allowlisted Klonet install scripts such as base_requ_setup.sh and docker_service.sh. Reports existence, shebang, executable bit, risk markers, allowed_args and whether run_install_script can be attached; never executes scripts or modifies the environment.",
+        {
+            "script_dir": {
+                "type": "string",
+                "description": "Directory containing extracted Klonet install scripts, for example /root/vemu_install_new_gen.",
+            },
+            "scripts": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["base_requ_setup.sh", "docker_service.sh"],
+                },
+                "description": "Optional allowlisted script names; defaults to base_requ_setup.sh and docker_service.sh.",
+            },
+        },
+        ["script_dir"],
+    ),
+    _tool(
         "render_docker_daemon_config",
         "只读生成 Docker daemon.json 合并草案，不写文件。用于把 insecure-registries 合并进现有配置，同时保留 registry-mirrors、dns、runtimes 等已有字段；写入必须再通过 OperationPlan 绑定 write_ops_file，重启 Docker 必须二次确认。",
         {
