@@ -26,6 +26,7 @@ from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
     inspect_archive,
     inspect_nginx_routes,
+    inspect_platform_health,
     inspect_platform_instances,
     inspect_process_detail,
     inspect_screen_session,
@@ -163,6 +164,9 @@ class ToolExecutor:
 
         if tool_name == "inspect_archive":
             return inspect_archive(tool_args)
+
+        if tool_name == "inspect_platform_health":
+            return inspect_platform_health(tool_args)
 
         if tool_name == "inspect_platform_instances":
             return inspect_platform_instances(tool_args)

@@ -71,6 +71,7 @@ def test_environment_tools_are_registered_for_llm():
 
     assert "render_klonet_config" in tool_names
     assert "inspect_ops_context" in tool_names
+    assert "inspect_platform_health" in tool_names
     assert "inspect_platform_instances" in tool_names
     assert "inspect_system_environment" in tool_names
     assert "inspect_service_health" in tool_names
@@ -532,6 +533,115 @@ def test_executor_dispatches_service_health_tool():
 
     assert "inspect_service_health" in result
     assert "environment unchanged" in result
+
+
+def test_platform_health_verifier_summarizes_config_screen_process_ports_and_nginx(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project"
+        project_root.mkdir()
+        config = project_root / "config.py"
+        config.write_text(
+            "master_port = 20220\n"
+            "worker_port = 20221\n"
+            "public_port = 20222\n"
+            "web_terminal_port = 5045\n",
+            encoding="utf-8",
+        )
+        nginx_conf = temp_dir / "nginx.conf"
+        nginx_conf.write_text(
+            "server { listen 20222; location /VEMU2-103/ { alias /srv/frontend/; } }",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            environment,
+            "_screen_instance_rows",
+            lambda: [
+                {"platform": "103", "role": "master", "session": "103_m"},
+                {"platform": "103", "role": "worker", "session": "103_w"},
+                {"platform": "103", "role": "celery", "session": "103_c"},
+                {"platform": "103", "role": "web_terminal", "session": "103_web"},
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {"platform": "103", "role": "master", "pid": 1101, "cwd": str(project_root)},
+                {"platform": "103", "role": "worker", "pid": 1102, "cwd": str(project_root)},
+                {"platform": "103", "role": "celery", "pid": 1103, "cwd": str(project_root)},
+                {"platform": "103", "role": "web_terminal", "pid": 1104, "cwd": str(project_root)},
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_inspect_port_owners",
+            lambda args: [
+                environment.ProbeResult("port_owner", "detected", f"port={port} pid={2000 + port}")
+                for port in args["ports"]
+            ],
+        )
+
+        result = environment.inspect_platform_health(
+            {
+                "platform": "103",
+                "project_root": str(project_root),
+                "nginx_paths": [str(nginx_conf)],
+            }
+        )
+
+    assert "inspect_platform_health" in result
+    assert "platform=103" in result
+    assert f"project_root={project_root}" in result
+    assert "screen_status=ready roles=celery,master,web_terminal,worker" in result
+    assert "process_status=ready roles=celery,master,web_terminal,worker" in result
+    assert "config_ports=master_port:20220,worker_port:20221,public_port:20222,web_terminal_port:5045" in result
+    assert "port_status=ready ports=5045,20220,20221,20222" in result
+    assert "nginx_status=detected" in result
+    assert "overall_status=ready" in result
+    assert "environment unchanged" in result
+
+
+def test_platform_health_verifier_blocks_missing_configured_port(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project"
+        project_root.mkdir()
+        (project_root / "config.py").write_text("master_port = 20220\n", encoding="utf-8")
+
+        monkeypatch.setattr(environment, "_screen_instance_rows", lambda: [])
+        monkeypatch.setattr(environment, "_process_instance_rows", lambda: [])
+        monkeypatch.setattr(
+            environment,
+            "_inspect_port_owners",
+            lambda args: [environment.ProbeResult("port_owner", "missing", "port=20220 not listening")],
+        )
+
+        result = environment.inspect_platform_health({"platform": "103", "project_root": str(project_root)})
+
+    assert "inspect_platform_health" in result
+    assert "screen_status=missing" in result
+    assert "process_status=missing" in result
+    assert "port_status=blocked" in result
+    assert "port=20220 not listening" in result
+    assert "overall_status=blocked" in result
+
+
+def test_executor_dispatches_platform_health_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_platform_health"}).run(
+        "inspect_platform_health",
+        {"platform": "103", "project_root": "/tmp/missing"},
+    )
+
+    assert "inspect_platform_health" in result
+    assert "project_root_status=missing" in result
 
 
 def test_install_script_inspection_reports_allowed_scripts_and_risks():

@@ -246,6 +246,34 @@ TOOLS = [
         [],
     ),
     _tool(
+        "inspect_platform_health",
+        "Read-only post-start/post-restart verifier for one Klonet platform. Summarizes project_root, required screen roles, process roles/cwd evidence, configured ports, live port owners and optional Nginx route evidence; returns overall_status ready/blocked/unchecked and never modifies the environment.",
+        {
+            "platform": {
+                "type": "string",
+                "description": "Platform name such as 102, lht or 103.",
+            },
+            "project_root": {
+                "type": "string",
+                "description": "Runtime project root, for example /home/adminis/lht/103_project.",
+            },
+            "nginx_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional Nginx config paths to inspect for routes.",
+            },
+            "required_roles": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["master", "worker", "celery", "web_terminal"],
+                },
+                "description": "Optional required roles; defaults to master, worker, celery and web_terminal.",
+            },
+        },
+        ["platform", "project_root"],
+    ),
+    _tool(
         "inspect_service_health",
         "只读汇总 Docker 容器、Redis、MySQL、RabbitMQ、Nginx 等共享服务健康状态，并给出 reuse/start_candidate/inspect 建议。用于部署前判断是否复用已有服务，避免重复执行 docker_service.sh 或重复启动 Redis；不修改环境。",
         {

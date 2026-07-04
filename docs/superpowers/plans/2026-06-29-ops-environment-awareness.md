@@ -77,16 +77,17 @@ Implemented substrate so far:
   extracted `base_requ_setup.sh` and `docker_service.sh` existence, shebangs,
   executable bits, allowed args and risk markers before attaching
   `run_install_script`;
+- read-only platform health verifier: `inspect_platform_health` checks one
+  platform after start/restart by combining project root, screen roles, process
+  roles/cwd, configured ports, live port owners and optional Nginx routes into
+  `overall_status=ready|blocked|unchecked`;
 - controlled recipes: `extract_archive`, `prepare_project_files`,
   `run_install_script`, `write_ops_file`, `reload_nginx`,
   `start_platform_screens`, stop/restart screen recipes.
 
 Remaining high-value tools:
 
-1. Platform health verifier: after start/restart, verify screen sessions,
-   process cwd, configured ports, Nginx routes and selected HTTP health
-   endpoints in one structured result.
-2. Frontend config validator: compare rendered frontend config against actual
+1. Frontend config validator: compare rendered frontend config against actual
    `scripts/config.js` field names and Nginx aliases.
 
 ---

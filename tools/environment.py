@@ -491,6 +491,91 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def inspect_platform_health(args: Optional[dict] = None) -> str:
+    """Verify a Klonet platform after start/restart without modifying the host."""
+
+    args = args or {}
+    raw_platform = str(args.get("platform") or "").strip()
+    raw_root = str(args.get("project_root") or "").strip()
+    project_root = Path(raw_root).expanduser() if raw_root else None
+    platform_name = raw_platform or (_platform_from_project_root(project_root) if project_root else "")
+    lines = ["inspect_platform_health", f"platform={platform_name or 'missing'}"]
+    blockers = []
+    unchecked = []
+
+    if not platform_name or not _SAFE_PLATFORM_NAME.match(platform_name):
+        blockers.append("platform")
+        lines.append(f"platform_status=invalid value={platform_name or 'missing'}")
+    if project_root is None:
+        blockers.append("project_root")
+        lines.append("project_root_status=missing")
+    elif _is_sensitive_path(project_root):
+        blockers.append("project_root")
+        lines.append(f"project_root_status=refused path={project_root.name}")
+    elif not project_root.exists() or not project_root.is_dir():
+        blockers.append("project_root")
+        lines.append(f"project_root={project_root}")
+        lines.append("project_root_status=missing")
+    else:
+        lines.append(f"project_root={project_root}")
+        lines.append("project_root_status=detected")
+
+    required_roles = _requested_platform_roles(args)
+    screen_roles = _roles_for_platform(_screen_instance_rows(), platform_name)
+    _append_role_health(lines, "screen", required_roles, screen_roles, blockers)
+
+    process_rows = _process_rows_for_platform(platform_name, project_root)
+    process_roles = {row["role"] for row in process_rows if row.get("role") and row.get("role") != "unknown"}
+    _append_role_health(lines, "process", required_roles, process_roles, blockers)
+    if process_rows:
+        pids = sorted({int(row["pid"]) for row in process_rows if str(row.get("pid", "")).isdigit()})
+        if pids:
+            lines.append("process_pids=" + ",".join(str(pid) for pid in pids))
+
+    ports = _read_config_ports_from_root(project_root) if project_root and project_root.exists() else {}
+    if ports:
+        lines.append("config_ports=" + ",".join(f"{key}:{ports[key]}" for key in _ordered_ports(ports)))
+        port_numbers = sorted({_safe_port(value) for value in ports.values() if _safe_port(value) is not None})
+        port_results = _inspect_port_owners({"ports": port_numbers})
+        missing_or_unchecked = [result for result in port_results if result.status != STATUS_DETECTED]
+        if missing_or_unchecked:
+            blockers.append("ports")
+            lines.append("port_status=blocked ports=" + ",".join(str(port) for port in port_numbers))
+        else:
+            lines.append("port_status=ready ports=" + ",".join(str(port) for port in port_numbers))
+        lines.extend(result.render() for result in port_results)
+    else:
+        unchecked.append("ports")
+        lines.append("config_ports=missing")
+        lines.append("port_status=unchecked")
+
+    nginx_paths = args.get("nginx_paths")
+    if isinstance(nginx_paths, list) and nginx_paths:
+        nginx_result = inspect_nginx_routes({"paths": nginx_paths})
+        if "nginx_route: detected" in nginx_result:
+            lines.append("nginx_status=detected")
+        elif "nginx_route" in nginx_result:
+            unchecked.append("nginx")
+            lines.append("nginx_status=unchecked")
+        else:
+            unchecked.append("nginx")
+            lines.append("nginx_status=missing")
+        lines.append(_single_line(nginx_result, max_chars=900))
+    else:
+        unchecked.append("nginx")
+        lines.append("nginx_status=unchecked")
+
+    if blockers:
+        overall = "blocked"
+    elif unchecked:
+        overall = "unchecked"
+    else:
+        overall = "ready"
+    lines.append(f"overall_status={overall}")
+    lines.append("environment unchanged")
+    return "\n".join(lines)
+
+
 def read_klonet_logs(args: Optional[dict] = None) -> str:
     """Read a safe tail of a whitelisted log file and redact sensitive values."""
 
@@ -976,6 +1061,46 @@ def _ordered_ports(ports: dict) -> list:
     ordered = [key for key in KLONET_PORT_KEYS if key in ports]
     ordered.extend(sorted(key for key in ports if key not in ordered))
     return ordered
+
+
+def _requested_platform_roles(args: dict) -> set:
+    raw_roles = args.get("required_roles")
+    if not isinstance(raw_roles, list) or not raw_roles:
+        return {"master", "worker", "celery", "web_terminal"}
+    roles = {str(role or "").strip() for role in raw_roles}
+    return {role for role in roles if role} or {"master", "worker", "celery", "web_terminal"}
+
+
+def _roles_for_platform(rows: list, platform_name: str) -> set:
+    return {
+        str(row.get("role") or "")
+        for row in rows
+        if str(row.get("platform") or "") == platform_name and str(row.get("role") or "")
+    }
+
+
+def _process_rows_for_platform(platform_name: str, project_root: Optional[Path]) -> list:
+    rows = []
+    expected_root = str(project_root) if project_root else ""
+    for row in _process_instance_rows():
+        row_platform = str(row.get("platform") or "")
+        row_cwd = str(row.get("cwd") or "")
+        if row_platform == platform_name or (expected_root and row_cwd == expected_root):
+            rows.append(row)
+    return rows
+
+
+def _append_role_health(lines: list, label: str, required_roles: set, detected_roles: set, blockers: list) -> None:
+    roles_text = ",".join(sorted(detected_roles)) if detected_roles else "none"
+    missing = sorted(required_roles - detected_roles)
+    if not detected_roles:
+        blockers.append(label)
+        lines.append(f"{label}_status=missing roles=none missing=" + ",".join(missing))
+    elif missing:
+        blockers.append(label)
+        lines.append(f"{label}_status=partial roles={roles_text} missing=" + ",".join(missing))
+    else:
+        lines.append(f"{label}_status=ready roles={roles_text}")
 
 
 def run_read_only_probe(name: str) -> ProbeResult:

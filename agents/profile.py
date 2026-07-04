@@ -44,6 +44,7 @@ ENVIRONMENT_TOOLS = {
     "inspect_service_health",
     "inspect_nginx_routes",
     "inspect_ops_context",
+    "inspect_platform_health",
     "inspect_platform_instances",
     "inspect_system_environment",
     "inspect_klonet_runtime",
