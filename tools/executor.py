@@ -31,6 +31,7 @@ from klonet_agent.tools.environment import (
     inspect_screen_session,
     inspect_klonet_runtime,
     inspect_ops_context,
+    inspect_service_health,
     inspect_system_environment,
     read_klonet_logs,
     read_ops_file,
@@ -143,6 +144,9 @@ class ToolExecutor:
             if "## baseline" in result:
                 self.memory_store.write_shared_ops_baseline(result)
             return result
+
+        if tool_name == "inspect_service_health":
+            return inspect_service_health(tool_args)
 
         if tool_name == "render_klonet_config":
             return render_klonet_config(tool_args)

@@ -53,6 +53,13 @@ OPS_RUNTIME_CHECKS = (
     "rabbitmq",
     "nginx",
 )
+OPS_SERVICE_HEALTH_CHECKS = (
+    "docker_containers",
+    "redis",
+    "mysql",
+    "rabbitmq",
+    "nginx",
+)
 OPS_CONTEXT_SECTIONS = ("baseline", "runtime", "assets")
 DEPLOYMENT_ASSET_NAMES = {
     "docker-compose.yml",
@@ -227,6 +234,44 @@ def inspect_ops_context(args: Optional[dict] = None) -> str:
     if "assets" in sections:
         lines.append("## assets")
         lines.extend(_scan_deployment_assets(args))
+    return "\n".join(lines)
+
+
+def inspect_service_health(args: Optional[dict] = None) -> str:
+    """Summarize shared service health and reuse/start guidance."""
+
+    args = args or {}
+    requested = _requested_service_health_checks(args)
+    results = [run_read_only_probe(service) for service in requested]
+    lines = ["inspect_service_health"]
+    has_reusable = False
+    has_missing = False
+    has_unchecked = False
+    for result in results:
+        recommendation = _service_health_recommendation(result)
+        if recommendation == "reuse":
+            has_reusable = True
+        elif recommendation == "start_candidate":
+            has_missing = True
+        else:
+            has_unchecked = True
+        lines.append(
+            (
+                f"- service={result.name} "
+                f"status={result.status} "
+                f"recommendation={recommendation} "
+                f"evidence={_single_line(result.detail, max_chars=420)}"
+            )
+        )
+    if has_reusable and not has_missing:
+        lines.append("docker_service_action=skip")
+    else:
+        lines.append("docker_service_action=inspect_before_run")
+    if has_missing:
+        lines.append("missing_services_require_plan=true")
+    if has_unchecked:
+        lines.append("unchecked_services_require_more_evidence=true")
+    lines.append("environment unchanged")
     return "\n".join(lines)
 
 
@@ -1472,6 +1517,42 @@ def _requested_sections(args: dict) -> tuple:
         if normalized in OPS_CONTEXT_SECTIONS and normalized not in sections:
             sections.append(normalized)
     return tuple(sections) or OPS_CONTEXT_SECTIONS
+
+
+def _requested_service_health_checks(args: dict) -> tuple:
+    services = args.get("services")
+    if not isinstance(services, list) or not services:
+        return OPS_SERVICE_HEALTH_CHECKS
+    result = []
+    for service in services:
+        normalized = str(service or "").strip().lower()
+        if normalized in OPS_SERVICE_HEALTH_CHECKS and normalized not in result:
+            result.append(normalized)
+    return tuple(result) or OPS_SERVICE_HEALTH_CHECKS
+
+
+def _service_health_recommendation(result: ProbeResult) -> str:
+    detail = (result.detail or "").lower()
+    if result.status == STATUS_UNCHECKED:
+        return "inspect"
+    if result.status == STATUS_DETECTED and not _service_detail_looks_inactive(detail):
+        return "reuse"
+    if result.status == STATUS_MISSING or _service_detail_looks_inactive(detail):
+        return "start_candidate"
+    return "inspect"
+
+
+def _service_detail_looks_inactive(detail: str) -> bool:
+    inactive_markers = (
+        "inactive",
+        "not found",
+        "missing",
+        "failed",
+        "stopped",
+        "exited",
+        "no output",
+    )
+    return any(marker in detail for marker in inactive_markers)
 
 
 def _scan_deployment_assets(args: dict):

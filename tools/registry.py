@@ -246,6 +246,21 @@ TOOLS = [
         [],
     ),
     _tool(
+        "inspect_service_health",
+        "只读汇总 Docker 容器、Redis、MySQL、RabbitMQ、Nginx 等共享服务健康状态，并给出 reuse/start_candidate/inspect 建议。用于部署前判断是否复用已有服务，避免重复执行 docker_service.sh 或重复启动 Redis；不修改环境。",
+        {
+            "services": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["docker_containers", "redis", "mysql", "rabbitmq", "nginx"],
+                },
+                "description": "可选服务列表；默认检查 docker_containers、redis、mysql、rabbitmq、nginx。",
+            },
+        },
+        [],
+    ),
+    _tool(
         "inspect_klonet_runtime",
         "只读检查本机 Klonet 相关运行状态，例如端口、screen、nginx、Docker、Redis、RabbitMQ、MySQL、OVS、KVM、libvirt。",
         {

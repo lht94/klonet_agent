@@ -73,6 +73,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_ops_context" in tool_names
     assert "inspect_platform_instances" in tool_names
     assert "inspect_system_environment" in tool_names
+    assert "inspect_service_health" in tool_names
     assert "inspect_klonet_runtime" in tool_names
     assert "inspect_process_detail" in tool_names
     assert "read_ops_file" in tool_names
@@ -469,6 +470,66 @@ def test_render_docker_daemon_config_missing_file_uses_minimal_draft():
     assert "source_status=missing" in result
     assert '"insecure-registries": [' in result
     assert '"10.0.0.5:5024"' in result
+    assert "environment unchanged" in result
+
+
+def test_service_health_summary_recommends_reusing_running_services(monkeypatch):
+    from klonet_agent.tools import environment
+
+    fake_results = {
+        "docker_containers": environment.ProbeResult(
+            "docker_containers",
+            "detected",
+            "redis-celery Up 6 days | mysql-vemu Up 6 days | rabbitmq-server Up 6 days",
+        ),
+        "nginx": environment.ProbeResult("nginx", "detected", "active"),
+        "redis": environment.ProbeResult("redis", "detected", "active"),
+        "mysql": environment.ProbeResult("mysql", "detected", "active"),
+        "rabbitmq": environment.ProbeResult("rabbitmq", "detected", "active"),
+    }
+
+    monkeypatch.setattr(environment, "run_read_only_probe", lambda name: fake_results[name])
+
+    result = environment.inspect_service_health(
+        {"services": ["redis", "mysql", "rabbitmq", "nginx", "docker_containers"]}
+    )
+
+    assert "inspect_service_health" in result
+    assert "service=redis status=detected recommendation=reuse" in result
+    assert "service=mysql status=detected recommendation=reuse" in result
+    assert "service=rabbitmq status=detected recommendation=reuse" in result
+    assert "service=nginx status=detected recommendation=reuse" in result
+    assert "service=docker_containers status=detected recommendation=reuse" in result
+    assert "docker_service_action=skip" in result
+    assert "environment unchanged" in result
+
+
+def test_service_health_summary_marks_missing_services_as_start_candidate(monkeypatch):
+    from klonet_agent.tools import environment
+
+    fake_results = {
+        "redis": environment.ProbeResult("redis", "missing", "inactive"),
+        "nginx": environment.ProbeResult("nginx", "unchecked", "systemctl not found"),
+    }
+
+    monkeypatch.setattr(environment, "run_read_only_probe", lambda name: fake_results[name])
+
+    result = environment.inspect_service_health({"services": ["redis", "nginx"]})
+
+    assert "service=redis status=missing recommendation=start_candidate" in result
+    assert "service=nginx status=unchecked recommendation=inspect" in result
+    assert "docker_service_action=inspect_before_run" in result
+
+
+def test_executor_dispatches_service_health_tool():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_service_health"}).run(
+        "inspect_service_health",
+        {"services": []},
+    )
+
+    assert "inspect_service_health" in result
     assert "environment unchanged" in result
 
 
