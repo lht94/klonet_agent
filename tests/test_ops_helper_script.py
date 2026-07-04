@@ -557,6 +557,66 @@ def test_configured_ports_reads_vemu_config_ports(tmp_path):
     assert helper.configured_ports(str(tmp_path)) == [5000, 5001, 8080, 5045]
 
 
+def test_extract_archive_helper_execute_extracts_safe_tar_members(tmp_path, capsys):
+    import tarfile
+
+    helper = _load_helper_module()
+    payload = tmp_path / "base_requ_setup.sh"
+    payload.write_text("# setup\n", encoding="utf-8")
+    archive = tmp_path / "vemu_install_2024_12_5.tar"
+    with tarfile.open(archive, "w") as handle:
+        handle.add(payload, arcname="vemu_install_new_gen/base_requ_setup.sh")
+    destination = tmp_path / "root"
+
+    code = helper.main(
+        [
+            "extract-archive",
+            "--execute",
+            "--archive-path",
+            str(archive),
+            "--destination-dir",
+            str(destination),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert (destination / "vemu_install_new_gen" / "base_requ_setup.sh").read_text(encoding="utf-8") == "# setup\n"
+    assert "action=extract-archive" in captured.out
+    assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_run_install_script_helper_execute_uses_allowlisted_command(monkeypatch, tmp_path, capsys):
+    helper = _load_helper_module()
+    commands = []
+    script_dir = tmp_path / "vemu_install_new_gen"
+    script_dir.mkdir()
+    (script_dir / "base_requ_setup.sh").write_text("# setup\n", encoding="utf-8")
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+
+    code = helper.main(
+        [
+            "run-install-script",
+            "--execute",
+            "--script-dir",
+            str(script_dir),
+            "--script-name",
+            "base_requ_setup.sh",
+            "--script-args",
+            "NORMAL",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [["bash", "-lc", f"cd '{script_dir}' && bash ./base_requ_setup.sh NORMAL"]]
+    assert "action=run-install-script" in captured.out
+    assert "script_name=base_requ_setup.sh" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
 def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []

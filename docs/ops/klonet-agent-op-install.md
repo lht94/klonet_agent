@@ -1,4 +1,4 @@
-# klonet-agent-op 安装契约
+﻿# klonet-agent-op 安装契约
 
 `klonet-agent-op` 是 Ops Agent 修改服务器环境时唯一应该被 sudoers 放行的入口。Agent 侧默认仍然 dry-run；只有 OperationPlan 已确认、单步已确认，并且服务端明确安装 helper 与 sudoers 后，才允许进入真实执行链路。
 
@@ -170,3 +170,23 @@ worker_main.py
 真实执行 `reload-nginx --execute` 时，helper 会先执行 `nginx -t`；只有配置测试成功才继续执行 `nginx -s reload`。如果配置测试失败，会返回 `nginx_test_failed` 和 `environment_changed=false`，计划执行层会阻断该步骤，但不会要求重新确认运行态是否未知。
 
 如果真实执行阶段的底层命令失败，helper 会返回非零退出码并输出 `error=command_failed`、`failed_command=...` 和 `environment_changed=unknown`。这表示命令可能已经执行到中途；计划执行层会把该步骤标记为 `blocked` 而不是 `failed`，并要求先重新读取运行态环境后再决定是否继续计划。
+## Install preparation helper checks
+
+Archive extraction dry-run:
+
+```bash
+/usr/local/bin/klonet-agent-op extract-archive --dry-run \
+  --archive-path /home/adminis/vemu_install_2024_12_5.tar \
+  --destination-dir /root
+```
+
+Install script dry-run:
+
+```bash
+/usr/local/bin/klonet-agent-op run-install-script --dry-run \
+  --script-dir /root/vemu_install_new_gen \
+  --script-name base_requ_setup.sh \
+  --script-args NORMAL
+```
+
+Do not pass sudo passwords through chat. Real execution should use the root-owned helper plus sudoers NOPASSWD allowlist and `KLONET_AGENT_OPS_REAL_EXECUTION=1`.

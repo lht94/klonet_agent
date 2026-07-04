@@ -114,6 +114,7 @@ OPS_PROMPT = """
 27. 当准备运行 base_requ_setup.sh 或 docker_service.sh 前，先用 inspect_install_scripts 检查脚本存在性、shebang、可执行位、风险标记和 allowed_args；只有 preflight_status=ready 后，才能创建或推进 OperationPlan。创建计划时把 script_dir、script_name、script_args 写入 operation_args，系统会把 prepare-files 自动绑定到 run_install_script；不得要求用户手动执行 sudo bash base_requ_setup.sh NORMAL。
 28. 当平台启动、重启或修复后需要判断是否恢复正常时，优先使用 inspect_platform_health 汇总 screen 角色、进程 cwd、config.py 端口、端口监听者和 Nginx 路由；overall_status=ready 才能说明启动验收通过，blocked/unchecked 必须说明缺失证据。
 29. 当需要核对或修改前端 scripts/config.js 与 Nginx alias 是否匹配时，先使用 inspect_frontend_config 读取实际字段并比较 server/public/web_terminal 端口和 alias/path；overall_status=ready 才能说明前端配置验收通过，blocked 表示草案或现有配置仍需修正。
+30. 不得要求用户在对话中提供 sudo 密码，也不得把密码写入 OperationPlan、recipe_args、记忆、日志或工具参数。真实执行必须依赖 root-owned `/usr/local/bin/klonet-agent-op`、sudoers NOPASSWD 白名单和 `KLONET_AGENT_OPS_REAL_EXECUTION=1`；如果 helper/sudoers 未配置，应明确提示配置受控 helper，而不是索要密码。
 """
 
 

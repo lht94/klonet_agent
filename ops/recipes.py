@@ -406,8 +406,32 @@ class ControlledRecipeRunner:
                         "environment unchanged"
                     ),
                 )
+            if _requires_sudo_helper_path(destination):
+                command = [
+                    "sudo",
+                    "-n",
+                    self.helper_path,
+                    "extract-archive",
+                    "--execute",
+                    "--archive-path",
+                    archive_path,
+                    "--destination-dir",
+                    destination_dir,
+                ]
+                output = self.command_runner(command)
+                return RecipeExecutionResult(
+                    "completed",
+                    (
+                        "dry_run=false "
+                        f"recipe_id={EXTRACT_ARCHIVE} "
+                        f"command={_format_command(command)} "
+                        f"helper_output={_one_line(output)}"
+                    ),
+                )
             destination.mkdir(parents=True, exist_ok=True)
             _extract_archive_to(archive, destination)
+        except subprocess.CalledProcessError as exc:
+            return _helper_failure_result(exc)
         except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
             return RecipeExecutionResult(
                 "blocked",
@@ -455,12 +479,6 @@ class ControlledRecipeRunner:
                     "environment unchanged"
                 ),
             )
-        script_path = Path(script_dir) / script_name
-        if not script_path.is_file():
-            return RecipeExecutionResult(
-                "blocked",
-                f"recipe_id={RUN_INSTALL_SCRIPT} script_not_found={_one_line(str(script_path))}; environment unchanged",
-            )
         command = _install_script_command(script_dir, script_name, script_args)
         if self.dry_run:
             return RecipeExecutionResult(
@@ -469,10 +487,31 @@ class ControlledRecipeRunner:
                     "dry_run=true "
                     f"recipe_id={RUN_INSTALL_SCRIPT} "
                     f"command_preview={_format_command(command)} "
-                    "environment unchanged"
-                ),
-            )
+                        "environment unchanged"
+                    ),
+                )
         try:
+            if _requires_sudo_helper_path(Path(script_dir)):
+                command = [
+                    "sudo",
+                    "-n",
+                    self.helper_path,
+                    "run-install-script",
+                    "--execute",
+                    "--script-dir",
+                    script_dir,
+                    "--script-name",
+                    script_name,
+                ]
+                if script_args:
+                    command.extend(["--script-args", " ".join(script_args)])
+            else:
+                script_path = Path(script_dir) / script_name
+                if not script_path.is_file():
+                    return RecipeExecutionResult(
+                        "blocked",
+                        f"recipe_id={RUN_INSTALL_SCRIPT} script_not_found={_one_line(str(script_path))}; environment unchanged",
+                    )
             output = self.command_runner(command)
         except subprocess.CalledProcessError as exc:
             return _script_failure_result(exc)
@@ -716,6 +755,11 @@ def _looks_unsafe_path(value: str) -> bool:
     if any(part in value for part in ("\x00", "\n", "\r")):
         return True
     return not (value.startswith("/") or Path(value).is_absolute())
+
+
+def _requires_sudo_helper_path(path: Path) -> bool:
+    normalized = str(path).replace("\\", "/")
+    return normalized == "/root" or normalized.startswith("/root/")
 
 
 def _redact_sensitive_text(text: str) -> str:

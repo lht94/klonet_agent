@@ -11,8 +11,11 @@ from __future__ import annotations
 import argparse
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
 
@@ -42,6 +45,10 @@ REQUIRED_PROJECT_ENTRY_FILES = (
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
+ALLOWED_INSTALL_SCRIPTS = {
+    "base_requ_setup.sh": ("NORMAL",),
+    "docker_service.sh": (),
+}
 
 
 def main(argv=None) -> int:
@@ -77,6 +84,19 @@ def main(argv=None) -> int:
     reload_nginx_mode = reload_nginx.add_mutually_exclusive_group(required=True)
     reload_nginx_mode.add_argument("--dry-run", action="store_true")
     reload_nginx_mode.add_argument("--execute", action="store_true")
+    extract_archive = subcommands.add_parser("extract-archive")
+    extract_archive_mode = extract_archive.add_mutually_exclusive_group(required=True)
+    extract_archive_mode.add_argument("--dry-run", action="store_true")
+    extract_archive_mode.add_argument("--execute", action="store_true")
+    extract_archive.add_argument("--archive-path", required=True)
+    extract_archive.add_argument("--destination-dir", required=True)
+    run_install = subcommands.add_parser("run-install-script")
+    run_install_mode = run_install.add_mutually_exclusive_group(required=True)
+    run_install_mode.add_argument("--dry-run", action="store_true")
+    run_install_mode.add_argument("--execute", action="store_true")
+    run_install.add_argument("--script-dir", required=True)
+    run_install.add_argument("--script-name", required=True)
+    run_install.add_argument("--script-args", default="")
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
@@ -88,6 +108,10 @@ def main(argv=None) -> int:
         return _start_platform_screens(args)
     if args.action == "reload-nginx":
         return _reload_nginx(args)
+    if args.action == "extract-archive":
+        return _extract_archive(args)
+    if args.action == "run-install-script":
+        return _run_install_script(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
 
@@ -227,6 +251,73 @@ def _reload_nginx(args) -> int:
     if args.execute:
         print("nginx_test=ok")
         print("nginx_reload=ok")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
+def _extract_archive(args) -> int:
+    archive_path = args.archive_path
+    destination_dir = args.destination_dir
+    if _unsafe_path(archive_path):
+        _print_error(f"invalid_archive_path={archive_path or 'missing'}")
+        return 2
+    if _unsafe_path(destination_dir):
+        _print_error(f"invalid_destination_dir={destination_dir or 'missing'}")
+        return 2
+    archive = Path(archive_path)
+    destination = Path(destination_dir)
+    if not archive.is_file():
+        _print_error(f"archive_not_found={archive_path}")
+        return 2
+    try:
+        members = archive_members(archive)
+        unsafe_member = first_unsafe_archive_member(destination, members)
+        if unsafe_member:
+            _print_error(f"unsafe_archive_member={unsafe_member}")
+            return 2
+        if args.execute:
+            destination.mkdir(parents=True, exist_ok=True)
+            extract_archive_to(archive, destination)
+    except (OSError, tarfile.TarError, zipfile.BadZipFile) as exc:
+        _print_error(f"extract_failed={_one_line(str(exc))}")
+        return 1
+    print("klonet_agent_op")
+    print("action=extract-archive")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"archive_path={archive_path}")
+    print(f"destination_dir={destination_dir}")
+    print(f"member_count={len(members)}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
+def _run_install_script(args) -> int:
+    script_dir = args.script_dir
+    script_name = args.script_name
+    script_args = shlex.split(args.script_args or "")
+    if _unsafe_path(script_dir):
+        _print_error(f"invalid_script_dir={script_dir or 'missing'}")
+        return 2
+    if script_name not in ALLOWED_INSTALL_SCRIPTS:
+        _print_error(f"unsupported_script={script_name or 'missing'}")
+        return 2
+    allowed_args = ALLOWED_INSTALL_SCRIPTS[script_name]
+    if tuple(script_args) != allowed_args:
+        _print_error(f"unsupported_script_args={','.join(script_args) or 'none'}")
+        return 2
+    script_path = Path(script_dir) / script_name
+    if not script_path.is_file():
+        _print_error(f"script_not_found={script_path}")
+        return 2
+    command = install_script_command(script_dir, script_name, script_args)
+    if args.execute and not _run_commands([command]):
+        return 1
+    print("klonet_agent_op")
+    print("action=run-install-script")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"script_dir={script_dir}")
+    print(f"script_name={script_name}")
+    print(f"script_args={','.join(script_args) if script_args else 'none'}")
     print(f"environment_changed={str(args.execute).lower()}")
     return 0
 
@@ -422,6 +513,61 @@ def listening_ports(ports: list) -> list:
         if re.search(rf"(?<!\d):{port}\b", output):
             occupied.append(port)
     return occupied
+
+
+def archive_members(archive: Path) -> list:
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as handle:
+            return [name for name in handle.namelist() if name and not name.endswith("/")]
+    if tarfile.is_tarfile(archive):
+        with tarfile.open(archive) as handle:
+            return [member.name for member in handle.getmembers() if member.name and member.isfile()]
+    raise OSError(f"unsupported_archive={archive.name}")
+
+
+def first_unsafe_archive_member(destination: Path, members: list) -> str:
+    destination_root = destination.resolve()
+    for member in members:
+        if Path(member).is_absolute():
+            return member
+        target = (destination / member).resolve()
+        if not path_is_relative_to(target, destination_root):
+            return member
+    return ""
+
+
+def extract_archive_to(archive: Path, destination: Path) -> None:
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive) as handle:
+            handle.extractall(destination)
+        return
+    with tarfile.open(archive) as handle:
+        for member in handle.getmembers():
+            if not member.isfile():
+                continue
+            source = handle.extractfile(member)
+            if source is None:
+                continue
+            target = destination / member.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+def path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def install_script_command(script_dir: str, script_name: str, script_args: list) -> list:
+    args = " ".join(shlex.quote(item) for item in script_args)
+    command = f"cd {shlex.quote(script_dir)} && bash ./{shlex.quote(script_name)}"
+    if args:
+        command = f"{command} {args}"
+    return ["bash", "-lc", command]
 
 
 def _start_platform_commands(platform: str, project_root: str) -> list:

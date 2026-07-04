@@ -1200,6 +1200,64 @@ def test_extract_archive_recipe_execute_extracts_tar_members():
     assert extracted == "# docker\n"
 
 
+def test_extract_archive_recipe_execute_uses_sudo_helper_for_root_destination():
+    import tarfile
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return "helper extracted"
+
+    with local_temp_dir() as temp_dir:
+        payload = temp_dir / "docker_service.sh"
+        payload.write_text("# docker\n", encoding="utf-8")
+        archive = temp_dir / "vemu_install_2024_12_5.tar"
+        with tarfile.open(archive, "w") as handle:
+            handle.add(payload, arcname="vemu_install_new_gen/docker_service.sh")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=command_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="env-setup",
+            objective="extract install bundle",
+            operation_args={
+                "archive_path": str(archive),
+                "destination_dir": "/root",
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert calls == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "extract-archive",
+            "--execute",
+            "--archive-path",
+            str(archive),
+            "--destination-dir",
+            "/root",
+        ]
+    ]
+    assert "dry_run=false" in result
+    assert "recipe_id=extract_archive" in result
+    assert "helper extracted" in result
+
+
 def test_extract_archive_recipe_blocks_path_traversal_members():
     import tarfile
 
@@ -1337,6 +1395,60 @@ def test_run_install_script_recipe_execute_calls_fixed_command():
     assert len(calls) == 1
     assert calls[0][0:2] == ["bash", "-lc"]
     assert "docker_service.sh" in calls[0][2]
+
+
+def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return "setup done"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=command_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="env-setup",
+            objective="run base setup",
+            operation_args={
+                "script_dir": "/root/vemu_install_new_gen",
+                "script_name": "base_requ_setup.sh",
+                "script_args": "NORMAL",
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert calls == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "run-install-script",
+            "--execute",
+            "--script-dir",
+            "/root/vemu_install_new_gen",
+            "--script-name",
+            "base_requ_setup.sh",
+            "--script-args",
+            "NORMAL",
+        ]
+    ]
+    assert "dry_run=false" in result
+    assert "recipe_id=run_install_script" in result
+    assert "setup done" in result
 
 
 def test_run_install_script_recipe_blocks_unsupported_script():
