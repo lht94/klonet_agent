@@ -1694,7 +1694,9 @@ def test_reload_nginx_recipe_execute_tests_config_before_reload():
 
         result = store.execute_step(plan.plan_id, "start-services")
 
-    assert calls == [["/usr/local/bin/klonet-agent-op", "reload-nginx", "--execute"]]
+    assert calls == [
+        ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "reload-nginx", "--execute"]
+    ]
     assert "result_status=completed" in result
     assert "dry_run=false" in result
     assert "recipe_id=reload_nginx" in result
@@ -1749,7 +1751,9 @@ def test_reload_nginx_recipe_blocks_when_config_test_fails_without_reload():
         result = store.execute_step(plan.plan_id, "start-services")
         loaded = store.load_plan(plan.plan_id)
 
-    assert calls == [["/usr/local/bin/klonet-agent-op", "reload-nginx", "--execute"]]
+    assert calls == [
+        ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "reload-nginx", "--execute"]
+    ]
     assert "result_status=blocked" in result
     assert "nginx_test_failed returncode=1" in result
     assert "test failed" in result
@@ -1847,6 +1851,78 @@ def test_stop_platform_screens_recipe_dry_run_generates_safe_preview():
     assert statuses["cleanup-owned-resources"] == "pending"
 
 
+def test_helper_backed_recipes_use_sudo_only_for_real_execution():
+    from klonet_agent.ops.operations import OperationPlan, OperationStep
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    plan = OperationPlan(
+        plan_id="plan-sudo-boundary",
+        operation="restart_platform",
+        target="102",
+        objective="verify helper privilege boundary",
+    )
+    cases = [
+        (
+            "restart_screen_component",
+            {
+                "platform": "102",
+                "component": "master",
+                "screen_session": "102_m",
+                "project_root": "/home/adminis/lht/102_project",
+            },
+            "restart-screen-component",
+        ),
+        (
+            "stop_screen_component",
+            {
+                "platform": "102",
+                "component": "master",
+                "screen_session": "102_m",
+            },
+            "stop-screen-component",
+        ),
+        ("stop_platform_screens", {"platform": "102"}, "stop-platform-screens"),
+        (
+            "start_platform_screens",
+            {
+                "platform": "102",
+                "project_root": "/home/adminis/lht/102_project",
+            },
+            "start-platform-screens",
+        ),
+        ("reload_nginx", {}, "reload-nginx"),
+    ]
+
+    for recipe_id, recipe_args, action in cases:
+        calls = []
+        step = OperationStep(
+            step_id=f"test-{recipe_id}",
+            title="test helper command",
+            purpose="verify sudo boundary",
+            recipe_id=recipe_id,
+            recipe_args=recipe_args,
+        )
+        real_result = ControlledRecipeRunner(
+            dry_run=False,
+            command_runner=lambda command: calls.append(command) or "helper ok",
+        )(plan, step)
+
+        assert real_result.status == "completed"
+        assert calls[0][:4] == [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            action,
+        ]
+        assert "--execute" in calls[0]
+
+        dry_result = ControlledRecipeRunner(dry_run=True)(plan, step)
+        assert dry_result.status == "completed"
+        assert "command_preview=/usr/local/bin/klonet-agent-op" in dry_result.output
+        assert "command_preview=sudo " not in dry_result.output
+        assert "--dry-run" in dry_result.output
+
+
 def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -1893,6 +1969,8 @@ def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
 
     assert calls == [
         [
+            "sudo",
+            "-n",
             "/usr/local/bin/klonet-agent-op",
             "restart-screen-component",
             "--execute",

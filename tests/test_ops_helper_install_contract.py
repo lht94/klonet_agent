@@ -36,6 +36,8 @@ def test_install_doc_requires_root_owned_helper_and_visudo_validation():
     assert "Agent 侧默认仍然 dry-run" in text
     assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" in text
     assert "不要直接放行 screen、kill、bash、python、nginx" in text
+    assert "sudo -n /usr/local/bin/klonet-agent-op" in text
+    assert "只有运行 Agent 的专用 `klonet-agent` 账户应加入 `klonet-ops`" in text
     assert "reload-nginx --dry-run" in text
     assert "extract-archive --dry-run" in text
     assert "run-install-script --dry-run" in text

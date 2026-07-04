@@ -113,6 +113,17 @@ class ControlledRecipeRunner:
         self.helper_path = helper_path
         self.command_runner = command_runner or _run_command
 
+    def _helper_command(self, action: str, *args: str) -> list:
+        command = [
+            self.helper_path,
+            action,
+            "--dry-run" if self.dry_run else "--execute",
+            *args,
+        ]
+        if self.dry_run:
+            return command
+        return ["sudo", "-n", *command]
+
     def __call__(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         if step.recipe_id == MANUAL_CHECKPOINT:
             return self._manual_checkpoint(step)
@@ -160,10 +171,8 @@ class ControlledRecipeRunner:
         problem = _validate_restart_args(platform, component, screen_session, project_root)
         if problem:
             return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
-        command = [
-            self.helper_path,
+        command = self._helper_command(
             "restart-screen-component",
-            "--dry-run" if self.dry_run else "--execute",
             "--platform",
             platform,
             "--component",
@@ -172,7 +181,7 @@ class ControlledRecipeRunner:
             screen_session,
             "--project-root",
             project_root,
-        ]
+        )
         if not self.dry_run:
             try:
                 output = self.command_runner(command)
@@ -205,17 +214,15 @@ class ControlledRecipeRunner:
         problem = _validate_screen_component_args(platform, component, screen_session)
         if problem:
             return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
-        command = [
-            self.helper_path,
+        command = self._helper_command(
             "stop-screen-component",
-            "--dry-run" if self.dry_run else "--execute",
             "--platform",
             platform,
             "--component",
             component,
             "--screen",
             screen_session,
-        ]
+        )
         return self._helper_result(STOP_SCREEN_COMPONENT, command)
 
     def _stop_platform_screens(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
@@ -223,13 +230,11 @@ class ControlledRecipeRunner:
         platform = str(args.get("platform") or plan.target or "").strip()
         if not _safe_token(platform):
             return RecipeExecutionResult("blocked", f"invalid_platform={platform or 'missing'}; environment unchanged")
-        command = [
-            self.helper_path,
+        command = self._helper_command(
             "stop-platform-screens",
-            "--dry-run" if self.dry_run else "--execute",
             "--platform",
             platform,
-        ]
+        )
         return self._helper_result(STOP_PLATFORM_SCREENS, command)
 
     def _start_platform_screens(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
@@ -239,15 +244,13 @@ class ControlledRecipeRunner:
         problem = _validate_start_platform_args(platform, project_root)
         if problem:
             return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
-        command = [
-            self.helper_path,
+        command = self._helper_command(
             "start-platform-screens",
-            "--dry-run" if self.dry_run else "--execute",
             "--platform",
             platform,
             "--project-root",
             project_root,
-        ]
+        )
         if not self.dry_run:
             try:
                 output = self.command_runner(command)
@@ -407,17 +410,13 @@ class ControlledRecipeRunner:
                     ),
                 )
             if _requires_sudo_helper_path(destination):
-                command = [
-                    "sudo",
-                    "-n",
-                    self.helper_path,
+                command = self._helper_command(
                     "extract-archive",
-                    "--execute",
                     "--archive-path",
                     archive_path,
                     "--destination-dir",
                     destination_dir,
-                ]
+                )
                 output = self.command_runner(command)
                 return RecipeExecutionResult(
                     "completed",
@@ -492,17 +491,13 @@ class ControlledRecipeRunner:
                 )
         try:
             if _requires_sudo_helper_path(Path(script_dir)):
-                command = [
-                    "sudo",
-                    "-n",
-                    self.helper_path,
+                command = self._helper_command(
                     "run-install-script",
-                    "--execute",
                     "--script-dir",
                     script_dir,
                     "--script-name",
                     script_name,
-                ]
+                )
                 if script_args:
                     command.extend(["--script-args", " ".join(script_args)])
             else:
@@ -589,11 +584,9 @@ class ControlledRecipeRunner:
         return RecipeExecutionResult("completed", " ".join(parts))
 
     def _reload_nginx(self) -> RecipeExecutionResult:
-        command = [
-            self.helper_path,
+        command = self._helper_command(
             "reload-nginx",
-            "--dry-run" if self.dry_run else "--execute",
-        ]
+        )
         if self.dry_run:
             return RecipeExecutionResult(
                 "completed",

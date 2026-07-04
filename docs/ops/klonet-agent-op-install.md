@@ -37,6 +37,22 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 
 原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护、启动命令模板都在 helper 内完成。放行底层命令会绕过这些校验。
 
+## Agent 调用方式
+
+dry-run 由 Agent 普通用户直接调用 helper，不经过 sudo，也不会修改服务器：
+
+```text
+/usr/local/bin/klonet-agent-op <action> --dry-run ...
+```
+
+真实执行统一使用非交互 sudo：
+
+```text
+sudo -n /usr/local/bin/klonet-agent-op <action> --execute ...
+```
+
+`-n` 禁止 sudo 弹出密码提示；如果专用账户、用户组或 sudoers 未正确配置，命令会立即失败。不要通过对话、stdin、环境变量或工具参数向 Agent 提供 sudo 密码。只有运行 Agent 的专用 `klonet-agent` 账户应加入 `klonet-ops`，日常登录账户不应加入该组。
+
 ## 启用真实执行
 
 Agent 侧默认仍然 dry-run。即使 helper 和 sudoers 已安装，`execute_ops_operation_step` 也只会生成预览，除非运行 Agent 的环境显式设置：
