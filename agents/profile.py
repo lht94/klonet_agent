@@ -38,6 +38,7 @@ MENTOR_TOOLS = {
 
 ENVIRONMENT_TOOLS = {
     "render_klonet_config",
+    "render_docker_daemon_config",
     "inspect_archive",
     "inspect_nginx_routes",
     "inspect_ops_context",

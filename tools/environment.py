@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
@@ -108,6 +109,7 @@ _SAFE_PLATFORM_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _SAFE_SERVER_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
 _SAFE_FRONTEND_ALIAS = re.compile(r"^/[A-Za-z0-9_./:-]{1,120}$")
 _SAFE_COMMAND_NAME = re.compile(r"^[A-Za-z0-9_.+-]{1,80}$")
+_SAFE_REGISTRY_ENDPOINT = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
@@ -529,6 +531,79 @@ def inspect_archive(args: Optional[dict] = None) -> str:
         lines.append(f"  - omitted={len(members) - len(preview)}")
     lines.append("environment unchanged")
     return "\n".join(lines)
+
+
+def render_docker_daemon_config(args: Optional[dict] = None) -> str:
+    """Render a Docker daemon.json merge draft without writing files."""
+
+    args = args or {}
+    raw_path = str(args.get("path") or "/etc/docker/daemon.json").strip()
+    registry = str(args.get("registry") or "").strip()
+    if not raw_path:
+        return "Error: path is required"
+    path = Path(raw_path).expanduser()
+    if _is_sensitive_path(path):
+        return "\n".join(
+            ["render_docker_daemon_config", f"refused_sensitive_path={path.name}", "environment unchanged"]
+        )
+    if path.suffix.lower() != ".json":
+        return "\n".join(
+            ["render_docker_daemon_config", f"refused_non_json_path={path.name}", "environment unchanged"]
+        )
+    if not registry or not _SAFE_REGISTRY_ENDPOINT.match(registry) or ":" not in registry:
+        return "\n".join(
+            [
+                "render_docker_daemon_config",
+                f"invalid_registry={registry or 'missing'}",
+                "environment unchanged",
+            ]
+        )
+    source_status = "missing"
+    config = {}
+    if path.exists() and path.is_file():
+        source_status = "detected"
+        try:
+            config = json.loads(path.read_text(encoding="utf-8", errors="replace") or "{}")
+        except (OSError, json.JSONDecodeError) as exc:
+            return "\n".join(
+                [
+                    "render_docker_daemon_config",
+                    f"invalid_source_json={_single_line(str(exc), max_chars=300)}",
+                    "environment unchanged",
+                ]
+            )
+        if not isinstance(config, dict):
+            return "\n".join(
+                [
+                    "render_docker_daemon_config",
+                    "invalid_source_json=root_must_be_object",
+                    "environment unchanged",
+                ]
+            )
+    registries = config.get("insecure-registries")
+    if not isinstance(registries, list):
+        registries = []
+    merged_registries = [str(item) for item in registries if str(item).strip()]
+    if registry not in merged_registries:
+        merged_registries.append(registry)
+    config["insecure-registries"] = merged_registries
+    draft = json.dumps(config, ensure_ascii=False, indent=2)
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        resolved_path = path
+    return "\n".join(
+        [
+            "render_docker_daemon_config",
+            f"source_path={resolved_path}",
+            f"source_status={source_status}",
+            "template_status=draft",
+            "environment unchanged",
+            "next_recipes=write_ops_file",
+            "## daemon_json_patch_draft",
+            redact_sensitive_text(draft),
+        ]
+    )
 
 
 def inspect_screen_session(args: Optional[dict] = None) -> str:

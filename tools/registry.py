@@ -342,6 +342,21 @@ TOOLS = [
         ["path"],
     ),
     _tool(
+        "render_docker_daemon_config",
+        "只读生成 Docker daemon.json 合并草案，不写文件。用于把 insecure-registries 合并进现有配置，同时保留 registry-mirrors、dns、runtimes 等已有字段；写入必须再通过 OperationPlan 绑定 write_ops_file，重启 Docker 必须二次确认。",
+        {
+            "path": {
+                "type": "string",
+                "description": "daemon.json 路径，默认 /etc/docker/daemon.json；只读取 JSON 并生成草案。",
+            },
+            "registry": {
+                "type": "string",
+                "description": "要加入 insecure-registries 的 Master 镜像仓库 endpoint，例如 192.168.1.33:5024。",
+            },
+        },
+        ["registry"],
+    ),
+    _tool(
         "inspect_screen_session",
         "只读抓取指定 screen 会话的窗口/滚屏快照，用于查看 master、worker、celery、web_terminal 最近输出。返回 screen_scrollback 证据，current_state=false；不能单独证明当前进程仍存活。使用 screen hardcopy，不发送交互输入。",
         {

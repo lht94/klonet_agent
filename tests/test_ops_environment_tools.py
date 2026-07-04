@@ -77,6 +77,7 @@ def test_environment_tools_are_registered_for_llm():
     assert "inspect_process_detail" in tool_names
     assert "read_ops_file" in tool_names
     assert "read_klonet_logs" in tool_names
+    assert "render_docker_daemon_config" in tool_names
     assert "inspect_archive" in tool_names
     assert "inspect_screen_session" in tool_names
     assert "inspect_nginx_routes" in tool_names
@@ -400,6 +401,90 @@ def test_executor_dispatches_archive_inspection_tool():
 
     assert "inspect_archive" in result
     assert "archive_missing=/tmp/missing.zip" in result
+
+
+def test_render_docker_daemon_config_merges_insecure_registry_without_overwriting():
+    import json
+
+    from klonet_agent.tools.environment import render_docker_daemon_config
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        daemon = temp_dir / "daemon.json"
+        daemon.write_text(
+            json.dumps(
+                {
+                    "registry-mirrors": ["https://mirror.example"],
+                    "dns": ["8.8.8.8"],
+                    "runtimes": {
+                        "nvidia": {
+                            "path": "nvidia-container-runtime",
+                            "runtimeArgs": [],
+                        }
+                    },
+                    "insecure-registries": ["192.168.1.10:5024"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        result = render_docker_daemon_config(
+            {
+                "path": str(daemon),
+                "registry": "192.168.1.33:5024",
+            }
+        )
+
+    assert "render_docker_daemon_config" in result
+    assert f"source_path={daemon.resolve()}" in result
+    assert "template_status=draft" in result
+    assert "environment unchanged" in result
+    assert "next_recipes=write_ops_file" in result
+    assert '"registry-mirrors": [' in result
+    assert '"https://mirror.example"' in result
+    assert '"dns": [' in result
+    assert '"8.8.8.8"' in result
+    assert '"runtimes": {' in result
+    assert '"192.168.1.10:5024"' in result
+    assert '"192.168.1.33:5024"' in result
+
+
+def test_render_docker_daemon_config_missing_file_uses_minimal_draft():
+    from klonet_agent.tools.environment import render_docker_daemon_config
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        daemon = temp_dir / "daemon.json"
+        result = render_docker_daemon_config(
+            {
+                "path": str(daemon),
+                "registry": "10.0.0.5:5024",
+            }
+        )
+
+    assert "render_docker_daemon_config" in result
+    assert f"source_path={daemon.resolve()}" in result
+    assert "source_status=missing" in result
+    assert '"insecure-registries": [' in result
+    assert '"10.0.0.5:5024"' in result
+    assert "environment unchanged" in result
+
+
+def test_executor_dispatches_docker_daemon_config_renderer():
+    from klonet_agent.tools.executor import ToolExecutor
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        daemon = temp_dir / "daemon.json"
+        result = ToolExecutor(allowed_tools={"render_docker_daemon_config"}).run(
+            "render_docker_daemon_config",
+            {"path": str(daemon), "registry": "10.0.0.5:5024"},
+        )
+
+    assert "render_docker_daemon_config" in result
+    assert '"10.0.0.5:5024"' in result
 
 
 def test_ops_context_groups_baseline_runtime_and_assets(monkeypatch):

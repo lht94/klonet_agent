@@ -13,7 +13,17 @@ def test_pytest_ignores_runtime_directories():
     text = config.read_text(encoding="utf-8")
 
     assert "norecursedirs" in text
+    assert "--basetemp=C:/tmp/klonet_agent_pytest_tmp" in text
     assert "workspaces" in text
     assert "journals" in text
     assert "memory" in text
     assert "klonet_knowledge" in text
+
+
+def test_local_temp_dir_avoids_onedrive_project_tmp_by_default():
+    """Test helper temp root should avoid OneDrive ACL/sync locks."""
+
+    from tests import helpers
+
+    assert helpers.TEST_TMP_ROOT != PROJECT_ROOT / ".test_tmp"
+    assert helpers.TEST_TMP_ROOT.name == "klonet_agent_test_tmp"

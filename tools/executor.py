@@ -34,6 +34,7 @@ from klonet_agent.tools.environment import (
     inspect_system_environment,
     read_klonet_logs,
     read_ops_file,
+    render_docker_daemon_config,
     render_klonet_config,
 )
 from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
@@ -145,6 +146,9 @@ class ToolExecutor:
 
         if tool_name == "render_klonet_config":
             return render_klonet_config(tool_args)
+
+        if tool_name == "render_docker_daemon_config":
+            return render_docker_daemon_config(tool_args)
 
         if tool_name == "inspect_nginx_routes":
             return inspect_nginx_routes(tool_args)

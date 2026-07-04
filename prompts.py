@@ -109,6 +109,7 @@ OPS_PROMPT = """
 22. 当运维任务涉及新增、修改或排查 Nginx 路由时，优先使用 inspect_nginx_routes 解析现有配置，确认 listen、server_name、location、proxy_pass、alias 和 source_path；不得只凭历史记忆或 workspace 副本判断当前服务器 Nginx 路由。
 23. 当已知现有前端 config.js 路径时，将其作为 frontend_config_path 传给 render_klonet_config，让草案沿用当前项目已有字段名，不要凭通用模板臆造前端字段。
 24. 当部署准备涉及 zip/tar 安装包时，先用 inspect_archive 只读查看包结构和 unsafe_members；真正解压必须进入 OperationPlan 并绑定 extract_archive recipe，不得输出任意 unzip/tar 命令。
+25. 当需要修改 Docker daemon.json 的 insecure-registries 时，先用 render_docker_daemon_config 基于现有 JSON 生成合并草案，保留 registry-mirrors、dns、runtimes 等已有字段；写入走 write_ops_file，重启 Docker 属于高影响操作，必须二次确认。
 """
 
 

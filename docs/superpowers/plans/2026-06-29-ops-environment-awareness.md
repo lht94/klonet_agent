@@ -67,24 +67,24 @@ Implemented substrate so far:
 - read-only system probes: `inspect_system_environment` supports fixed baseline
   checks plus `system_python` and `command_paths` for command path/version
   verification;
+- read-only config drafting: `render_docker_daemon_config` merges
+  `insecure-registries` into an existing `daemon.json` draft while preserving
+  existing mirrors, DNS, runtimes and other Docker daemon fields;
 - controlled recipes: `extract_archive`, `prepare_project_files`,
   `run_install_script`, `write_ops_file`, `reload_nginx`,
   `start_platform_screens`, stop/restart screen recipes.
 
 Remaining high-value tools:
 
-1. Docker daemon config merge preview: read current `daemon.json`, produce a
-   JSON-valid patch draft for `insecure-registries` without overwriting existing
-   mirrors, DNS, runtimes or storage settings.
-2. Service/container health summary: deterministic Redis/MySQL/RabbitMQ/Nginx
+1. Service/container health summary: deterministic Redis/MySQL/RabbitMQ/Nginx
    container/process health with "reuse existing service" guidance.
-3. Script inventory and preflight: inspect extracted install scripts, list
+2. Script inventory and preflight: inspect extracted install scripts, list
    expected scripts, executable bits, shebangs, and risky commands before
    attaching `run_install_script`.
-4. Platform health verifier: after start/restart, verify screen sessions,
+3. Platform health verifier: after start/restart, verify screen sessions,
    process cwd, configured ports, Nginx routes and selected HTTP health
    endpoints in one structured result.
-5. Frontend config validator: compare rendered frontend config against actual
+4. Frontend config validator: compare rendered frontend config against actual
    `scripts/config.js` field names and Nginx aliases.
 
 ---
