@@ -25,6 +25,7 @@ from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
 from klonet_agent.tools.environment import (
     inspect_archive,
+    inspect_frontend_config,
     inspect_nginx_routes,
     inspect_platform_health,
     inspect_platform_instances,
@@ -155,6 +156,9 @@ class ToolExecutor:
 
         if tool_name == "render_klonet_config":
             return render_klonet_config(tool_args)
+
+        if tool_name == "inspect_frontend_config":
+            return inspect_frontend_config(tool_args)
 
         if tool_name == "render_docker_daemon_config":
             return render_docker_daemon_config(tool_args)

@@ -70,6 +70,7 @@ def test_environment_tools_are_registered_for_llm():
     tool_names = {item["function"]["name"] for item in TOOLS}
 
     assert "render_klonet_config" in tool_names
+    assert "inspect_frontend_config" in tool_names
     assert "inspect_ops_context" in tool_names
     assert "inspect_platform_health" in tool_names
     assert "inspect_platform_instances" in tool_names
@@ -118,6 +119,7 @@ def test_ops_profile_allows_screen_inspection():
     profile = get_profile("ops")
 
     assert "render_klonet_config" in profile.allowed_tools
+    assert "inspect_frontend_config" in profile.allowed_tools
     assert "inspect_screen_session" in profile.allowed_tools
     assert "inspect_platform_instances" in profile.allowed_tools
     assert "inspect_ops_context" in profile.allowed_tools
@@ -259,6 +261,95 @@ def test_render_klonet_config_rejects_unsafe_inputs():
     assert "render_klonet_config" in result
     assert "invalid_platform=bad;name" in result
     assert "environment unchanged" in result
+
+
+def test_frontend_config_validator_confirms_fields_and_nginx_alias():
+    from klonet_agent.tools.environment import inspect_frontend_config
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        config = temp_dir / "config.js"
+        config.write_text(
+            "\n".join(
+                [
+                    'var server_ip = "192.168.1.33";',
+                    "var server_port = 20222;",
+                    "var terminal_port = 5045;",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        nginx = temp_dir / "nginx.conf"
+        nginx.write_text(
+            "server { listen 20222; location /VEMU2-103/ { alias /home/adminis/lht/103_project/vemu_frontend/VEMU2/; } }",
+            encoding="utf-8",
+        )
+
+        result = inspect_frontend_config(
+            {
+                "frontend_config_path": str(config),
+                "server_name": "192.168.1.33",
+                "public_port": 20222,
+                "terminal_port": 5045,
+                "frontend_alias": "/VEMU2-103/",
+                "frontend_path": "/home/adminis/lht/103_project/vemu_frontend/VEMU2",
+                "nginx_paths": [str(nginx)],
+            }
+        )
+
+    assert "inspect_frontend_config" in result
+    assert f"frontend_config_source={config.resolve()}" in result
+    assert "field=server_ip actual=192.168.1.33 expected=192.168.1.33 status=matched" in result
+    assert "field=server_port actual=20222 expected=20222 status=matched" in result
+    assert "field=terminal_port actual=5045 expected=5045 status=matched" in result
+    assert "frontend_config_status=aligned" in result
+    assert "nginx_alias_status=matched" in result
+    assert "overall_status=ready" in result
+    assert "environment unchanged" in result
+
+
+def test_frontend_config_validator_blocks_mismatched_port():
+    from klonet_agent.tools.environment import inspect_frontend_config
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        config = temp_dir / "config.js"
+        config.write_text(
+            "\n".join(
+                [
+                    'var backend_ip = "192.168.1.33";',
+                    "var backend_port = 30000;",
+                    "var web_terminal_port = 5045;",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = inspect_frontend_config(
+            {
+                "frontend_config_path": str(config),
+                "server_name": "192.168.1.33",
+                "public_port": 20222,
+                "terminal_port": 5045,
+            }
+        )
+
+    assert "inspect_frontend_config" in result
+    assert "field=backend_port actual=30000 expected=20222 status=mismatch" in result
+    assert "frontend_config_status=blocked" in result
+    assert "overall_status=blocked" in result
+
+
+def test_executor_dispatches_frontend_config_validator():
+    from klonet_agent.tools.executor import ToolExecutor
+
+    result = ToolExecutor(allowed_tools={"inspect_frontend_config"}).run(
+        "inspect_frontend_config",
+        {"frontend_config_path": "/tmp/missing.js", "server_name": "127.0.0.1", "public_port": 20222},
+    )
+
+    assert "inspect_frontend_config" in result
+    assert "frontend_config_status=missing" in result
 
 
 def test_executor_dispatches_render_klonet_config_tool():

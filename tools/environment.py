@@ -436,6 +436,81 @@ def render_klonet_config(args: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def inspect_frontend_config(args: Optional[dict] = None) -> str:
+    """Validate frontend config.js and optional Nginx alias evidence."""
+
+    args = args or {}
+    raw_path = str(args.get("frontend_config_path") or "").strip()
+    lines = ["inspect_frontend_config"]
+    blockers = []
+    unchecked = []
+    if not raw_path:
+        return "\n".join(["inspect_frontend_config", "frontend_config_status=missing", "environment unchanged"])
+
+    source_path, source_text, problem = _load_frontend_config_source(raw_path)
+    if problem:
+        status = "missing" if problem.startswith("frontend_config_missing") else "blocked"
+        return "\n".join(
+            [
+                "inspect_frontend_config",
+                problem,
+                f"frontend_config_status={status}",
+                f"overall_status={status}",
+                "environment unchanged",
+            ]
+        )
+
+    lines.append(f"frontend_config_source={source_path}")
+    expected = _frontend_expected_values(args)
+    assignments = _parse_frontend_assignments(source_text)
+    matches = []
+    mismatches = []
+    for assignment in assignments:
+        kind = _frontend_assignment_kind(assignment["name"])
+        if kind not in expected:
+            continue
+        actual = assignment["value"]
+        wanted = expected[kind]
+        status = "matched" if actual == wanted else "mismatch"
+        if status == "matched":
+            matches.append(assignment["name"])
+        else:
+            mismatches.append(assignment["name"])
+        lines.append(
+            f"field={assignment['name']} actual={actual} expected={wanted} status={status}"
+        )
+    missing_kinds = sorted(set(expected) - {_frontend_assignment_kind(item["name"]) for item in assignments})
+    if mismatches:
+        blockers.append("frontend_config")
+        lines.append("frontend_config_status=blocked")
+    elif missing_kinds:
+        unchecked.append("frontend_config")
+        lines.append("frontend_config_status=unchecked missing_expected=" + ",".join(missing_kinds))
+    elif matches:
+        lines.append("frontend_config_status=aligned")
+    else:
+        unchecked.append("frontend_config")
+        lines.append("frontend_config_status=unchecked")
+
+    nginx_status = _frontend_nginx_alias_status(args)
+    if nginx_status:
+        lines.append(nginx_status)
+        if nginx_status.endswith("mismatch") or nginx_status.endswith("missing"):
+            blockers.append("nginx_alias")
+        elif nginx_status.endswith("unchecked"):
+            unchecked.append("nginx_alias")
+
+    if blockers:
+        overall = "blocked"
+    elif unchecked:
+        overall = "unchecked"
+    else:
+        overall = "ready"
+    lines.append(f"overall_status={overall}")
+    lines.append("environment unchanged")
+    return "\n".join(lines)
+
+
 def inspect_platform_instances(args: Optional[dict] = None) -> str:
     """Inspect running Klonet-like platform instances from screen, processes and configs."""
 
@@ -1597,6 +1672,83 @@ def _replace_frontend_config_assignment(
         quote = _assignment_quote(value)
         return f"{prefix}{quote}{server_name}{quote}{suffix}", True
     return line, False
+
+
+def _frontend_expected_values(args: dict) -> dict:
+    expected = {}
+    server_name = str(args.get("server_name") or "").strip()
+    public_port = _safe_port(args.get("public_port"))
+    terminal_port = _safe_port(args.get("terminal_port") or args.get("web_terminal_port"))
+    if server_name:
+        expected["server"] = server_name
+    if public_port is not None:
+        expected["public_port"] = str(public_port)
+    if terminal_port is not None:
+        expected["terminal_port"] = str(terminal_port)
+    return expected
+
+
+def _parse_frontend_assignments(text: str) -> list:
+    assignments = []
+    for line in str(text or "").splitlines():
+        match = re.match(
+            r"^\s*(?:(?:var|let|const)\s+)?([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)\s*=\s*([^;]+)",
+            line,
+        )
+        if not match:
+            continue
+        name = match.group(1)
+        value = match.group(2).strip()
+        assignments.append({"name": name, "value": _normalize_js_assignment_value(value)})
+    return assignments
+
+
+def _normalize_js_assignment_value(value: str) -> str:
+    stripped = str(value or "").strip()
+    if (stripped.startswith("\"") and stripped.endswith("\"")) or (
+        stripped.startswith("'") and stripped.endswith("'")
+    ):
+        return stripped[1:-1]
+    return stripped
+
+
+def _frontend_assignment_kind(name: str) -> str:
+    lowered = str(name or "").lower()
+    if "terminal" in lowered and "port" in lowered:
+        return "terminal_port"
+    if "port" in lowered:
+        return "public_port"
+    if any(key in lowered for key in ("ip", "host", "server")):
+        return "server"
+    return ""
+
+
+def _frontend_nginx_alias_status(args: dict) -> str:
+    nginx_paths = args.get("nginx_paths")
+    frontend_alias = _normalize_frontend_alias(str(args.get("frontend_alias") or "").strip())
+    frontend_path = _normalize_frontend_path(str(args.get("frontend_path") or "").strip())
+    if not isinstance(nginx_paths, list) or not nginx_paths:
+        return ""
+    if not frontend_alias or not frontend_path:
+        return "nginx_alias_status=unchecked"
+    expected_alias = frontend_path.rstrip("/") + "/"
+    saw_routes = False
+    for raw_path in nginx_paths:
+        path = Path(str(raw_path or "")).expanduser()
+        if _is_sensitive_path(path) or not _is_safe_ops_file_path(path) or not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for route in _parse_nginx_routes(text, str(path.resolve())):
+            saw_routes = True
+            detail = route.detail
+            if f"location={frontend_alias}" in detail:
+                if f"alias={expected_alias}" in detail:
+                    return "nginx_alias_status=matched"
+                return "nginx_alias_status=mismatch"
+    return "nginx_alias_status=missing" if saw_routes else "nginx_alias_status=unchecked"
 
 
 def _assignment_quote(value: str) -> str:

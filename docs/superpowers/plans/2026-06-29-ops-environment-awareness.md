@@ -81,14 +81,19 @@ Implemented substrate so far:
   platform after start/restart by combining project root, screen roles, process
   roles/cwd, configured ports, live port owners and optional Nginx routes into
   `overall_status=ready|blocked|unchecked`;
+- read-only frontend config validator: `inspect_frontend_config` compares an
+  existing `scripts/config.js` against expected server/public/web-terminal
+  values and optional Nginx alias/path evidence before writing frontend config;
 - controlled recipes: `extract_archive`, `prepare_project_files`,
   `run_install_script`, `write_ops_file`, `reload_nginx`,
   `start_platform_screens`, stop/restart screen recipes.
 
 Remaining high-value tools:
 
-1. Frontend config validator: compare rendered frontend config against actual
-   `scripts/config.js` field names and Nginx aliases.
+The current read-only high-value tool backlog is complete. Next work should move
+from validation substrate to broader controlled modifying capabilities: safer
+write workflows, start/restart/destroy recipes, and richer post-operation
+verification.
 
 ---
 

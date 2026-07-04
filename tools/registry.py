@@ -170,6 +170,42 @@ TOOLS = [
         ["platform", "server_name", "master_port", "worker_port", "public_port", "terminal_port", "frontend_alias", "frontend_path"],
     ),
     _tool(
+        "inspect_frontend_config",
+        "Read-only validator for an existing Klonet frontend config.js and optional Nginx alias. Parses actual frontend fields, compares server/public/web_terminal values with expected deployment values, checks Nginx alias when paths are provided, and returns overall_status ready/blocked/unchecked without modifying files.",
+        {
+            "frontend_config_path": {
+                "type": "string",
+                "description": "Absolute path to the existing frontend scripts/config.js file.",
+            },
+            "server_name": {
+                "type": "string",
+                "description": "Expected backend host or server IP used by the frontend.",
+            },
+            "public_port": {
+                "type": "integer",
+                "description": "Expected public/backend port used by the frontend.",
+            },
+            "terminal_port": {
+                "type": "integer",
+                "description": "Expected web terminal port used by the frontend.",
+            },
+            "frontend_alias": {
+                "type": "string",
+                "description": "Optional expected Nginx frontend location alias, for example /VEMU2-103/.",
+            },
+            "frontend_path": {
+                "type": "string",
+                "description": "Optional expected frontend directory used by the Nginx alias.",
+            },
+            "nginx_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional Nginx config paths to check for the frontend alias.",
+            },
+        },
+        ["frontend_config_path"],
+    ),
+    _tool(
         "inspect_nginx_routes",
         "只读解析 Nginx 配置文件中的 listen、server_name、location、proxy_pass 和 alias，并返回 source_path。用于新平台部署前判断 public_port、frontend alias、反代后端端口是否与已有平台冲突；不执行 nginx -T、不 reload、不修改环境。",
         {

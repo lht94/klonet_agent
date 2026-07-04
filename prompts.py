@@ -113,6 +113,7 @@ OPS_PROMPT = """
 26. 当问题涉及 Redis、MySQL、RabbitMQ、Nginx 或 Docker 基础容器是否需要启动/复用时，优先使用 inspect_service_health 形成服务健康摘要；已检测到运行中的共享服务时默认建议复用，不要重复执行 docker_service.sh 或重复创建 Redis。
 27. 当准备运行 base_requ_setup.sh 或 docker_service.sh 前，先用 inspect_install_scripts 检查脚本存在性、shebang、可执行位、风险标记和 allowed_args；只有 preflight_status=ready 后，才能创建或推进绑定 run_install_script 的 OperationPlan。
 28. 当平台启动、重启或修复后需要判断是否恢复正常时，优先使用 inspect_platform_health 汇总 screen 角色、进程 cwd、config.py 端口、端口监听者和 Nginx 路由；overall_status=ready 才能说明启动验收通过，blocked/unchecked 必须说明缺失证据。
+29. 当需要核对或修改前端 scripts/config.js 与 Nginx alias 是否匹配时，先使用 inspect_frontend_config 读取实际字段并比较 server/public/web_terminal 端口和 alias/path；overall_status=ready 才能说明前端配置验收通过，blocked 表示草案或现有配置仍需修正。
 """
 
 
