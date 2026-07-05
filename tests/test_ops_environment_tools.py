@@ -1154,6 +1154,45 @@ def test_process_detail_tool_returns_target_pid_cmd_and_cwd(monkeypatch):
     assert "cwd=/home/adminis/lht/102_project" in result
 
 
+def test_process_detail_reports_unchecked_when_proc_cwd_is_unreadable(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout='LISTEN 0 128 0.0.0.0:5045 0.0.0.0:* users:(("python3.8",pid=1467095,fd=7))',
+                stderr="",
+            )
+        if command[:2] == ["ps", "-p"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_text",
+        lambda path: "python3.8 web_terminal_main.py"
+        if path.endswith("/cmdline")
+        else "",
+    )
+    monkeypatch.setattr(environment.os, "readlink", lambda path: (_ for _ in ()).throw(PermissionError("denied")))
+
+    result = environment.inspect_process_detail({"ports": [5045]})
+
+    assert "pid=1467095" in result
+    assert "cwd=unchecked" in result
+    assert "/proc/1467095/cwd" not in result
+
+
 def test_executor_dispatches_environment_tool():
     from klonet_agent.tools.executor import ToolExecutor
 

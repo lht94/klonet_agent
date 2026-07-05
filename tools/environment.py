@@ -1459,7 +1459,7 @@ def _read_proc_text(path: str) -> str:
 
 def _read_proc_link(path: str) -> str:
     try:
-        return str(Path(path).resolve())
+        return os.readlink(path)
     except OSError:
         return ""
 
