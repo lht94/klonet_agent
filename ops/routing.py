@@ -69,7 +69,7 @@ def route_ops_request(user_input: str) -> OpsRoute:
             ports=ports,
             paths=paths,
             components=components,
-            recommended_tools=["inspect_klonet_runtime", "inspect_process_detail"],
+            recommended_tools=["inspect_process_detail", "inspect_klonet_runtime"],
         )
 
     if any(term in lowered for term in ("traceback", "日志", "error.log", "报错")):

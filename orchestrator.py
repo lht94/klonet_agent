@@ -1392,6 +1392,7 @@ class AgentOrchestrator:
                     f"- paths: {', '.join(ops_route.paths[:3]) or 'none'}",
                     f"- components: {', '.join(ops_route.components[:5]) or 'none'}",
                     f"- recommended_tools: {', '.join(ops_route.recommended_tools) or 'none'}",
+                    *self._ops_tool_arg_hints(ops_route),
                     "- Ops must treat these as tool-routing hints, not as final diagnosis.",
                 ]
             )
@@ -1464,6 +1465,19 @@ class AgentOrchestrator:
                 ]
             )
         return {"role": "system", "content": "\n".join(rules)}
+
+    def _ops_tool_arg_hints(self, ops_route: OpsRoute) -> list[str]:
+        """Return deterministic argument hints for high-risk Ops diagnostic routes."""
+
+        hints = []
+        if "inspect_process_detail" in ops_route.recommended_tools and ops_route.ports:
+            port_list = ", ".join(str(port) for port in ops_route.ports)
+            hints.append(
+                "- tool_args_hint: inspect_process_detail "
+                f'{{"ports":[{port_list}]}} '
+                "purpose=confirm realtime listener PID/cmd/cwd before relying on screen or broad runtime output"
+            )
+        return hints
 
     def _refresh_memory_prompt(self, history: list[dict]):
         """刷新上下文里的记忆系统提示词。"""

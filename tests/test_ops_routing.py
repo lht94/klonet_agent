@@ -26,7 +26,10 @@ def test_ops_route_extracts_port_conflict_slots():
     assert route.ports == [5045]
     assert route.paths == ["/home/adminis/lht/102_project"]
     assert route.components == ["web_terminal_main.py"]
-    assert "inspect_klonet_runtime" in route.recommended_tools
+    assert route.recommended_tools[:2] == [
+        "inspect_process_detail",
+        "inspect_klonet_runtime",
+    ]
     assert "code_lookup" not in route.summary()
 
 

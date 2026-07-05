@@ -1198,7 +1198,9 @@ def test_ops_scope_message_injects_tool_routing_plan():
     assert "Ops tool routing" in content
     assert "goal:" in content
     assert "port_conflict" in content
-    assert "recommended_tools: inspect_klonet_runtime, inspect_process_detail" in content
+    assert "recommended_tools: inspect_process_detail, inspect_klonet_runtime" in content
+    assert 'tool_args_hint: inspect_process_detail {"ports":[5045]}' in content
+    assert "confirm realtime listener PID/cmd/cwd" in content
 
 
 def test_ops_tool_action_uses_safe_arguments_only():

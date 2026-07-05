@@ -114,6 +114,16 @@ def test_ops_prompt_uses_dedicated_account_platform_path():
     assert "不要把历史服务器用户名" in OPS_PROMPT
 
 
+def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():
+    """Port/PID/cwd questions should prefer precise process evidence first."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "inspect_process_detail" in OPS_PROMPT
+    assert "PID、命令或 cwd" in OPS_PROMPT
+    assert "不得先用 screen 存在、历史日志" in OPS_PROMPT
+
+
 def test_tool_descriptions_do_not_suggest_adminis_paths():
     """Model-visible tool examples should use neutral or klonet-agent paths."""
 
