@@ -42,6 +42,7 @@ from klonet_agent.knowledge.turn_intent import (
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
+from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.routing import OpsRoute, route_ops_request
 from klonet_agent.prompts import build_system_prompts
@@ -165,6 +166,9 @@ class AgentOrchestrator:
         return response
 
     def _complete_llm(self, history: list[dict], *, stream: bool):
+        sanitized_history = sanitize_openai_tool_history(history)
+        if len(sanitized_history) != len(history):
+            history[:] = sanitized_history
         tools = self._visible_tools()
         if not stream:
             return self.llm.complete(messages=history, tools=tools)
