@@ -324,15 +324,15 @@ python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
 python agent.py --help
 ```
 
-## Ubuntu 专用 SSH 账户部署
+## Ubuntu Python 运行环境准备
 
-在服务器更新代码后，运行部署脚本，把 `klonet-agent` 配置为专用 SSH
-登录账户：
+专用 SSH 账号和 Python 虚拟环境是两件独立的事：
 
-```bash
-cd ~/lht/agent/klonet_agent
-git pull
-```
+- 专用 SSH 账号负责 Linux 身份、home 目录、sudoers 白名单和运维权限边界。
+- Python 运行环境负责安装依赖，部署脚本只需要拿到一个可执行的 Python 路径。
+
+如果服务器已有可用 Python 环境，可以直接把那个解释器传给安装脚本的 `--python`。
+如果希望项目自带独立依赖，推荐在项目目录准备 `.venv`。
 
 如果服务器使用 Klonet 环境里的 Python 3.8，且 `python3.8 -m venv`
 在 `ensurepip` 阶段失败，可以先创建不带 pip 的虚拟环境，再手动安装 pip：
@@ -354,7 +354,17 @@ sudo -u klonet-agent .venv/bin/python --version
 sudo -u klonet-agent .venv/bin/pip --version
 ```
 
-虚拟环境准备好后，再把 `.venv/bin/python` 交给部署脚本：
+## Ubuntu 专用 SSH 账户部署
+
+在服务器更新代码后，运行部署脚本，把 `klonet-agent` 配置为专用 SSH
+登录账户：
+
+```bash
+cd ~/lht/agent/klonet_agent
+git pull
+```
+
+把已经准备好的 Python 解释器交给部署脚本；下面示例使用项目内 `.venv`，但也可以换成其他已安装好依赖的 Python：
 
 ```bash
 sudo ./scripts/install-klonet-agent-service.sh \
