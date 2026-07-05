@@ -1,0 +1,9 @@
+if [[ "${USER:-}" == "klonet-agent" ]]; then
+  export PATH=@VENV_BIN@:"$PATH"
+  if [[ -r @ENV_FILE@ ]]; then
+    set -a
+    source @ENV_FILE@
+    set +a
+  fi
+  cd @PACKAGE_PARENT@
+fi

@@ -12,6 +12,8 @@ project_id="default"
 service_name="klonet-agent"
 env_file="/etc/klonet-agent/klonet-agent.env"
 start_service=0
+enable_ssh_login=0
+set_password=0
 
 usage() {
   cat <<'EOF'
@@ -24,6 +26,8 @@ Options:
   --service-name NAME      systemd service name (default: klonet-agent)
   --env-file PATH          root-managed environment file
   --start                  Restart the service after installation
+  --enable-ssh-login       Allow klonet-agent to log in with /bin/bash
+  --set-password           Interactively run passwd for klonet-agent
   -h, --help               Show this help
 
 The service is enabled but not started by default because the current Agent
@@ -51,11 +55,16 @@ while (($#)); do
     --service-name) require_value "$@"; service_name="$2"; shift 2 ;;
     --env-file) require_value "$@"; env_file="$2"; shift 2 ;;
     --start) start_service=1; shift ;;
+    --enable-ssh-login) enable_ssh_login=1; shift ;;
+    --set-password) set_password=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
+if ((set_password && !enable_ssh_login)); then
+  die "--set-password requires --enable-ssh-login"
+fi
 [[ "$(id -u)" == "0" ]] || die "run this installer as root (sudo)"
 [[ -n "$project_root" ]] || die "--project-root is required"
 [[ -n "$python_path" ]] || die "--python is required"
@@ -65,6 +74,11 @@ python_path="$(readlink -f "$python_path")"
 [[ -f "$project_root/scripts/klonet-agent-op" ]] || die "missing scripts/klonet-agent-op"
 [[ -f "$project_root/scripts/klonet-agent-op.sudoers" ]] || die "missing sudoers template"
 [[ -f "$project_root/scripts/klonet-agent.service.in" ]] || die "missing systemd template"
+if ((enable_ssh_login)); then
+  [[ -f "$project_root/scripts/klonet-agent-login-profile.sh.in" ]] \
+    || die "missing login profile template"
+  [[ -x /bin/bash ]] || die "/bin/bash is required for SSH login"
+fi
 [[ -x "$python_path" ]] || die "Python is not executable: $python_path"
 [[ "$service_name" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "invalid service name"
 [[ "$env_file" == /* ]] || die "--env-file must be absolute"
@@ -75,6 +89,9 @@ done
 for command in getent groupadd useradd usermod install visudo systemctl sudo; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
+if ((set_password)); then
+  command -v passwd >/dev/null || die "required command not found: passwd"
+fi
 
 prefix_path() {
   printf '%s%s' "$install_root" "$1"
@@ -99,12 +116,21 @@ if id "$agent_user" >/dev/null 2>&1; then
   IFS=: read -r _ _ existing_uid _ _ _ existing_shell <<<"$passwd_entry"
   [[ "$existing_uid" =~ ^[0-9]+$ && "$existing_uid" -lt 1000 ]] \
     || die "existing $agent_user is not a system account"
-  [[ "$existing_shell" == "/usr/sbin/nologin" || "$existing_shell" == "/bin/false" ]] \
-    || die "existing $agent_user has an interactive shell"
+  [[ "$existing_shell" == "/usr/sbin/nologin" \
+    || "$existing_shell" == "/bin/false" \
+    || "$existing_shell" == "/bin/bash" ]] \
+    || die "existing $agent_user has an unsupported shell"
+  if ((enable_ssh_login)) && [[ "$existing_shell" != "/bin/bash" ]]; then
+    usermod --shell /bin/bash "$agent_user"
+  fi
 else
+  account_shell="/usr/sbin/nologin"
+  if ((enable_ssh_login)); then
+    account_shell="/bin/bash"
+  fi
   useradd --system --user-group --create-home \
     --home-dir /var/lib/klonet-agent \
-    --shell /usr/sbin/nologin \
+    --shell "$account_shell" \
     "$agent_user"
 fi
 usermod -aG "$ops_group" "$agent_user"
@@ -139,6 +165,10 @@ escape_sed() {
   printf '%s' "$1" | sed 's/[&|\\]/\\&/g'
 }
 
+shell_quote() {
+  printf '%q' "$1"
+}
+
 package_parent="$(dirname "$project_root")"
 unit_tmp="${unit_path}.tmp.$$"
 sed \
@@ -157,6 +187,28 @@ else
 fi
 mv -f "$unit_tmp" "$unit_path"
 
+if ((enable_ssh_login)); then
+  profile_path="$(prefix_path /etc/profile.d/klonet-agent.sh)"
+  mkdir -p "$(dirname "$profile_path")"
+  profile_tmp="${profile_path}.tmp.$$"
+  venv_bin="$(dirname "$python_path")"
+  sed \
+    -e "s|@VENV_BIN@|$(escape_sed "$(shell_quote "$venv_bin")")|g" \
+    -e "s|@ENV_FILE@|$(escape_sed "$(shell_quote "$env_file")")|g" \
+    -e "s|@PACKAGE_PARENT@|$(escape_sed "$(shell_quote "$package_parent")")|g" \
+    "$project_root/scripts/klonet-agent-login-profile.sh.in" >"$profile_tmp"
+  install_with_mode root root 0644 "$profile_tmp" "$profile_path"
+  rm -f "$profile_tmp"
+
+  for runtime_dir in memory journals workspaces tracing; do
+    runtime_path="$project_root/$runtime_dir"
+    mkdir -p "$runtime_path"
+    chgrp -R "$agent_user" "$runtime_path"
+    chmod -R g+rwX "$runtime_path"
+    find "$runtime_path" -type d -exec chmod g+s {} +
+  done
+fi
+
 systemctl daemon-reload
 systemctl enable "${service_name}.service"
 if ((start_service)); then
@@ -167,6 +219,10 @@ visudo -cf "$sudoers_path"
 sudo -l -U "$agent_user" >/dev/null
 sudo -u "$agent_user" "$helper_path" reload-nginx --dry-run >/dev/null
 
+if ((set_password)); then
+  passwd "$agent_user"
+fi
+
 printf 'Klonet Agent deployment complete.\n'
 printf 'service=%s.service\n' "$service_name"
 printf 'account=%s\n' "$agent_user"
@@ -174,4 +230,7 @@ printf 'environment_file=%s\n' "$env_file"
 if ((!start_service)); then
   printf 'The service was enabled but not started. Configure the environment, then run:\n'
   printf '  systemctl start %s.service\n' "$service_name"
+fi
+if ((enable_ssh_login)); then
+  printf 'SSH account login enabled for %s. Server sshd password policy still applies.\n' "$agent_user"
 fi

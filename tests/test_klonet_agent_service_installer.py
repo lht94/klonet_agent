@@ -45,7 +45,10 @@ def _run_installer(tmp_path: Path, *extra_args: str):
         'if [[ "${1:-}" == "-u" ]]; then echo 0; exit 0; fi; exit 1',
     )
     _write_fake_command(bin_dir, "getent", "exit 2")
-    for name in ("groupadd", "useradd", "usermod", "visudo", "systemctl", "sudo"):
+    for name in (
+        "groupadd", "useradd", "usermod", "visudo", "systemctl", "sudo",
+        "passwd", "chgrp", "chmod", "find",
+    ):
         _write_fake_command(bin_dir, name)
 
     env = os.environ.copy()
@@ -98,3 +101,35 @@ def test_reinstall_preserves_environment_file(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert env_file.read_text(encoding="utf-8") == "OPENAI_API_KEY=server-secret\n"
+
+
+def test_set_password_requires_ssh_login(tmp_path):
+    result, calls, _ = _run_installer(tmp_path, "--set-password")
+
+    assert result.returncode != 0
+    assert "--set-password requires --enable-ssh-login" in result.stderr
+    assert "passwd klonet-agent" not in calls
+
+
+def test_ssh_login_installs_profile_and_sets_password_interactively(tmp_path):
+    result, calls, install_root = _run_installer(
+        tmp_path, "--enable-ssh-login", "--set-password"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--shell /bin/bash klonet-agent" in calls
+    assert "passwd klonet-agent" in calls
+    profile = (install_root / "etc/profile.d/klonet-agent.sh").read_text(
+        encoding="utf-8"
+    )
+    assert str(Path(os.sys.executable).resolve().parent) in profile
+    assert "/etc/klonet-agent/klonet-agent.env" in profile
+    assert str(PROJECT_ROOT.parent) in profile
+
+
+def test_installer_contains_no_password_input_option():
+    text = INSTALLER.read_text(encoding="utf-8")
+
+    assert "--password " not in text
+    assert "chpasswd" not in text
+    assert 'passwd "$agent_user"' in text
