@@ -234,6 +234,21 @@ class OperationPlanStore:
             return f"Error: previous step must be completed first: {previous_incomplete.step_id}"
         previous_status = step.status
         if not step.recipe_id:
+            if plan.operation == "deploy_platform" and step.step_id == "precheck":
+                step.status = "blocked"
+                self.save_plan(plan)
+                return _render_step_execution(
+                    plan,
+                    step,
+                    previous_status=previous_status,
+                    result_status="blocked",
+                    execution_result=(
+                        "deploy_precheck_requires_project_root_or_recipe; environment unchanged"
+                    ),
+                    next_required_action=(
+                        "provide operation_args.project_root or bind a readonly precheck recipe"
+                    ),
+                )
             if not step.requires_step_confirmation and step.risk == "normal":
                 step.status = "completed"
                 if _all_steps_completed(plan):

@@ -551,6 +551,32 @@ def test_store_execute_next_step_uses_current_execution_order():
     assert _status_by_step(loaded)["precheck-runtime"] == "completed"
 
 
+def test_deploy_precheck_without_recipe_blocks_instead_of_fake_completion():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "precheck")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=precheck" in result
+    assert "result_status=blocked" in result
+    assert "execution_result=deploy_precheck_requires_project_root_or_recipe; environment unchanged" in result
+    assert "next_required_action=provide operation_args.project_root or bind a readonly precheck recipe" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["precheck"] == "blocked"
+    assert statuses["prepare-files"] == "pending"
+
+
 def test_store_execute_next_step_reports_required_confirm_step_command():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir
