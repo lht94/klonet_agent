@@ -135,6 +135,15 @@ _SAFE_COMMAND_NAME = re.compile(r"^[A-Za-z0-9_.+-]{1,80}$")
 _SAFE_REGISTRY_ENDPOINT = re.compile(r"^[A-Za-z0-9_.:-]{1,255}$")
 _SECRET_PATTERNS = (
     re.compile(
+        r"(?i)((?:[A-Za-z0-9_.]+\.)?config\[\s*['\"][^'\"]*(?:password|passwd|pwd|api[_-]?key|secret|token)[^'\"]*['\"]\s*\]\s*=\s*)([^\r\n]+)"
+    ),
+    re.compile(
+        r"(?i)((?:['\"]?[A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*['\"]?\s*[:=]\s*))([^\r\n,}]+)"
+    ),
+    re.compile(
+        r"(?i)((?:['\"]?authorization['\"]?\s*:\s*['\"]?\s*bearer\s+))([^'\"\s,}]+)"
+    ),
+    re.compile(
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
     ),
     re.compile(

@@ -943,6 +943,35 @@ def test_ops_file_reader_allows_config_and_redacts_secrets():
     assert "[REDACTED]" in result
 
 
+def test_ops_file_reader_redacts_source_secret_assignments():
+    from klonet_agent.tools.environment import read_ops_file
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        config = temp_dir / "app_factory.py"
+        config.write_text(
+            "\n".join(
+                [
+                    "master_port = 12000",
+                    "flask_app.config['SECRET_KEY'] = b'raw-secret-bytes'",
+                    'settings = {"api_token": "json-token-value"}',
+                    'headers = {"Authorization": "Bearer bearer-token-value"}',
+                    "client_secret: yaml-secret-value",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = read_ops_file({"path": str(config), "max_chars": 1000})
+
+    assert "master_port = 12000" in result
+    assert "raw-secret-bytes" not in result
+    assert "json-token-value" not in result
+    assert "bearer-token-value" not in result
+    assert "yaml-secret-value" not in result
+    assert result.count("[REDACTED]") >= 4
+
+
 def test_ops_file_reader_rejects_env_files():
     from klonet_agent.tools.environment import read_ops_file
     from tests.helpers import local_temp_dir
