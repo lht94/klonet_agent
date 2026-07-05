@@ -155,6 +155,10 @@ class OperationPlanStore:
             raise ValueError(
                 "blocked step must be resolved with resolve_ops_blocked_step before confirm-step"
             )
+        if step.status == "running":
+            raise ValueError(
+                "running step must be inspected and resolved before confirm-step"
+            )
         if step.status == "failed":
             raise ValueError("failed step cannot be approved; create a new plan or recover manually")
         step.status = "approved"
@@ -204,6 +208,20 @@ class OperationPlanStore:
                 result_status="failed",
                 execution_result="step already failed; create a new plan or repair state before continuing",
                 next_required_action="create_new_plan_or_recover_manually",
+            )
+        if step.status == "running":
+            step.status = "blocked"
+            self.save_plan(plan)
+            return _render_step_execution(
+                plan,
+                step,
+                previous_status="running",
+                result_status="blocked",
+                execution_result=(
+                    "previous execution left this step running; environment state unknown; "
+                    "inspect runtime, logs and processes before retrying"
+                ),
+                next_required_action="inspect_runtime",
             )
         if step.requires_step_confirmation and step.status != "approved":
             return (

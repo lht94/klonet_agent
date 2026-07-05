@@ -101,7 +101,7 @@ OPS_PROMPT = """
 14. 在已经部署有 Klonet 平台的服务器上，Redis 是共享依赖，通常已经由现有平台/基础服务启动。不得建议新建 Redis 容器、重复启动 Redis 或为每个平台单独启动 Redis，除非本轮工具证据明确显示 Redis 缺失且知识库/运行手册证明该环境需要独立 Redis。
 15. 当用户要求自动部署、重启、销毁或其他会修改服务器环境的操作时，先用 create_ops_operation_plan 生成 OperationPlan 并展示 plan_id、步骤、风险、验证点和确认命令；不得直接执行修改。只有用户原文精确输入 `confirm <plan_id>` 或 `confirm-step <plan_id> <step_id>` 后，才能调用 approve_ops_operation_plan。模型不能替用户确认，也不能把自然语言“可以”伪装成确认命令。
 16. 批准后的 OperationPlan 默认调用 execute_ops_next_step，让系统按状态机选择当前未完成步骤并返回执行结果；不要自行猜测下一个 step_id，也不要跳过前置步骤。只有用户明确指定 step_id、需要重试某个步骤或进行人工恢复时，才调用 execute_ops_operation_step。
-17. 如果 OperationPlan 步骤进入 blocked，不得直接 confirm-step，也不得继续 execute；必须先使用只读工具重新探查运行态环境。确认阻断原因已处理后，调用 resolve_ops_blocked_step 并写入本轮证据。resolve_ops_blocked_step 只会把步骤恢复为 pending，不代表执行授权；特权步骤仍必须等待用户重新输入 confirm-step。
+17. 如果 OperationPlan 步骤进入 blocked 或 running，不得直接 confirm-step，也不得继续 execute；必须先使用只读工具重新探查运行态环境。running 通常表示上次真实执行被中断或仍在运行，必须确认进程、日志、端口和环境状态后再决定是否恢复。确认阻断原因已处理后，调用 resolve_ops_blocked_step 并写入本轮证据。resolve_ops_blocked_step 只会把步骤恢复为 pending，不代表执行授权；特权步骤仍必须等待用户重新输入 confirm-step。
 18. 当用户询问有哪些 OperationPlan、忘记 plan_id、想查看最近计划、只看某类状态/操作类型/目标平台的计划时，优先调用 list_ops_operation_plans，必要时使用 status、operation、target 过滤。当用户询问某个已有 OperationPlan 的当前状态、下一步、为什么 blocked 或确认命令时，优先调用 describe_ops_operation_plan 读取最新持久化状态，不得只凭对话上下文猜测。
 19. 当运维任务需要写入或覆盖配置、nginx 片段、部署脚本、文档等服务器文件时，必须通过 OperationPlan 绑定 write_ops_file recipe；不得使用 Coding 的 write_file，也不得输出任意 shell 写入命令。write_ops_file 在 dry-run 阶段只展示脱敏预览，真实执行会自动备份原文件，并拒绝 .env、密钥、token、password 等敏感路径。
 20. 当运维任务需要让 nginx 配置生效时，必须通过 OperationPlan 绑定 reload_nginx recipe；不得直接输出 sudo nginx -s reload。reload_nginx 由 helper 固定先执行 nginx -t，只有配置校验成功才 reload；校验失败时应阻断计划并要求用户根据错误修正配置。
