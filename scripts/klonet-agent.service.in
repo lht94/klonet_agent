@@ -1,0 +1,20 @@
+[Unit]
+Description=Klonet Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=klonet-agent
+Group=klonet-agent
+WorkingDirectory=@PACKAGE_PARENT@
+EnvironmentFile=-@ENV_FILE@
+ExecStart=@PYTHON@ -m klonet_agent.agent --mode @MODE@ --user-id @USER_ID@ --project-id @PROJECT_ID@
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
