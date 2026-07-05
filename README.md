@@ -127,6 +127,11 @@ python -m klonet_agent.agent --mode mentor --user-id default --project-id defaul
 python -m klonet_agent.agent --mode coding --user-id default --project-id demo
 ```
 
+Ubuntu 服务器需要让 Ops Agent 以 `klonet-agent` 专用系统账户运行时，请使用
+[`docs/ops/klonet-agent-op-install.md`](docs/ops/klonet-agent-op-install.md) 中的
+幂等部署脚本和 systemd 配置。当前入口仍是交互式 CLI，终端对话应使用文档中的
+`sudo -u klonet-agent` 启动方式；systemd 常驻运行需要后续接入 Web/API 服务入口。
+
 也可以用脚本方式查看帮助或启动：
 ```bash
 python agent.py --help
@@ -223,7 +228,7 @@ client.py -> llm/client.py
 history.py -> memory/store.py
 skills.py -> knowledge/skill_loader.py
 tools.py -> tools/*
-run.py -> 
+run.py ->
 ```
 
 ## 更新：任务规划模块的设计
@@ -291,7 +296,7 @@ run.py ->
 ```
 agent.py                    项目入口
 agent_v5/
-    ├── __init__.py      
+    ├── __init__.py
     ├── client.py           大模型客户端初始化
     ├── prompts.py          系统提示词
     ├── history.py          负责对话记忆
@@ -305,11 +310,12 @@ agent_v5/
 1. 把原本的一段段代码封装成一个个函数
 2. 然后在主函数里import这个函数，再调用即可
 3. 目前以面向过程编程为原则，主要是比较简单。后续做大后，为了维护方便可以改成面向对象编程
-   
+
 ## 运行方法
 当前项目建议在仓库根目录运行：
 ``` bash
-cd C:\Users\LHT\OneDrive\课设\agent开发\klonet_agent
-python -m klonet_agent.agent --help
+cd ~/lht/agent
+source klonet_agent/.venv/bin/activate
+python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
 python agent.py --help
 ```
