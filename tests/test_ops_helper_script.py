@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -611,7 +612,13 @@ def test_run_install_script_helper_execute_uses_allowlisted_command(monkeypatch,
     captured = capsys.readouterr()
 
     assert code == 0
-    assert commands == [["bash", "-lc", f"cd '{script_dir}' && bash ./base_requ_setup.sh NORMAL"]]
+    assert commands == [
+        [
+            "bash",
+            "-lc",
+            f"cd {shlex.quote(str(script_dir))} && bash ./base_requ_setup.sh NORMAL",
+        ]
+    ]
     assert "action=run-install-script" in captured.out
     assert "script_name=base_requ_setup.sh" in captured.out
     assert "environment_changed=true" in captured.out
