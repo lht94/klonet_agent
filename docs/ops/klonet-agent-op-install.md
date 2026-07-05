@@ -20,8 +20,12 @@ sudo ./scripts/install-klonet-agent-service.sh \
 脚本可以在多台 Ubuntu 服务器重复执行，并会：
 
 - 创建 `klonet-ops` 系统组；
-- 创建不可交互登录的 `klonet-agent` 系统账户；
+- 创建不可交互登录的 `klonet-agent` 系统账户，新账户默认 home 为
+  `/home/klonet-agent`；
 - 只把 `klonet-agent` 加入 `klonet-ops`，不影响日常登录账户；
+- 创建 `/home/klonet-agent/.cache/tmp`，并在首次生成环境文件时写入
+  `TMPDIR=/home/klonet-agent/.cache/tmp`，避免 jieba 等库复用 `/tmp`
+  下其他用户创建的缓存文件；
 - 安装 root-owned helper 与 sudoers 白名单并通过 `visudo` 校验；
 - 安装并 enable `klonet-agent.service`；
 - 执行 helper 的 `reload-nginx --dry-run` 验证，不执行任何 `--execute` 操作。
@@ -101,6 +105,7 @@ sudoedit /etc/klonet-agent/klonet-agent.env
 ```dotenv
 OPENAI_API_KEY=替换为服务器密钥
 OPENAI_BASE_URL=https://api.deepseek.com
+TMPDIR=/home/klonet-agent/.cache/tmp
 # 完成 helper、sudoers 和计划确认链路验收后，才可手动取消下一行注释：
 # KLONET_AGENT_OPS_REAL_EXECUTION=1
 ```

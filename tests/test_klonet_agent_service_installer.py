@@ -47,7 +47,7 @@ def _run_installer(tmp_path: Path, *extra_args: str):
     _write_fake_command(bin_dir, "getent", "exit 2")
     for name in (
         "groupadd", "useradd", "usermod", "visudo", "systemctl", "sudo",
-        "passwd", "chgrp", "chmod", "find",
+        "passwd", "chgrp", "chmod", "find", "chown",
     ):
         _write_fake_command(bin_dir, name)
 
@@ -100,7 +100,21 @@ def test_reinstall_preserves_environment_file(tmp_path):
     result, _, _ = _run_installer(tmp_path)
 
     assert result.returncode == 0, result.stderr
-    assert env_file.read_text(encoding="utf-8") == "OPENAI_API_KEY=server-secret\n"
+    env_text = env_file.read_text(encoding="utf-8")
+    assert "OPENAI_API_KEY=server-secret\n" in env_text
+    assert "TMPDIR=/home/klonet-agent/.cache/tmp\n" in env_text
+
+
+def test_installer_uses_home_tmpdir_by_default(tmp_path):
+    result, calls, install_root = _run_installer(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "--home-dir /home/klonet-agent" in calls
+    assert "chown klonet-agent:klonet-agent" in calls
+    env_file = install_root / "etc/klonet-agent/klonet-agent.env"
+    assert "TMPDIR=/home/klonet-agent/.cache/tmp\n" in env_file.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_set_password_requires_ssh_login(tmp_path):

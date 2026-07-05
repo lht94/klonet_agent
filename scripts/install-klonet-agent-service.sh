@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 readonly agent_user="klonet-agent"
 readonly ops_group="klonet-ops"
+readonly default_agent_home="/home/klonet-agent"
 install_root="${KLONET_INSTALL_ROOT:-}"
 project_root=""
 python_path=""
@@ -86,7 +87,7 @@ fi
 for value in "$mode" "$user_id" "$project_id"; do
   [[ "$value" != *$'\n'* && "$value" != *'|'* ]] || die "arguments may not contain newlines or |"
 done
-for command in getent groupadd useradd usermod install visudo systemctl sudo; do
+for command in getent groupadd useradd usermod install visudo systemctl sudo chown; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 if ((set_password)); then
@@ -113,7 +114,7 @@ fi
 if id "$agent_user" >/dev/null 2>&1; then
   passwd_entry="$(getent passwd "$agent_user")"
   [[ -n "$passwd_entry" ]] || die "cannot inspect existing $agent_user account"
-  IFS=: read -r _ _ existing_uid _ _ _ existing_shell <<<"$passwd_entry"
+  IFS=: read -r _ _ existing_uid _ _ existing_home existing_shell <<<"$passwd_entry"
   [[ "$existing_uid" =~ ^[0-9]+$ && "$existing_uid" -lt 1000 ]] \
     || die "existing $agent_user is not a system account"
   [[ "$existing_shell" == "/usr/sbin/nologin" \
@@ -128,8 +129,9 @@ else
   if ((enable_ssh_login)); then
     account_shell="/bin/bash"
   fi
+  existing_home="$default_agent_home"
   useradd --system --user-group --create-home \
-    --home-dir /var/lib/klonet-agent \
+    --home-dir "$existing_home" \
     --shell "$account_shell" \
     "$agent_user"
 fi
@@ -139,8 +141,16 @@ helper_path="$(prefix_path /usr/local/bin/klonet-agent-op)"
 sudoers_path="$(prefix_path /etc/sudoers.d/klonet-agent-op)"
 unit_path="$(prefix_path "/etc/systemd/system/${service_name}.service")"
 env_target="$(prefix_path "$env_file")"
+agent_tmpdir="${existing_home:-$default_agent_home}/.cache/tmp"
+tmpdir_target="$(prefix_path "$agent_tmpdir")"
 mkdir -p "$(dirname "$helper_path")" "$(dirname "$sudoers_path")" \
-  "$(dirname "$unit_path")" "$(dirname "$env_target")"
+  "$(dirname "$unit_path")" "$(dirname "$env_target")" "$tmpdir_target"
+if [[ -n "$install_root" ]]; then
+  chmod 0700 "$tmpdir_target"
+else
+  chown "$agent_user:$agent_user" "$tmpdir_target"
+  chmod 0700 "$tmpdir_target"
+fi
 
 install_with_mode root root 0755 "$project_root/scripts/klonet-agent-op" "$helper_path"
 
@@ -157,8 +167,11 @@ if [[ ! -e "$env_target" ]]; then
 # Add OPENAI_API_KEY and provider configuration here.
 # Keep real Ops execution disabled until the server safety checks pass.
 EOF
+  printf 'TMPDIR=%s\n' "$agent_tmpdir" >>"$env_tmp"
   install_with_mode root "$agent_user" 0640 "$env_tmp" "$env_target"
   rm -f "$env_tmp"
+elif ! grep -q '^TMPDIR=' "$env_target"; then
+  printf '\nTMPDIR=%s\n' "$agent_tmpdir" >>"$env_target"
 fi
 
 escape_sed() {

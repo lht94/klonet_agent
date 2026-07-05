@@ -367,6 +367,11 @@ sudo ./scripts/install-klonet-agent-service.sh \
   --set-password
 ```
 
+新建账户时，`klonet-agent` 的默认 home 为 `/home/klonet-agent`。安装脚本会创建
+`/home/klonet-agent/.cache/tmp`，并在首次生成 `/etc/klonet-agent/klonet-agent.env`
+时写入 `TMPDIR=/home/klonet-agent/.cache/tmp`，避免 jieba 等依赖库复用 `/tmp`
+下其他用户创建的缓存文件。
+
 脚本会调用系统 `passwd`，在终端交互设置 `klonet-agent` 的登录密码。
 密码不会写入脚本、环境文件或 Git。请不要使用曾在聊天或文档中公开过的密码。
 
