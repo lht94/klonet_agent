@@ -43,3 +43,31 @@ def test_ops_route_detects_write_request_but_keeps_plan_boundary():
     assert route.risk == "high"
     assert route.action == "stop"
     assert "create_ops_operation_plan" in route.recommended_tools
+
+
+def test_ops_route_does_not_treat_platform_name_as_port_for_restart_plan():
+    from klonet_agent.ops.routing import route_ops_request
+
+    route = route_ops_request(
+        "为 102 平台创建一个重启 OperationPlan。不要读取环境，不要执行，"
+        "只展示 plan_id、步骤和确认命令。project_root=/home/adminis/lht/102_project。"
+    )
+
+    assert route.action == "restart"
+    assert route.ports == []
+    assert route.paths == ["/home/adminis/lht/102_project"]
+    assert "port=102" not in route.summary()
+
+
+def test_ops_route_does_not_treat_plan_id_or_date_as_port():
+    from klonet_agent.ops.routing import route_ops_request
+
+    route = route_ops_request(
+        "confirm-step restart-e5126acfe3 restart-master，"
+        "这是 2026-07-02 的计划回归，不要读环境。"
+    )
+
+    assert route.action == "restart"
+    assert route.ports == []
+    assert "5126" not in route.summary()
+    assert "2026" not in route.summary()

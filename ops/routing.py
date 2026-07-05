@@ -7,8 +7,11 @@ from dataclasses import dataclass, field
 from typing import List
 
 
-PORT_RE = re.compile(r"(?<![\d.])([1-9]\d{1,4})(?![\d.])")
+PORT_RE = re.compile(r"(?<![\dA-Za-z_.-])([1-9]\d{1,4})(?![\dA-Za-z_.-])")
 PATH_RE = re.compile(r"/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+/?")
+PLAN_ID_RE = re.compile(r"\b(?:restart|deploy|destroy|stop)-[A-Za-z0-9_-]+\b", re.IGNORECASE)
+DATE_RE = re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b")
+SCREEN_SESSION_RE = re.compile(r"\b[A-Za-z0-9_.:-]+_(?:m|w|c|web|t)\b", re.IGNORECASE)
 COMPONENT_RE = re.compile(
     r"\b(?:web_terminal_main\.py|master_main\.py|worker_main\.py|celery_worker\.py|gunicorn|celery|nginx|redis|mysql|rabbitmq|docker)\b",
     re.IGNORECASE,
@@ -103,15 +106,30 @@ def route_ops_request(user_input: str) -> OpsRoute:
 
 
 def _extract_ports(text: str) -> List[int]:
-    path_spans = [match.span() for match in PATH_RE.finditer(text or "")]
+    text = text or ""
+    excluded_spans = []
+    for pattern in (PATH_RE, PLAN_ID_RE, DATE_RE, SCREEN_SESSION_RE):
+        excluded_spans.extend(match.span() for match in pattern.finditer(text))
     ports = []
-    for match in PORT_RE.finditer(text or ""):
-        if any(start <= match.start() < end for start, end in path_spans):
+    for match in PORT_RE.finditer(text):
+        if any(start <= match.start() < end for start, end in excluded_spans):
+            continue
+        if _looks_like_platform_number(text, match.start(), match.end()):
             continue
         port = int(match.group(1))
         if 1 <= port <= 65535 and port not in ports:
             ports.append(port)
     return ports
+
+
+def _looks_like_platform_number(text: str, start: int, end: int) -> bool:
+    before = text[max(0, start - 12) : start].lower()
+    after = text[end : min(len(text), end + 12)].lower()
+    platform_before_markers = ("platform ", "platform=", "平台", "平台名", "实例", "instance ")
+    platform_after_markers = (" platform", "平台", "_project", "_m", "_w", "_c", "_web", "_t")
+    return any(marker in before for marker in platform_before_markers) or any(
+        marker in after for marker in platform_after_markers
+    )
 
 
 def _action_for(lowered: str) -> str:
