@@ -323,3 +323,50 @@ source klonet_agent/.venv/bin/activate
 python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
 python agent.py --help
 ```
+
+## Ubuntu 专用 SSH 账户部署
+
+在服务器更新代码后，运行部署脚本，把 `klonet-agent` 配置为专用 SSH
+登录账户：
+
+```bash
+cd ~/lht/agent/klonet_agent
+git pull
+
+sudo ./scripts/install-klonet-agent-service.sh \
+  --project-root "$PWD" \
+  --python "$PWD/.venv/bin/python" \
+  --mode ops \
+  --user-id lht \
+  --project-id test \
+  --enable-ssh-login \
+  --set-password
+```
+
+脚本会调用系统 `passwd`，在终端交互设置 `klonet-agent` 的登录密码。
+密码不会写入脚本、环境文件或 Git。请不要使用曾在聊天或文档中公开过的密码。
+
+检查服务器是否允许 SSH 密码认证：
+
+```bash
+sudo sshd -T | grep -i passwordauthentication
+```
+
+然后从客户端登录：
+
+```bash
+ssh klonet-agent@服务器地址
+```
+
+登录后，环境文件、虚拟环境和项目目录会自动加载，可以使用统一入口启动
+mentor、coding 或 ops 模式：
+
+```bash
+python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
+python -m klonet_agent.agent --mode coding --user-id lht --project-id test
+python -m klonet_agent.agent --mode ops --user-id lht --project-id test
+```
+
+真实 Ops 执行默认仍然关闭。只有完成 helper、sudoers 和计划确认链路验证后，
+才应在 `/etc/klonet-agent/klonet-agent.env` 中启用
+`KLONET_AGENT_OPS_REAL_EXECUTION=1`。
