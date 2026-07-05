@@ -105,6 +105,33 @@ def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
     assert "只有用户明确指定 step_id" in OPS_PROMPT
 
 
+def test_ops_prompt_uses_dedicated_account_platform_path():
+    """Ops should not reuse historical adminis paths as deployment defaults."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "/home/klonet-agent/platforms/<platform>_project" in OPS_PROMPT
+    assert "不要把历史服务器用户名" in OPS_PROMPT
+
+
+def test_tool_descriptions_do_not_suggest_adminis_paths():
+    """Model-visible tool examples should use neutral or klonet-agent paths."""
+
+    from klonet_agent.tools.registry import TOOLS
+
+    descriptions = []
+    for tool in TOOLS:
+        function = tool.get("function", {})
+        descriptions.append(function.get("description", ""))
+        properties = function.get("parameters", {}).get("properties", {})
+        for value in properties.values():
+            descriptions.append(value.get("description", ""))
+
+    joined = "\n".join(descriptions)
+
+    assert "/home/adminis" not in joined
+
+
 def test_memory_prompt_uses_teaching_agent_language():
     """记忆提示词不应该残留旧个人 Agent 称呼。"""
 

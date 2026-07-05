@@ -164,7 +164,7 @@ TOOLS = [
             "public_port": {"type": "integer", "description": "Nginx 对外监听端口，也就是浏览器访问的 public_port。"},
             "terminal_port": {"type": "integer", "description": "Web Terminal 端口。"},
             "frontend_alias": {"type": "string", "description": "Nginx 前端 location，例如 /VEMU2/ 或 /VEMU2-103/，必须以 / 开始。"},
-            "frontend_path": {"type": "string", "description": "前端静态目录绝对路径，例如 /home/adminis/lht/103_project/vemu_frontend/VEMU2。"},
+            "frontend_path": {"type": "string", "description": "前端静态目录绝对路径，例如 /home/klonet-agent/platforms/103_project/vemu_frontend/VEMU2。"},
             "frontend_config_path": {"type": "string", "description": "Optional existing frontend config.js absolute path; when provided, render_klonet_config aligns the draft to existing field names without writing files."},
         },
         ["platform", "server_name", "master_port", "worker_port", "public_port", "terminal_port", "frontend_alias", "frontend_path"],
@@ -272,7 +272,7 @@ TOOLS = [
             "project_roots": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "可选：已知 Klonet 项目根目录列表，用于读取各自 config.py 中的端口配置，例如 /home/adminis/lht/102_project。",
+                "description": "可选：已知 Klonet 项目根目录列表，用于读取各自 config.py 中的端口配置，例如 /home/klonet-agent/platforms/102_project。",
             },
             "max_instances": {
                 "type": "integer",
@@ -291,7 +291,7 @@ TOOLS = [
             },
             "project_root": {
                 "type": "string",
-                "description": "Runtime project root, for example /home/adminis/lht/103_project.",
+                "description": "Runtime project root, for example /home/klonet-agent/platforms/103_project/vemu_uestc.",
             },
             "nginx_paths": {
                 "type": "array",
@@ -509,7 +509,7 @@ TOOLS = [
             },
             "operation_args": {
                 "type": "object",
-                "description": "可选：计划级结构化参数，用于生成受控默认 recipe，不直接执行。deploy_platform 支持 {\"project_root\":\"/home/adminis/lht/103_project/vemu_uestc\"} 自动绑定 prepare_project_files/start_platform_screens；支持 {\"archive_path\":\"/home/adminis/vemu_install_2024_12_5.tar\",\"destination_dir\":\"/root\"} 自动绑定 prepare-files=extract_archive；支持 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"} 自动绑定 prepare-files=run_install_script。",
+                "description": "可选：计划级结构化参数，用于生成受控默认 recipe，不直接执行。deploy_platform 支持 {\"project_root\":\"/home/klonet-agent/platforms/103_project/vemu_uestc\"} 自动绑定 prepare_project_files/start_platform_screens；支持 {\"archive_path\":\"/home/klonet-agent/inbox/vemu_install_2024_12_5.tar\",\"destination_dir\":\"/root\"} 自动绑定 prepare-files=extract_archive；支持 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"} 自动绑定 prepare-files=run_install_script。",
             },
             "recipe_bindings": {
                 "type": "object",
