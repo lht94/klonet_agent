@@ -318,53 +318,46 @@ agent_v5/
 ## 运行方法
 当前项目建议在仓库根目录运行：
 ``` bash
-cd ~/lht/agent
-source klonet_agent/.venv/bin/activate
+cd ~/klonet_agent
+source /.venv/bin/activate
 python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
 python agent.py --help
 ```
 
 ## Ubuntu Python 运行环境准备
 
-专用 SSH 账号和 Python 虚拟环境是两件独立的事：
-
-- 专用 SSH 账号负责 Linux 身份、home 目录、sudoers 白名单和运维权限边界。
-- Python 运行环境负责安装依赖，部署脚本只需要拿到一个可执行的 Python 路径。
-
-如果服务器已有可用 Python 环境，可以直接把那个解释器传给安装脚本的 `--python`。
-如果希望项目自带独立依赖，推荐在项目目录准备 `.venv`。
-
-如果服务器使用 Klonet 环境里的 Python 3.8，且 `python3.8 -m venv`
-在 `ensurepip` 阶段失败，可以先创建不带 pip 的虚拟环境，再手动安装 pip：
+推荐在项目目录准备 `.venv`。
 
 ```bash
-cd ~/lht/agent/klonet_agent
-sudo chown -R klonet-agent:klonet-agent "$PWD"
-sudo rm -rf .venv
+# 进入项目目录
+cd ~/klonet_agent
 
+# 创建虚拟环境（清华源）
 sudo -u klonet-agent /usr/local/python3/bin/python3.8 -m venv .venv --without-pip
 wget https://bootstrap.pypa.io/pip/3.8/get-pip.py -O /tmp/get-pip.py
 sudo -u klonet-agent .venv/bin/python /tmp/get-pip.py \
   -i https://pypi.tuna.tsinghua.edu.cn/simple
 
+# 安装依赖
 sudo -u klonet-agent .venv/bin/pip install -r requirements.txt \
   -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 sudo -u klonet-agent .venv/bin/python --version
 sudo -u klonet-agent .venv/bin/pip --version
+
+# 激活虚拟环境
+source /.venv/bin/activate
+
+# 退出虚拟环境
+deactive
 ```
 
 ## Ubuntu 专用 SSH 账户部署
 
-在服务器更新代码后，运行部署脚本，把 `klonet-agent` 配置为专用 SSH
-登录账户：
+使用agent前，需要运行部署脚本，创建 `klonet-agent` 账户
 
-```bash
-cd ~/lht/agent/klonet_agent
-git pull
-```
-
-把已经准备好的 Python 解释器交给部署脚本；下面示例使用项目内 `.venv`，但也可以换成其他已安装好依赖的 Python：
+把当前环境的 Python 解释器交给部署脚本；下面以使用项目内虚拟环境为例，但也可以换成其他已安装好依赖的 Python：
+（执行 which python 把输出替代 --python后的参数即可）
 
 ```bash
 sudo ./scripts/install-klonet-agent-service.sh \
@@ -377,21 +370,7 @@ sudo ./scripts/install-klonet-agent-service.sh \
   --set-password
 ```
 
-新建账户时，`klonet-agent` 的默认 home 为 `/home/klonet-agent`。安装脚本会创建
-`/home/klonet-agent/.cache/tmp`，并在首次生成 `/etc/klonet-agent/klonet-agent.env`
-时写入 `TMPDIR=/home/klonet-agent/.cache/tmp`，避免 jieba 等依赖库复用 `/tmp`
-下其他用户创建的缓存文件。
-
-脚本会调用系统 `passwd`，在终端交互设置 `klonet-agent` 的登录密码。
-密码不会写入脚本、环境文件或 Git。请不要使用曾在聊天或文档中公开过的密码。
-
-检查服务器是否允许 SSH 密码认证：
-
-```bash
-sudo sshd -T | grep -i passwordauthentication
-```
-
-然后从客户端登录：
+之后用这个用户登录即可：
 
 ```bash
 ssh klonet-agent@服务器地址
