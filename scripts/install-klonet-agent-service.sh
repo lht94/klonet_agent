@@ -32,8 +32,9 @@ Options:
   -h, --help               Show this help
 
 The service is enabled but not started by default because the current Agent
-entry point is an interactive CLI. This installer never enables real Ops
-execution and only runs the privileged helper with reload-nginx --dry-run.
+entry point is an interactive CLI. The installer enables controlled real Ops
+execution in the root-managed environment file; actual changes still require
+OperationPlan approval, step approval, and the sudoers allowlisted helper.
 EOF
 }
 
@@ -87,7 +88,7 @@ fi
 for value in "$mode" "$user_id" "$project_id"; do
   [[ "$value" != *$'\n'* && "$value" != *'|'* ]] || die "arguments may not contain newlines or |"
 done
-for command in getent groupadd useradd usermod install visudo systemctl sudo chown; do
+for command in getent groupadd useradd usermod install visudo systemctl sudo chown sed; do
   command -v "$command" >/dev/null || die "required command not found: $command"
 done
 if ((set_password)); then
@@ -104,6 +105,16 @@ install_with_mode() {
     install -m "$mode_bits" "$source" "$target"
   else
     install -o "$owner" -g "$group" -m "$mode_bits" "$source" "$target"
+  fi
+}
+
+ensure_env_setting() {
+  local path="$1" key="$2" value="$3" escaped_value
+  escaped_value="$(printf '%s' "$value" | sed 's/[\/&]/\\&/g')"
+  if grep -q "^${key}=" "$path"; then
+    sed -i "s/^${key}=.*/${key}=${escaped_value}/" "$path"
+  else
+    printf '\n%s=%s\n' "$key" "$value" >>"$path"
   fi
 }
 
@@ -165,13 +176,14 @@ if [[ ! -e "$env_target" ]]; then
   cat >"$env_tmp" <<'EOF'
 # Root-managed Klonet Agent environment.
 # Add OPENAI_API_KEY and provider configuration here.
-# Keep real Ops execution disabled until the server safety checks pass.
 EOF
   printf 'TMPDIR=%s\n' "$agent_tmpdir" >>"$env_tmp"
+  printf 'KLONET_AGENT_OPS_REAL_EXECUTION=1\n' >>"$env_tmp"
   install_with_mode root "$agent_user" 0640 "$env_tmp" "$env_target"
   rm -f "$env_tmp"
-elif ! grep -q '^TMPDIR=' "$env_target"; then
-  printf '\nTMPDIR=%s\n' "$agent_tmpdir" >>"$env_target"
+else
+  ensure_env_setting "$env_target" "TMPDIR" "$agent_tmpdir"
+  ensure_env_setting "$env_target" "KLONET_AGENT_OPS_REAL_EXECUTION" "1"
 fi
 
 escape_sed() {

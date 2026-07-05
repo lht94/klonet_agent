@@ -72,12 +72,13 @@ def _run_installer(tmp_path: Path, *extra_args: str):
     return result, calls.read_text(encoding="utf-8"), install_root
 
 
-def test_installer_keeps_real_execution_disabled():
+def test_installer_enables_controlled_real_execution_by_default():
     text = INSTALLER.read_text(encoding="utf-8")
 
-    assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" not in text
+    assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" in text
     assert "--execute" not in text
     assert "reload-nginx --dry-run" in text
+    assert "OperationPlan approval" in text
 
 
 def test_installer_requires_explicit_start(tmp_path):
@@ -103,6 +104,7 @@ def test_reinstall_preserves_environment_file(tmp_path):
     env_text = env_file.read_text(encoding="utf-8")
     assert "OPENAI_API_KEY=server-secret\n" in env_text
     assert "TMPDIR=/home/klonet-agent/.cache/tmp\n" in env_text
+    assert "KLONET_AGENT_OPS_REAL_EXECUTION=1\n" in env_text
 
 
 def test_installer_uses_home_tmpdir_by_default(tmp_path):
@@ -113,6 +115,9 @@ def test_installer_uses_home_tmpdir_by_default(tmp_path):
     assert "chown klonet-agent:klonet-agent" in calls
     env_file = install_root / "etc/klonet-agent/klonet-agent.env"
     assert "TMPDIR=/home/klonet-agent/.cache/tmp\n" in env_file.read_text(
+        encoding="utf-8"
+    )
+    assert "KLONET_AGENT_OPS_REAL_EXECUTION=1\n" in env_file.read_text(
         encoding="utf-8"
     )
 

@@ -385,11 +385,10 @@ python -m klonet_agent.agent --mode coding --user-id lht --project-id test
 python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 ```
 
-真实 Ops 执行默认仍然关闭。只有完成 helper、sudoers 和计划确认链路验证后，
-才应在 `/etc/klonet-agent/klonet-agent.env` 中启用
-`KLONET_AGENT_OPS_REAL_EXECUTION=1`。
-
-要让 Ops 模式真正修改环境，而不是只做 dry-run，需要完成以下配置。
+部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
+`KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。
+真实环境修改仍然必须经过 OperationPlan、计划确认、特权步骤确认和 sudoers
+白名单 helper。
 
 先用管理员账户确认 helper、sudoers 和专用账户权限：
 
@@ -397,19 +396,7 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 ls -l /usr/local/bin/klonet-agent-op
 sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 sudo -l -U klonet-agent
-```
-
-然后编辑环境文件：
-
-```bash
-sudoedit /etc/klonet-agent/klonet-agent.env
-```
-
-至少包含：
-
-```dotenv
-TMPDIR=/home/klonet-agent/.cache/tmp
-KLONET_AGENT_OPS_REAL_EXECUTION=1
+grep -E '^(TMPDIR|KLONET_AGENT_OPS_REAL_EXECUTION)=' /etc/klonet-agent/klonet-agent.env
 ```
 
 重新登录 `klonet-agent`，或在当前 shell 手动加载：
@@ -436,5 +423,5 @@ sudo -n /usr/local/bin/klonet-agent-op reload-nginx --execute
 python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 ```
 
-如果之前已经生成过 dry-run 的部署计划，开启真实执行后建议重新创建一个新计划，
+如果之前已经生成过 dry-run 的部署计划，重新部署并启用默认真实执行后建议创建一个新计划，
 不要继续复用已把步骤标记为 completed 的旧计划。
