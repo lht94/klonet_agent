@@ -129,8 +129,12 @@ python -m klonet_agent.agent --mode coding --user-id default --project-id demo
 
 Ubuntu 服务器需要让 Ops Agent 以 `klonet-agent` 专用系统账户运行时，请使用
 [`docs/ops/klonet-agent-op-install.md`](docs/ops/klonet-agent-op-install.md) 中的
-幂等部署脚本和 systemd 配置。当前入口仍是交互式 CLI，终端对话应使用文档中的
-`sudo -u klonet-agent` 启动方式；systemd 常驻运行需要后续接入 Web/API 服务入口。
+幂等部署脚本和账户配置。当前入口仍是交互式 CLI；systemd 常驻运行需要后续接入
+Web/API 服务入口。
+
+部署脚本也支持 `--enable-ssh-login --set-password`。启用后可以先通过
+`ssh klonet-agent@SERVER_ADDRESS` 登录，再用同一个 `python -m klonet_agent.agent`
+入口启动 mentor、coding 或 ops 模式；密码由系统 `passwd` 交互设置，不保存在仓库中。
 
 也可以用脚本方式查看帮助或启动：
 ```bash

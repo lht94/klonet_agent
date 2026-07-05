@@ -26,6 +26,54 @@ sudo ./scripts/install-klonet-agent-service.sh \
 - 安装并 enable `klonet-agent.service`；
 - 执行 helper 的 `reload-nginx --dry-run` 验证，不执行任何 `--execute` 操作。
 
+## 配置为专用 SSH 登录账户
+
+如果希望先登录专用账户，再像本地一样用 `python -m` 启动所有模式，可以在
+部署时增加 `--enable-ssh-login` 和 `--set-password`：
+
+```bash
+sudo ./scripts/install-klonet-agent-service.sh \
+  --project-root "$PWD" \
+  --python "$PWD/.venv/bin/python" \
+  --mode ops \
+  --user-id lht \
+  --project-id test \
+  --enable-ssh-login \
+  --set-password
+```
+
+脚本会调用系统 `passwd klonet-agent`，由终端提示输入两次密码。密码不会作为
+脚本参数传入，也不会写进源码、环境文件、日志或 Git。不要使用曾经出现在聊天
+或文档中的示例密码。
+
+安装器只配置 Linux 账户，不修改全局 SSH daemon 策略。先检查服务器是否允许
+密码认证：
+
+```bash
+sudo sshd -T | grep -i passwordauthentication
+```
+
+如果输出为 `passwordauthentication no`，应由服务器管理员依据本机安全策略配置
+`sshd_config`；修改后必须先运行 `sudo sshd -t`，确认成功后才能 reload SSH。
+
+账户配置完成后，从客户端登录：
+
+```bash
+ssh klonet-agent@SERVER_ADDRESS
+```
+
+登录环境会自动加载 `/etc/klonet-agent/klonet-agent.env`、项目虚拟环境并进入
+包目录的父目录。mentor、coding 和 ops 都使用相同入口：
+
+```bash
+python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
+python -m klonet_agent.agent --mode coding --user-id lht --project-id test
+python -m klonet_agent.agent --mode ops --user-id lht --project-id test
+```
+
+只有 ops 模式会使用 `klonet-ops` 能力，而且仍受 helper、sudoers 白名单、计划确认
+和 `KLONET_AGENT_OPS_REAL_EXECUTION` 开关约束。
+
 重复执行会更新 helper、sudoers 和 systemd unit，但保留已有的
 `/etc/klonet-agent/klonet-agent.env`。脚本默认不启动服务；只有显式加入
 `--start` 才会在安装后执行 `systemctl restart`：

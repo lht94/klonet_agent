@@ -52,3 +52,15 @@ def test_install_doc_covers_dedicated_service_deployment():
     assert "journalctl -u klonet-agent" in text
     assert "/etc/klonet-agent/klonet-agent.env" in text
     assert "--start" in text
+
+
+def test_install_doc_covers_ssh_login_account():
+    text = INSTALL_DOC.read_text(encoding="utf-8")
+
+    assert "--enable-ssh-login" in text
+    assert "--set-password" in text
+    assert "ssh klonet-agent@" in text
+    assert "python -m klonet_agent.agent --mode mentor" in text
+    assert "python -m klonet_agent.agent --mode coding" in text
+    assert "python -m klonet_agent.agent --mode ops" in text
+    assert "sshd -T" in text
