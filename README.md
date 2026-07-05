@@ -332,7 +332,31 @@ python agent.py --help
 ```bash
 cd ~/lht/agent/klonet_agent
 git pull
+```
 
+如果服务器使用 Klonet 环境里的 Python 3.8，且 `python3.8 -m venv`
+在 `ensurepip` 阶段失败，可以先创建不带 pip 的虚拟环境，再手动安装 pip：
+
+```bash
+cd ~/lht/agent/klonet_agent
+sudo chown -R klonet-agent:klonet-agent "$PWD"
+sudo rm -rf .venv
+
+sudo -u klonet-agent /usr/local/python3/bin/python3.8 -m venv .venv --without-pip
+wget https://bootstrap.pypa.io/pip/3.8/get-pip.py -O /tmp/get-pip.py
+sudo -u klonet-agent .venv/bin/python /tmp/get-pip.py \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+sudo -u klonet-agent .venv/bin/pip install -r requirements.txt \
+  -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+sudo -u klonet-agent .venv/bin/python --version
+sudo -u klonet-agent .venv/bin/pip --version
+```
+
+虚拟环境准备好后，再把 `.venv/bin/python` 交给部署脚本：
+
+```bash
 sudo ./scripts/install-klonet-agent-service.sh \
   --project-root "$PWD" \
   --python "$PWD/.venv/bin/python" \
