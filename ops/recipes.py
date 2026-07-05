@@ -111,6 +111,7 @@ class ControlledRecipeRunner:
     ):
         self.dry_run = dry_run
         self.helper_path = helper_path
+        self._uses_default_command_runner = command_runner is None
         self.command_runner = command_runner or _run_command
 
     def _helper_command(self, action: str, *args: str) -> list:
@@ -507,7 +508,7 @@ class ControlledRecipeRunner:
                         "blocked",
                         f"recipe_id={RUN_INSTALL_SCRIPT} script_not_found={_one_line(str(script_path))}; environment unchanged",
                     )
-            output = self.command_runner(command)
+            output = self._run_install_command(command)
         except subprocess.CalledProcessError as exc:
             return _script_failure_result(exc)
         return RecipeExecutionResult(
@@ -520,6 +521,11 @@ class ControlledRecipeRunner:
                 "environment_changed=true"
             ),
         )
+
+    def _run_install_command(self, command: list) -> str:
+        if self._uses_default_command_runner and not self.dry_run:
+            return _run_command_streaming(command)
+        return self.command_runner(command)
 
     def _write_ops_file(self, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}
@@ -799,6 +805,17 @@ def _run_command(command: list) -> str:
         errors="replace",
     )
     return completed.stdout.strip()
+
+
+def _run_command_streaming(command: list) -> str:
+    subprocess.run(
+        command,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return "streamed_to_console=true"
 
 
 def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:

@@ -2,8 +2,8 @@
 """Server-side Klonet Ops helper.
 
 This helper is intended to be installed as /usr/local/bin/klonet-agent-op and
-allowlisted in sudoers later. The current contract is validation-only dry-run:
-it does not modify the host.
+allowlisted in sudoers. Dry-run validates and previews; execute performs only
+the allowlisted, argument-validated host operations.
 """
 
 from __future__ import annotations

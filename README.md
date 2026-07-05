@@ -417,6 +417,10 @@ echo "$TMPDIR"
 sudo -n /usr/local/bin/klonet-agent-op reload-nginx --execute
 ```
 
+`base_requ_setup.sh NORMAL` 这类耗时安装步骤会把脚本输出直接流到当前终端；
+如果看到 Docker 镜像解压、`docker load`、OVS/Docker 服务启动等日志，说明仍在执行，
+不是 Agent 已经卡死。
+
 最后用 `klonet-agent` 身份启动 Ops：
 
 ```bash

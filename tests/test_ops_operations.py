@@ -1397,6 +1397,66 @@ def test_run_install_script_recipe_execute_calls_fixed_command():
     assert "docker_service.sh" in calls[0][2]
 
 
+def test_run_install_script_recipe_default_runner_streams_output(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_run(command, check, text, encoding, errors):
+        calls.append(
+            {
+                "command": command,
+                "check": check,
+                "text": text,
+                "encoding": encoding,
+                "errors": errors,
+            }
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("klonet_agent.ops.recipes.subprocess.run", fake_run)
+
+    with local_temp_dir() as temp_dir:
+        script_dir = temp_dir / "vemu_install_new_gen"
+        script_dir.mkdir()
+        (script_dir / "docker_service.sh").write_text("# docker\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="run docker service",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "run_install_script",
+                    "args": {
+                        "script_dir": str(script_dir),
+                        "script_name": "docker_service.sh",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert len(calls) == 1
+    assert "capture_output" not in calls[0]
+    assert calls[0]["command"][0:2] == ["bash", "-lc"]
+    assert "streamed_to_console=true" in result
+    assert "result_status=completed" in result
+
+
 def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
