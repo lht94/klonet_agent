@@ -2,6 +2,108 @@
 
 `klonet-agent-op` 是 Ops Agent 修改服务器环境时唯一应该被 sudoers 放行的入口。Agent 侧默认仍然 dry-run；只有 OperationPlan 已确认、单步已确认，并且服务端明确安装 helper 与 sudoers 后，才允许进入真实执行链路。
 
+## 一键部署专用账户与服务
+
+在仓库的 `klonet_agent` 目录执行以下命令。`--project-root` 指向包含
+`agent.py` 的包目录，`--python` 指向已经装好项目依赖的虚拟环境解释器：
+
+```bash
+cd /home/adminis/lht/agent/klonet_agent
+sudo ./scripts/install-klonet-agent-service.sh \
+  --project-root "$PWD" \
+  --python "$PWD/.venv/bin/python" \
+  --mode ops \
+  --user-id lht \
+  --project-id test1
+```
+
+脚本可以在多台 Ubuntu 服务器重复执行，并会：
+
+- 创建 `klonet-ops` 系统组；
+- 创建不可交互登录的 `klonet-agent` 系统账户；
+- 只把 `klonet-agent` 加入 `klonet-ops`，不影响日常登录账户；
+- 安装 root-owned helper 与 sudoers 白名单并通过 `visudo` 校验；
+- 安装并 enable `klonet-agent.service`；
+- 执行 helper 的 `reload-nginx --dry-run` 验证，不执行任何 `--execute` 操作。
+
+重复执行会更新 helper、sudoers 和 systemd unit，但保留已有的
+`/etc/klonet-agent/klonet-agent.env`。脚本默认不启动服务；只有显式加入
+`--start` 才会在安装后执行 `systemctl restart`：
+
+```bash
+sudo ./scripts/install-klonet-agent-service.sh \
+  --project-root "$PWD" \
+  --python "$PWD/.venv/bin/python" \
+  --mode ops \
+  --user-id lht \
+  --project-id test1 \
+  --start
+```
+
+### 配置运行环境
+
+不要复制仓库 `.env`，也不要把密钥提交到 Git。使用 root 管理的环境文件：
+
+```bash
+sudoedit /etc/klonet-agent/klonet-agent.env
+```
+
+示例内容：
+
+```dotenv
+OPENAI_API_KEY=替换为服务器密钥
+OPENAI_BASE_URL=https://api.deepseek.com
+# 完成 helper、sudoers 和计划确认链路验收后，才可手动取消下一行注释：
+# KLONET_AGENT_OPS_REAL_EXECUTION=1
+```
+
+该文件权限为 `root:klonet-agent 0640`。密钥不会出现在模型对话或 Git
+历史中。
+
+### 以专用账户运行交互式 Agent
+
+当前入口是交互式 CLI，而不是 Web/API 守护进程。要在终端对话，显式用
+`sudo -u klonet-agent` 启动，并从受保护的环境文件加载配置：
+
+```bash
+sudo -u klonet-agent -H /bin/bash -c '
+  set -a
+  source /etc/klonet-agent/klonet-agent.env
+  set +a
+  cd /home/adminis/lht/agent
+  exec /home/adminis/lht/agent/klonet_agent/.venv/bin/python \
+    -m klonet_agent.agent --mode ops --user-id lht --project-id test1
+'
+```
+
+这样 Python 进程的 Linux 身份就是 `klonet-agent`，它只能通过
+`sudo -n /usr/local/bin/klonet-agent-op ...` 使用 sudoers 白名单中的受控操作。
+
+### systemd 状态与日志
+
+配置环境文件后可以运行：
+
+```bash
+sudo systemctl start klonet-agent
+sudo systemctl status klonet-agent --no-pager
+sudo journalctl -u klonet-agent -n 100 --no-pager
+sudo systemctl restart klonet-agent
+```
+
+但当前 CLI 在 systemd 的 `StandardInput=null` 下会读到 EOF 并正常退出，
+因此它暂时不能作为常驻聊天服务。unit 的作用是先固化专用账户、环境和启动
+契约；需要常驻服务时，应先实现 Web/API 或消息队列入口。交互使用请采用上面的
+`sudo -u klonet-agent` 命令。
+
+### 部署后验证
+
+```bash
+id klonet-agent
+sudo -l -U klonet-agent
+sudo visudo -cf /etc/sudoers.d/klonet-agent-op
+sudo -u klonet-agent /usr/local/bin/klonet-agent-op reload-nginx --dry-run
+```
+
 ## 安装 helper
 
 在服务器上执行：

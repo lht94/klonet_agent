@@ -41,3 +41,14 @@ def test_install_doc_requires_root_owned_helper_and_visudo_validation():
     assert "reload-nginx --dry-run" in text
     assert "extract-archive --dry-run" in text
     assert "run-install-script --dry-run" in text
+
+
+def test_install_doc_covers_dedicated_service_deployment():
+    text = INSTALL_DOC.read_text(encoding="utf-8")
+
+    assert "install-klonet-agent-service.sh" in text
+    assert "sudo -u klonet-agent" in text
+    assert "systemctl start klonet-agent" in text
+    assert "journalctl -u klonet-agent" in text
+    assert "/etc/klonet-agent/klonet-agent.env" in text
+    assert "--start" in text
