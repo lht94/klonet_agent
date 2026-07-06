@@ -783,6 +783,8 @@ def _is_supported_ops_write_path(path: Path) -> bool:
     lower_name = path.name.lower()
     if lower_name in SAFE_OPS_WRITE_NAMES or lower_name.startswith("dockerfile"):
         return True
+    if path.suffix.lower() == ".py":
+        return False
     return path.suffix.lower() in SAFE_OPS_WRITE_SUFFIXES
 
 

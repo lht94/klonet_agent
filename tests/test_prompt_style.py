@@ -105,6 +105,17 @@ def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
     assert "只有用户明确指定 step_id" in OPS_PROMPT
 
 
+def test_ops_prompt_allows_controlled_startup_file_edits_but_not_business_development():
+    """Ops can modify deployment startup files through OperationPlan only."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "不得做普通业务源码开发修改" in OPS_PROMPT
+    assert "允许通过 OperationPlan + write_ops_file 修改平台启动必需文件" in OPS_PROMPT
+    assert "vemu_config/config.py" in OPS_PROMPT
+    assert "mains/web_terminal_main.py" in OPS_PROMPT
+
+
 def test_ops_prompt_uses_dedicated_account_platform_path():
     """Ops should not reuse historical adminis paths as deployment defaults."""
 

@@ -513,7 +513,7 @@ TOOLS = [
             },
             "recipe_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、extract_archive、run_install_script、write_ops_file、reload_nginx。extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}；run_install_script 只允许 base_requ_setup.sh NORMAL 或 docker_service.sh，参数为 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"}；write_ops_file 参数为 {\"path\":\"/path/config.py\",\"content\":\"...\"}，dry-run 时只脱敏预览，真实执行会备份原文件并拒绝 .env、密钥、token、password 等敏感路径；reload_nginx 无参数，通过 helper 固定执行 nginx -t 成功后再 nginx -s reload。只保存绑定，不执行。",
+                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、extract_archive、run_install_script、write_ops_file、reload_nginx。extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}；run_install_script 只允许 base_requ_setup.sh NORMAL 或 docker_service.sh，参数为 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"}；write_ops_file 参数为 {\"path\":\"/path/config.py\",\"content\":\"...\"}，可写配置、nginx/frontend 配置和平台启动必需源码文件（如 vemu_config/config.py、mains/web_terminal_main.py、web_terminal_main.py、gun.py、worker_gun.py），dry-run 时只脱敏预览，真实执行会备份原文件并拒绝 .env、密钥、token、password 等敏感路径；reload_nginx 无参数，通过 helper 固定执行 nginx -t 成功后再 nginx -s reload。只保存绑定，不执行。",
             },
         },
         ["operation", "target"],

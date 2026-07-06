@@ -1720,6 +1720,86 @@ def test_write_ops_file_recipe_execute_writes_file_and_backs_up_existing_content
     assert old_content == "master_port = 5000\n"
 
 
+def test_write_ops_file_recipe_allows_klonet_startup_source_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        targets = [
+            temp_dir / "103_project" / "vemu_uestc" / "vemu_config" / "config.py",
+            temp_dir / "103_project" / "vemu_uestc" / "mains" / "web_terminal_main.py",
+            temp_dir / "103_project" / "vemu_uestc" / "web_terminal_main.py",
+        ]
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        results = []
+        for index, target in enumerate(targets):
+            plan = store.create_plan(
+                operation="deploy_platform",
+                target=f"103-{index}",
+                objective="write startup file",
+                recipe_bindings={
+                    "prepare-files": {
+                        "recipe_id": "write_ops_file",
+                        "args": {
+                            "path": str(target),
+                            "content": "# startup config\n",
+                        },
+                    }
+                },
+            )
+            plan.status = "approved"
+            prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+            prepare_step.status = "approved"
+            _complete_steps_before(plan, "prepare-files")
+            store.save_plan(plan)
+            results.append(store.execute_step(plan.plan_id, "prepare-files"))
+
+        assert all("result_status=completed" in result for result in results)
+        assert all(target.read_text(encoding="utf-8") == "# startup config\n" for target in targets)
+
+
+def test_write_ops_file_recipe_blocks_non_startup_python_source_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / "103_project" / "vemu_uestc" / "webserver" / "api" / "topo.py"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write business source",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "content": "# business logic\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "unsupported_file_type=topo.py" in result
+    assert not target.exists()
+
+
 def test_write_ops_file_recipe_blocks_sensitive_paths():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
