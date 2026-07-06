@@ -831,6 +831,78 @@ reload_nginx             -> reload_nginx recipe
 
 这样 Planner 不需要直接绑定 `recipe_id`，只表达任务动作；Router 再负责执行路径选择。
 
+#### action_type 与 recipe 的关系
+
+`action_type -> recipe` 的对应关系可以理解为：
+
+```text
+计划步骤 step
+  -> action_type
+  -> recipe_id
+  -> recipe 函数
+```
+
+其中：
+
+- `action_type` 是计划/动作语义，表示 Planner 或 LLM 判断“现在应该做什么”。
+- `recipe_id` 是系统内部的受控执行接口，表示“这个动作由哪个白名单实现来执行”。
+- recipe 函数是代码里的真实实现，例如 `ControlledRecipeRunner._ensure_shared_services()`。
+
+以共享基础服务为例：
+
+```text
+Planner:
+  需要确保 Redis/MySQL/RabbitMQ 可用。
+  action_type = ensure_shared_services
+
+Action Router:
+  ensure_shared_services 这个动作应该由哪个受控实现执行？
+  -> recipe_id = ensure_shared_services
+
+Executor:
+  recipe_id = ensure_shared_services
+  -> 调用 ControlledRecipeRunner._ensure_shared_services()
+
+Permission Guard / Helper:
+  如果缺 Redis/MySQL/RabbitMQ
+  -> sudo -n /usr/local/bin/klonet-agent-op run-install-script --execute ...
+```
+
+当前代码还没有完全拆出 `action_type` 和 Action Router，因此现在更接近：
+
+```text
+OperationPlan step
+  -> recipe_id = ensure_shared_services
+  -> _ensure_shared_services()
+```
+
+未来优化后应变成：
+
+```text
+OperationPlan step
+  -> action_type = ensure_shared_services
+  -> Action Router
+  -> recipe_id = ensure_shared_services
+  -> _ensure_shared_services()
+```
+
+拆出这一层的原因是：一个 `action_type` 不应该永久绑定唯一 recipe。不同服务器环境下，同一个“确保共享基础服务可用”动作可能有不同执行方式：
+
+```text
+服务器 A：运行 docker_service.sh。
+服务器 B：执行 docker compose up -d。
+服务器 C：systemctl start redis mysql rabbitmq。
+服务器 D：只检查，不启动，因为共享服务由外部系统维护。
+```
+
+所以更好的边界是：
+
+```text
+Planner 只说“我要确保共享服务可用”。
+Router 根据当前环境决定“怎么确保”。
+Executor 再调用具体 recipe。
+```
+
 ### 3. Executor：负责按计划执行和记录 observation
 
 Executor 是 Plan-Execute-Replan 的状态机核心。
