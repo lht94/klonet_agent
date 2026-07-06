@@ -595,6 +595,16 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
         script_dir = str(plan.operation_args.get("script_dir") or "").strip()
         script_name = str(plan.operation_args.get("script_name") or "").strip()
         script_args = str(plan.operation_args.get("script_args") or "").strip()
+        shared_services_script_dir = str(
+            plan.operation_args.get("shared_services_script_dir")
+            or plan.operation_args.get("docker_service_script_dir")
+            or ""
+        ).strip()
+        if not shared_services_script_dir and script_name == "docker_service.sh":
+            shared_services_script_dir = script_dir
+        start_shared_services = _truthy(plan.operation_args.get("start_shared_services"))
+        if start_shared_services and not shared_services_script_dir:
+            shared_services_script_dir = "/root/vemu_install_new_gen"
         if project_root:
             try:
                 precheck_step = _find_step(plan, "precheck")
@@ -621,6 +631,8 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
                 "platform": _one_line(plan.target, 120),
                 "project_root": _one_line(project_root, 300),
             }
+            if start_shared_services:
+                _bind_shared_services_step(plan, shared_services_script_dir)
             return
         try:
             prepare_step = _find_step(plan, "prepare-files")
@@ -658,6 +670,45 @@ def _clean_operation_args(args: dict) -> dict:
         for key, value in args.items()
         if key and value is not None
     }
+
+
+def _truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _bind_shared_services_step(plan: OperationPlan, script_dir: str) -> None:
+    if not script_dir:
+        return
+    try:
+        _find_step(plan, "start-shared-services")
+    except ValueError:
+        _insert_step_before(
+            plan,
+            "start-services",
+            OperationStep(
+                "start-shared-services",
+                "启动共享基础服务",
+                "运行 docker_service.sh 启动 Redis/MySQL/RabbitMQ 等共享容器",
+                risk="controlled",
+            ),
+        )
+    step = _find_step(plan, "start-shared-services")
+    step.recipe_id = "run_install_script"
+    step.recipe_args = {
+        "script_dir": _one_line(script_dir, 300),
+        "script_name": "docker_service.sh",
+    }
+
+
+def _insert_step_before(plan: OperationPlan, before_step_id: str, step: OperationStep) -> None:
+    for index, existing in enumerate(plan.steps):
+        if existing.step_id == step.step_id:
+            plan.steps[index] = step
+            return
+        if existing.step_id == before_step_id:
+            plan.steps.insert(index, step)
+            return
+    plan.steps.append(step)
 
 
 def _render_recipe_args(recipe_args: dict) -> str:

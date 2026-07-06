@@ -240,6 +240,44 @@ def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
 
+def test_deploy_operation_plan_can_start_shared_services_before_platform_screens():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+                "start_shared_services": "true",
+                "shared_services_script_dir": "/root/vemu_install_new_gen",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    assert [step.step_id for step in loaded.steps] == [
+        "precheck",
+        "prepare-files",
+        "start-shared-services",
+        "start-services",
+    ]
+    step = next(item for item in loaded.steps if item.step_id == "start-shared-services")
+    assert step.requires_step_confirmation is False
+    assert step.risk == "controlled"
+    assert step.recipe_id == "run_install_script"
+    assert step.recipe_args == {
+        "script_dir": "/root/vemu_install_new_gen",
+        "script_name": "docker_service.sh",
+    }
+    assert "execution_order=precheck -> prepare-files -> start-shared-services -> start-services" in rendered
+    assert "recipe=run_install_script" in rendered
+    assert "recipe_args.script_name=docker_service.sh" in rendered
+
+
 def test_deploy_operation_plan_non_destructive_steps_do_not_require_step_confirmation():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir

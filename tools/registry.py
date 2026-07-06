@@ -509,7 +509,7 @@ TOOLS = [
             },
             "operation_args": {
                 "type": "object",
-                "description": "可选：计划级结构化参数，用于生成受控默认 recipe，不直接执行。deploy_platform 支持 {\"project_root\":\"/home/klonet-agent/platforms/103_project/vemu_uestc\"} 自动绑定 prepare_project_files/start_platform_screens；支持 {\"archive_path\":\"/home/klonet-agent/inbox/vemu_install_2024_12_5.tar\",\"destination_dir\":\"/root\"} 自动绑定 prepare-files=extract_archive；支持 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"} 自动绑定 prepare-files=run_install_script。",
+                "description": "可选：计划级结构化参数，用于生成受控默认 recipe，不直接执行。deploy_platform 支持 {\"project_root\":\"/home/klonet-agent/platforms/103_project/vemu_uestc\"} 自动绑定 prepare_project_files/start_platform_screens；支持 {\"project_root\":\"/home/klonet-agent/platforms/103_project/vemu_uestc\",\"start_shared_services\":\"true\",\"shared_services_script_dir\":\"/root/vemu_install_new_gen\"} 在启动平台前插入 start-shared-services=run_install_script docker_service.sh；支持 {\"archive_path\":\"/home/klonet-agent/inbox/vemu_install_2024_12_5.tar\",\"destination_dir\":\"/root\"} 自动绑定 prepare-files=extract_archive；支持 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"} 自动绑定 prepare-files=run_install_script。",
             },
             "recipe_bindings": {
                 "type": "object",
