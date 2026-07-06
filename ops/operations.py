@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -34,9 +34,12 @@ class OperationStep:
     step_id: str
     title: str
     purpose: str
+    action_type: str = ""
     risk: str = "normal"
+    permission: str = ""
     requires_step_confirmation: bool = False
     status: str = "pending"
+    observation: str = ""
     recipe_id: str = ""
     recipe_args: dict = field(default_factory=dict)
 
@@ -95,11 +98,14 @@ class OperationPlanStore:
         )
         _apply_default_recipe_bindings(plan)
         _apply_recipe_bindings(plan, recipe_bindings or {})
+        _apply_action_routing(plan)
+        _normalize_plan_steps(plan)
         self.save_plan(plan)
         return plan
 
     def save_plan(self, plan: OperationPlan) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+        _normalize_plan_steps(plan)
         self._path(plan.plan_id).write_text(
             json.dumps(_plan_to_mapping(plan), ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -111,7 +117,9 @@ class OperationPlanStore:
         if not path.exists():
             raise ValueError(f"operation plan not found: {normalized}")
         raw = json.loads(path.read_text(encoding="utf-8"))
-        return _plan_from_mapping(raw)
+        plan = _plan_from_mapping(raw)
+        _normalize_plan_steps(plan)
+        return plan
 
     def list_plans(
         self,
@@ -187,6 +195,8 @@ class OperationPlanStore:
             return "Error: plan must be approved before execution. Use confirm <plan_id>."
         step = _find_step(plan, step_id)
         if step.status == "completed":
+            _record_observation(step, "step already completed; environment unchanged")
+            self.save_plan(plan)
             return _render_step_execution(
                 plan,
                 step,
@@ -194,6 +204,8 @@ class OperationPlanStore:
                 execution_result="step already completed; environment unchanged",
             )
         if step.status == "blocked":
+            _record_observation(step, "step is blocked; resolve required action before continuing")
+            self.save_plan(plan)
             return _render_step_execution(
                 plan,
                 step,
@@ -202,6 +214,8 @@ class OperationPlanStore:
                 next_required_action="inspect_runtime_or_update_plan",
             )
         if step.status == "failed":
+            _record_observation(step, "step already failed; create a new plan or repair state before continuing")
+            self.save_plan(plan)
             return _render_step_execution(
                 plan,
                 step,
@@ -211,6 +225,10 @@ class OperationPlanStore:
             )
         if step.status == "running":
             step.status = "blocked"
+            _record_observation(
+                step,
+                "previous execution left this step running; environment state unknown; inspect runtime",
+            )
             self.save_plan(plan)
             return _render_step_execution(
                 plan,
@@ -236,6 +254,10 @@ class OperationPlanStore:
         if not step.recipe_id:
             if plan.operation == "deploy_platform" and step.step_id == "precheck":
                 step.status = "blocked"
+                _record_observation(
+                    step,
+                    "deploy_precheck_requires_project_root_or_recipe; environment unchanged",
+                )
                 self.save_plan(plan)
                 return _render_step_execution(
                     plan,
@@ -251,6 +273,10 @@ class OperationPlanStore:
                 )
             if not step.requires_step_confirmation and step.risk == "normal":
                 step.status = "completed"
+                _record_observation(
+                    step,
+                    "readonly_or_manual_checkpoint_completed; environment unchanged",
+                )
                 if _all_steps_completed(plan):
                     plan.status = "completed"
                 self.save_plan(plan)
@@ -262,6 +288,7 @@ class OperationPlanStore:
                     execution_result="readonly_or_manual_checkpoint_completed; environment unchanged",
                 )
             step.status = "blocked"
+            _record_observation(step, "no_recipe_attached; environment unchanged")
             self.save_plan(plan)
             return _render_step_execution(
                 plan,
@@ -273,6 +300,7 @@ class OperationPlanStore:
             )
         if self.recipe_runner is None:
             step.status = "blocked"
+            _record_observation(step, "recipe_runner_unavailable; environment unchanged")
             self.save_plan(plan)
             return _render_step_execution(
                 plan,
@@ -286,6 +314,7 @@ class OperationPlanStore:
         self.save_plan(plan)
         result = self._run_recipe(plan, step)
         step.status = _recipe_status(result.status)
+        _record_observation(step, result.output)
         if step.status == "failed":
             plan.status = "failed"
         elif _all_steps_completed(plan):
@@ -346,6 +375,8 @@ class OperationPlanStore:
                     f"plan_status={plan.status}\n"
                     f"execute_step={step.step_id}\n"
                     f"step_title={step.title}\n"
+                    f"action_type={step.action_type or 'unknown'}\n"
+                    f"permission={step.permission or _default_permission(step)}\n"
                     f"step_status={step.status}\n"
                     "result_status=waiting_for_confirmation\n"
                     "execution_result=step requires explicit confirmation; environment unchanged\n"
@@ -406,12 +437,28 @@ def render_plan(plan: OperationPlan) -> str:
     lines.append("steps:")
     for step in plan.steps:
         confirm = " step-confirm" if step.requires_step_confirmation else ""
-        recipe = f" recipe={step.recipe_id}" if step.recipe_id else ""
-        recipe_args = _render_recipe_args(step.recipe_args)
+        action = f" action={step.action_type}" if step.action_type else ""
+        permission = f" permission={step.permission}" if step.permission else ""
         lines.append(
             f"  - {step.step_id}: {step.title} "
-            f"risk={step.risk}{confirm}{recipe}{recipe_args} status={step.status}"
+            f"risk={step.risk}{permission}{confirm}{action} status={step.status}"
         )
+        if step.observation:
+            lines.append(f"    observation={_one_line(step.observation, 180)}")
+    bindings = [
+        step
+        for step in plan.steps
+        if step.recipe_id or step.recipe_args
+    ]
+    if bindings:
+        lines.append("execution_bindings:")
+        for step in bindings:
+            action = f" action={step.action_type}" if step.action_type else ""
+            recipe = f" recipe={step.recipe_id}" if step.recipe_id else ""
+            recipe_args = _render_recipe_args(step.recipe_args)
+            lines.append(
+                f"  - {step.step_id}:{action}{recipe}{recipe_args}"
+            )
     lines.append(f"approve_plan_command=confirm {plan.plan_id}")
     lines.append(
         "approve_step_command=confirm-step "
@@ -492,6 +539,8 @@ def _render_step_execution(
         f"plan_status={plan.status}",
         f"execute_step={step.step_id}",
         f"step_title={step.title}",
+        f"action_type={step.action_type or 'unknown'}",
+        f"permission={step.permission or _default_permission(step)}",
     ]
     if previous_status:
         lines.append(f"previous_step_status={previous_status}")
@@ -502,6 +551,8 @@ def _render_step_execution(
             f"execution_result={execution_result}",
         ]
     )
+    if step.observation:
+        lines.append(f"observation={_one_line(step.observation, 300)}")
     if next_required_action:
         lines.append(f"next_required_action={next_required_action}")
     return "\n".join(lines)
@@ -510,24 +561,92 @@ def _render_step_execution(
 def _default_steps(operation: str) -> List[OperationStep]:
     if operation == "deploy_platform":
         return [
-            OperationStep("precheck", "预检环境和冲突", "确认端口、screen、源码路径和共享服务状态"),
-            OperationStep("prepare-files", "准备项目文件与配置", "复制入口文件并渲染配置", risk="controlled"),
-            OperationStep("start-services", "启动后端与前端服务", "启动 screen、校验 nginx 并 reload", risk="controlled"),
+            OperationStep("precheck", "预检环境和冲突", "确认端口、screen、源码路径和共享服务状态", action_type="validate_project_files"),
+            OperationStep("prepare-files", "准备项目文件与配置", "复制入口文件并渲染配置", action_type="prepare_project_files", risk="controlled"),
+            OperationStep("start-services", "启动后端与前端服务", "启动 screen、校验 nginx 并 reload", action_type="start_platform", risk="controlled"),
         ]
     if operation == "destroy_platform":
         return [
-            OperationStep("identify-owned-resources", "识别目标平台资源", "证明 screen、端口、目录和 nginx 片段属于目标平台"),
-            OperationStep("stop-services", "停止目标平台服务", "停止目标 screen 和专属进程", risk="dangerous", requires_step_confirmation=True),
-            OperationStep("cleanup-owned-resources", "清理本平台资源", "只清理由计划证明归属的资源", risk="dangerous", requires_step_confirmation=True),
+            OperationStep("identify-owned-resources", "识别目标平台资源", "证明 screen、端口、目录和 nginx 片段属于目标平台", action_type="identify_owned_resources"),
+            OperationStep("stop-services", "停止目标平台服务", "停止目标 screen 和专属进程", action_type="stop_platform", risk="dangerous", requires_step_confirmation=True),
+            OperationStep("cleanup-owned-resources", "清理本平台资源", "只清理由计划证明归属的资源", action_type="cleanup_owned_resources", risk="dangerous", requires_step_confirmation=True),
         ]
     return [
-        OperationStep("precheck-runtime", "读取当前运行态", "确认目标平台、screen、端口和日志来源"),
-        OperationStep("restart-master", "重启 Master", "按已确认启动命令重启 master screen", risk="privileged", requires_step_confirmation=True),
-        OperationStep("restart-worker", "重启 Worker", "按已确认启动命令重启 worker screen", risk="privileged", requires_step_confirmation=True),
-        OperationStep("restart-celery", "重启 Celery", "按已确认启动命令重启 celery screen", risk="privileged", requires_step_confirmation=True),
-        OperationStep("restart-web-terminal", "重启 Web Terminal", "按已确认启动命令重启 web terminal screen", risk="privileged", requires_step_confirmation=True),
-        OperationStep("verify-health", "验证重启结果", "检查 screen、进程、端口和最新日志"),
+        OperationStep("precheck-runtime", "读取当前运行态", "确认目标平台、screen、端口和日志来源", action_type="inspect_runtime"),
+        OperationStep("restart-master", "重启 Master", "按已确认启动命令重启 master screen", action_type="restart_component", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-worker", "重启 Worker", "按已确认启动命令重启 worker screen", action_type="restart_component", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-celery", "重启 Celery", "按已确认启动命令重启 celery screen", action_type="restart_component", risk="privileged", requires_step_confirmation=True),
+        OperationStep("restart-web-terminal", "重启 Web Terminal", "按已确认启动命令重启 web terminal screen", action_type="restart_component", risk="privileged", requires_step_confirmation=True),
+        OperationStep("verify-health", "验证重启结果", "检查 screen、进程、端口和最新日志", action_type="verify_health"),
     ]
+
+
+def _normalize_plan_steps(plan: OperationPlan) -> None:
+    for step in plan.steps:
+        if not step.action_type:
+            step.action_type = _default_action_type(plan.operation, step.step_id, step.recipe_id)
+        if not step.permission:
+            step.permission = _default_permission(step)
+        if step.observation:
+            step.observation = _one_line(step.observation, 300)
+
+
+def _default_action_type(operation: str, step_id: str, recipe_id: str = "") -> str:
+    if recipe_id:
+        return _action_type_for_recipe(recipe_id)
+    defaults = {
+        "deploy_platform": {
+            "precheck": "validate_project_files",
+            "prepare-files": "prepare_project_files",
+            "start-shared-services": "ensure_shared_services",
+            "start-services": "start_platform",
+        },
+        "destroy_platform": {
+            "identify-owned-resources": "identify_owned_resources",
+            "stop-services": "stop_platform",
+            "cleanup-owned-resources": "cleanup_owned_resources",
+        },
+        "restart_platform": {
+            "precheck-runtime": "inspect_runtime",
+            "restart-master": "restart_component",
+            "restart-worker": "restart_component",
+            "restart-celery": "restart_component",
+            "restart-web-terminal": "restart_component",
+            "verify-health": "verify_health",
+        },
+    }
+    return defaults.get(operation, {}).get(step_id, step_id.replace("-", "_"))
+
+
+def _action_type_for_recipe(recipe_id: str) -> str:
+    return {
+        "validate_project_files": "validate_project_files",
+        "prepare_project_files": "prepare_project_files",
+        "ensure_shared_services": "ensure_shared_services",
+        "start_platform_screens": "start_platform",
+        "stop_platform_screens": "stop_platform",
+        "restart_screen_component": "restart_component",
+        "stop_screen_component": "stop_component",
+        "extract_archive": "extract_archive",
+        "run_install_script": "run_install_script",
+        "write_ops_file": "write_file",
+        "reload_nginx": "reload_nginx",
+        "manual_checkpoint": "manual_checkpoint",
+    }.get(recipe_id, recipe_id)
+
+
+def _default_permission(step: OperationStep) -> str:
+    if step.requires_step_confirmation:
+        return "step_confirm_required"
+    if step.risk in {"dangerous", "destructive"}:
+        return "step_confirm_required"
+    if step.risk in {"controlled", "privileged"}:
+        return "plan_confirmed"
+    return "readonly_or_plan_confirmed"
+
+
+def _record_observation(step: OperationStep, text: str) -> None:
+    step.observation = _one_line(text, 300)
 
 
 def _find_step(plan: OperationPlan, step_id: str) -> OperationStep:
@@ -552,6 +671,12 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
         recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
         if recipe_id:
             step.recipe_id = recipe_id
+            step.action_type = _one_line(
+                str(binding.get("action_type") or _action_type_for_recipe(recipe_id)),
+                120,
+            )
+        elif binding.get("action_type"):
+            step.action_type = _one_line(str(binding.get("action_type")), 120)
         args = binding.get("args")
         if not isinstance(args, dict):
             args = binding.get("recipe_args")
@@ -562,14 +687,43 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
                 step.recipe_args = previous_recipe_args
             continue
         step.recipe_args = {}
+        effective_recipe_id = step.recipe_id or _recipe_for_action_type(step.action_type)
         for key, value in args.items():
             if not key or value is None:
                 continue
             normalized_key = _one_line(str(key), 80)
-            if step.recipe_id == "write_ops_file" and normalized_key == "content":
+            if effective_recipe_id == "write_ops_file" and normalized_key == "content":
                 step.recipe_args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
                 continue
             step.recipe_args[normalized_key] = _one_line(str(value), 300)
+
+
+def _apply_action_routing(plan: OperationPlan) -> None:
+    for step in plan.steps:
+        if step.recipe_id:
+            continue
+        action_type = step.action_type or _default_action_type(plan.operation, step.step_id)
+        recipe_id = _recipe_for_action_type(action_type)
+        if recipe_id:
+            if not step.recipe_args and action_type not in {"manual_checkpoint"}:
+                continue
+            step.recipe_id = recipe_id
+
+
+def _recipe_for_action_type(action_type: str) -> str:
+    return {
+        "validate_project_files": "validate_project_files",
+        "prepare_project_files": "prepare_project_files",
+        "ensure_shared_services": "ensure_shared_services",
+        "start_platform": "start_platform_screens",
+        "stop_platform": "stop_platform_screens",
+        "restart_component": "restart_screen_component",
+        "extract_archive": "extract_archive",
+        "run_install_script": "run_install_script",
+        "write_file": "write_ops_file",
+        "reload_nginx": "reload_nginx",
+        "manual_checkpoint": "manual_checkpoint",
+    }.get(str(action_type or ""))
 
 
 def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
@@ -689,6 +843,7 @@ def _bind_shared_services_step(plan: OperationPlan, script_dir: str) -> None:
                 "start-shared-services",
                 "启动共享基础服务",
                 "检查 Redis/MySQL/RabbitMQ；缺失时运行 docker_service.sh",
+                action_type="ensure_shared_services",
                 risk="controlled",
             ),
         )
@@ -761,8 +916,9 @@ def _plan_to_mapping(plan: OperationPlan) -> dict:
 
 
 def _plan_from_mapping(raw: dict) -> OperationPlan:
+    step_fields = {item.name for item in fields(OperationStep)}
     steps = [
-        OperationStep(**step)
+        OperationStep(**{key: value for key, value in step.items() if key in step_fields})
         for step in raw.get("steps", [])
         if isinstance(step, dict)
     ]

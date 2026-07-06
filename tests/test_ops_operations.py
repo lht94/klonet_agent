@@ -276,6 +276,38 @@ def test_deploy_operation_plan_can_start_shared_services_before_platform_screens
     assert "recipe_args.script_dir=/root/vemu_install_new_gen" in rendered
 
 
+def test_render_plan_separates_task_steps_from_execution_bindings():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        rendered = render_plan(plan)
+
+    step_section = rendered.split("execution_bindings:", 1)[0]
+    step_lines = [
+        line
+        for line in step_section.splitlines()
+        if line.startswith("  - precheck:") or line.startswith("  - start-services:")
+    ]
+    assert step_lines
+    assert all("recipe=" not in line for line in step_lines)
+    assert all("recipe_args." not in line for line in step_lines)
+    assert "action=validate_project_files" in rendered
+    assert "permission=readonly_or_plan_confirmed" in rendered
+    assert "permission=plan_confirmed" in rendered
+    assert "execution_bindings:" in rendered
+    assert "  - precheck: action=validate_project_files recipe=validate_project_files" in rendered
+
+
 def test_deploy_operation_plan_non_destructive_steps_do_not_require_step_confirmation():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir
@@ -354,6 +386,36 @@ def test_recipe_binding_without_args_preserves_same_default_recipe_args():
     assert step.recipe_id == "prepare_project_files"
     assert step.recipe_args == {
         "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+    }
+
+
+def test_action_router_maps_action_type_to_recipe_when_args_are_present():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="route action",
+            recipe_bindings={
+                "prepare-files": {
+                    "action_type": "write_file",
+                    "args": {
+                        "path": "/home/klonet-agent/vemu_uestc/web_terminal_main.py",
+                        "content": "# patched\n",
+                    },
+                }
+            },
+        )
+
+    step = next(item for item in plan.steps if item.step_id == "prepare-files")
+    assert step.action_type == "write_file"
+    assert step.recipe_id == "write_ops_file"
+    assert step.recipe_args == {
+        "path": "/home/klonet-agent/vemu_uestc/web_terminal_main.py",
+        "content": "# patched\n",
     }
 
 

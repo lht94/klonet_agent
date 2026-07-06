@@ -483,7 +483,7 @@ TOOLS = [
     ),
     _tool(
         "create_ops_operation_plan",
-        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存计划，不执行任何环境修改；可为步骤绑定白名单 recipe_id 和结构化参数，但必须等用户确认后才能执行。",
+        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存任务级计划，不执行任何环境修改；步骤优先表达 action_type，系统再通过 Action Router 映射到受控 recipe；recipe_id 仅作为兼容/调试级执行绑定，必须等用户确认后才能执行。",
         {
             "operation": {
                 "type": "string",
@@ -513,7 +513,7 @@ TOOLS = [
             },
             "recipe_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、ensure_shared_services、extract_archive、run_install_script、write_ops_file、reload_nginx。ensure_shared_services 会先检查 Redis/MySQL/RabbitMQ，缺失时才通过 helper 跑 docker_service.sh；extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}；run_install_script 只允许 base_requ_setup.sh NORMAL 或 docker_service.sh，参数为 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"}；write_ops_file 参数为 {\"path\":\"/path/config.py\",\"content\":\"...\"}，可写配置、nginx/frontend 配置和平台启动必需源码文件（如 vemu_config/config.py、mains/web_terminal_main.py、web_terminal_main.py、gun.py、worker_gun.py），dry-run 时只脱敏预览，真实执行会备份原文件并拒绝 .env、密钥、token、password 等敏感路径；reload_nginx 无参数，通过 helper 固定执行 nginx -t 成功后再 nginx -s reload。只保存绑定，不执行。",
+                "description": "可选：按 step_id 提供执行参数。优先写 action_type，例如 {\"prepare-files\":{\"action_type\":\"write_file\",\"args\":{\"path\":\"/path/config.py\",\"content\":\"...\"}}}；系统会通过 Action Router 映射到 recipe。兼容旧式 recipe_id，例如 restart_screen_component、prepare_project_files、ensure_shared_services、extract_archive、run_install_script、write_ops_file、reload_nginx。ensure_shared_services 会先检查 Redis/MySQL/RabbitMQ，缺失时才通过 helper 跑 docker_service.sh；write_file/write_ops_file 可写配置、nginx/frontend 配置和平台启动必需源码文件，真实执行会备份原文件并拒绝 .env、密钥、token、password 等敏感路径。只保存绑定，不执行。",
             },
         },
         ["operation", "target"],
