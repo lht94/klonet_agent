@@ -553,7 +553,7 @@ TOOLS = [
     ),
     _tool(
         "approve_ops_operation_plan",
-        "记录用户对 Ops 操作计划或单个特权步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>，模型不能自行授权。",
+        "记录用户对 Ops 操作计划或单个高风险步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>；confirm <plan_id> 授权计划内非破坏性步骤按顺序执行，destructive/high-risk 步骤仍需 confirm-step，模型不能自行授权。",
         {
             "plan_id": {"type": "string", "description": "要确认的计划 ID。"},
             "scope": {
@@ -570,7 +570,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_operation_step",
-        "执行已确认 Ops 计划中的一个受控 recipe 步骤。需要先完成 confirm <plan_id>；特权步骤还必须 confirm-step <plan_id> <step_id>。只会运行该步骤绑定 recipe_id 的白名单 runner；未知、未绑定或未接入 recipe 的步骤会 blocked，不会执行任意 shell。",
+        "执行已确认 Ops 计划中的一个受控 recipe 步骤。需要先完成 confirm <plan_id>；只有 destructive/high-risk 步骤还必须 confirm-step <plan_id> <step_id>。只会运行该步骤绑定 recipe_id 的白名单 runner；未知、未绑定或未接入 recipe 的步骤会 blocked，不会执行任意 shell。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
             "step_id": {"type": "string", "description": "要执行的步骤 ID。"},
@@ -579,7 +579,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_next_step",
-        "按 OperationPlan 的 execution_order 执行当前下一步。模型不需要也不应该猜 step_id；如果下一步是特权步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
+        "按 OperationPlan 的 execution_order 执行当前下一步。模型不需要也不应该猜 step_id；如果下一步是 destructive/high-risk 步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
         },
@@ -587,7 +587,7 @@ TOOLS = [
     ),
     _tool(
         "resolve_ops_blocked_step",
-        "Reset a blocked Ops OperationPlan step to pending after runtime reinspection evidence has been collected. This does not authorize execution; privileged steps still require confirm-step again.",
+        "Reset a blocked Ops OperationPlan step to pending after runtime reinspection evidence has been collected. This does not authorize new destructive/high-risk execution; non-destructive steps keep the already confirmed plan authorization.",
         {
             "plan_id": {"type": "string", "description": "Existing Ops operation plan id."},
             "step_id": {"type": "string", "description": "Blocked step id to resolve."},

@@ -230,7 +230,7 @@ def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
 
     step = next(item for item in loaded.steps if item.step_id == "prepare-files")
     assert step.status == "pending"
-    assert step.requires_step_confirmation is True
+    assert step.requires_step_confirmation is False
     assert step.recipe_id == "prepare_project_files"
     assert step.recipe_args == {
         "project_root": "/home/adminis/lht/103_project/vemu_uestc",
@@ -238,6 +238,101 @@ def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
     assert "prepare-files" in rendered
     assert "recipe=prepare_project_files" in rendered
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
+
+
+def test_deploy_operation_plan_non_destructive_steps_do_not_require_step_confirmation():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+
+    steps = {step.step_id: step for step in plan.steps}
+    assert steps["precheck"].requires_step_confirmation is False
+    assert steps["prepare-files"].requires_step_confirmation is False
+    assert steps["start-services"].requires_step_confirmation is False
+
+
+def test_recipe_bindings_accept_recipe_args_and_clear_default_args():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write startup file",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "recipe_args": {
+                        "path": "/home/klonet-agent/vemu_uestc/mains/web_terminal_main.py",
+                        "content": "# patched\n",
+                    },
+                }
+            },
+        )
+
+    step = next(item for item in plan.steps if item.step_id == "prepare-files")
+    assert step.recipe_id == "write_ops_file"
+    assert step.recipe_args == {
+        "path": "/home/klonet-agent/vemu_uestc/mains/web_terminal_main.py",
+        "content": "# patched\n",
+    }
+
+
+def test_confirmed_deploy_plan_executes_prepare_without_confirm_step():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        for filename in required_files:
+            (mains / filename).write_text(f"# {filename}\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        store.approve_plan(plan.plan_id)
+
+        precheck = store.execute_next_step(plan.plan_id)
+        prepare = store.execute_next_step(plan.plan_id)
+
+    assert "execute_step=precheck" in precheck
+    assert "result_status=completed" in precheck
+    assert "execute_step=prepare-files" in prepare
+    assert "step requires explicit confirm-step" not in prepare
+    assert "result_status=completed" in prepare
+    assert "recipe_id=prepare_project_files" in prepare
 
 
 def test_deploy_operation_plan_default_binds_extract_archive_recipe_for_prepare_files():

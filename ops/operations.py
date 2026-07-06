@@ -465,8 +465,8 @@ def _default_steps(operation: str) -> List[OperationStep]:
     if operation == "deploy_platform":
         return [
             OperationStep("precheck", "预检环境和冲突", "确认端口、screen、源码路径和共享服务状态"),
-            OperationStep("prepare-files", "准备项目文件与配置", "复制入口文件并渲染配置", risk="privileged", requires_step_confirmation=True),
-            OperationStep("start-services", "启动后端与前端服务", "启动 screen、校验 nginx 并 reload", risk="privileged", requires_step_confirmation=True),
+            OperationStep("prepare-files", "准备项目文件与配置", "复制入口文件并渲染配置", risk="privileged"),
+            OperationStep("start-services", "启动后端与前端服务", "启动 screen、校验 nginx 并 reload", risk="privileged"),
         ]
     if operation == "destroy_platform":
         return [
@@ -503,8 +503,10 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
             continue
         step.recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
         args = binding.get("args")
+        if not isinstance(args, dict):
+            args = binding.get("recipe_args")
+        step.recipe_args = {}
         if isinstance(args, dict):
-            step.recipe_args = {}
             for key, value in args.items():
                 if not key or value is None:
                     continue
