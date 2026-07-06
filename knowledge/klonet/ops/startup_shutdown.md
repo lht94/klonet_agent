@@ -21,6 +21,26 @@ last_verified: 2026-06-24
 - `<master_port>`、`<worker_port>`、`<public_port>`、`<terminal_port>`：当前实例配置的端口。
 - `<frontend_path>`：前端目录的绝对路径，Nginx alias 中末尾必须保留 `/`。
 
+## 第零步：获取平台源码并确认项目根目录
+
+Klonet 平台源码不从 `vemu_install_new_gen` 环境安装包中推断。该安装包主要用于基础环境、依赖服务、Redis、Docker 镜像和辅助脚本；正在启动的后端源码应来自 Git 仓库或一台已验证服务器上的完整项目副本。
+
+标准来源有两类：
+
+1. Git 仓库：已知仓库地址时，先配置当前服务器的 Git 认证，再执行 `git clone <repo_url> <project_root>`，并按部署要求切换分支或 tag。
+2. 服务器复制：仓库地址暂不可用时，可以用 `rsync`、`scp` 或运维传输方式，从一台已验证平台服务器复制完整项目目录到 `<project_root>`。
+
+Git 配置不清楚时，先检查已有项目副本，而不是从环境安装包里找源码：
+
+~~~bash
+test -d <project_root>/.git
+git -C <project_root> remote -v
+git -C <project_root> branch --show-current
+git -C <project_root> status --short
+~~~
+
+如果没有 `.git`，只能说明当前目录可能是复制副本或导出目录，不能反推出仓库地址、分支或认证方式；需要向维护者确认 Git URL、认证方式和目标分支。拿到源码后，必须确认 `<project_root>` 同时包含 `mains/` 与 `vemu_uestc/`，再继续后续配置和启动步骤。
+
 ## 服务器角色与启动顺序
 
 Master 服务器通常启动：

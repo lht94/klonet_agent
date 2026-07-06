@@ -48,6 +48,21 @@ def test_startup_runbook_contains_concrete_runtime_commands():
     assert "<python_env>" not in text
 
 
+def test_startup_runbook_documents_source_acquisition_before_runtime_start():
+    text = _read(STARTUP_RUNBOOK)
+
+    for expected in (
+        "## 第零步：获取平台源码并确认项目根目录",
+        "git clone <repo_url> <project_root>",
+        "git -C <project_root> remote -v",
+        "rsync",
+        "scp",
+        "Klonet 平台源码不从 `vemu_install_new_gen` 环境安装包中推断",
+        "同时包含 `mains/` 与 `vemu_uestc/`",
+    ):
+        assert expected in text
+
+
 def test_multi_platform_startup_runbook_is_generic_and_conflict_aware():
     text = _read(MULTI_PLATFORM_STARTUP_RUNBOOK)
 
@@ -68,6 +83,8 @@ def test_multi_platform_startup_runbook_is_generic_and_conflict_aware():
         "sudo /usr/local/python3/bin/gunicorn -c worker_gun.py worker_main:flask_app",
         "sudo nginx -t",
         "sudo nginx -s reload",
+        "优先从 Git 仓库克隆",
+        "不要从 `vemu_install_new_gen` 环境安装包推断或抽取平台源码",
     ):
         assert expected in text
 
