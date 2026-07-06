@@ -28,6 +28,7 @@ VALIDATE_PROJECT_FILES = "validate_project_files"
 PREPARE_PROJECT_FILES = "prepare_project_files"
 EXTRACT_ARCHIVE = "extract_archive"
 RUN_INSTALL_SCRIPT = "run_install_script"
+ENSURE_SHARED_SERVICES = "ensure_shared_services"
 WRITE_OPS_FILE = "write_ops_file"
 RELOAD_NGINX = "reload_nginx"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
@@ -43,6 +44,11 @@ REQUIRED_PROJECT_ENTRY_FILES = (
     "worker_gun.py",
     "worker_main.py",
 )
+SHARED_SERVICE_PORTS = {
+    "redis": "6379",
+    "mysql": "3306",
+    "rabbitmq": "5672",
+}
 SAFE_OPS_WRITE_SUFFIXES = {
     ".py",
     ".conf",
@@ -144,6 +150,8 @@ class ControlledRecipeRunner:
             return self._extract_archive(step)
         if step.recipe_id == RUN_INSTALL_SCRIPT:
             return self._run_install_script(step)
+        if step.recipe_id == ENSURE_SHARED_SERVICES:
+            return self._ensure_shared_services(step)
         if step.recipe_id == WRITE_OPS_FILE:
             return self._write_ops_file(step)
         if step.recipe_id == RELOAD_NGINX:
@@ -527,6 +535,66 @@ class ControlledRecipeRunner:
             return _run_command_streaming(command)
         return self.command_runner(command)
 
+    def _ensure_shared_services(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        script_dir = str(args.get("script_dir") or "/root/vemu_install_new_gen").strip()
+        if not script_dir or _looks_unsafe_path(script_dir):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={ENSURE_SHARED_SERVICES} invalid_script_dir={script_dir or 'missing'}; environment unchanged",
+            )
+        check_command = _shared_service_check_command()
+        if self.dry_run:
+            install_command = self._helper_command(
+                "run-install-script",
+                "--script-dir",
+                script_dir,
+                "--script-name",
+                "docker_service.sh",
+            )
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={ENSURE_SHARED_SERVICES} "
+                    f"check_command_preview={_format_command(check_command)} "
+                    f"fallback_command_preview={_format_command(install_command)} "
+                    "environment unchanged"
+                ),
+            )
+        try:
+            status_output = self.command_runner(check_command)
+        except subprocess.CalledProcessError as exc:
+            return _script_failure_result(exc)
+        missing = _missing_shared_services(status_output)
+        if not missing:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    f"dry_run=false recipe_id={ENSURE_SHARED_SERVICES} "
+                    f"service_status={_one_line(status_output)} "
+                    "environment unchanged"
+                ),
+            )
+        install_step = OperationStep(
+            step_id=step.step_id,
+            title=step.title,
+            purpose=step.purpose,
+            recipe_id=RUN_INSTALL_SCRIPT,
+            recipe_args={
+                "script_dir": script_dir,
+                "script_name": "docker_service.sh",
+            },
+        )
+        result = self._run_install_script(install_step)
+        result.output = (
+            f"recipe_id={ENSURE_SHARED_SERVICES} "
+            f"missing_services={','.join(missing)} "
+            f"service_status={_one_line(status_output)} "
+            f"fallback_result=({result.output})"
+        )
+        return result
+
     def _write_ops_file(self, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}
         raw_path = str(args.get("path") or "").strip()
@@ -729,6 +797,34 @@ def _install_script_command(script_dir: str, script_name: str, script_args: list
     if args:
         command = f"{command} {args}"
     return ["bash", "-lc", command]
+
+
+def _shared_service_check_command() -> list:
+    checks = []
+    for service, port in SHARED_SERVICE_PORTS.items():
+        checks.append(
+            "if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)"
+            + re.escape(port)
+            + "$'; then echo service="
+            + service
+            + " port="
+            + port
+            + " status=listen; else echo service="
+            + service
+            + " port="
+            + port
+            + " status=missing; fi"
+        )
+    return ["bash", "-lc", " ".join(checks)]
+
+
+def _missing_shared_services(status_output: str) -> list:
+    missing = []
+    for line in str(status_output or "").splitlines():
+        service_match = re.search(r"\bservice=([A-Za-z0-9_-]+)\b", line)
+        if "status=missing" in line and service_match:
+            missing.append(service_match.group(1))
+    return missing
 
 
 def _first_unsafe_archive_member(destination: Path, members: list) -> str:

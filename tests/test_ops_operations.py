@@ -252,7 +252,6 @@ def test_deploy_operation_plan_can_start_shared_services_before_platform_screens
             objective="deploy platform 103",
             operation_args={
                 "project_root": "/home/adminis/lht/103_project/vemu_uestc",
-                "start_shared_services": "true",
                 "shared_services_script_dir": "/root/vemu_install_new_gen",
             },
         )
@@ -268,14 +267,13 @@ def test_deploy_operation_plan_can_start_shared_services_before_platform_screens
     step = next(item for item in loaded.steps if item.step_id == "start-shared-services")
     assert step.requires_step_confirmation is False
     assert step.risk == "controlled"
-    assert step.recipe_id == "run_install_script"
+    assert step.recipe_id == "ensure_shared_services"
     assert step.recipe_args == {
         "script_dir": "/root/vemu_install_new_gen",
-        "script_name": "docker_service.sh",
     }
     assert "execution_order=precheck -> prepare-files -> start-shared-services -> start-services" in rendered
-    assert "recipe=run_install_script" in rendered
-    assert "recipe_args.script_name=docker_service.sh" in rendered
+    assert "recipe=ensure_shared_services" in rendered
+    assert "recipe_args.script_dir=/root/vemu_install_new_gen" in rendered
 
 
 def test_deploy_operation_plan_non_destructive_steps_do_not_require_step_confirmation():
@@ -296,6 +294,7 @@ def test_deploy_operation_plan_non_destructive_steps_do_not_require_step_confirm
     steps = {step.step_id: step for step in plan.steps}
     assert steps["precheck"].requires_step_confirmation is False
     assert steps["prepare-files"].requires_step_confirmation is False
+    assert steps["start-shared-services"].requires_step_confirmation is False
     assert steps["start-services"].requires_step_confirmation is False
 
 
@@ -437,6 +436,7 @@ def test_deploy_plan_execute_until_blocked_runs_all_controlled_steps():
 
     assert "execute_step=precheck" in result
     assert "execute_step=prepare-files" in result
+    assert "execute_step=start-shared-services" in result
     assert "execute_step=start-services" in result
     assert "step requires explicit confirm-step" not in result
     assert loaded.status == "completed"
@@ -1687,6 +1687,101 @@ def test_run_install_script_recipe_execute_calls_fixed_command():
     assert len(calls) == 1
     assert calls[0][0:2] == ["bash", "-lc"]
     assert "docker_service.sh" in calls[0][2]
+
+
+def test_ensure_shared_services_skips_install_when_ports_are_listening():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_runner(command):
+        calls.append(command)
+        return "\n".join(
+            [
+                "service=redis port=6379 status=listen",
+                "service=mysql port=3306 status=listen",
+                "service=rabbitmq port=5672 status=listen",
+            ]
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=fake_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="ensure shared services",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "start-shared-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-shared-services")
+
+    assert "result_status=completed" in result
+    assert "recipe_id=ensure_shared_services" in result
+    assert "environment unchanged" in result
+    assert len(calls) == 1
+    assert calls[0][0:2] == ["bash", "-lc"]
+
+
+def test_ensure_shared_services_runs_docker_service_when_any_port_is_missing():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_runner(command):
+        calls.append(command)
+        if len(calls) == 1:
+            return "\n".join(
+                [
+                    "service=redis port=6379 status=missing",
+                    "service=mysql port=3306 status=missing",
+                    "service=rabbitmq port=5672 status=missing",
+                ]
+            )
+        return "docker services started"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=fake_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="ensure shared services",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "start-shared-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-shared-services")
+
+    assert "result_status=completed" in result
+    assert "recipe_id=ensure_shared_services" in result
+    assert "missing_services=redis,mysql,rabbitmq" in result
+    assert "docker services started" in result
+    assert len(calls) == 2
+    assert calls[1][0:4] == [
+        "sudo",
+        "-n",
+        "/usr/local/bin/klonet-agent-op",
+        "run-install-script",
+    ]
+    assert "docker_service.sh" in calls[1]
 
 
 def test_run_install_script_recipe_default_runner_streams_output(monkeypatch):

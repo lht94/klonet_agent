@@ -602,8 +602,8 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
         ).strip()
         if not shared_services_script_dir and script_name == "docker_service.sh":
             shared_services_script_dir = script_dir
-        start_shared_services = _truthy(plan.operation_args.get("start_shared_services"))
-        if start_shared_services and not shared_services_script_dir:
+        skip_shared_services = _truthy(plan.operation_args.get("skip_shared_services"))
+        if not shared_services_script_dir:
             shared_services_script_dir = "/root/vemu_install_new_gen"
         if project_root:
             try:
@@ -631,7 +631,7 @@ def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
                 "platform": _one_line(plan.target, 120),
                 "project_root": _one_line(project_root, 300),
             }
-            if start_shared_services:
+            if not skip_shared_services:
                 _bind_shared_services_step(plan, shared_services_script_dir)
             return
         try:
@@ -688,15 +688,14 @@ def _bind_shared_services_step(plan: OperationPlan, script_dir: str) -> None:
             OperationStep(
                 "start-shared-services",
                 "启动共享基础服务",
-                "运行 docker_service.sh 启动 Redis/MySQL/RabbitMQ 等共享容器",
+                "检查 Redis/MySQL/RabbitMQ；缺失时运行 docker_service.sh",
                 risk="controlled",
             ),
         )
     step = _find_step(plan, "start-shared-services")
-    step.recipe_id = "run_install_script"
+    step.recipe_id = "ensure_shared_services"
     step.recipe_args = {
         "script_dir": _one_line(script_dir, 300),
-        "script_name": "docker_service.sh",
     }
 
 
