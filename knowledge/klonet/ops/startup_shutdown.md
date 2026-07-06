@@ -25,7 +25,7 @@ last_verified: 2026-06-24
 
 Klonet 平台源码不从 `vemu_install_new_gen` 环境安装包中推断。该安装包主要用于基础环境、依赖服务、Redis、Docker 镜像和辅助脚本；正在启动的后端源码应来自 Git 仓库或一台已验证服务器上的完整项目副本。
 
-标准来源有两类：
+详细 Git SSH 配置、后端/前端仓库地址和分支检查见 `knowledge/klonet/ops/source_acquisition_git.md`。标准来源有两类：
 
 1. Git 仓库：已知仓库地址时，先配置当前服务器的 Git 认证，再执行 `git clone <repo_url> <project_root>`，并按部署要求切换分支或 tag。
 2. 服务器复制：仓库地址暂不可用时，可以用 `rsync`、`scp` 或运维传输方式，从一台已验证平台服务器复制完整项目目录到 `<project_root>`。

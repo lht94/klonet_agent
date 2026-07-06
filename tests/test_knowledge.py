@@ -152,19 +152,15 @@ def test_source_acquisition_runbook_is_retrievable_for_git_questions():
     from klonet_agent.knowledge.retriever import KnowledgeRetriever
 
     results = KnowledgeRetriever().search(
-        "Klonet 平台源码 git clone 仓库 服务器复制 vemu_install_new_gen",
+        "Klonet 平台源码 git clone 仓库 ssh .ssh gitee vemu_uestc",
         top_k=5,
         task_type="operation_guide",
         domains=("runtime",),
     )
 
     assert results
-    assert any(
-        result.path == "knowledge/klonet/ops/startup_shutdown.md"
-        and "Klonet 平台源码不从 `vemu_install_new_gen` 环境安装包中推断"
-        in result.snippet
-        for result in results
-    )
+    assert results[0].path == "knowledge/klonet/ops/source_acquisition_git.md"
+    assert "git clone gitee:uestc-minenet/vemu_uestc.git" in results[0].snippet
 
 
 def test_general_query_does_not_force_klonet_results():
