@@ -18,6 +18,9 @@ def test_sudoers_template_only_allows_fixed_helper_entrypoint():
     assert "/usr/local/bin/klonet-agent-op reload-nginx --execute" in text
     assert "/usr/local/bin/klonet-agent-op extract-archive --execute" in text
     assert "/usr/local/bin/klonet-agent-op run-install-script --execute" in text
+    assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute" in text
+    assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute," in text
+    assert "/usr/local/bin/klonet-agent-op start-docker-container --execute" in text
     assert "NOPASSWD:" in text
     assert "/bin/bash" not in text
     assert "/usr/bin/screen" not in text

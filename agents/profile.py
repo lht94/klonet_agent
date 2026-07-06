@@ -43,6 +43,8 @@ ENVIRONMENT_TOOLS = {
     "inspect_frontend_config",
     "inspect_install_scripts",
     "inspect_service_health",
+    "inspect_docker_containers",
+    "run_readonly_command",
     "inspect_nginx_routes",
     "inspect_ops_context",
     "inspect_platform_health",

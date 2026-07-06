@@ -15,18 +15,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from klonet_agent.ops.actions import (
+    DEFAULT_OPS_ACTION_REGISTRY,
+    default_action_bindings,
+)
+
 
 _UTC8 = timezone(timedelta(hours=8))
 VALID_OPERATIONS = {"deploy_platform", "restart_platform", "destroy_platform"}
 VALID_PLAN_STATUS = {"pending", "approved", "aborted", "completed", "failed"}
 VALID_STEP_STATUS = {"pending", "approved", "running", "completed", "failed", "blocked"}
-RESTART_STEP_COMPONENTS = {
-    "restart-master": ("master", "m"),
-    "restart-worker": ("worker", "w"),
-    "restart-celery": ("celery", "c"),
-    "restart-web-terminal": ("web_terminal", "web"),
-}
 MAX_RECIPE_CONTENT_CHARS = 20000
+MAX_PLAN_STEPS = 20
 
 
 @dataclass
@@ -40,6 +40,9 @@ class OperationStep:
     requires_step_confirmation: bool = False
     status: str = "pending"
     observation: str = ""
+    action: str = ""
+    args: dict = field(default_factory=dict)
+    # Deprecated compatibility fields for plans created before action/args.
     recipe_id: str = ""
     recipe_args: dict = field(default_factory=dict)
 
@@ -61,6 +64,7 @@ class OperationPlan:
     created_at: str = ""
     constraints: str = ""
     operation_args: dict = field(default_factory=dict)
+    steps_source: str = "default"
     evidence: List[str] = field(default_factory=list)
     steps: List[OperationStep] = field(default_factory=list)
 
@@ -68,9 +72,15 @@ class OperationPlan:
 class OperationPlanStore:
     """Filesystem-backed OperationPlan store."""
 
-    def __init__(self, root: Path, recipe_runner: Optional[Callable] = None):
+    def __init__(
+        self,
+        root: Path,
+        action_runner: Optional[Callable] = None,
+        recipe_runner: Optional[Callable] = None,
+    ):
         self.root = Path(root)
-        self.recipe_runner = recipe_runner
+        self.action_runner = action_runner or recipe_runner
+        self.recipe_runner = self.action_runner
         self.root.mkdir(parents=True, exist_ok=True)
 
     def create_plan(
@@ -82,6 +92,8 @@ class OperationPlanStore:
         objective: str = "",
         constraints: str = "",
         operation_args: Optional[dict] = None,
+        steps: Optional[List[dict]] = None,
+        action_bindings: Optional[dict] = None,
         recipe_bindings: Optional[dict] = None,
     ) -> OperationPlan:
         operation = operation if operation in VALID_OPERATIONS else "restart_platform"
@@ -93,12 +105,13 @@ class OperationPlanStore:
             created_at=datetime.now(_UTC8).isoformat(timespec="seconds"),
             constraints=str(constraints or "").strip(),
             operation_args=_clean_operation_args(operation_args or {}),
+            steps_source="custom" if steps else "default",
             evidence=[_one_line(item, 300) for item in (evidence or [])[:12]],
-            steps=_default_steps(operation),
+            steps=_custom_steps(steps) if steps else _default_steps(operation),
         )
-        _apply_default_recipe_bindings(plan)
-        _apply_recipe_bindings(plan, recipe_bindings or {})
-        _apply_action_routing(plan)
+        if not steps:
+            _apply_default_action_bindings(plan)
+        _apply_action_bindings(plan, action_bindings or recipe_bindings or {})
         _normalize_plan_steps(plan)
         self.save_plan(plan)
         return plan
@@ -251,8 +264,12 @@ class OperationPlanStore:
         if previous_incomplete:
             return f"Error: previous step must be completed first: {previous_incomplete.step_id}"
         previous_status = step.status
-        if not step.recipe_id:
-            if plan.operation == "deploy_platform" and step.step_id == "precheck":
+        if not step.action:
+            if (
+                plan.steps_source == "default"
+                and plan.operation == "deploy_platform"
+                and step.step_id == "precheck"
+            ):
                 step.status = "blocked"
                 _record_observation(
                     step,
@@ -296,9 +313,9 @@ class OperationPlanStore:
                 previous_status=previous_status,
                 result_status="blocked",
                 execution_result="no_recipe_attached; environment unchanged",
-                next_required_action="attach a controlled recipe before executing this step",
+                next_required_action="attach an allowlisted action before executing this step",
             )
-        if self.recipe_runner is None:
+        if self.action_runner is None:
             step.status = "blocked"
             _record_observation(step, "recipe_runner_unavailable; environment unchanged")
             self.save_plan(plan)
@@ -308,11 +325,11 @@ class OperationPlanStore:
                 previous_status=previous_status,
                 result_status="blocked",
                 execution_result="recipe_runner_unavailable; environment unchanged",
-                next_required_action="configure a controlled recipe runner for this environment",
+                next_required_action="configure a controlled action runner for this environment",
             )
         step.status = "running"
         self.save_plan(plan)
-        result = self._run_recipe(plan, step)
+        result = self._run_action(plan, step)
         step.status = _recipe_status(result.status)
         _record_observation(step, result.output)
         if step.status == "failed":
@@ -393,9 +410,9 @@ class OperationPlanStore:
                 break
         return "\n---\n".join(outputs)
 
-    def _run_recipe(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
+    def _run_action(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         try:
-            result = self.recipe_runner(plan, step)
+            result = self.action_runner(plan, step)
         except Exception as exc:
             return RecipeExecutionResult("failed", f"recipe_exception={exc}")
         if isinstance(result, RecipeExecutionResult):
@@ -415,6 +432,7 @@ def render_plan(plan: OperationPlan) -> str:
         f"operation={plan.operation}",
         f"target={plan.target or 'unknown'}",
         f"status={plan.status}",
+        f"steps_source={plan.steps_source}",
         f"objective={plan.objective}",
     ]
     if plan.constraints:
@@ -448,16 +466,17 @@ def render_plan(plan: OperationPlan) -> str:
     bindings = [
         step
         for step in plan.steps
-        if step.recipe_id or step.recipe_args
+        if step.action or step.args
     ]
     if bindings:
         lines.append("execution_bindings:")
         for step in bindings:
             action = f" action={step.action_type}" if step.action_type else ""
-            recipe = f" recipe={step.recipe_id}" if step.recipe_id else ""
-            recipe_args = _render_recipe_args(step.recipe_args)
+            legacy_recipe = f" recipe={step.recipe_id}" if step.recipe_id else ""
+            action_id = f" action_id={step.action}" if step.action else ""
+            action_args = _render_action_args(step.args)
             lines.append(
-                f"  - {step.step_id}:{action}{recipe}{recipe_args}"
+                f"  - {step.step_id}:{action}{legacy_recipe}{action_id}{action_args}"
             )
     lines.append(f"approve_plan_command=confirm {plan.plan_id}")
     lines.append(
@@ -581,10 +600,103 @@ def _default_steps(operation: str) -> List[OperationStep]:
     ]
 
 
+def _custom_steps(raw_steps: List[dict]) -> List[OperationStep]:
+    """Validate LLM-authored task steps without accepting commands."""
+
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise ValueError("steps must be a non-empty array")
+    if len(raw_steps) > MAX_PLAN_STEPS:
+        raise ValueError(f"steps exceeds maximum of {MAX_PLAN_STEPS}")
+    result = []
+    seen = set()
+    for index, raw in enumerate(raw_steps, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f"step {index} must be an object")
+        step_id = _safe_step_id(raw.get("step_id") or f"step-{index}")
+        if step_id in seen:
+            raise ValueError(f"duplicate step_id: {step_id}")
+        seen.add(step_id)
+        if "command" in raw or "shell" in raw:
+            raise ValueError(f"step {step_id} must use action + args, not command")
+        requested_action = _one_line(str(raw.get("action") or ""), 120)
+        action = ""
+        if requested_action:
+            action = DEFAULT_OPS_ACTION_REGISTRY.canonical_name(requested_action)
+            if not action:
+                raise ValueError(f"action_not_allowlisted={requested_action}")
+        action_args = raw.get("args") or {}
+        if not isinstance(action_args, dict):
+            raise ValueError(f"step {step_id} args must be an object")
+        cleaned_args = _clean_action_args(action, action_args)
+        spec = DEFAULT_OPS_ACTION_REGISTRY.get(action)
+        risk = spec.risk if spec else _one_line(str(raw.get("risk") or "normal"), 40)
+        requires_step_confirmation = bool(
+            spec and spec.confirmation_scope == "step"
+        )
+        result.append(
+            OperationStep(
+                step_id=step_id,
+                title=_one_line(str(raw.get("title") or step_id), 160),
+                purpose=_one_line(str(raw.get("purpose") or raw.get("title") or step_id), 260),
+                action_type=_action_type_for_recipe(action) if action else "checkpoint",
+                risk=risk or "normal",
+                requires_step_confirmation=requires_step_confirmation,
+                action=action,
+                args=cleaned_args,
+                recipe_id=action,
+                recipe_args=dict(cleaned_args),
+            )
+        )
+    return result
+
+
+def _clean_action_args(action: str, args: dict) -> dict:
+    cleaned = {}
+    for key, value in args.items():
+        normalized_key = _one_line(str(key), 80)
+        if not normalized_key or value is None:
+            continue
+        if action == "write_ops_file" and normalized_key == "content":
+            cleaned[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+        else:
+            cleaned[normalized_key] = _one_line(str(value), 300)
+    return cleaned
+
+
+def _safe_step_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 80:
+        raise ValueError("invalid step_id")
+    if any(not (char.isalnum() or char in "-_") for char in text):
+        raise ValueError(f"invalid step_id: {text}")
+    return text
+
+
 def _normalize_plan_steps(plan: OperationPlan) -> None:
     for step in plan.steps:
+        requested_action = step.action or step.recipe_id
+        if step.recipe_id and step.recipe_id != step.action:
+            requested_action = step.recipe_id
+        canonical_action = DEFAULT_OPS_ACTION_REGISTRY.canonical_name(requested_action)
+        if canonical_action:
+            step.action = canonical_action
+            step.recipe_id = canonical_action
+        elif requested_action:
+            # Preserve custom runners and old extension points.
+            step.action = requested_action
+            step.recipe_id = requested_action
+        spec = DEFAULT_OPS_ACTION_REGISTRY.get(step.action)
+        if spec:
+            if step.risk == "normal" and spec.risk != "normal":
+                step.risk = spec.risk
+            if spec.confirmation_scope == "step":
+                step.requires_step_confirmation = True
+        if step.args:
+            step.recipe_args = dict(step.args)
+        elif step.recipe_args:
+            step.args = dict(step.recipe_args)
         if not step.action_type:
-            step.action_type = _default_action_type(plan.operation, step.step_id, step.recipe_id)
+            step.action_type = _default_action_type(plan.operation, step.step_id, step.action)
         if not step.permission:
             step.permission = _default_permission(step)
         if step.observation:
@@ -619,20 +731,10 @@ def _default_action_type(operation: str, step_id: str, recipe_id: str = "") -> s
 
 
 def _action_type_for_recipe(recipe_id: str) -> str:
-    return {
-        "validate_project_files": "validate_project_files",
-        "prepare_project_files": "prepare_project_files",
-        "ensure_shared_services": "ensure_shared_services",
-        "start_platform_screens": "start_platform",
-        "stop_platform_screens": "stop_platform",
-        "restart_screen_component": "restart_component",
-        "stop_screen_component": "stop_component",
-        "extract_archive": "extract_archive",
-        "run_install_script": "run_install_script",
-        "write_ops_file": "write_file",
-        "reload_nginx": "reload_nginx",
-        "manual_checkpoint": "manual_checkpoint",
-    }.get(recipe_id, recipe_id)
+    spec = DEFAULT_OPS_ACTION_REGISTRY.get(recipe_id)
+    if not spec:
+        return recipe_id
+    return spec.aliases[0] if spec.aliases else spec.name
 
 
 def _default_permission(step: OperationStep) -> str:
@@ -656,164 +758,73 @@ def _find_step(plan: OperationPlan, step_id: str) -> OperationStep:
     raise ValueError(f"operation step not found: {step_id}")
 
 
-def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
-    if not isinstance(recipe_bindings, dict):
+def _apply_action_bindings(plan: OperationPlan, action_bindings: dict) -> None:
+    if not isinstance(action_bindings, dict):
         return
-    for step_id, binding in recipe_bindings.items():
+    for step_id, binding in action_bindings.items():
         if not isinstance(binding, dict):
             continue
         try:
             step = _find_step(plan, str(step_id))
         except ValueError:
             continue
-        previous_recipe_id = step.recipe_id
-        previous_recipe_args = dict(step.recipe_args)
-        recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
-        if recipe_id:
-            step.recipe_id = recipe_id
+        previous_action = step.action or step.recipe_id
+        previous_args = dict(step.args or step.recipe_args)
+        requested_action = _one_line(
+            str(binding.get("action") or binding.get("recipe_id") or ""),
+            120,
+        )
+        canonical_action = DEFAULT_OPS_ACTION_REGISTRY.canonical_name(requested_action)
+        if requested_action and not canonical_action:
+            step.action = requested_action
+            step.recipe_id = requested_action
+        elif canonical_action:
+            step.action = canonical_action
+            step.recipe_id = canonical_action
             step.action_type = _one_line(
-                str(binding.get("action_type") or _action_type_for_recipe(recipe_id)),
+                str(binding.get("action_type") or _action_type_for_recipe(canonical_action)),
                 120,
             )
         elif binding.get("action_type"):
             step.action_type = _one_line(str(binding.get("action_type")), 120)
+            routed_action = DEFAULT_OPS_ACTION_REGISTRY.canonical_name(step.action_type)
+            if routed_action:
+                step.action = routed_action
+                step.recipe_id = routed_action
         args = binding.get("args")
         if not isinstance(args, dict):
             args = binding.get("recipe_args")
         if not isinstance(args, dict):
-            if step.recipe_id != previous_recipe_id:
+            if step.action != previous_action:
+                step.args = {}
                 step.recipe_args = {}
             else:
-                step.recipe_args = previous_recipe_args
+                step.args = previous_args
+                step.recipe_args = dict(previous_args)
             continue
+        step.args = {}
         step.recipe_args = {}
-        effective_recipe_id = step.recipe_id or _recipe_for_action_type(step.action_type)
+        effective_action = step.action or DEFAULT_OPS_ACTION_REGISTRY.canonical_name(step.action_type)
         for key, value in args.items():
             if not key or value is None:
                 continue
             normalized_key = _one_line(str(key), 80)
-            if effective_recipe_id == "write_ops_file" and normalized_key == "content":
-                step.recipe_args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+            if effective_action == "write_ops_file" and normalized_key == "content":
+                step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
                 continue
-            step.recipe_args[normalized_key] = _one_line(str(value), 300)
+            step.args[normalized_key] = _one_line(str(value), 300)
+        step.recipe_args = dict(step.args)
 
 
-def _apply_action_routing(plan: OperationPlan) -> None:
-    for step in plan.steps:
-        if step.recipe_id:
-            continue
-        action_type = step.action_type or _default_action_type(plan.operation, step.step_id)
-        recipe_id = _recipe_for_action_type(action_type)
-        if recipe_id:
-            if not step.recipe_args and action_type not in {"manual_checkpoint"}:
-                continue
-            step.recipe_id = recipe_id
-
-
-def _recipe_for_action_type(action_type: str) -> str:
-    return {
-        "validate_project_files": "validate_project_files",
-        "prepare_project_files": "prepare_project_files",
-        "ensure_shared_services": "ensure_shared_services",
-        "start_platform": "start_platform_screens",
-        "stop_platform": "stop_platform_screens",
-        "restart_component": "restart_screen_component",
-        "extract_archive": "extract_archive",
-        "run_install_script": "run_install_script",
-        "write_file": "write_ops_file",
-        "reload_nginx": "reload_nginx",
-        "manual_checkpoint": "manual_checkpoint",
-    }.get(str(action_type or ""))
-
-
-def _apply_default_recipe_bindings(plan: OperationPlan) -> None:
-    if plan.operation == "restart_platform" and plan.target:
-        project_root = str(plan.operation_args.get("project_root") or "").strip()
-        if project_root:
-            for step_id, (component, screen_suffix) in RESTART_STEP_COMPONENTS.items():
-                try:
-                    step = _find_step(plan, step_id)
-                except ValueError:
-                    continue
-                step.recipe_id = "restart_screen_component"
-                step.recipe_args = {
-                    "platform": _one_line(plan.target, 120),
-                    "component": component,
-                    "screen_session": _one_line(f"{plan.target}_{screen_suffix}", 120),
-                    "project_root": _one_line(project_root, 300),
-                }
-    if plan.operation == "deploy_platform" and plan.target:
-        project_root = str(plan.operation_args.get("project_root") or "").strip()
-        archive_path = str(plan.operation_args.get("archive_path") or "").strip()
-        destination_dir = str(plan.operation_args.get("destination_dir") or "").strip()
-        script_dir = str(plan.operation_args.get("script_dir") or "").strip()
-        script_name = str(plan.operation_args.get("script_name") or "").strip()
-        script_args = str(plan.operation_args.get("script_args") or "").strip()
-        shared_services_script_dir = str(
-            plan.operation_args.get("shared_services_script_dir")
-            or plan.operation_args.get("docker_service_script_dir")
-            or ""
-        ).strip()
-        if not shared_services_script_dir and script_name == "docker_service.sh":
-            shared_services_script_dir = script_dir
-        skip_shared_services = _truthy(plan.operation_args.get("skip_shared_services"))
-        if not shared_services_script_dir:
-            shared_services_script_dir = "/root/vemu_install_new_gen"
-        if project_root:
-            try:
-                precheck_step = _find_step(plan, "precheck")
-                precheck_step.recipe_id = "validate_project_files"
-                precheck_step.recipe_args = {
-                    "project_root": _one_line(project_root, 300),
-                }
-            except ValueError:
-                pass
-            try:
-                prepare_step = _find_step(plan, "prepare-files")
-                prepare_step.recipe_id = "prepare_project_files"
-                prepare_step.recipe_args = {
-                    "project_root": _one_line(project_root, 300),
-                }
-            except ValueError:
-                pass
-            try:
-                step = _find_step(plan, "start-services")
-            except ValueError:
-                return
-            step.recipe_id = "start_platform_screens"
-            step.recipe_args = {
-                "platform": _one_line(plan.target, 120),
-                "project_root": _one_line(project_root, 300),
-            }
-            if not skip_shared_services:
-                _bind_shared_services_step(plan, shared_services_script_dir)
-            return
-        try:
-            prepare_step = _find_step(plan, "prepare-files")
-        except ValueError:
-            prepare_step = None
-        if prepare_step and archive_path and destination_dir:
-            prepare_step.recipe_id = "extract_archive"
-            prepare_step.recipe_args = {
-                "archive_path": _one_line(archive_path, 300),
-                "destination_dir": _one_line(destination_dir, 300),
-            }
-            return
-        if prepare_step and script_dir and script_name:
-            prepare_step.recipe_id = "run_install_script"
-            prepare_step.recipe_args = {
-                "script_dir": _one_line(script_dir, 300),
-                "script_name": _one_line(script_name, 120),
-            }
-            if script_args:
-                prepare_step.recipe_args["script_args"] = _one_line(script_args, 300)
-    if plan.operation == "destroy_platform" and plan.target:
-        try:
-            step = _find_step(plan, "stop-services")
-        except ValueError:
-            return
-        step.recipe_id = "stop_platform_screens"
-        step.recipe_args = {"platform": _one_line(plan.target, 120)}
+def _apply_default_action_bindings(plan: OperationPlan) -> None:
+    bindings, add_shared_services = default_action_bindings(
+        plan.operation,
+        plan.target,
+        plan.operation_args,
+    )
+    if add_shared_services:
+        _ensure_shared_services_step(plan)
+    _apply_action_bindings(plan, bindings)
 
 
 def _clean_operation_args(args: dict) -> dict:
@@ -826,13 +837,7 @@ def _clean_operation_args(args: dict) -> dict:
     }
 
 
-def _truthy(value: object) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def _bind_shared_services_step(plan: OperationPlan, script_dir: str) -> None:
-    if not script_dir:
-        return
+def _ensure_shared_services_step(plan: OperationPlan) -> None:
     try:
         _find_step(plan, "start-shared-services")
     except ValueError:
@@ -847,11 +852,6 @@ def _bind_shared_services_step(plan: OperationPlan, script_dir: str) -> None:
                 risk="controlled",
             ),
         )
-    step = _find_step(plan, "start-shared-services")
-    step.recipe_id = "ensure_shared_services"
-    step.recipe_args = {
-        "script_dir": _one_line(script_dir, 300),
-    }
 
 
 def _insert_step_before(plan: OperationPlan, before_step_id: str, step: OperationStep) -> None:
@@ -865,22 +865,24 @@ def _insert_step_before(plan: OperationPlan, before_step_id: str, step: Operatio
     plan.steps.append(step)
 
 
-def _render_recipe_args(recipe_args: dict) -> str:
-    if not isinstance(recipe_args, dict) or not recipe_args:
+def _render_action_args(action_args: dict) -> str:
+    if not isinstance(action_args, dict) or not action_args:
         return ""
     pairs = []
-    for key in sorted(recipe_args)[:6]:
+    for key in sorted(action_args)[:6]:
         if not key:
             continue
         if str(key) == "content":
-            pairs.append(f"recipe_args.content=<{len(str(recipe_args[key]))} chars>")
+            pairs.append(f"args.content=<{len(str(action_args[key]))} chars>")
             continue
         pairs.append(
+            f"args.{_one_line(str(key), 40)}="
+            f"{_one_line(str(action_args[key]), 120)} "
             f"recipe_args.{_one_line(str(key), 40)}="
-            f"{_one_line(str(recipe_args[key]), 120)}"
+            f"{_one_line(str(action_args[key]), 120)}"
         )
-    if len(recipe_args) > 6:
-        pairs.append("recipe_args.omitted=...")
+    if len(action_args) > 6:
+        pairs.append("args.omitted=...")
     return " " + " ".join(pairs) if pairs else ""
 
 
@@ -928,6 +930,11 @@ def _plan_from_mapping(raw: dict) -> OperationPlan:
     for step in steps:
         if step.status not in VALID_STEP_STATUS:
             step.status = "pending"
+    steps_source = str(raw.get("steps_source") or "").strip()
+    if steps_source not in {"default", "custom"}:
+        default_ids = {step.step_id for step in _default_steps(str(raw.get("operation") or "restart_platform"))}
+        actual_ids = {step.step_id for step in steps}
+        steps_source = "default" if actual_ids == default_ids else "custom"
     return OperationPlan(
         plan_id=_safe_plan_id(str(raw.get("plan_id") or "")),
         operation=str(raw.get("operation") or "restart_platform"),
@@ -937,6 +944,7 @@ def _plan_from_mapping(raw: dict) -> OperationPlan:
         created_at=str(raw.get("created_at") or ""),
         constraints=str(raw.get("constraints") or ""),
         operation_args=_clean_operation_args(raw.get("operation_args") or {}),
+        steps_source=steps_source,
         evidence=[str(item) for item in raw.get("evidence", []) if item],
         steps=steps,
     )

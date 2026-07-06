@@ -44,6 +44,7 @@ REQUIRED_PROJECT_ENTRY_FILES = (
     "worker_main.py",
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -97,6 +98,16 @@ def main(argv=None) -> int:
     run_install.add_argument("--script-dir", required=True)
     run_install.add_argument("--script-name", required=True)
     run_install.add_argument("--script-args", default="")
+    inspect_containers = subcommands.add_parser("inspect-docker-containers")
+    inspect_containers_mode = inspect_containers.add_mutually_exclusive_group(required=True)
+    inspect_containers_mode.add_argument("--dry-run", action="store_true")
+    inspect_containers_mode.add_argument("--execute", action="store_true")
+    inspect_containers.add_argument("--name", default="")
+    start_container = subcommands.add_parser("start-docker-container")
+    start_container_mode = start_container.add_mutually_exclusive_group(required=True)
+    start_container_mode.add_argument("--dry-run", action="store_true")
+    start_container_mode.add_argument("--execute", action="store_true")
+    start_container.add_argument("--name", required=True)
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
@@ -112,8 +123,88 @@ def main(argv=None) -> int:
         return _extract_archive(args)
     if args.action == "run-install-script":
         return _run_install_script(args)
+    if args.action == "inspect-docker-containers":
+        return _inspect_docker_containers(args)
+    if args.action == "start-docker-container":
+        return _start_docker_container(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
+
+
+def _inspect_docker_containers(args) -> int:
+    if args.name and not SAFE_CONTAINER_NAME.fullmatch(args.name):
+        _print_error(f"invalid_container_name={args.name}")
+        return 2
+    print("klonet_agent_op")
+    print("action=inspect-docker-containers")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    if args.dry_run:
+        print(f"container_filter={args.name or 'all'}")
+        print("environment_changed=false")
+        return 0
+    command = [
+        "docker",
+        "ps",
+        "-a",
+        "--format",
+        "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}",
+    ]
+    if args.name:
+        command.extend(["--filter", f"name=^/{args.name}$"])
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        _print_error(f"docker_inspect_failed={exc}")
+        return 1
+    if completed.returncode != 0:
+        _print_error(f"docker_inspect_failed={completed.stderr.strip() or completed.returncode}")
+        return 1
+    output = completed.stdout.strip()
+    print(f"container_filter={args.name or 'all'}")
+    print(f"containers={output or 'none'}")
+    print("environment_changed=false")
+    return 0
+
+
+def _start_docker_container(args) -> int:
+    if not SAFE_CONTAINER_NAME.fullmatch(args.name):
+        _print_error(f"invalid_container_name={args.name}")
+        return 2
+    if args.execute:
+        try:
+            inspected = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", args.name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if inspected.returncode != 0:
+                _print_error(f"container_not_found={args.name}")
+                return 1
+            already_running = inspected.stdout.strip().lower() == "true"
+            if not already_running:
+                run_checked(["docker", "start", args.name])
+        except (subprocess.CalledProcessError, OSError) as exc:
+            _print_command_failure(["docker", "start", args.name], exc)
+            return 1
+    else:
+        already_running = False
+    print("klonet_agent_op")
+    print("action=start-docker-container")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"container={args.name}")
+    print(f"already_running={str(already_running).lower()}")
+    print(f"environment_changed={str(args.execute and not already_running).lower()}")
+    return 0
 
 
 def _restart_screen_component(args) -> int:

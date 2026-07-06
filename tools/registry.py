@@ -310,6 +310,45 @@ TOOLS = [
         ["platform", "project_root"],
     ),
     _tool(
+        "run_readonly_command",
+        "执行结构化只读诊断命令或有限管道。只允许 which、ls、find、stat、grep、rg、head、tail、ps、ss、systemctl 只读子命令，以及 Python/pip 的版本和 pip list/show/freeze；使用 argv 数组且 shell=False。禁止 python -c、安装卸载、find -exec/-delete 和 Shell 字符串。",
+        {
+            "program": {"type": "string", "description": "单命令程序名或绝对路径。"},
+            "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "单命令参数数组，不含程序名。",
+            },
+            "pipeline": {
+                "type": "array",
+                "description": "可选的结构化管道，最多 4 段；提供后忽略顶层 program/argv。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "program": {"type": "string"},
+                        "argv": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["program", "argv"],
+                },
+            },
+            "cwd": {"type": "string", "description": "可选的绝对工作目录。"},
+            "stderr": {"type": "string", "enum": ["capture", "discard"]},
+            "timeout_seconds": {"type": "integer", "description": "1 到 30 秒。"},
+        },
+        [],
+    ),
+    _tool(
+        "inspect_docker_containers",
+        "通过 root-owned helper 只读查看 Docker 容器名称、状态、镜像和端口。用于 klonet-agent 用户无权访问 Docker socket 的环境；不会启动、停止或修改容器。",
+        {
+            "name": {
+                "type": "string",
+                "description": "可选的精确容器名，例如 mysql-vemu；省略则列出全部容器。",
+            }
+        },
+        [],
+    ),
+    _tool(
         "inspect_service_health",
         "只读汇总 Docker 容器、Redis、MySQL、RabbitMQ、Nginx 等共享服务健康状态，并给出 reuse/start_candidate/inspect 建议。用于部署前判断是否复用已有服务，避免重复执行 docker_service.sh 或重复启动 Redis；不修改环境。",
         {
@@ -483,7 +522,7 @@ TOOLS = [
     ),
     _tool(
         "create_ops_operation_plan",
-        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存任务级计划，不执行任何环境修改；步骤优先表达 action_type，系统再通过 Action Router 映射到受控 recipe；recipe_id 仅作为兼容/调试级执行绑定，必须等用户确认后才能执行。",
+        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。LLM 只提交结构化 action + args，系统通过 OpsActionRegistry 校验操作、路径和权限并选择固定实现；不接受模型生成的 Shell 命令。创建时只保存计划，确认后才能执行。",
         {
             "operation": {
                 "type": "string",
@@ -509,11 +548,30 @@ TOOLS = [
             },
             "operation_args": {
                 "type": "object",
-                "description": "可选：计划级结构化参数，用于生成受控默认 recipe，不直接执行。deploy_platform 支持 {\"project_root\":\"/home/klonet-agent/platforms/103_project/vemu_uestc\"} 自动绑定 prepare_project_files、ensure_shared_services、start_platform_screens；可用 {\"shared_services_script_dir\":\"/root/vemu_install_new_gen\"} 指定 docker_service.sh 所在目录，或 {\"skip_shared_services\":\"true\"} 显式跳过共享服务检查；支持 {\"archive_path\":\"/home/klonet-agent/inbox/vemu_install_2024_12_5.tar\",\"destination_dir\":\"/root\"} 自动绑定 prepare-files=extract_archive；支持 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"} 自动绑定 prepare-files=run_install_script。",
+                "description": "计划级结构化参数，用于由注册表生成默认 action，不直接执行。可提供 project_root、archive_path/destination_dir、script_dir/script_name/script_args、shared_services_script_dir 或 skip_shared_services。",
+            },
+            "steps": {
+                "type": "array",
+                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。省略时才使用兼容的默认步骤模板。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "purpose": {"type": "string"},
+                        "action": {"type": "string"},
+                        "args": {"type": "object"},
+                    },
+                    "required": ["step_id", "title"],
+                },
+            },
+            "action_bindings": {
+                "type": "object",
+                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；mode 可为 insert_after、insert_before、replace_text。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
             },
             "recipe_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 提供执行参数。优先写 action_type，例如 {\"prepare-files\":{\"action_type\":\"write_file\",\"args\":{\"path\":\"/path/config.py\",\"content\":\"...\"}}}；系统会通过 Action Router 映射到 recipe。兼容旧式 recipe_id，例如 restart_screen_component、prepare_project_files、ensure_shared_services、extract_archive、run_install_script、write_ops_file、reload_nginx。ensure_shared_services 会先检查 Redis/MySQL/RabbitMQ，缺失时才通过 helper 跑 docker_service.sh；write_file/write_ops_file 可写配置、nginx/frontend 配置和平台启动必需源码文件，真实执行会备份原文件并拒绝 .env、密钥、token、password 等敏感路径。只保存绑定，不执行。",
+                "description": "已弃用的旧计划兼容字段。新调用必须使用 action_bindings。",
             },
         },
         ["operation", "target"],
@@ -570,7 +628,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_operation_step",
-        "执行已确认 Ops 计划中的一个受控 recipe 步骤。需要先完成 confirm <plan_id>；只有 destructive/high-risk 步骤还必须 confirm-step <plan_id> <step_id>。只会运行该步骤绑定 recipe_id 的白名单 runner；未知、未绑定或未接入 recipe 的步骤会 blocked，不会执行任意 shell。",
+        "执行已确认 Ops 计划中的一个操作白名单步骤。需要先完成 confirm <plan_id>；destructive/high-risk 步骤还必须 confirm-step。系统只运行注册表中的 action，未知或未绑定 action 会 blocked，不会执行模型生成的 Shell。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
             "step_id": {"type": "string", "description": "要执行的步骤 ID。"},

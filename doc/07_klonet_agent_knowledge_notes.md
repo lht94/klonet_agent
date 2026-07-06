@@ -1,5 +1,113 @@
 # Klonet Agent 知识整理
 
+## 知识点：Ops 应使用操作白名单，而不是命令字符串白名单
+
+### 问题背景
+
+Ops Agent 不应该让 LLM 直接生成 Shell 命令，再由系统判断整段命令是否可以执行。命令字符串包含引号、管道、重定向、变量展开、命令替换和路径拼接，难以可靠判断，也容易产生参数注入。
+
+更合适的职责划分是：
+
+```text
+LLM 决定“预期执行什么操作”
+系统决定“这个操作是否允许以及具体怎样执行”
+```
+
+例如，LLM 输出结构化意图：
+
+```json
+{
+  "action": "deploy_node",
+  "args": {
+    "platform": "103",
+    "node": "master",
+    "project_root": "/home/adminis/lht/103_project"
+  }
+}
+```
+
+系统随后检查：
+
+1. `deploy_node` 是否属于允许的操作。
+2. `master` 是否属于允许的节点类型。
+3. `project_root` 解析后的真实路径是否位于允许目录中。
+4. 操作风险等级是否要求用户确认。
+5. 参数通过后，应调用哪个确定性 handler 或 root helper。
+
+最终命令由系统根据操作规则生成，并使用参数数组执行；LLM 不负责生成最终 Shell 字符串。
+
+### 标准执行循环
+
+```text
+LLM 输出结构化计划和 action + args
+  -> OpsActionRegistry 查询操作白名单
+  -> 校验参数、真实路径、风险和确认要求
+  -> handler/helper 生成标准 argv 并执行
+  -> Observation 返回 LLM
+  -> 成功则继续下一步，失败则根据真实结果调整计划
+```
+
+### 为什么它看起来像 if-else 规则库
+
+从逻辑上看，操作白名单确实相当于：如果 action 是部署 Master，就校验部署参数并执行 Master 的标准流程；如果 action 是重启 Worker，就执行 Worker 的标准流程。
+
+实现上不应持续堆叠大型 if-else，而应使用注册表：
+
+```python
+OPS_ACTIONS = {
+    "deploy_node": ActionSpec(
+        handler=deploy_node,
+        risk="privileged",
+        requires_confirmation=True,
+        path_args=("project_root",),
+    ),
+}
+```
+
+注册表集中表达：操作名称、handler、参数约束、路径字段、风险等级和确认要求。新增操作时主要增加一条 `ActionSpec` 和对应 handler，不再同时修改 Planner、Router、Executor 和多层 recipe 分支。
+
+### 路径检查要点
+
+不能只使用字符串前缀判断路径：
+
+```python
+path.startswith("/home/adminis/lht")
+```
+
+这种写法可能错误接受 `/home/adminis/lht-evil`，也无法可靠处理 `..` 和符号链接。应先解析路径，再判断它是否位于允许根目录中：
+
+```python
+resolved = Path(path).resolve(strict=False)
+resolved.relative_to(allowed_root.resolve(strict=False))
+```
+
+### 当前项目的迁移策略
+
+`OpsActionRegistry` 作为操作权限、路径参数、风险等级、确认要求和 handler 映射的统一入口。迁移期间继续把 `recipe_id` 当作 action 名使用，以兼容现有 OperationPlan 数据和测试。
+
+当前代码已经完成以下迁移：
+
+- 新计划以 `OperationStep.action + OperationStep.args` 作为主数据。
+- `create_ops_operation_plan` 对外提供 `action_bindings`。
+- 默认部署、重启、销毁步骤由 `default_action_bindings()` 统一生成，不再在 OperationPlan 中维护一套 recipe 分支。
+- `ControlledActionRunner` 先查询 `OpsActionRegistry`，再检查结构化路径并调用固定 handler。
+- 可通过 `KLONET_AGENT_OPS_ALLOWED_ROOTS` 配置生产环境允许的路径根目录；多个根目录使用系统路径分隔符分开。
+- 旧计划中的 `recipe_id/recipe_args` 会在加载时迁移为 `action/args`；旧类名和字段只作为兼容别名保留。
+- action 执行成功或失败后，Observation 仍进入 LLM 工具循环，由 LLM 决定继续下一步或调整计划。
+- OperationPlan 支持 LLM 提交自定义 `steps`；固定部署模板只作为未提供 steps 时的兼容回退，因此排障、恢复单个服务等任务不必再套用 precheck/prepare-files/start-services。
+- Docker socket 不直接授权给 `klonet-agent`。只读查看通过 `inspect_docker_containers` 调用 root helper；启动已有容器通过 `start_docker_container` action，仍受计划确认、容器名校验、helper 和 sudoers 控制。
+- `write_ops_file` 同时支持整文件和增量编辑。大文件只改一处时，LLM 提供 mode、anchor、content、expected_matches；执行器读取完整文件、验证锚点唯一、自动备份并幂等插入或替换，不依赖模型拿到完整文件正文。
+- Ops 提供结构化只读终端 `run_readonly_command`。它接受 program、argv、cwd 和最多四段 pipeline，以 shell=False 执行固定程序；允许环境定位、文本检索、进程端口和依赖清单诊断，拒绝 python -c、软件安装、find 执行/删除谓词以及任意 Shell。
+
+以下安全边界仍然保留：
+
+- OperationPlan 的用户确认和状态持久化。
+- 操作执行记录与审计。
+- handler 内的业务参数检查。
+- root helper 和 sudoers 的最终系统权限限制。
+
+因此，架构精简的目标不是取消安全检查，而是把重复、分散的操作声明收敛成一个规则来源。
+
 ## 版本记录
 
 本文基于当前 Git 历史中的以下版本整理：

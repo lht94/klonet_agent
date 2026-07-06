@@ -344,7 +344,16 @@ class AgentOrchestrator:
                 # 执行归档压缩中的工具调用。
                 for tool_call in compress_response.choices[0].message.tool_calls:
                     tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
+                    tool_args, parse_error = self._parse_tool_arguments(tool_call)
+                    if parse_error:
+                        comp_tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": parse_error,
+                        }
+                        history.append(comp_tool_msg)
+                        self.memory_store.append_history(comp_tool_msg)
+                        continue
 
                     tool_result = self.use_tool(tool_name, tool_args)
 
@@ -635,7 +644,20 @@ class AgentOrchestrator:
                     # 工具名，即 schema 中 function.name。
                     tool_name = tool_call.function.name
                     # 工具参数，即 schema 中 function.parameters 约束出的标准 JSON。
-                    tool_args = json.loads(tool_call.function.arguments)
+                    tool_args, parse_error = self._parse_tool_arguments(tool_call)
+                    if parse_error:
+                        self._print_tool_loop_observation(tool_name, parse_error)
+                        tool_events.append(
+                            {"name": tool_name, "args": {}, "result": parse_error}
+                        )
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": parse_error,
+                        }
+                        history.append(tool_msg)
+                        self.memory_store.append_history(tool_msg)
+                        continue
                     if tool_name == "search_knowledge":
                         candidate_intent = QueryIntent.from_mapping(
                             tool_args.get("intent")
@@ -801,6 +823,26 @@ class AgentOrchestrator:
 
         return reply, history, token
 
+    def _parse_tool_arguments(self, tool_call) -> tuple[dict, str]:
+        """Parse model tool JSON without allowing malformed output to crash the CLI."""
+
+        raw = str(getattr(tool_call.function, "arguments", "") or "")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {}, (
+                "Error: invalid_tool_arguments_json "
+                f"tool={tool_call.function.name} position={exc.pos}. "
+                "The tool was not executed. Resubmit one valid JSON object matching the tool schema; "
+                "do not embed a Shell command, and prefer incremental write_ops_file edits over large file content."
+            )
+        if not isinstance(parsed, dict):
+            return {}, (
+                "Error: invalid_tool_arguments_type "
+                f"tool={tool_call.function.name}. The tool was not executed; arguments must be one JSON object."
+            )
+        return parsed, ""
+
     def _show_visible_reasoning_trace(self) -> bool:
         """默认输出用户可见思考摘要；brief 模式只输出最终答案。"""
 
@@ -844,6 +886,8 @@ class AgentOrchestrator:
             "read_klonet_logs": ("正在读取 Klonet 日志", "path"),
             "inspect_screen_session": ("正在检查 screen 会话", "session"),
             "inspect_system_environment": ("正在检查系统环境", "checks"),
+            "inspect_docker_containers": ("正在查看 Docker 容器", "name"),
+            "run_readonly_command": ("正在执行只读诊断命令", "program"),
             "inspect_ops_context": ("正在检查运维环境", "checks"),
             "inspect_platform_instances": ("正在盘点 Klonet 平台实例", "project_roots"),
             "inspect_klonet_runtime": ("正在检查 Klonet 运行状态", "checks"),

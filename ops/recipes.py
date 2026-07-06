@@ -16,6 +16,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+from klonet_agent.ops.actions import OpsActionRegistry, configured_ops_action_registry
 from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExecutionResult
 
 
@@ -31,6 +32,7 @@ RUN_INSTALL_SCRIPT = "run_install_script"
 ENSURE_SHARED_SERVICES = "ensure_shared_services"
 WRITE_OPS_FILE = "write_ops_file"
 RELOAD_NGINX = "reload_nginx"
+START_DOCKER_CONTAINER = "start_docker_container"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -105,8 +107,8 @@ _SECRET_PATTERNS = (
 )
 
 
-class ControlledRecipeRunner:
-    """Dispatch allowlisted Ops recipes."""
+class ControlledActionRunner:
+    """Validate and dispatch allowlisted structured Ops actions."""
 
     def __init__(
         self,
@@ -114,11 +116,13 @@ class ControlledRecipeRunner:
         dry_run: bool = True,
         helper_path: str = "/usr/local/bin/klonet-agent-op",
         command_runner=None,
+        action_registry: OpsActionRegistry | None = None,
     ):
         self.dry_run = dry_run
         self.helper_path = helper_path
         self._uses_default_command_runner = command_runner is None
         self.command_runner = command_runner or _run_command
+        self.action_registry = action_registry or configured_ops_action_registry()
 
     def _helper_command(self, action: str, *args: str) -> list:
         command = [
@@ -132,31 +136,44 @@ class ControlledRecipeRunner:
         return ["sudo", "-n", *command]
 
     def __call__(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
-        if step.recipe_id == MANUAL_CHECKPOINT:
-            return self._manual_checkpoint(step)
-        if step.recipe_id == RESTART_SCREEN_COMPONENT:
-            return self._restart_screen_component(plan, step)
-        if step.recipe_id == STOP_SCREEN_COMPONENT:
-            return self._stop_screen_component(plan, step)
-        if step.recipe_id == STOP_PLATFORM_SCREENS:
-            return self._stop_platform_screens(plan, step)
-        if step.recipe_id == START_PLATFORM_SCREENS:
-            return self._start_platform_screens(plan, step)
-        if step.recipe_id == VALIDATE_PROJECT_FILES:
-            return self._validate_project_files(step)
-        if step.recipe_id == PREPARE_PROJECT_FILES:
-            return self._prepare_project_files(step)
-        if step.recipe_id == EXTRACT_ARCHIVE:
-            return self._extract_archive(step)
-        if step.recipe_id == RUN_INSTALL_SCRIPT:
-            return self._run_install_script(step)
-        if step.recipe_id == ENSURE_SHARED_SERVICES:
-            return self._ensure_shared_services(step)
-        if step.recipe_id == WRITE_OPS_FILE:
-            return self._write_ops_file(step)
-        if step.recipe_id == RELOAD_NGINX:
-            return self._reload_nginx()
-        return RecipeExecutionResult("blocked", f"unknown_recipe={step.recipe_id}; environment unchanged")
+        action = step.action or step.recipe_id
+        action_args = step.args or step.recipe_args
+        spec = self.action_registry.get(action)
+        if spec is None:
+            return RecipeExecutionResult(
+                "blocked",
+                f"action_not_allowlisted={action or 'missing'}; environment unchanged",
+            )
+        problem = self.action_registry.validate_args(spec, action_args)
+        if problem:
+            return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
+        # Keep legacy handlers working while action/args are the canonical model.
+        step.action = spec.name
+        step.args = dict(action_args)
+        step.recipe_id = spec.name
+        step.recipe_args = dict(action_args)
+        handler = getattr(self, spec.handler_name, None)
+        if handler is None:
+            return RecipeExecutionResult(
+                "blocked",
+                f"action_handler_unavailable={action}; environment unchanged",
+            )
+        if spec.name == MANUAL_CHECKPOINT:
+            return handler(step)
+        step_only_actions = {
+            VALIDATE_PROJECT_FILES,
+            PREPARE_PROJECT_FILES,
+            EXTRACT_ARCHIVE,
+            RUN_INSTALL_SCRIPT,
+            ENSURE_SHARED_SERVICES,
+            WRITE_OPS_FILE,
+            START_DOCKER_CONTAINER,
+        }
+        if spec.name in step_only_actions:
+            return handler(step)
+        if spec.name == RELOAD_NGINX:
+            return handler()
+        return handler(plan, step)
 
     def _manual_checkpoint(self, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}
@@ -596,9 +613,11 @@ class ControlledRecipeRunner:
         return result
 
     def _write_ops_file(self, step: OperationStep) -> RecipeExecutionResult:
-        args = step.recipe_args or {}
+        args = step.args or step.recipe_args or {}
         raw_path = str(args.get("path") or "").strip()
         content = str(args.get("content") or "")
+        mode = str(args.get("mode") or "replace_file").strip().lower()
+        anchor = str(args.get("anchor") or "")
         if not raw_path or _looks_unsafe_path(raw_path):
             return RecipeExecutionResult(
                 "blocked",
@@ -616,6 +635,42 @@ class ControlledRecipeRunner:
                 f"recipe_id={WRITE_OPS_FILE} unsupported_file_type={path.name or raw_path}; environment unchanged",
             )
 
+        if mode not in {"replace_file", "insert_after", "insert_before", "replace_text"}:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={WRITE_OPS_FILE} unsupported_write_mode={mode}; environment unchanged",
+            )
+        old_content = ""
+        new_content = content
+        already_applied = False
+        if mode != "replace_file":
+            if not path.is_file():
+                return RecipeExecutionResult(
+                    "blocked",
+                    f"recipe_id={WRITE_OPS_FILE} incremental_target_missing={path}; environment unchanged",
+                )
+            try:
+                old_content = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                return RecipeExecutionResult(
+                    "blocked",
+                    f"recipe_id={WRITE_OPS_FILE} read_failed={_one_line(str(exc))}; environment unchanged",
+                )
+            edit_result = _apply_incremental_edit(
+                old_content,
+                mode=mode,
+                anchor=anchor,
+                content=content,
+                expected_matches=args.get("expected_matches", 1),
+            )
+            if edit_result[0]:
+                return RecipeExecutionResult(
+                    "blocked",
+                    f"recipe_id={WRITE_OPS_FILE} {edit_result[0]}; environment unchanged",
+                )
+            new_content = edit_result[1]
+            already_applied = edit_result[2]
+
         preview = _one_line(_redact_sensitive_text(content))
         if self.dry_run:
             return RecipeExecutionResult(
@@ -624,18 +679,29 @@ class ControlledRecipeRunner:
                     "dry_run=true "
                     f"recipe_id={WRITE_OPS_FILE} "
                     f"path={_one_line(raw_path)} "
+                    f"mode={mode} "
+                    f"already_applied={str(already_applied).lower()} "
                     f"preview={preview} "
                     "environment unchanged"
                 ),
             )
         try:
+            if already_applied:
+                return RecipeExecutionResult(
+                    "completed",
+                    (
+                        f"dry_run=false recipe_id={WRITE_OPS_FILE} "
+                        f"path={_one_line(raw_path)} mode={mode} "
+                        "already_applied=true environment_changed=false"
+                    ),
+                )
             path.parent.mkdir(parents=True, exist_ok=True)
             backup_path = ""
             if path.exists():
                 backup = _ops_backup_path(path)
                 shutil.copy2(path, backup)
                 backup_path = str(backup)
-            path.write_text(content, encoding="utf-8")
+            path.write_text(new_content, encoding="utf-8")
         except OSError as exc:
             return RecipeExecutionResult(
                 "blocked",
@@ -650,7 +716,8 @@ class ControlledRecipeRunner:
             "dry_run=false",
             f"recipe_id={WRITE_OPS_FILE}",
             f"path={_one_line(raw_path)}",
-            f"bytes_written={len(content.encode('utf-8'))}",
+            f"mode={mode}",
+            f"bytes_written={len(new_content.encode('utf-8'))}",
         ]
         if backup_path:
             parts.append(f"backup_path={_one_line(backup_path)}")
@@ -685,6 +752,16 @@ class ControlledRecipeRunner:
             ),
         )
 
+    def _start_docker_container(self, step: OperationStep) -> RecipeExecutionResult:
+        name = str((step.args or step.recipe_args or {}).get("name") or "").strip()
+        if not _safe_container_name(name):
+            return RecipeExecutionResult(
+                "blocked",
+                f"invalid_container_name={name or 'missing'}; environment unchanged",
+            )
+        command = self._helper_command("start-docker-container", "--name", name)
+        return self._helper_result(START_DOCKER_CONTAINER, command)
+
     def _helper_result(self, recipe_id: str, command: list) -> RecipeExecutionResult:
         if not self.dry_run:
             try:
@@ -709,6 +786,10 @@ class ControlledRecipeRunner:
                 "environment unchanged"
             ),
         )
+
+
+# Backward-compatible import for existing integrations and persisted terminology.
+ControlledRecipeRunner = ControlledActionRunner
 
 
 def _validate_restart_args(platform: str, component: str, screen_session: str, project_root: str) -> str:
@@ -742,6 +823,52 @@ def _validate_start_platform_args(platform: str, project_root: str) -> str:
 
 def _safe_token(value: str) -> bool:
     return bool(value and _SAFE_NAME.match(value))
+
+
+def _safe_container_name(value: str) -> bool:
+    return bool(value and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value))
+
+
+def _apply_incremental_edit(
+    original: str,
+    *,
+    mode: str,
+    anchor: str,
+    content: str,
+    expected_matches,
+) -> tuple[str, str, bool]:
+    """Return (problem, new_content, already_applied) for a deterministic edit."""
+
+    if not anchor:
+        return "missing_anchor", original, False
+    try:
+        expected = int(expected_matches)
+    except (TypeError, ValueError):
+        return "invalid_expected_matches", original, False
+    if expected < 1 or expected > 20:
+        return "invalid_expected_matches", original, False
+    newline = "\r\n" if "\r\n" in original else "\n"
+    snippet = content.rstrip("\r\n")
+    matches = original.count(anchor)
+    if mode == "insert_after":
+        replacement = anchor + newline + snippet
+        if matches != expected:
+            return f"anchor_match_count={matches} expected={expected}", original, False
+        if replacement in original:
+            return "", original, True
+    elif mode == "insert_before":
+        replacement = snippet + newline + anchor
+        if matches != expected:
+            return f"anchor_match_count={matches} expected={expected}", original, False
+        if replacement in original:
+            return "", original, True
+    else:
+        replacement = content
+        if anchor not in original and content and content in original:
+            return "", original, True
+        if matches != expected:
+            return f"anchor_match_count={matches} expected={expected}", original, False
+    return "", original.replace(anchor, replacement, expected), False
 
 
 def _project_entry_file_sources(root: Path) -> dict:

@@ -188,7 +188,12 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 /usr/local/bin/klonet-agent-op stop-platform-screens --execute *
 /usr/local/bin/klonet-agent-op start-platform-screens --execute *
 /usr/local/bin/klonet-agent-op reload-nginx --execute *
+/usr/local/bin/klonet-agent-op inspect-docker-containers --execute *
+/usr/local/bin/klonet-agent-op start-docker-container --execute *
 ```
+
+查看全部容器时 helper 没有额外参数，因此 sudoers 同时包含精确的
+`inspect-docker-containers --execute` 规则；按名称过滤时使用带参数规则。
 
 原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护、启动命令模板都在 helper 内完成。放行底层命令会绕过这些校验。
 

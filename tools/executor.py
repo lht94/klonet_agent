@@ -20,9 +20,11 @@ from klonet_agent.ops.operations import (
     render_plan_list,
     render_step_resolution,
 )
-from klonet_agent.ops.recipes import ControlledRecipeRunner
+from klonet_agent.ops.recipes import ControlledActionRunner
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
+from klonet_agent.tools.docker_ops import inspect_docker_containers
+from klonet_agent.tools.read_only_terminal import run_readonly_command
 from klonet_agent.tools.environment import (
     inspect_archive,
     inspect_frontend_config,
@@ -151,6 +153,12 @@ class ToolExecutor:
         if tool_name == "inspect_service_health":
             return inspect_service_health(tool_args)
 
+        if tool_name == "inspect_docker_containers":
+            return inspect_docker_containers(tool_args)
+
+        if tool_name == "run_readonly_command":
+            return run_readonly_command(tool_args)
+
         if tool_name == "inspect_install_scripts":
             return inspect_install_scripts(tool_args)
 
@@ -203,6 +211,8 @@ class ToolExecutor:
                 objective=tool_args.get("objective", ""),
                 constraints=tool_args.get("constraints", ""),
                 operation_args=tool_args.get("operation_args"),
+                steps=tool_args.get("steps"),
+                action_bindings=tool_args.get("action_bindings"),
                 recipe_bindings=tool_args.get("recipe_bindings"),
                 evidence=[
                     str(item)
@@ -371,7 +381,7 @@ class ToolExecutor:
     def _operation_plan_store(self) -> OperationPlanStore:
         return OperationPlanStore(
             self.memory_store.memory_dir / "ops_operation_plans",
-            recipe_runner=ControlledRecipeRunner(
+            action_runner=ControlledActionRunner(
                 dry_run=not ops_real_execution_enabled()
             ),
         )

@@ -12,6 +12,25 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HELPER = PROJECT_ROOT / "scripts" / "klonet-agent-op"
 
 
+def test_docker_container_helper_dry_run_contracts():
+    inspect_result = subprocess.run(
+        [sys.executable, str(HELPER), "inspect-docker-containers", "--dry-run", "--name", "mysql-vemu"],
+        capture_output=True,
+        text=True,
+    )
+    start_result = subprocess.run(
+        [sys.executable, str(HELPER), "start-docker-container", "--dry-run", "--name", "mysql-vemu"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert inspect_result.returncode == 0
+    assert "container_filter=mysql-vemu" in inspect_result.stdout
+    assert start_result.returncode == 0
+    assert "container=mysql-vemu" in start_result.stdout
+    assert "environment_changed=false" in start_result.stdout
+
+
 def test_restart_screen_component_helper_dry_run_outputs_command_contract():
     result = subprocess.run(
         [
