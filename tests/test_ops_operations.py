@@ -206,7 +206,23 @@ def test_deploy_operation_plan_default_binds_start_platform_recipe_when_project_
         "platform": "103",
         "project_root": "/home/adminis/lht/103_project/vemu_uestc",
     }
+    shared_step = next(
+        item for item in loaded.steps if item.step_id == "start-shared-services"
+    )
+    assert shared_step.status == "pending"
+    assert shared_step.recipe_id == "ensure_shared_services"
+    assert shared_step.recipe_args == {
+        "script_dir": "/root/vemu_install_new_gen",
+    }
+    assert [item.step_id for item in loaded.steps] == [
+        "precheck",
+        "prepare-files",
+        "start-shared-services",
+        "start-services",
+    ]
+    assert "execution_order=precheck -> prepare-files -> start-shared-services -> start-services" in rendered
     assert "recipe=start_platform_screens" in rendered
+    assert "recipe=ensure_shared_services" in rendered
     assert "recipe_args.platform=103" in rendered
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 

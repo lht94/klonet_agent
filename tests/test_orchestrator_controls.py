@@ -1283,6 +1283,67 @@ def test_ops_observation_shows_three_real_lines_and_omission():
     assert omitted is True
 
 
+def test_ops_operation_observation_keeps_plan_and_execution_details_visible():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    lines, omitted = orchestrator._tool_observation_lines(
+        "approve_ops_operation_plan",
+        "\n".join(
+            [
+                "ops_operation_plan",
+                "plan_id=deploy-abc",
+                "operation=deploy_platform",
+                "target=lht",
+                "status=completed",
+                "execution_state:",
+                "  total_steps=4",
+                "  completed=4",
+                "  next_step=none",
+                "  execution_order=precheck -> prepare-files -> start-shared-services -> start-services",
+                "steps:",
+                "  - precheck: 预检环境和冲突 risk=normal permission=readonly_or_plan_confirmed action=validate_project_files status=completed",
+                "  - start-shared-services: 启动共享基础服务 risk=controlled permission=plan_confirmed action=ensure_shared_services status=completed",
+                "    observation=dry_run=false recipe_id=ensure_shared_services missing=mysql command_completed",
+                "execution_bindings:",
+                "  - start-shared-services: action=ensure_shared_services recipe=ensure_shared_services recipe_args.script_dir=/root/vemu_install_new_gen",
+                "---",
+                "ops_operation_execution",
+                "plan_id=deploy-abc",
+                "execute_step=start-shared-services",
+                "step_title=启动共享基础服务",
+                "action_type=ensure_shared_services",
+                "permission=plan_confirmed",
+                "result_status=completed",
+                "execution_result=dry_run=false recipe_id=ensure_shared_services missing=mysql command_completed",
+            ]
+        ),
+    )
+
+    assert omitted is False
+    assert "计划 deploy-abc：deploy_platform / lht，状态 completed" in lines
+    assert "执行顺序：precheck -> prepare-files -> start-shared-services -> start-services" in lines
+    assert any(
+        "start-shared-services：启动共享基础服务；状态 completed；动作 ensure_shared_services；权限 plan_confirmed"
+        in line
+        for line in lines
+    )
+    assert any(
+        "start-shared-services：动作 ensure_shared_services；执行器 ensure_shared_services"
+        in line
+        for line in lines
+    )
+    assert "执行 start-shared-services（启动共享基础服务）：completed" in lines
+    assert any(
+        "结果：dry_run=false recipe_id=ensure_shared_services missing=mysql command_completed"
+        in line
+        for line in lines
+    )
+
+
 def test_ops_knowledge_observation_prioritizes_source_and_evidence():
     from klonet_agent.agents import get_profile
     from klonet_agent.orchestrator import AgentOrchestrator

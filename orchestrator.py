@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from time import perf_counter
 from types import SimpleNamespace
 
@@ -906,12 +907,24 @@ class AgentOrchestrator:
         tool_name: str,
         result: str,
     ) -> tuple[list[str], bool]:
-        """Extract at most three meaningful, bounded lines from a tool result."""
+        """Extract meaningful, bounded lines from a tool result."""
 
         if tool_name == "search_knowledge":
             knowledge_lines = self._knowledge_observation_lines(result)
             if knowledge_lines:
                 return knowledge_lines, False
+        if tool_name in {
+            "create_ops_operation_plan",
+            "list_ops_operation_plans",
+            "describe_ops_operation_plan",
+            "approve_ops_operation_plan",
+            "execute_ops_operation_step",
+            "execute_ops_next_step",
+            "resolve_ops_blocked_step",
+        }:
+            ops_lines = self._ops_operation_observation_lines(result)
+            if ops_lines:
+                return ops_lines
 
         candidates = []
         for raw_line in (result or "").splitlines():
@@ -926,6 +939,195 @@ class AgentOrchestrator:
         if not candidates:
             return ["工具未返回可展示结果。"], False
         return candidates[:3], len(candidates) > 3
+
+    def _ops_operation_observation_lines(self, result: str) -> tuple[list[str], bool]:
+        """Summarize OperationPlan state-machine output for humans."""
+
+        blocks = []
+        current = []
+        for raw_line in (result or "").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped in {"```", "```text"}:
+                continue
+            if stripped == "---":
+                if current:
+                    blocks.append(current)
+                    current = []
+                continue
+            current.append(stripped)
+        if current:
+            blocks.append(current)
+        if not blocks:
+            return [], False
+
+        candidates = []
+        for block in blocks:
+            header = block[0] if block else ""
+            if header == "ops_operation_plan":
+                candidates.extend(self._summarize_ops_plan_block(block))
+            elif header == "ops_operation_execution":
+                candidates.extend(self._summarize_ops_execution_block(block))
+            elif header == "ops_operation_resolution":
+                candidates.extend(self._summarize_ops_resolution_block(block))
+            elif header == "ops_operation_plan_list":
+                candidates.extend(self._summarize_ops_plan_list_block(block))
+            else:
+                candidates.extend(block[:6])
+        max_lines = 40
+        return candidates[:max_lines], len(candidates) > max_lines
+
+    def _summarize_ops_plan_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        lines = [
+            (
+                f"计划 {fields.get('plan_id', 'unknown')}："
+                f"{fields.get('operation', 'unknown')} / {fields.get('target', 'unknown')}，"
+                f"状态 {fields.get('status', 'unknown')}"
+            )
+        ]
+        if fields.get("objective"):
+            lines.append(f"目标：{self._compact_observation_text(fields['objective'], 180)}")
+        execution_order = self._first_prefixed_value(block, "execution_order=")
+        if execution_order:
+            lines.append(f"执行顺序：{execution_order}")
+        step_summaries = self._ops_step_summaries(block)
+        if step_summaries:
+            lines.append("步骤概览：")
+            lines.extend(f"  - {item}" for item in step_summaries[:8])
+        binding_summaries = self._ops_binding_summaries(block)
+        if binding_summaries:
+            lines.append("执行绑定：")
+            lines.extend(f"  - {item}" for item in binding_summaries[:6])
+        return lines
+
+    def _summarize_ops_execution_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        step = fields.get("execute_step", "unknown")
+        title = fields.get("step_title", "")
+        status = fields.get("result_status", fields.get("step_status", "unknown"))
+        prefix = f"执行 {step}"
+        if title:
+            prefix += f"（{title}）"
+        lines = [f"{prefix}：{status}"]
+        result = fields.get("execution_result") or fields.get("observation")
+        if result:
+            lines.append(f"结果：{self._compact_observation_text(result, 220)}")
+        action = fields.get("action_type")
+        permission = fields.get("permission")
+        if action or permission:
+            detail = []
+            if action:
+                detail.append(f"动作 {action}")
+            if permission:
+                detail.append(f"权限 {permission}")
+            lines.append("依据：" + "；".join(detail))
+        next_action = fields.get("next_required_action")
+        if next_action:
+            lines.append(f"下一步：{next_action}")
+        return lines
+
+    def _summarize_ops_resolution_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        lines = [
+            (
+                f"解除阻塞 {fields.get('resolved_step', 'unknown')}："
+                f"{fields.get('result_status', fields.get('step_status', 'unknown'))}"
+            )
+        ]
+        if fields.get("resolution_evidence"):
+            lines.append(
+                "依据："
+                + self._compact_observation_text(fields["resolution_evidence"], 220)
+            )
+        if fields.get("next_required_action"):
+            lines.append(f"下一步：{fields['next_required_action']}")
+        return lines
+
+    def _summarize_ops_plan_list_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        lines = [f"计划列表：共 {fields.get('count', '0')} 个"]
+        for line in block:
+            if not line.startswith("plan "):
+                continue
+            lines.append(
+                "  - "
+                + self._compact_observation_text(line[len("plan ") :], 220)
+            )
+        return lines
+
+    @staticmethod
+    def _ops_key_values(lines: list[str]) -> dict[str, str]:
+        fields = {}
+        for line in lines:
+            if "=" not in line or line.startswith("  - "):
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key and re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+                fields[key] = value.strip()
+        return fields
+
+    @staticmethod
+    def _first_prefixed_value(lines: list[str], prefix: str) -> str:
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                return stripped[len(prefix) :].strip()
+        return ""
+
+    def _ops_step_summaries(self, lines: list[str]) -> list[str]:
+        summaries = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("- ") or ":" not in stripped:
+                continue
+            if " risk=" not in stripped or " status=" not in stripped:
+                continue
+            step_id, rest = stripped[2:].split(":", 1)
+            title = rest.split(" risk=", 1)[0].strip()
+            status = self._ops_token_value(rest, "status")
+            action = self._ops_token_value(rest, "action")
+            permission = self._ops_token_value(rest, "permission")
+            pieces = [title]
+            if status:
+                pieces.append(f"状态 {status}")
+            if action:
+                pieces.append(f"动作 {action}")
+            if permission:
+                pieces.append(f"权限 {permission}")
+            summaries.append(f"{step_id}：" + "；".join(pieces))
+        return summaries
+
+    def _ops_binding_summaries(self, lines: list[str]) -> list[str]:
+        summaries = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("- ") or ":" not in stripped:
+                continue
+            if " recipe=" not in stripped:
+                continue
+            step_id, rest = stripped[2:].split(":", 1)
+            action = self._ops_token_value(rest, "action")
+            recipe = self._ops_token_value(rest, "recipe")
+            args = [
+                part
+                for part in rest.split()
+                if part.startswith("recipe_args.")
+            ]
+            pieces = []
+            if action:
+                pieces.append(f"动作 {action}")
+            if recipe:
+                pieces.append(f"执行器 {recipe}")
+            if args:
+                pieces.append(self._compact_observation_text(" ".join(args), 180))
+            summaries.append(f"{step_id}：" + "；".join(pieces))
+        return summaries
+
+    @staticmethod
+    def _ops_token_value(text: str, key: str) -> str:
+        match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", text)
+        return match.group(1) if match else ""
 
     def _knowledge_observation_lines(self, result: str) -> list[str]:
         """Summarize knowledge retrieval by cited source and evidence snippet."""
