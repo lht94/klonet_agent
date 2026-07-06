@@ -88,12 +88,11 @@ def test_mentor_prompt_forbids_operation_plan_generation():
 
 
 
-def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
-    """Ops should drive approved OperationPlans with the next-step tool."""
+def test_ops_prompt_says_confirm_auto_advances_operation_plans():
+    """Ops should rely on plan confirmation auto-advancing safe steps."""
 
     from klonet_agent.prompts import OPS_PROMPT
 
-    assert "execute_ops_next_step" in OPS_PROMPT
     assert "execute_ops_operation_step" in OPS_PROMPT
     assert "list_ops_operation_plans" in OPS_PROMPT
     assert "describe_ops_operation_plan" in OPS_PROMPT
@@ -101,8 +100,9 @@ def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
     assert "blocked" in OPS_PROMPT
     assert "running" in OPS_PROMPT
     assert "不得直接 confirm-step" in OPS_PROMPT
-    assert "批准后的 OperationPlan 默认调用 execute_ops_next_step" in OPS_PROMPT
-    assert "只有用户明确指定 step_id" in OPS_PROMPT
+    assert "approve_ops_operation_plan 会自动按状态机连续执行" in OPS_PROMPT
+    assert "不要在刚 confirm 后再要求用户确认普通步骤" in OPS_PROMPT
+    assert "不要自行重建计划绕过当前计划" in OPS_PROMPT
 
 
 def test_ops_prompt_allows_controlled_startup_file_edits_but_not_business_development():

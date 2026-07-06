@@ -316,6 +316,52 @@ class OperationPlanStore:
             )
         return self.execute_step(plan_id, next_step_id)
 
+    def execute_until_blocked(self, plan_id: str) -> str:
+        """Run approved steps until completion, blockage, or step confirmation."""
+
+        outputs = []
+        max_steps = len(self.load_plan(plan_id).steps) + 1
+        for _ in range(max_steps):
+            plan = self.load_plan(plan_id)
+            next_step_id = _next_step_id(plan)
+            if next_step_id == "none":
+                outputs.append(
+                    "ops_operation_execution\n"
+                    f"plan_id={plan.plan_id}\n"
+                    f"operation={plan.operation}\n"
+                    f"target={plan.target or 'unknown'}\n"
+                    f"plan_status={plan.status}\n"
+                    "execute_step=none\n"
+                    "result_status=completed\n"
+                    "execution_result=no remaining steps; environment unchanged"
+                )
+                break
+            step = _find_step(plan, next_step_id)
+            if step.requires_step_confirmation and step.status != "approved":
+                outputs.append(
+                    "ops_operation_execution\n"
+                    f"plan_id={plan.plan_id}\n"
+                    f"operation={plan.operation}\n"
+                    f"target={plan.target or 'unknown'}\n"
+                    f"plan_status={plan.status}\n"
+                    f"execute_step={step.step_id}\n"
+                    f"step_title={step.title}\n"
+                    f"step_status={step.status}\n"
+                    "result_status=waiting_for_confirmation\n"
+                    "execution_result=step requires explicit confirmation; environment unchanged\n"
+                    f"next_required_action=confirm-step {plan.plan_id} {step.step_id}"
+                )
+                break
+            result = self.execute_step(plan_id, next_step_id)
+            outputs.append(result)
+            latest = self.load_plan(plan_id)
+            latest_step = _find_step(latest, next_step_id)
+            if result.startswith("Error:") or latest_step.status in {"blocked", "failed", "running"}:
+                break
+            if latest.status in {"completed", "failed", "aborted"}:
+                break
+        return "\n---\n".join(outputs)
+
     def _run_recipe(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         try:
             result = self.recipe_runner(plan, step)
@@ -465,8 +511,8 @@ def _default_steps(operation: str) -> List[OperationStep]:
     if operation == "deploy_platform":
         return [
             OperationStep("precheck", "预检环境和冲突", "确认端口、screen、源码路径和共享服务状态"),
-            OperationStep("prepare-files", "准备项目文件与配置", "复制入口文件并渲染配置", risk="privileged"),
-            OperationStep("start-services", "启动后端与前端服务", "启动 screen、校验 nginx 并 reload", risk="privileged"),
+            OperationStep("prepare-files", "准备项目文件与配置", "复制入口文件并渲染配置", risk="controlled"),
+            OperationStep("start-services", "启动后端与前端服务", "启动 screen、校验 nginx 并 reload", risk="controlled"),
         ]
     if operation == "destroy_platform":
         return [
@@ -501,20 +547,29 @@ def _apply_recipe_bindings(plan: OperationPlan, recipe_bindings: dict) -> None:
             step = _find_step(plan, str(step_id))
         except ValueError:
             continue
-        step.recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
+        previous_recipe_id = step.recipe_id
+        previous_recipe_args = dict(step.recipe_args)
+        recipe_id = _one_line(str(binding.get("recipe_id") or ""), 120)
+        if recipe_id:
+            step.recipe_id = recipe_id
         args = binding.get("args")
         if not isinstance(args, dict):
             args = binding.get("recipe_args")
+        if not isinstance(args, dict):
+            if step.recipe_id != previous_recipe_id:
+                step.recipe_args = {}
+            else:
+                step.recipe_args = previous_recipe_args
+            continue
         step.recipe_args = {}
-        if isinstance(args, dict):
-            for key, value in args.items():
-                if not key or value is None:
-                    continue
-                normalized_key = _one_line(str(key), 80)
-                if step.recipe_id == "write_ops_file" and normalized_key == "content":
-                    step.recipe_args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
-                    continue
-                step.recipe_args[normalized_key] = _one_line(str(value), 300)
+        for key, value in args.items():
+            if not key or value is None:
+                continue
+            normalized_key = _one_line(str(key), 80)
+            if step.recipe_id == "write_ops_file" and normalized_key == "content":
+                step.recipe_args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+                continue
+            step.recipe_args[normalized_key] = _one_line(str(value), 300)
 
 
 def _apply_default_recipe_bindings(plan: OperationPlan) -> None:

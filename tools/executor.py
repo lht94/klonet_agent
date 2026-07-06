@@ -363,6 +363,9 @@ class ToolExecutor:
                     "模型不能自行授权计划。"
                 )
             plan = store.approve_plan(plan_id)
+            execution = store.execute_until_blocked(plan_id)
+            latest = store.load_plan(plan_id)
+            return render_plan(latest) + "\n---\n" + execution
         return render_plan(plan)
 
     def _operation_plan_store(self) -> OperationPlanStore:

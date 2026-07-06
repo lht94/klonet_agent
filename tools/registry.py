@@ -553,7 +553,7 @@ TOOLS = [
     ),
     _tool(
         "approve_ops_operation_plan",
-        "记录用户对 Ops 操作计划或单个高风险步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>；confirm <plan_id> 授权计划内非破坏性步骤按顺序执行，destructive/high-risk 步骤仍需 confirm-step，模型不能自行授权。",
+        "记录用户对 Ops 操作计划或单个高风险步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>；confirm <plan_id> 会立即按状态机连续执行计划内已授权的非破坏性步骤，直到完成、阻塞或遇到 destructive/high-risk 步骤；模型不能自行授权。",
         {
             "plan_id": {"type": "string", "description": "要确认的计划 ID。"},
             "scope": {
@@ -579,7 +579,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_next_step",
-        "按 OperationPlan 的 execution_order 执行当前下一步。模型不需要也不应该猜 step_id；如果下一步是 destructive/high-risk 步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
+        "按 OperationPlan 的 execution_order 执行当前下一步。通常 confirm <plan_id> 已经会自动推进到阻塞点；本工具主要用于人工恢复、resolve 后继续执行或调试。模型不需要也不应该猜 step_id；如果下一步是 destructive/high-risk 步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
         },

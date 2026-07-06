@@ -293,6 +293,33 @@ def test_recipe_bindings_accept_recipe_args_and_clear_default_args():
     }
 
 
+def test_recipe_binding_without_args_preserves_same_default_recipe_args():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="prepare project files",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "prepare_project_files",
+                }
+            },
+        )
+
+    step = next(item for item in plan.steps if item.step_id == "prepare-files")
+    assert step.recipe_id == "prepare_project_files"
+    assert step.recipe_args == {
+        "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+    }
+
+
 def test_confirmed_deploy_plan_executes_prepare_without_confirm_step():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -333,6 +360,49 @@ def test_confirmed_deploy_plan_executes_prepare_without_confirm_step():
     assert "step requires explicit confirm-step" not in prepare
     assert "result_status=completed" in prepare
     assert "recipe_id=prepare_project_files" in prepare
+
+
+def test_deploy_plan_execute_until_blocked_runs_all_controlled_steps():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        for filename in required_files:
+            (mains / filename).write_text(f"# {filename}\n", encoding="utf-8")
+            (project_root / filename).write_text(f"# root {filename}\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        store.approve_plan(plan.plan_id)
+
+        result = store.execute_until_blocked(plan.plan_id)
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=precheck" in result
+    assert "execute_step=prepare-files" in result
+    assert "execute_step=start-services" in result
+    assert "step requires explicit confirm-step" not in result
+    assert loaded.status == "completed"
+    assert set(_status_by_step(loaded).values()) == {"completed"}
 
 
 def test_deploy_operation_plan_default_binds_extract_archive_recipe_for_prepare_files():
@@ -539,9 +609,17 @@ def test_executor_accepts_exact_user_confirm_text_and_requires_step_confirmation
         loaded_after_execute = executor._operation_plan_store().load_plan(plan_id)
 
     assert "status=approved" in approved
+    assert "execute_step=precheck-runtime" in approved
+    assert "result_status=waiting_for_confirmation" in approved
     assert blocked.startswith("Error:")
     assert "step requires explicit confirm-step" in blocked
-    assert set(_status_by_step(loaded_after_execute).values()) == {"pending"}
+    statuses = _status_by_step(loaded_after_execute)
+    assert statuses["precheck-runtime"] == "completed"
+    assert statuses["restart-master"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["restart-celery"] == "pending"
+    assert statuses["restart-web-terminal"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
@@ -2525,7 +2603,7 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
     assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
 
 
-def test_executor_execute_ops_next_step_runs_current_plan_step():
+def test_executor_execute_ops_next_step_stops_at_step_confirmation_after_auto_precheck():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
@@ -2557,8 +2635,10 @@ def test_executor_execute_ops_next_step_runs_current_plan_step():
 
         result = executor.run("execute_ops_next_step", {"plan_id": plan_id})
 
-    assert "execute_step=precheck-runtime" in result
-    assert "result_status=completed" in result
+    assert result.startswith("Error:")
+    assert "execute_step=precheck-runtime" not in result
+    assert "step requires explicit confirm-step" in result
+    assert "restart-master" in result
 
 
 def test_executor_resolve_ops_blocked_step_resets_step_to_pending():
