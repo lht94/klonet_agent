@@ -39,7 +39,7 @@ class OpsActionRegistry:
             for alias in spec.aliases
         }
         self._allowed_path_roots = tuple(
-            Path(root).expanduser().resolve(strict=False)
+            _normalized_absolute_path_text(str(root))
             for root in (allowed_path_roots or ())
         )
 
@@ -66,12 +66,11 @@ class OpsActionRegistry:
                 continue
             if any(char in raw_value for char in ("\x00", "\n", "\r")):
                 return f"invalid_path_arg={field}"
-            path = Path(raw_value).expanduser()
-            if not path.is_absolute():
+            resolved = _normalized_absolute_path_text(raw_value)
+            if not resolved:
                 return f"invalid_path_arg={field}"
-            resolved = path.resolve(strict=False)
             if self._allowed_path_roots and not any(
-                _is_relative_to(resolved, root)
+                _path_text_is_relative_to(resolved, root)
                 for root in self._allowed_path_roots
             ):
                 return f"path_not_allowlisted={field}"
@@ -81,12 +80,22 @@ class OpsActionRegistry:
         return tuple(self._specs.values())
 
 
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
+def _normalized_absolute_path_text(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    expanded = str(Path(raw).expanduser())
+    if raw.startswith("/"):
+        expanded = raw
+    elif not Path(expanded).is_absolute():
+        return ""
+    return expanded.replace("\\", "/").rstrip("/") or "/"
+
+
+def _path_text_is_relative_to(path: str, root: str) -> bool:
+    if not path or not root:
         return False
-    return True
+    return path == root or path.startswith(root.rstrip("/") + "/")
 
 
 DEFAULT_OPS_ACTIONS = (
@@ -163,6 +172,12 @@ DEFAULT_OPS_ACTIONS = (
         True,
         ("path",),
         ("write_file",),
+    ),
+    OpsActionSpec(
+        "install_nginx_config",
+        "_install_nginx_config",
+        "privileged",
+        True,
     ),
     OpsActionSpec("reload_nginx", "_reload_nginx", "privileged", True),
     OpsActionSpec(

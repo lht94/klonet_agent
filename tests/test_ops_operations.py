@@ -2261,6 +2261,87 @@ def test_reload_nginx_recipe_dry_run_generates_fixed_preview():
     assert statuses["start-services"] == "completed"
 
 
+def test_install_nginx_config_recipe_execute_uses_sudo_helper():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return (
+            "klonet_agent_op action=install-nginx-config dry_run=false "
+            "destination_path=/etc/nginx/conf.d/103.conf environment_changed=true"
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="install nginx config",
+            action_bindings={
+                "prepare-files": {
+                    "action": "install_nginx_config",
+                    "args": {
+                        "source_path": "/tmp/103.conf",
+                        "config_name": "103.conf",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert calls == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "install-nginx-config",
+            "--execute",
+            "--source-path",
+            "/tmp/103.conf",
+            "--config-name",
+            "103.conf",
+        ]
+    ]
+    assert "result_status=completed" in result
+    assert "recipe_id=install_nginx_config" in result
+    assert "environment_changed=true" in result
+
+
+def test_install_nginx_config_recipe_blocks_invalid_config_name():
+    from klonet_agent.ops.operations import OperationPlan, OperationStep
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    result = ControlledRecipeRunner(dry_run=True)(
+        OperationPlan("p1", "deploy_platform", "103", "install nginx"),
+        OperationStep(
+            "install-nginx",
+            "install nginx",
+            "install nginx",
+            action="install_nginx_config",
+            args={"source_path": "/tmp/103.conf", "config_name": "../bad.conf"},
+        ),
+    )
+
+    assert result.status == "blocked"
+    assert "invalid_config_name" in result.output
+
+
 def test_reload_nginx_recipe_execute_tests_config_before_reload():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner

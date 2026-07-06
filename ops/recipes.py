@@ -31,6 +31,7 @@ EXTRACT_ARCHIVE = "extract_archive"
 RUN_INSTALL_SCRIPT = "run_install_script"
 ENSURE_SHARED_SERVICES = "ensure_shared_services"
 WRITE_OPS_FILE = "write_ops_file"
+INSTALL_NGINX_CONFIG = "install_nginx_config"
 RELOAD_NGINX = "reload_nginx"
 START_DOCKER_CONTAINER = "start_docker_container"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
@@ -180,6 +181,7 @@ class ControlledActionRunner:
             RUN_INSTALL_SCRIPT,
             ENSURE_SHARED_SERVICES,
             WRITE_OPS_FILE,
+            INSTALL_NGINX_CONFIG,
             START_DOCKER_CONTAINER,
         }
         if spec.name in step_only_actions:
@@ -737,6 +739,37 @@ class ControlledActionRunner:
         parts.append("environment_changed=true")
         return RecipeExecutionResult("completed", " ".join(parts))
 
+    def _install_nginx_config(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.args or step.recipe_args or {}
+        source_path = str(args.get("source_path") or "").strip()
+        config_name = str(args.get("config_name") or "").strip()
+        if not source_path or _looks_unsafe_path(source_path):
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={INSTALL_NGINX_CONFIG} "
+                    f"invalid_source_path={source_path or 'missing'}; "
+                    "environment unchanged"
+                ),
+            )
+        if not _safe_nginx_config_name(config_name):
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={INSTALL_NGINX_CONFIG} "
+                    f"invalid_config_name={config_name or 'missing'}; "
+                    "environment unchanged"
+                ),
+            )
+        command = self._helper_command(
+            "install-nginx-config",
+            "--source-path",
+            source_path,
+            "--config-name",
+            config_name,
+        )
+        return self._helper_result(INSTALL_NGINX_CONFIG, command)
+
     def _reload_nginx(self) -> RecipeExecutionResult:
         command = self._helper_command(
             "reload-nginx",
@@ -840,6 +873,10 @@ def _safe_token(value: str) -> bool:
 
 def _safe_container_name(value: str) -> bool:
     return bool(value and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value))
+
+
+def _safe_nginx_config_name(value: str) -> bool:
+    return bool(value and re.fullmatch(r"[A-Za-z0-9_.-]{1,120}\.conf", value))
 
 
 def _apply_incremental_edit(

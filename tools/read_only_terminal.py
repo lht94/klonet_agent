@@ -70,13 +70,13 @@ def _validated_command(raw) -> tuple[str, list[str]]:
     argv = [str(item) for item in argv]
     if any("\x00" in item or "\n" in item or "\r" in item or len(item) > 500 for item in argv):
         return "argv contains an invalid value", []
-    executable = _resolve_program(program)
-    if not executable:
-        return f"program_not_allowlisted={program}", []
-    basename = Path(executable).name
+    basename = Path(program).name
     problem = _validate_program_args(basename, argv)
     if problem:
         return problem, []
+    executable = _resolve_program(program)
+    if not executable:
+        return f"program_not_allowlisted={program}", []
     return "", [executable, *argv]
 
 
@@ -88,6 +88,10 @@ def _resolve_program(program: str) -> str:
     if os.path.isabs(program):
         path = Path(program)
         return str(path) if path.is_file() and os.access(path, os.X_OK) else ""
+    if os.name == "nt" and basename == "which":
+        return shutil.which("where.exe") or shutil.which("where") or ""
+    if os.name == "nt" and basename == "grep":
+        return shutil.which("findstr.exe") or shutil.which("findstr") or ""
     return shutil.which(program) or ""
 
 

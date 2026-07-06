@@ -4,6 +4,16 @@ def test_registry_rejects_unknown_action():
     assert DEFAULT_OPS_ACTION_REGISTRY.get("run_model_shell") is None
 
 
+def test_registry_allows_install_nginx_config_action():
+    from klonet_agent.ops.actions import DEFAULT_OPS_ACTION_REGISTRY
+
+    spec = DEFAULT_OPS_ACTION_REGISTRY.require("install_nginx_config")
+
+    assert spec.handler_name == "_install_nginx_config"
+    assert spec.risk == "privileged"
+    assert spec.requires_confirmation is True
+
+
 def test_registry_validates_resolved_paths_against_allowed_roots():
     from klonet_agent.ops.actions import OpsActionRegistry, OpsActionSpec
     from tests.helpers import local_temp_dir

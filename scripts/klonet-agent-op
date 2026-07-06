@@ -85,6 +85,12 @@ def main(argv=None) -> int:
     reload_nginx_mode = reload_nginx.add_mutually_exclusive_group(required=True)
     reload_nginx_mode.add_argument("--dry-run", action="store_true")
     reload_nginx_mode.add_argument("--execute", action="store_true")
+    install_nginx = subcommands.add_parser("install-nginx-config")
+    install_nginx_mode = install_nginx.add_mutually_exclusive_group(required=True)
+    install_nginx_mode.add_argument("--dry-run", action="store_true")
+    install_nginx_mode.add_argument("--execute", action="store_true")
+    install_nginx.add_argument("--source-path", required=True)
+    install_nginx.add_argument("--config-name", required=True)
     extract_archive = subcommands.add_parser("extract-archive")
     extract_archive_mode = extract_archive.add_mutually_exclusive_group(required=True)
     extract_archive_mode.add_argument("--dry-run", action="store_true")
@@ -117,6 +123,8 @@ def main(argv=None) -> int:
         return _stop_platform_screens(args)
     if args.action == "start-platform-screens":
         return _start_platform_screens(args)
+    if args.action == "install-nginx-config":
+        return _install_nginx_config(args)
     if args.action == "reload-nginx":
         return _reload_nginx(args)
     if args.action == "extract-archive":
@@ -322,6 +330,32 @@ def _start_platform_screens(args) -> int:
     return 0
 
 
+def _install_nginx_config(args) -> int:
+    problem = _validate_nginx_config_install_args(args.source_path, args.config_name)
+    if problem:
+        _print_error(problem)
+        return 2
+    source = Path(args.source_path)
+    destination_text = f"/etc/nginx/conf.d/{args.config_name}"
+    destination = Path(destination_text)
+    if args.execute:
+        try:
+            if not source.is_file():
+                _print_error(f"source_not_found={args.source_path}")
+                return 2
+            shutil.copy2(source, destination)
+        except OSError as exc:
+            _print_error(f"install_nginx_config_failed={_one_line(str(exc))}")
+            return 1
+    print("klonet_agent_op")
+    print("action=install-nginx-config")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"source_path={args.source_path}")
+    print(f"destination_path={destination_text}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
 def _reload_nginx(args) -> int:
     if args.execute:
         try:
@@ -440,6 +474,32 @@ def _validate_start_platform_args(platform: str, project_root: str) -> str:
     if not project_root or _unsafe_path(project_root):
         return f"invalid_project_root={project_root or 'missing'}"
     return ""
+
+
+def _validate_nginx_config_install_args(source_path: str, config_name: str) -> str:
+    if not source_path or _unsafe_path(source_path):
+        return f"invalid_source_path={source_path or 'missing'}"
+    source_text = _normalized_path_text(source_path)
+    allowed_roots = (
+        "/tmp",
+        "/home/klonet-agent",
+        "/var/lib/klonet-agent",
+    )
+    if not any(_path_text_is_relative_to(source_text, root) for root in allowed_roots):
+        return "source_path_not_allowlisted"
+    if Path(source_path).suffix != ".conf":
+        return f"unsupported_source_file={Path(source_path).name or source_path}"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}\.conf", config_name or ""):
+        return f"invalid_config_name={config_name or 'missing'}"
+    return ""
+
+
+def _normalized_path_text(value: str) -> str:
+    return str(value or "").replace("\\", "/").rstrip("/") or "/"
+
+
+def _path_text_is_relative_to(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
 
 
 def _safe_name(value: str) -> bool:

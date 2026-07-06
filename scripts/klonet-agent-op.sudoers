@@ -12,6 +12,7 @@ Cmnd_Alias KLONET_AGENT_OP = /usr/local/bin/klonet-agent-op restart-screen-compo
     /usr/local/bin/klonet-agent-op stop-screen-component --execute *, \
     /usr/local/bin/klonet-agent-op stop-platform-screens --execute *, \
     /usr/local/bin/klonet-agent-op start-platform-screens --execute *, \
+    /usr/local/bin/klonet-agent-op install-nginx-config --execute *, \
     /usr/local/bin/klonet-agent-op reload-nginx --execute *, \
     /usr/local/bin/klonet-agent-op extract-archive --execute *, \
     /usr/local/bin/klonet-agent-op run-install-script --execute *, \

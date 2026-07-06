@@ -170,6 +170,92 @@ def test_reload_nginx_helper_dry_run_outputs_command_contract():
     assert "environment_changed=false" in result.stdout
 
 
+def test_install_nginx_config_helper_dry_run_outputs_destination():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "install-nginx-config",
+            "--dry-run",
+            "--source-path",
+            "/tmp/103.conf",
+            "--config-name",
+            "103.conf",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "klonet_agent_op" in result.stdout
+    assert "action=install-nginx-config" in result.stdout
+    assert "dry_run=true" in result.stdout
+    assert "source_path=/tmp/103.conf" in result.stdout
+    assert "destination_path=/etc/nginx/conf.d/103.conf" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
+def test_install_nginx_config_helper_execute_copies_valid_conf(monkeypatch, tmp_path, capsys):
+    helper = _load_helper_module()
+    source = tmp_path / "103.conf"
+    source.write_text("server {}", encoding="utf-8")
+    copied = []
+
+    monkeypatch.setattr(
+        helper,
+        "_validate_nginx_config_install_args",
+        lambda source_path, config_name: "",
+    )
+    monkeypatch.setattr(
+        helper.shutil,
+        "copy2",
+        lambda source_path, destination_path: copied.append((source_path, destination_path)),
+    )
+
+    code = helper.main(
+        [
+            "install-nginx-config",
+            "--execute",
+            "--source-path",
+            str(source),
+            "--config-name",
+            "103.conf",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert copied == [(source, helper.Path("/etc/nginx/conf.d/103.conf"))]
+    assert "action=install-nginx-config" in captured.out
+    assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_install_nginx_config_helper_rejects_source_outside_staging_area():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "install-nginx-config",
+            "--dry-run",
+            "--source-path",
+            "/etc/passwd.conf",
+            "--config-name",
+            "103.conf",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 2
+    assert "source_path_not_allowlisted" in result.stderr
+    assert "environment_changed=false" in result.stderr
+
+
 def test_reload_nginx_helper_execute_tests_config_before_reload(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []

@@ -116,6 +116,16 @@ def test_ops_prompt_allows_controlled_startup_file_edits_but_not_business_develo
     assert "mains/web_terminal_main.py" in OPS_PROMPT
 
 
+def test_ops_prompt_routes_nginx_install_and_reload_through_actions():
+    """Ops should not ask the user to sudo-copy nginx config by hand."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "install_nginx_config" in OPS_PROMPT
+    assert "reload_nginx" in OPS_PROMPT
+    assert "不得要求用户手工 `sudo cp`" in OPS_PROMPT
+
+
 def test_ops_prompt_uses_dedicated_account_platform_path():
     """Ops should not reuse historical adminis paths as deployment defaults."""
 
