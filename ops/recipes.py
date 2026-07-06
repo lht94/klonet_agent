@@ -117,12 +117,14 @@ class ControlledActionRunner:
         helper_path: str = "/usr/local/bin/klonet-agent-op",
         command_runner=None,
         action_registry: OpsActionRegistry | None = None,
+        execution_config: str = "enabled",
     ):
         self.dry_run = dry_run
         self.helper_path = helper_path
         self._uses_default_command_runner = command_runner is None
         self.command_runner = command_runner or _run_command
         self.action_registry = action_registry or configured_ops_action_registry()
+        self.execution_config = execution_config
 
     def _helper_command(self, action: str, *args: str) -> list:
         command = [
@@ -143,6 +145,17 @@ class ControlledActionRunner:
             return RecipeExecutionResult(
                 "blocked",
                 f"action_not_allowlisted={action or 'missing'}; environment unchanged",
+            )
+        if spec.requires_confirmation and self.execution_config != "enabled":
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    "ops_real_execution_not_configured "
+                    f"config_status={self.execution_config} "
+                    "required=KLONET_AGENT_OPS_REAL_EXECUTION=1; "
+                    "environment unchanged"
+                ),
+                "configure /etc/klonet-agent/klonet-agent.env and restart the Agent process",
             )
         problem = self.action_registry.validate_args(spec, action_args)
         if problem:

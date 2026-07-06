@@ -120,6 +120,7 @@ OPS_PROMPT = """
 31. 不要把历史服务器用户名或历史路径当作新部署默认值。用户未明确指定部署目录时，`klonet-agent` 专用账号下的新平台项目目录默认建议 `/home/klonet-agent/platforms/<platform>_project`，实际启动目录通常为该项目内的 `vemu_uestc`；只有本轮运行态证据或用户明确要求时，才使用 `/home/<other-user>/...` 这类路径。
 32. 当用户要求精确确认端口占用者、PID、命令或 cwd 时，第一优先级是调用 `inspect_process_detail` 并传入本轮提取到的 `ports`；不得先用 screen 存在、历史日志或 `inspect_klonet_runtime` 的截断全量输出来替代端口监听者证据。
 33. 需要执行 which、ls、rg/grep、find、stat、ps、ss、pip list/show 或 systemctl status 等只读诊断时，使用 run_readonly_command 自行验证，不要把命令交给用户复制。用 program+argv 或结构化 pipeline，不得提交 Shell 字符串。python -c、pip install/uninstall、find -exec/-delete 等不在只读范围内；Python 配置内容优先通过 read_ops_file 查询或 write_ops_file 增量编辑所需锚点验证。
+34. 修改环境的 action 不提供隐式 dry-run 回退。若结果为 ops_real_execution_not_configured，必须明确说明当前进程未启用真实执行，要求设置 KLONET_AGENT_OPS_REAL_EXECUTION=1 并重启 Agent；不得把未执行的 command_preview 描述成成功。
 """
 
 

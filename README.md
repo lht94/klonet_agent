@@ -429,3 +429,7 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 
 如果之前已经生成过 dry-run 的部署计划，重新部署并启用默认真实执行后建议创建一个新计划，
 不要继续复用已把步骤标记为 completed 的旧计划。
+
+更新 helper/sudoers：
+cd /home/klonet-agent/klonet_agent
+sudo bash scripts/install-klonet-agent-service.sh --project-root "$PWD" --python "$PWD/.venv/bin/python"

@@ -281,3 +281,27 @@ def test_write_ops_file_incremental_edit_blocks_ambiguous_anchor():
 
     assert result.status == "blocked"
     assert "anchor_match_count=2 expected=1" in result.output
+
+
+def test_mutating_action_blocks_instead_of_dry_run_when_execution_is_unconfigured():
+    from klonet_agent.ops.operations import OperationPlan, OperationStep
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    result = ControlledActionRunner(
+        dry_run=False,
+        execution_config="missing",
+    )(
+        OperationPlan("p1", "deploy_platform", "lht", "start"),
+        OperationStep(
+            "start",
+            "start",
+            "start",
+            action="start_docker_container",
+            args={"name": "mysql-vemu"},
+        ),
+    )
+
+    assert result.status == "blocked"
+    assert "ops_real_execution_not_configured" in result.output
+    assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" in result.output
+    assert "dry_run=true" not in result.output

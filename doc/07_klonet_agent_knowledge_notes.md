@@ -98,6 +98,7 @@ resolved.relative_to(allowed_root.resolve(strict=False))
 - Docker socket 不直接授权给 `klonet-agent`。只读查看通过 `inspect_docker_containers` 调用 root helper；启动已有容器通过 `start_docker_container` action，仍受计划确认、容器名校验、helper 和 sudoers 控制。
 - `write_ops_file` 同时支持整文件和增量编辑。大文件只改一处时，LLM 提供 mode、anchor、content、expected_matches；执行器读取完整文件、验证锚点唯一、自动备份并幂等插入或替换，不依赖模型拿到完整文件正文。
 - Ops 提供结构化只读终端 `run_readonly_command`。它接受 program、argv、cwd 和最多四段 pipeline，以 shell=False 执行固定程序；允许环境定位、文本检索、进程端口和依赖清单诊断，拒绝 python -c、软件安装、find 执行/删除谓词以及任意 Shell。
+- 生产执行不再把缺少 `KLONET_AGENT_OPS_REAL_EXECUTION` 自动降级为 dry-run。配置缺失、显式关闭或值非法时，修改环境的 action 直接 blocked 并提示配置；只有测试显式构造 `dry_run=True` runner 时才生成预览。
 
 以下安全边界仍然保留：
 

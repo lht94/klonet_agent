@@ -2754,12 +2754,13 @@ def test_restart_screen_component_recipe_blocks_unknown_component():
     assert statuses["verify-health"] == "pending"
 
 
-def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
+def test_executor_blocks_bound_restart_when_real_execution_is_disabled(monkeypatch):
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
     from tests.helpers import local_temp_dir
 
+    monkeypatch.setenv("KLONET_AGENT_OPS_REAL_EXECUTION", "0")
     with local_temp_dir() as temp_dir:
         session = AgentSession(user_id="u1", project_id="p1", mode="ops")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
@@ -2808,10 +2809,10 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
             {"plan_id": plan_id, "step_id": "restart-master"},
         )
 
-    assert "result_status=completed" in result
-    assert "dry_run=true" in result
-    assert "recipe_id=restart_screen_component" in result
-    assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
+    assert "result_status=blocked" in result
+    assert "ops_real_execution_not_configured" in result
+    assert "config_status=disabled" in result
+    assert "command_preview=" not in result
 
 
 def test_executor_execute_ops_next_step_stops_at_step_confirmation_after_auto_precheck():
@@ -3127,19 +3128,21 @@ def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in result
 
 
-def test_executor_operation_plan_store_defaults_to_dry_run_recipe_runner():
+def test_executor_operation_plan_store_blocks_when_real_execution_env_is_missing(monkeypatch):
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
     from tests.helpers import local_temp_dir
 
+    monkeypatch.delenv("KLONET_AGENT_OPS_REAL_EXECUTION", raising=False)
     with local_temp_dir() as temp_dir:
         session = AgentSession(user_id="u1", project_id="p1", mode="ops")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(session=session, memory_store=store)
         operation_store = executor._operation_plan_store()
 
-    assert operation_store.recipe_runner.dry_run is True
+    assert operation_store.recipe_runner.dry_run is False
+    assert operation_store.recipe_runner.execution_config == "missing"
 
 
 def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypatch):
@@ -3156,6 +3159,7 @@ def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypa
         operation_store = executor._operation_plan_store()
 
     assert operation_store.recipe_runner.dry_run is False
+    assert operation_store.recipe_runner.execution_config == "enabled"
 
 
 def _extract_plan_id(text: str) -> str:

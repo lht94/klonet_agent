@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from time import perf_counter
 
-from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_enabled
+from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_mode
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
@@ -379,10 +379,12 @@ class ToolExecutor:
         return render_plan(plan)
 
     def _operation_plan_store(self) -> OperationPlanStore:
+        execution_mode = ops_real_execution_mode()
         return OperationPlanStore(
             self.memory_store.memory_dir / "ops_operation_plans",
             action_runner=ControlledActionRunner(
-                dry_run=not ops_real_execution_enabled()
+                dry_run=False,
+                execution_config=execution_mode,
             ),
         )
 
