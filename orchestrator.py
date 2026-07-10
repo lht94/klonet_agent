@@ -41,6 +41,7 @@ from klonet_agent.knowledge.turn_intent import (
     TurnIntentBuilder,
 )
 from klonet_agent.knowledge import SKILL_LOADER, route_query
+from klonet_agent.journal import ProjectJournal, ProjectJournalMaintainer
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
 from klonet_agent.memory.store import sanitize_openai_tool_history
@@ -68,6 +69,7 @@ class AgentOrchestrator:
         trace_logger: TraceLogger | None = None,
         memory_store: MemoryStore | None = None,
         intent_analyzer: IntentAnalyzer | None = None,
+        journal_maintainer: ProjectJournalMaintainer | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
@@ -94,6 +96,10 @@ class AgentOrchestrator:
         self._paused_turn_state: dict | None = None
         self._last_turn_state: dict | None = None
         self._ops_route: OpsRoute | None = None
+        self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
+            ProjectJournal.from_session(self.session),
+            llm=self.llm,
+        )
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
@@ -788,6 +794,7 @@ class AgentOrchestrator:
 
                 history.append(assistant_msg)
                 self.memory_store.append_history(assistant_msg)
+                self._maintain_project_journal(effective_user_input, reply)
                 self._record_ops_shared_turn(effective_user_input, tool_events, reply)
                 self._last_turn_state = self._snapshot_turn_state(effective_user_input)
                 self._paused_turn_state = None
@@ -801,6 +808,7 @@ class AgentOrchestrator:
             assistant_msg = {"role": "assistant", "content": reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
+            self._maintain_project_journal(effective_user_input, reply)
             print(f"Klonet Agent\uff1a{reply}")
 
         # 本轮作用域只约束当前用户输入，不写入长期历史，避免影响下一轮。
@@ -1568,6 +1576,22 @@ class AgentOrchestrator:
         for todo in self.session.todos:
             if todo["status"] in {"pending", "in_progress"}:
                 todo["status"] = status
+
+    def _maintain_project_journal(self, user_input: str, reply: str) -> None:
+        """让项目日志维护子 Agent 在 Mentor 回答后沉淀项目事实。"""
+
+        if self.profile.name != "mentor":
+            return
+        try:
+            decision = self.journal_maintainer.maintain_turn(
+                user_input,
+                reply,
+                mode=self.profile.name,
+            )
+            if decision.should_update:
+                print("Klonet Agent：项目日志已自动更新。")
+        except Exception:
+            return
 
     def _visible_tools(self) -> list[dict]:
         """根据 profile 和当前问题范围过滤模型可见工具。"""
