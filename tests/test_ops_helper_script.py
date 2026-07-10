@@ -31,6 +31,70 @@ def test_docker_container_helper_dry_run_contracts():
     assert "environment_changed=false" in start_result.stdout
 
 
+def test_read_file_helper_execute_reads_regular_file(tmp_path):
+    target = tmp_path / "secret.env"
+    target.write_text("TOKEN=visible-to-root-read\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "read-file",
+            "--execute",
+            "--path",
+            str(target),
+            "--max-chars",
+            "200",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "action=read-file" in result.stdout
+    assert "environment_changed=false" in result.stdout
+    assert "content:" in result.stdout
+    assert "TOKEN=visible-to-root-read" in result.stdout
+
+
+def test_inspect_install_scripts_helper_execute_reads_scripts(tmp_path):
+    install_dir = tmp_path / "vemu_install_new_gen"
+    install_dir.mkdir()
+    (install_dir / "base_requ_setup.sh").write_text(
+        "#!/usr/bin/env bash\napt-get update\n",
+        encoding="utf-8",
+    )
+    (install_dir / "docker_service.sh").write_text(
+        "#!/bin/bash\ndocker ps\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "inspect-install-scripts",
+            "--execute",
+            "--script-dir",
+            str(install_dir),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "action=inspect-install-scripts" in result.stdout
+    assert "script=base_requ_setup.sh status=detected" in result.stdout
+    assert "risk_markers=apt-get" in result.stdout
+    assert "script=docker_service.sh status=detected" in result.stdout
+    assert "risk_markers=docker" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
 def test_restart_screen_component_helper_dry_run_outputs_command_contract():
     result = subprocess.run(
         [

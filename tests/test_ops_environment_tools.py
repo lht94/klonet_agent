@@ -1,6 +1,7 @@
 """Read-only environment diagnostic tool tests."""
 
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -984,6 +985,96 @@ def test_ops_file_reader_rejects_env_files():
 
     assert result.startswith("Error:")
     assert "refused" in result.lower()
+
+
+def test_root_file_reader_uses_helper_without_sensitive_name_filter(monkeypatch):
+    from klonet_agent.tools.environment import read_root_file
+
+    def fake_run(command, **kwargs):
+        assert command[:4] == ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "read-file"]
+        assert "--path" in command
+        assert "/root/.ssh/id_rsa" in command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "klonet_agent_op\n"
+                "action=read-file\n"
+                "dry_run=false\n"
+                "path=/root/.ssh/id_rsa\n"
+                "environment_changed=false\n"
+                "content:\n"
+                "PRIVATE KEY TEST\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("klonet_agent.tools.environment.subprocess.run", fake_run)
+
+    result = read_root_file({"path": "/root/.ssh/id_rsa", "max_chars": 200})
+
+    assert "read_root_file" in result
+    assert "environment_changed=false" in result
+    assert "PRIVATE KEY TEST" in result
+
+
+def test_ops_file_reader_falls_back_to_root_helper_on_permission_error(monkeypatch):
+    from klonet_agent.tools.environment import read_ops_file
+
+    def fake_run(command, **kwargs):
+        assert command[:4] == ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "read-file"]
+        assert "/root/vemu_install_new_gen/base_requ_setup.sh" in command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "klonet_agent_op\n"
+                "action=read-file\n"
+                "dry_run=false\n"
+                "path=/root/vemu_install_new_gen/base_requ_setup.sh\n"
+                "environment_changed=false\n"
+                "content:\n"
+                "#!/bin/bash\n"
+                "install python\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("klonet_agent.tools.environment.subprocess.run", fake_run)
+
+    result = read_ops_file({"path": "/root/vemu_install_new_gen/base_requ_setup.sh"})
+
+    assert "read_ops_file" in result
+    assert "environment_changed=false" in result
+    assert "install python" in result
+
+
+def test_install_script_inspection_falls_back_to_root_helper(monkeypatch):
+    from klonet_agent.tools.environment import inspect_install_scripts
+
+    def fake_run(command, **kwargs):
+        assert command[:4] == ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "inspect-install-scripts"]
+        assert "/root/vemu_install_new_gen" in command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "klonet_agent_op\n"
+                "action=inspect-install-scripts\n"
+                "dry_run=false\n"
+                "script_dir=/root/vemu_install_new_gen\n"
+                "environment_changed=false\n"
+                "- script=base_requ_setup.sh status=detected executable=false shebang=#!/bin/bash recommended_recipe=run_install_script allowed_args=NORMAL risk_markers=apt-get\n"
+                "preflight_status=ready\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("klonet_agent.tools.environment.subprocess.run", fake_run)
+
+    result = inspect_install_scripts({"script_dir": "/root/vemu_install_new_gen"})
+
+    assert "inspect_install_scripts" in result
+    assert "root_helper=true" in result
+    assert "script=base_requ_setup.sh status=detected" in result
+    assert "preflight_status=ready" in result
 
 
 def test_screen_inspection_rejects_unsafe_session_name():

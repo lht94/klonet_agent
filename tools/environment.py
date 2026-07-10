@@ -18,8 +18,10 @@ from typing import Iterable, Optional, Sequence
 
 
 MAX_LOG_CHARS = 8000
+MAX_ROOT_READ_CHARS = 20000
 MAX_SCREEN_CHARS = 8000
 PROBE_TIMEOUT_SECONDS = 5
+OPS_HELPER_PATH = "/usr/local/bin/klonet-agent-op"
 STATUS_DETECTED = "detected"
 STATUS_MISSING = "missing"
 STATUS_UNCHECKED = "unchecked"
@@ -308,11 +310,14 @@ def inspect_install_scripts(args: Optional[dict] = None) -> str:
     if not raw_dir:
         return "Error: script_dir is required"
     script_dir = Path(raw_dir).expanduser()
-    if _is_sensitive_path(script_dir):
-        return "\n".join(
-            ["inspect_install_scripts", f"refused_sensitive_path={script_dir.name}", "environment unchanged"]
-        )
-    if not script_dir.exists() or not script_dir.is_dir():
+    try:
+        script_dir_available = script_dir.exists() and script_dir.is_dir()
+    except OSError:
+        script_dir_available = False
+    if not script_dir_available:
+        helper_result = _root_inspect_install_scripts(raw_dir, args.get("scripts"))
+        if helper_result:
+            return helper_result
         return "\n".join(["inspect_install_scripts", f"script_dir_missing={raw_dir}", "environment unchanged"])
     raw_scripts = args.get("scripts")
     if isinstance(raw_scripts, list) and raw_scripts:
@@ -339,6 +344,9 @@ def inspect_install_scripts(args: Optional[dict] = None) -> str:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
+            helper_result = _root_inspect_install_scripts(raw_dir, scripts)
+            if helper_result:
+                return helper_result
             blocked = True
             lines.append(
                 f"- script={script_name} status=unchecked error={_single_line(str(exc), max_chars=220)}"
@@ -361,6 +369,22 @@ def inspect_install_scripts(args: Optional[dict] = None) -> str:
     lines.append(f"preflight_status={'blocked' if blocked else 'ready'}")
     lines.append("environment unchanged")
     return "\n".join(lines)
+
+
+def read_root_file(args: Optional[dict] = None) -> str:
+    """Read any root-owned regular file through the root helper without writing."""
+
+    args = args or {}
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        return "Error: path is required"
+    try:
+        max_chars = max(1, min(int(args.get("max_chars", MAX_LOG_CHARS)), MAX_ROOT_READ_CHARS))
+    except (TypeError, ValueError):
+        return "Error: invalid max_chars"
+    return _root_read_file(raw_path, max_chars=max_chars) or (
+        f"Error: root read helper unavailable for path={raw_path}"
+    )
 
 
 def render_klonet_config(args: Optional[dict] = None) -> str:
@@ -714,11 +738,16 @@ def read_ops_file(args: Optional[dict] = None) -> str:
     if not raw_path:
         return "Error: path is required"
     path = Path(raw_path).expanduser()
-    if _is_sensitive_path(path):
-        return f"Error: refused to read sensitive file: {path.name}"
     if not _is_safe_ops_file_path(path):
         return f"Error: refused to read unsupported ops file: {path.name}"
-    if not path.exists() or not path.is_file():
+    try:
+        path_available = path.exists() and path.is_file()
+    except OSError:
+        path_available = False
+    if not path_available:
+        helper_result = _root_read_file(raw_path, max_chars=_safe_int(args.get("max_chars"), MAX_LOG_CHARS))
+        if helper_result:
+            return helper_result.replace("read_root_file", "read_ops_file", 1)
         return _render_tool_result(
             "read_ops_file",
             [ProbeResult(str(path), STATUS_UNCHECKED, "file does not exist or is not a file")],
@@ -729,6 +758,9 @@ def read_ops_file(args: Optional[dict] = None) -> str:
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
+        helper_result = _root_read_file(str(resolved_path), max_chars=max_chars)
+        if helper_result:
+            return helper_result.replace("read_root_file", "read_ops_file", 1)
         return _render_tool_result(
             "read_ops_file",
             [ProbeResult(str(path), STATUS_UNCHECKED, str(exc))],
@@ -2164,6 +2196,82 @@ def _is_safe_ops_file_path(path: Path) -> bool:
         return True
     normalized_parts = {part.lower() for part in path.parts}
     return "nginx" in normalized_parts and {"sites-enabled", "sites-available"} & normalized_parts
+
+
+def _root_read_file(path: str, *, max_chars: int) -> str:
+    command = [
+        "sudo",
+        "-n",
+        OPS_HELPER_PATH,
+        "read-file",
+        "--execute",
+        "--path",
+        path,
+        "--max-chars",
+        str(max(1, min(max_chars, MAX_ROOT_READ_CHARS))),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    return "read_root_file\n" + _strip_helper_header(completed.stdout)
+
+
+def _root_inspect_install_scripts(script_dir: str, scripts) -> str:
+    script_names = []
+    if isinstance(scripts, list):
+        script_names = [str(item).strip() for item in scripts if str(item).strip()]
+    command = [
+        "sudo",
+        "-n",
+        OPS_HELPER_PATH,
+        "inspect-install-scripts",
+        "--execute",
+        "--script-dir",
+        script_dir,
+    ]
+    if script_names:
+        command.extend(["--scripts", ",".join(script_names)])
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if completed.returncode != 0 or not completed.stdout:
+        return ""
+    body = _strip_helper_header(completed.stdout)
+    return "inspect_install_scripts\nroot_helper=true\n" + body
+
+
+def _strip_helper_header(text: str) -> str:
+    lines = (text or "").splitlines()
+    if lines and lines[0] == "klonet_agent_op":
+        lines = lines[1:]
+    converted = []
+    for line in lines:
+        if line == "action=read-file":
+            continue
+        if line == "action=inspect-install-scripts":
+            continue
+        converted.append(line)
+    return "\n".join(converted)
 
 
 def _safe_int(value, default: int) -> int:

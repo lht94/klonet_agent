@@ -54,6 +54,7 @@ ENVIRONMENT_TOOLS = {
     "inspect_process_detail",
     "read_klonet_logs",
     "read_ops_file",
+    "read_root_file",
     "inspect_screen_session",
     "search_shared_ops_memory",
 }
@@ -77,6 +78,7 @@ OPS_TOOLS = {
     "read_project_journal",
     "list_files",
     "read_file",
+    "write_file",
     "append_episode",
     "web_fetch",
 } | ENVIRONMENT_TOOLS | OPS_OPERATION_TOOLS

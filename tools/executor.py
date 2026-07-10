@@ -40,6 +40,7 @@ from klonet_agent.tools.environment import (
     inspect_system_environment,
     read_klonet_logs,
     read_ops_file,
+    read_root_file,
     render_docker_daemon_config,
     render_klonet_config,
 )
@@ -194,6 +195,9 @@ class ToolExecutor:
 
         if tool_name == "read_ops_file":
             return read_ops_file(tool_args)
+
+        if tool_name == "read_root_file":
+            return read_root_file(tool_args)
 
         if tool_name == "inspect_screen_session":
             return inspect_screen_session(tool_args)

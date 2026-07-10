@@ -440,13 +440,22 @@ TOOLS = [
     ),
     _tool(
         "read_ops_file",
-        "只读读取 Klonet 运维相关配置/源码/部署文件并脱敏，例如 config.py、nginx .conf、Compose、Dockerfile、systemd service、启动脚本和前端 config.js。可用于核对端口、路径、Nginx 路由和启动参数；不能读取 .env、私钥、token 或密码文件，也不能单独替代进程/端口/screen 的运行态证据。",
+        "只读读取 Klonet 运维相关配置/源码/部署文件并脱敏，例如 config.py、nginx .conf、Compose、Dockerfile、systemd service、启动脚本和前端 config.js。可用于核对端口、路径、Nginx 路由和启动参数；遇到普通用户无权读取的 root 文件时会尝试走受控 root 只读 helper；不能单独替代进程/端口/screen 的运行态证据。",
         {
             "path": {
                 "type": "string",
                 "description": "要读取的配置/源码/部署文件路径，可为服务器绝对路径；支持常见 .py/.conf/.yml/.yaml/.json/.ini/.service/.sh/.js 等运维文本文件。",
             },
             "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
+        },
+        ["path"],
+    ),
+    _tool(
+        "read_root_file",
+        "通过受控 root helper 只读读取任意 root 可读的普通文件尾部内容，不写入、不执行命令。用于排查 /root 部署包、root-owned 配置、安装脚本和其他普通权限无法读取的文件。",
+        {
+            "path": {"type": "string", "description": "要读取的服务器绝对路径。"},
+            "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000，上限 20000。"},
         },
         ["path"],
     ),
@@ -522,7 +531,7 @@ TOOLS = [
     ),
     _tool(
         "create_ops_operation_plan",
-        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。LLM 只提交结构化 action + args，系统通过 OpsActionRegistry 校验操作、路径和权限并选择固定实现；不接受模型生成的 Shell 命令。创建时只保存计划，确认后才能执行。",
+        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。LLM 只提交结构化 action + args，系统通过 OpsActionRegistry 校验操作、路径和权限并选择固定实现；不接受模型生成的 Shell 命令。通用命令使用 action=run_ops_command 且 args={program,argv,cwd}。创建时只保存计划，确认后才能执行。",
         {
             "operation": {
                 "type": "string",
@@ -552,7 +561,7 @@ TOOLS = [
             },
             "steps": {
                 "type": "array",
-                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。省略时才使用兼容的默认步骤模板。",
+                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。需要执行 make、git clone/pull/push/checkout/submodule、apt、cp/install、insmod/rmmod 或 tc qdisc 时，使用 action=run_ops_command，args 使用 program、argv 数组和 cwd。省略 steps 时才使用兼容的默认步骤模板。",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -567,7 +576,7 @@ TOOLS = [
             },
             "action_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；mode 可为 insert_after、insert_before、replace_text。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
+                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；run_ops_command 使用 {program,argv,cwd}。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
             },
             "recipe_bindings": {
                 "type": "object",
@@ -706,7 +715,7 @@ TOOLS = [
     ),
     _tool(
         "write_file",
-        "写入当前 workspace 内的文本文件。只能用于 Coding 模式。",
+        "写入当前 workspace 内的文本文件。适合生成讨论总结、草稿、报告和普通项目文档；只能写 workspace 沙箱内路径，不能修改服务器运行环境。服务器配置、部署脚本、Nginx、平台源码等运维文件仍必须走 OperationPlan/write_ops_file。",
         {
             "path": {"type": "string", "description": "workspace 内相对路径"},
             "content": {"type": "string", "description": "完整文件内容"},

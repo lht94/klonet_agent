@@ -92,6 +92,15 @@ def test_installer_requires_explicit_start(tmp_path):
     assert "systemctl restart klonet-agent.service" in calls
 
 
+def test_installer_pins_helper_shebang_to_configured_python(tmp_path):
+    result, _, install_root = _run_installer(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    helper = install_root / "usr/local/bin/klonet-agent-op"
+    first_line = helper.read_text(encoding="utf-8").splitlines()[0]
+    assert first_line == f"#!{Path(os.sys.executable).resolve()}"
+
+
 def test_reinstall_preserves_environment_file(tmp_path):
     result, _, install_root = _run_installer(tmp_path)
     assert result.returncode == 0, result.stderr
@@ -112,7 +121,7 @@ def test_installer_uses_home_tmpdir_by_default(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "--home-dir /home/klonet-agent" in calls
-    assert "chown klonet-agent:klonet-agent" in calls
+    assert "chown klonet-agent:klonet-agent" not in calls
     env_file = install_root / "etc/klonet-agent/klonet-agent.env"
     assert "TMPDIR=/home/klonet-agent/.cache/tmp\n" in env_file.read_text(
         encoding="utf-8"

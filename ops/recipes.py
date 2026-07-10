@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from klonet_agent.ops.actions import OpsActionRegistry, configured_ops_action_registry
+from klonet_agent.ops.command_policy import command_exists, decide_ops_command
 from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExecutionResult
 
 
@@ -34,6 +35,7 @@ WRITE_OPS_FILE = "write_ops_file"
 INSTALL_NGINX_CONFIG = "install_nginx_config"
 RELOAD_NGINX = "reload_nginx"
 START_DOCKER_CONTAINER = "start_docker_container"
+RUN_OPS_COMMAND = "run_ops_command"
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -183,6 +185,7 @@ class ControlledActionRunner:
             WRITE_OPS_FILE,
             INSTALL_NGINX_CONFIG,
             START_DOCKER_CONTAINER,
+            RUN_OPS_COMMAND,
         }
         if spec.name in step_only_actions:
             return handler(step)
@@ -808,6 +811,65 @@ class ControlledActionRunner:
         command = self._helper_command("start-docker-container", "--name", name)
         return self._helper_result(START_DOCKER_CONTAINER, command)
 
+    def _run_ops_command(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.args or step.recipe_args or {}
+        decision = decide_ops_command(args)
+        if not decision.allowed:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_OPS_COMMAND} command_not_allowed={decision.reason}; environment unchanged",
+            )
+        if not command_exists(decision.program):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_OPS_COMMAND} program_not_found={decision.program}; environment unchanged",
+            )
+        if decision.requires_sudo:
+            command = self._helper_command(
+                "run-ops-command",
+                "--program",
+                decision.program,
+                "--argv-json",
+                decision.argv_json(),
+            )
+            if decision.cwd:
+                command.extend(["--cwd", decision.cwd])
+        else:
+            command = [decision.program, *decision.argv]
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    f"dry_run=true recipe_id={RUN_OPS_COMMAND} "
+                    f"category={decision.category} risk={decision.risk} "
+                    f"requires_sudo={str(decision.requires_sudo).lower()} "
+                    f"command_preview={_format_command(command)} "
+                    f"cwd={_one_line(decision.cwd or '.')} "
+                    "environment unchanged"
+                ),
+            )
+        try:
+            if decision.requires_sudo:
+                output = self.command_runner(command)
+            elif self._uses_default_command_runner:
+                output = _run_command(command, cwd=decision.cwd or None)
+            else:
+                output = self.command_runner(command)
+        except subprocess.CalledProcessError as exc:
+            return _helper_failure_result(exc)
+        return RecipeExecutionResult(
+            "completed",
+            (
+                f"dry_run=false recipe_id={RUN_OPS_COMMAND} "
+                f"category={decision.category} risk={decision.risk} "
+                f"requires_sudo={str(decision.requires_sudo).lower()} "
+                f"command={_format_command(command)} "
+                f"cwd={_one_line(decision.cwd or '.')} "
+                f"command_output={_one_line(output)} "
+                "environment_changed=unknown"
+            ),
+        )
+
     def _helper_result(self, recipe_id: str, command: list) -> RecipeExecutionResult:
         if not self.dry_run:
             try:
@@ -1070,9 +1132,10 @@ def _format_command(command: list) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
-def _run_command(command: list) -> str:
+def _run_command(command: list, cwd: str | None = None) -> str:
     completed = subprocess.run(
         command,
+        cwd=cwd,
         check=True,
         capture_output=True,
         text=True,

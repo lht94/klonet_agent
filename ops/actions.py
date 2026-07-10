@@ -186,6 +186,13 @@ DEFAULT_OPS_ACTIONS = (
         "privileged",
         True,
     ),
+    OpsActionSpec(
+        "run_ops_command",
+        "_run_ops_command",
+        "controlled",
+        True,
+        ("cwd",),
+    ),
 )
 
 DEFAULT_OPS_ACTION_REGISTRY = OpsActionRegistry(DEFAULT_OPS_ACTIONS)

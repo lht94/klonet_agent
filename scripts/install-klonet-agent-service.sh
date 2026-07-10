@@ -108,6 +108,17 @@ install_with_mode() {
   fi
 }
 
+install_helper_with_python() {
+  local source="$1" target="$2" helper_tmp
+  helper_tmp="${target}.tmp.helper.$$"
+  {
+    printf '#!%s\n' "$python_path"
+    tail -n +2 "$source"
+  } >"$helper_tmp"
+  install_with_mode root root 0755 "$helper_tmp" "$target"
+  rm -f "$helper_tmp"
+}
+
 ensure_env_setting() {
   local path="$1" key="$2" value="$3" escaped_value
   escaped_value="$(printf '%s' "$value" | sed 's/[\/&]/\\&/g')"
@@ -163,7 +174,7 @@ else
   chmod 0700 "$tmpdir_target"
 fi
 
-install_with_mode root root 0755 "$project_root/scripts/klonet-agent-op" "$helper_path"
+install_helper_with_python "$project_root/scripts/klonet-agent-op" "$helper_path"
 
 sudoers_tmp="${sudoers_path}.tmp.$$"
 trap 'rm -f "${sudoers_tmp:-}" "${unit_tmp:-}"' EXIT

@@ -19,6 +19,7 @@ from klonet_agent.ops.actions import (
     DEFAULT_OPS_ACTION_REGISTRY,
     default_action_bindings,
 )
+from klonet_agent.ops.command_policy import decide_ops_command
 
 
 _UTC8 = timezone(timedelta(hours=8))
@@ -629,10 +630,16 @@ def _custom_steps(raw_steps: List[dict]) -> List[OperationStep]:
             raise ValueError(f"step {step_id} args must be an object")
         cleaned_args = _clean_action_args(action, action_args)
         spec = DEFAULT_OPS_ACTION_REGISTRY.get(action)
-        risk = spec.risk if spec else _one_line(str(raw.get("risk") or "normal"), 40)
+        command_decision = decide_ops_command(cleaned_args) if action == "run_ops_command" else None
+        if command_decision and command_decision.allowed:
+            risk = command_decision.risk
+        else:
+            risk = spec.risk if spec else _one_line(str(raw.get("risk") or "normal"), 40)
         requires_step_confirmation = bool(
             spec and spec.confirmation_scope == "step"
         )
+        if command_decision and command_decision.requires_step_confirmation:
+            requires_step_confirmation = True
         result.append(
             OperationStep(
                 step_id=step_id,
@@ -658,6 +665,18 @@ def _clean_action_args(action: str, args: dict) -> dict:
             continue
         if action == "write_ops_file" and normalized_key == "content":
             cleaned[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+        elif isinstance(value, list):
+            cleaned[normalized_key] = [
+                _one_line(str(item), 300)
+                for item in value[:40]
+                if item is not None
+            ]
+        elif isinstance(value, dict):
+            cleaned[normalized_key] = {
+                _one_line(str(item_key), 80): _one_line(str(item_value), 300)
+                for item_key, item_value in list(value.items())[:40]
+                if item_key is not None and item_value is not None
+            }
         else:
             cleaned[normalized_key] = _one_line(str(value), 300)
     return cleaned
@@ -691,6 +710,12 @@ def _normalize_plan_steps(plan: OperationPlan) -> None:
                 step.risk = spec.risk
             if spec.confirmation_scope == "step":
                 step.requires_step_confirmation = True
+        if step.action == "run_ops_command":
+            command_decision = decide_ops_command(step.args or step.recipe_args)
+            if command_decision.allowed:
+                step.risk = command_decision.risk
+                if command_decision.requires_step_confirmation:
+                    step.requires_step_confirmation = True
         if step.args:
             step.recipe_args = dict(step.args)
         elif step.recipe_args:
