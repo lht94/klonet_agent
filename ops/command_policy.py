@@ -154,7 +154,7 @@ def _decide_apt(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
         packages = [item for item in rest if not item.startswith("-")]
         if not packages:
             return _deny("apt_install_requires_packages")
-        if not options <= {"-y", "--yes", "--no-install-recommends"}:
+        if not options <= {"-y", "--yes", "--no-install-recommends", "--reinstall"}:
             return _deny("apt_install_option_not_allowed")
         if any(not SAFE_PACKAGE.fullmatch(item) for item in packages):
             return _deny("apt_package_not_allowed")

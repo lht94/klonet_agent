@@ -296,3 +296,30 @@ python3.8 -m pip install gunicorn celery gevent gevent-websocket
   - 覆盖断链绝对路径、允许的绝对路径执行、安全 `dpkg`。
 - `tests/test_ops_routing.py`
   - 覆盖“失败就停止”不触发 `action=stop`。
+
+## 2026-07-11 第九轮：run_ops_command 被拒绝时计划仍可创建
+
+### 测试结果
+
+第八版后重新启动 agent，`dpkg -s` 只读诊断可用，`/usr/bin/python3.8` 断链也被正确识别。agent 生成新计划 `deploy-09d230795f`，用于 `apt install --reinstall python3.8-minimal` 恢复 Python。
+
+新暴露的问题：
+
+- `reinstall-python38` 是系统包修改，但计划中 `risk=controlled`、`requires_step_confirmation=false`。
+- 根因不是单纯模型标注错，而是 `decide_ops_command` 当时不允许 `apt install --reinstall ...`，`_custom_steps` 在 command policy 拒绝时没有拒绝计划，反而退回到 action registry 默认风险，导致被包装成可执行的 controlled 步骤。
+
+### 第九版优化思路
+
+- `apt install --reinstall <safe-package>` 是合法恢复动作，但必须和普通 apt install 一样归类为 `dangerous`、`sudo`、`requires_step_confirmation=true`。
+- `run_ops_command` 的计划创建必须以 command policy 为硬边界：只要策略拒绝，就直接拒绝 OperationPlan，而不是降级使用 action registry 默认值。
+- 这样可以泛化覆盖 apt、pip、git、cp/install、tc、insmod/rmmod 等所有结构化命令，而不是只补 Python 断链这一个场景。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - 允许安全包名的 `apt install --reinstall`，并保持危险级别和二次确认。
+- `ops/operations.py`
+  - 自定义计划创建时，`run_ops_command` 被 command policy 拒绝即抛错。
+- `tests/test_ops_command_policy.py`
+  - 覆盖 apt reinstall 强制二次确认。
+  - 覆盖被拒绝的 `run_ops_command` 无法创建计划。

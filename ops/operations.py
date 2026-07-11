@@ -655,6 +655,8 @@ def _custom_steps(raw_steps: List[dict]) -> List[OperationStep]:
             raise ValueError(f"step {step_id} {problem}")
         spec = DEFAULT_OPS_ACTION_REGISTRY.get(action)
         command_decision = decide_ops_command(cleaned_args) if action == "run_ops_command" else None
+        if command_decision and not command_decision.allowed:
+            raise ValueError(f"step {step_id} {command_decision.reason}")
         if command_decision and command_decision.allowed:
             risk = command_decision.risk
         else:

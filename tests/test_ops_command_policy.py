@@ -36,12 +36,19 @@ def test_command_policy_classifies_apt_install_as_step_confirmed_sudo():
     decision = decide_ops_command(
         {"program": "apt", "argv": ["install", "-y", "build-essential"], "cwd": ""}
     )
+    reinstall = decide_ops_command(
+        {"program": "apt", "argv": ["install", "--reinstall", "-y", "python3.8-minimal"], "cwd": ""}
+    )
 
     assert decision.allowed
     assert decision.category == "system_package_install"
     assert decision.risk == "dangerous"
     assert decision.requires_sudo is True
     assert decision.requires_step_confirmation is True
+    assert reinstall.allowed
+    assert reinstall.risk == "dangerous"
+    assert reinstall.requires_sudo is True
+    assert reinstall.requires_step_confirmation is True
 
 
 def test_command_policy_allows_controlled_python_package_install():
@@ -276,6 +283,59 @@ def test_operation_plan_preserves_run_ops_command_argv_and_sets_risk(tmp_path):
     assert step.args["argv"] == ["update"]
     assert step.risk == "dangerous"
     assert step.requires_step_confirmation is True
+
+
+def test_operation_plan_forces_apt_reinstall_step_confirmation(tmp_path):
+    from klonet_agent.ops.operations import OperationPlanStore
+
+    plan = OperationPlanStore(tmp_path).create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "reinstall-python",
+                "title": "恢复 python",
+                "risk": "controlled",
+                "requires_step_confirmation": False,
+                "action": "run_ops_command",
+                "args": {
+                    "program": "apt",
+                    "argv": ["install", "--reinstall", "-y", "python3.8-minimal"],
+                    "cwd": "",
+                },
+            }
+        ],
+    )
+
+    step = plan.steps[0]
+    assert step.risk == "dangerous"
+    assert step.requires_step_confirmation is True
+    assert step.permission == "step_confirm_required"
+
+
+def test_operation_plan_rejects_disallowed_run_ops_command(tmp_path):
+    from klonet_agent.ops.operations import OperationPlanStore
+
+    try:
+        OperationPlanStore(tmp_path).create_plan(
+            operation="deploy_platform",
+            target="demo",
+            steps=[
+                {
+                    "step_id": "unsafe-apt",
+                    "title": "unsafe apt",
+                    "action": "run_ops_command",
+                    "args": {
+                        "program": "apt",
+                        "argv": ["install", "--allow-unauthenticated", "-y", "python3"],
+                    },
+                }
+            ],
+        )
+    except ValueError as exc:
+        assert "apt_install_option_not_allowed" in str(exc)
+    else:
+        raise AssertionError("expected disallowed run_ops_command to be rejected")
 
 
 def test_run_ops_command_make_executes_after_plan_confirm(tmp_path):
