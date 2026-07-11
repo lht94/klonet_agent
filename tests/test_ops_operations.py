@@ -1922,12 +1922,16 @@ def test_run_install_script_recipe_default_runner_streams_output(monkeypatch):
     assert "result_status=completed" in result
 
 
-def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir():
+def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir(monkeypatch):
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
     from tests.helpers import local_temp_dir
 
     calls = []
+    monkeypatch.setattr(
+        "klonet_agent.ops.recipes._install_script_postcondition_problem",
+        lambda script_name, script_args: "",
+    )
 
     def command_runner(command):
         calls.append(command)
@@ -1974,6 +1978,47 @@ def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir(
     assert "dry_run=false" in result
     assert "recipe_id=run_install_script" in result
     assert "setup done" in result
+
+
+def test_run_install_script_blocks_when_base_setup_postconditions_are_missing(monkeypatch):
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.recipes._command_or_known_path_exists",
+        lambda command, paths: False,
+    )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=lambda command: "klonet_agent_op environment_changed=true",
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="env-setup",
+            objective="run base setup",
+            operation_args={
+                "script_dir": "/root/vemu_install_new_gen",
+                "script_name": "base_requ_setup.sh",
+                "script_args": "NORMAL",
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "postcondition_failed=missing_commands=python3.8,pip3.8,gunicorn,celery" in result
+    assert "next_required_action=inspect_runtime" in result
 
 
 def test_run_install_script_recipe_blocks_unsupported_script():

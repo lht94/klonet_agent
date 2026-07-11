@@ -122,3 +122,33 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
   - 覆盖多源 `cp`、安全/不安全 symlink。
 - `tests/test_prompt_style.py`
   - 覆盖暂停规则和 `vemu_uestc/` 目录结构规则。
+
+## 2026-07-11 第四轮：安装脚本误判成功
+
+### 测试结果
+
+第四轮恢复计划 `deploy-8ea38bb518` 执行了 `/root/vemu_install_new_gen/base_requ_setup.sh NORMAL`。脚本输出显示大量高影响操作和失败：
+
+- 运行 Redis `make test`，耗时且输出极长。
+- 导入 Docker 镜像、安装 InfluxDB、修改 Docker/Libvirt 相关环境。
+- `libpcap`、`curl`、`python3.8` 编译出现 `Permission denied`、缺头文件、`pip3.8: command not found` 等错误。
+- `libvirt-bin` 无安装候选，`libvirtd` 启动失败。
+
+但 helper 最终输出 `environment_changed=true`，recipe 将步骤标记为 completed。随后 agent 认为“安装脚本成功”，继续执行后续步骤。这是错误的：历史安装脚本可能吞掉内部错误并返回 0，不能只信 exit code。
+
+### 第四版优化思路
+
+对 `base_requ_setup.sh NORMAL` 增加确定性后置条件校验：
+
+- 脚本执行后必须能找到 `python3.8`、`pip3.8`、`gunicorn`、`celery`，或历史固定路径存在对应可执行文件。
+- 若缺失，步骤返回 `blocked`，输出 `postcondition_failed=missing_commands=...`，并要求 `inspect_runtime`。
+- 不用自由扫描长输出作为主要判断，避免误报；后置条件直接对应部署后续步骤所需能力。
+
+### 实现文件
+
+- `ops/recipes.py`
+  - 新增 `_install_script_postcondition_problem`。
+  - `run_install_script` 成功返回后先检查后置条件，不满足则 blocked。
+- `tests/test_ops_operations.py`
+  - 更新 root 脚本 helper 测试。
+  - 新增 helper 返回成功但后置条件缺失时 blocked 的回归测试。

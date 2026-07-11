@@ -555,6 +555,20 @@ class ControlledActionRunner:
             output = self._run_install_command(command)
         except subprocess.CalledProcessError as exc:
             return _script_failure_result(exc)
+        postcondition_problem = _install_script_postcondition_problem(script_name, script_args)
+        if postcondition_problem:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    "dry_run=false "
+                    f"recipe_id={RUN_INSTALL_SCRIPT} "
+                    f"command={_format_command(command)} "
+                    f"postcondition_failed={postcondition_problem} "
+                    f"script_output={_one_line(output)} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
         return RecipeExecutionResult(
             "completed",
             (
@@ -1044,6 +1058,29 @@ def _split_script_args(value) -> list:
     if not text:
         return []
     return shlex.split(text)
+
+
+def _install_script_postcondition_problem(script_name: str, script_args: list[str]) -> str:
+    if script_name != "base_requ_setup.sh" or tuple(script_args) != ("NORMAL",):
+        return ""
+    required = {
+        "python3.8": ("/usr/local/python3/bin/python3.8",),
+        "pip3.8": ("/usr/local/python3/bin/pip3.8",),
+        "gunicorn": ("/usr/local/bin/gunicorn",),
+        "celery": ("/usr/local/bin/celery",),
+    }
+    missing = [
+        name
+        for name, paths in required.items()
+        if not _command_or_known_path_exists(name, paths)
+    ]
+    return "missing_commands=" + ",".join(missing) if missing else ""
+
+
+def _command_or_known_path_exists(command: str, paths: tuple[str, ...]) -> bool:
+    if shutil.which(command):
+        return True
+    return any(Path(path).is_file() for path in paths)
 
 
 def _install_script_command(script_dir: str, script_name: str, script_args: list) -> list:
