@@ -227,3 +227,37 @@ python3.8 -m pip install gunicorn celery gevent gevent-websocket
   - 覆盖只读 checkpoint 仍可完成。
 - `tests/test_prompt_style.py`
   - 覆盖 prompt 规则。
+
+## 2026-07-11 第七轮：计划完整但含不安全写入和明文密钥
+
+### 测试结果
+
+第六版后，agent 成功生成 `deploy-57bf9448a0`，并且所有修改步骤都有 action 绑定，说明“checkpoint 占位”问题已改善。
+
+新暴露的问题：
+
+- `config-lht-class` 的 `write_ops_file.content` 含 `redis_password = '123456'`，并且回答中明文展示了该值。
+- `config-nginx-location` 直接用 `write_ops_file` 修改 `/etc/nginx/sites-available/default`，绕过了既有的 staging `.conf` + `install_nginx_config` + `reload_nginx` 流程。
+- `config.py` 路径指向 `/home/klonet-agent/platforms/lht_project/vemu_uestc/vemu_config/config.py`，但真实环境中 `vemu_uestc/` 子目录不存在。这说明 prompt 的标准结构规则仍需要结合“本轮 resolved_path 证据”，后续还要优化。
+
+### 第七版优化思路
+
+本轮先把高风险问题前移到计划创建阶段：
+
+- `write_ops_file` 不能直接写 `/etc/nginx/...`；Nginx 必须通过 staging 文件和 `install_nginx_config`。
+- `write_ops_file.content` 中不能包含明显的 password/token/secret/api key 赋值。
+- Prompt 明确不得在回答或 OperationPlan action args 中写入明文敏感值；配置类应继承已有安全默认值或用 `[REDACTED]` 展示。
+
+### 实现文件
+
+- `ops/operations.py`
+  - 新增计划级 action args 校验。
+  - 拒绝直接写 `/etc/nginx`。
+  - 拒绝敏感赋值内容进入 `write_ops_file.content`。
+- `tests/test_ops_action_registry.py`
+  - 覆盖直接 Nginx 写入和敏感内容拒绝。
+- `prompts.py`
+  - 强化 Nginx staging + install 流程。
+  - 强化敏感字段脱敏和继承规则。
+- `tests/test_prompt_style.py`
+  - 覆盖 Nginx 直写禁令和明文密钥禁令。

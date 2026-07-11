@@ -9,6 +9,7 @@ into arbitrary shell.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,9 @@ VALID_PLAN_STATUS = {"pending", "approved", "aborted", "completed", "failed"}
 VALID_STEP_STATUS = {"pending", "approved", "running", "completed", "failed", "blocked"}
 MAX_RECIPE_CONTENT_CHARS = 20000
 MAX_PLAN_STEPS = 20
+SENSITIVE_ACTION_CONTENT = re.compile(
+    r"(?i)\b[A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*\s*[:=]"
+)
 
 
 @dataclass
@@ -646,6 +650,9 @@ def _custom_steps(raw_steps: List[dict]) -> List[OperationStep]:
         if not isinstance(action_args, dict):
             raise ValueError(f"step {step_id} args must be an object")
         cleaned_args = _clean_action_args(action, action_args)
+        problem = _validate_plan_action_args(action, cleaned_args)
+        if problem:
+            raise ValueError(f"step {step_id} {problem}")
         spec = DEFAULT_OPS_ACTION_REGISTRY.get(action)
         command_decision = decide_ops_command(cleaned_args) if action == "run_ops_command" else None
         if command_decision and command_decision.allowed:
@@ -895,6 +902,9 @@ def _apply_action_bindings(plan: OperationPlan, action_bindings: dict) -> None:
                 step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
                 continue
             step.args[normalized_key] = _one_line(str(value), 300)
+        problem = _validate_plan_action_args(effective_action, step.args)
+        if problem:
+            raise ValueError(f"step {step.step_id} {problem}")
         step.recipe_args = dict(step.args)
 
 
@@ -917,6 +927,25 @@ def _clean_operation_args(args: dict) -> dict:
         for key, value in args.items()
         if key and value is not None
     }
+
+
+def _validate_plan_action_args(action: str, args: dict) -> str:
+    if action != "write_ops_file" or not isinstance(args, dict):
+        return ""
+    path = str(args.get("path") or "").strip()
+    content = str(args.get("content") or "")
+    if _is_direct_nginx_write_path(path):
+        return "nginx_config_requires_install_nginx_config"
+    if SENSITIVE_ACTION_CONTENT.search(content):
+        return "sensitive_content_not_allowed"
+    return ""
+
+
+def _is_direct_nginx_write_path(path: str) -> bool:
+    if not path:
+        return False
+    normalized = str(path).replace("\\", "/")
+    return normalized == "/etc/nginx" or normalized.startswith("/etc/nginx/")
 
 
 def _ensure_shared_services_step(plan: OperationPlan) -> None:

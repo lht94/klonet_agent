@@ -123,6 +123,7 @@ def test_ops_prompt_routes_nginx_install_and_reload_through_actions():
 
     assert "install_nginx_config" in OPS_PROMPT
     assert "reload_nginx" in OPS_PROMPT
+    assert "不得通过 `write_ops_file` 直接修改 `/etc/nginx" in OPS_PROMPT
     assert "不得要求用户手工 `sudo cp`" in OPS_PROMPT
 
 
@@ -167,6 +168,16 @@ def test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps():
     assert "必须在创建计划时就绑定具体 action 和 args" in OPS_PROMPT
     assert "不得创建“checkpoint 占位步骤”" in OPS_PROMPT
     assert "未绑定 action 的修改步骤会被状态机阻塞" in OPS_PROMPT
+
+
+def test_ops_prompt_forbids_plaintext_secrets_in_plans():
+    """Plans and summaries should not leak config secrets."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "不得写入明文 password" in OPS_PROMPT
+    assert "[REDACTED]" in OPS_PROMPT
+    assert "敏感字段继承父类" in OPS_PROMPT
 
 
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():
