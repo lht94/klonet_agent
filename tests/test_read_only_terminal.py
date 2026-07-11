@@ -53,6 +53,30 @@ def test_readonly_terminal_rejects_ss_socket_kill():
     assert "ss socket-kill mode is not allowed" in result
 
 
+def test_readonly_terminal_allows_safe_ops_discovery_commands():
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    git = run_readonly_command({"program": "git", "argv": ["remote", "-v"]})
+    hostname = run_readonly_command({"program": "hostname", "argv": []})
+    ip = run_readonly_command({"program": "ip", "argv": ["route", "show"]})
+
+    assert "readonly_command" in git or "command returned non-zero status" in git
+    assert "program_not_allowlisted=git" not in git
+    assert "readonly_command" in hostname
+    assert "program_not_allowlisted=hostname" not in hostname
+    assert "program_not_allowlisted=ip" not in ip
+
+
+def test_readonly_terminal_rejects_mutating_or_broad_discovery_commands():
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    git = run_readonly_command({"program": "git", "argv": ["reset", "--hard"]})
+    ip = run_readonly_command({"program": "ip", "argv": ["link", "set", "eth0", "down"]})
+
+    assert "git only allows" in git
+    assert "ip only allows" in ip
+
+
 def test_ops_profile_exposes_readonly_terminal():
     from klonet_agent.agents.profile import get_profile
 

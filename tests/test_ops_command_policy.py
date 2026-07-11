@@ -70,6 +70,60 @@ def test_command_policy_allows_selected_git_workflows():
     assert push.risk == "dangerous"
 
 
+def test_command_policy_allows_workspace_directory_creation(tmp_path):
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    mkdir_decision = decide_ops_command(
+        {
+            "program": "mkdir",
+            "argv": ["-p", str(tmp_path / "platforms" / "lht_project")],
+            "cwd": str(tmp_path),
+        }
+    )
+    install_decision = decide_ops_command(
+        {
+            "program": "install",
+            "argv": ["-d", str(tmp_path / "platforms" / "lht_project" / "vemu_frontend")],
+            "cwd": str(tmp_path),
+        }
+    )
+    unsafe = decide_ops_command(
+        {"program": "mkdir", "argv": ["-p", "/etc/klonet-test"], "cwd": "/"}
+    )
+
+    assert mkdir_decision.allowed
+    assert mkdir_decision.category == "workspace_directory_create"
+    assert mkdir_decision.requires_sudo is False
+    assert install_decision.allowed
+    assert install_decision.category == "workspace_directory_create"
+    assert install_decision.requires_sudo is False
+    assert not unsafe.allowed
+    assert unsafe.reason == "destination_not_allowlisted"
+
+
+def test_command_policy_allows_git_clone_dot_with_cwd_and_reports_missing_cwd():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    allowed = decide_ops_command(
+        {
+            "program": "git",
+            "argv": ["clone", "gitee:uestc-minenet/vemu_uestc.git", "."],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    missing_cwd = decide_ops_command(
+        {
+            "program": "git",
+            "argv": ["clone", "gitee:uestc-minenet/vemu_uestc.git", "/home/klonet-agent/platforms/lht_project"],
+        }
+    )
+
+    assert allowed.allowed
+    assert allowed.category == "git_clone"
+    assert not missing_cwd.allowed
+    assert missing_cwd.reason == "git_clone_requires_cwd"
+
+
 def test_command_policy_accepts_legacy_string_argv_and_gitee_alias_url():
     from klonet_agent.ops.command_policy import decide_ops_command
 
@@ -103,7 +157,7 @@ def test_command_policy_rejects_unapproved_git_commands():
     assert not reset.allowed
     assert reset.reason == "git_args_not_allowed"
     assert not unsafe_clone.allowed
-    assert unsafe_clone.reason == "git_args_not_allowed"
+    assert unsafe_clone.reason == "git_destination_not_within_cwd"
 
 
 def test_operation_plan_preserves_run_ops_command_argv_and_sets_risk(tmp_path):

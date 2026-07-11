@@ -32,6 +32,23 @@ SYSTEM_INSTALL_DIRS = (
     Path("/usr/local/lib"),
     Path("/lib/modules"),
 )
+SYSTEM_WRITE_BASE_DENYLIST = {
+    Path("/"),
+    Path("/bin"),
+    Path("/boot"),
+    Path("/dev"),
+    Path("/etc"),
+    Path("/lib"),
+    Path("/lib64"),
+    Path("/opt"),
+    Path("/proc"),
+    Path("/root"),
+    Path("/run"),
+    Path("/sbin"),
+    Path("/sys"),
+    Path("/usr"),
+    Path("/var"),
+}
 
 
 @dataclass(frozen=True)
@@ -75,6 +92,8 @@ def decide_ops_command(args: Mapping | None) -> OpsCommandDecision:
         return _decide_git(program, argv, cwd)
     if program in {"apt", "apt-get"}:
         return _decide_apt(program, argv, cwd)
+    if program == "mkdir":
+        return _decide_mkdir(program, argv, cwd)
     if program in {"cp", "install"}:
         return _decide_file_install(program, argv, cwd)
     if program == "insmod":
@@ -115,6 +134,8 @@ def _decide_git(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
         return _allow(program, argv, cwd, risk="controlled", category="git_checkout")
     if push:
         return _allow(program, argv, cwd, risk="dangerous", step=True, category="git_push")
+    if argv[:1] == ("clone",):
+        return _deny(_git_clone_denial_reason(argv, cwd))
     return _deny("git_args_not_allowed")
 
 
@@ -135,7 +156,29 @@ def _decide_apt(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
     return _deny("apt_args_not_allowed")
 
 
+def _decide_mkdir(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
+    destinations = _mkdir_destinations(argv)
+    if not destinations:
+        return _deny("mkdir_args_not_allowed")
+    if not cwd:
+        return _deny("mkdir_requires_cwd")
+    if any(not _workspace_destination_allowed(destination, cwd) for destination in destinations):
+        return _deny("destination_not_allowlisted")
+    return _allow(program, argv, cwd, risk="controlled", category="workspace_directory_create")
+
+
 def _decide_file_install(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
+    if program == "install":
+        mkdir_destinations = _install_directory_destinations(argv)
+        if mkdir_destinations:
+            if not cwd:
+                return _deny("install_requires_cwd")
+            if any(
+                not _workspace_destination_allowed(destination, cwd)
+                for destination in mkdir_destinations
+            ):
+                return _deny("destination_not_allowlisted")
+            return _allow(program, argv, cwd, risk="controlled", category="workspace_directory_create")
     if program == "cp":
         if len(argv) != 2:
             return _deny("cp_requires_source_and_destination")
@@ -246,6 +289,21 @@ def _git_clone_allowed(argv: tuple[str, ...], cwd: str) -> bool:
     return bool(SAFE_GIT_URL.fullmatch(repo_url)) and _destination_within_cwd(destination, cwd)
 
 
+def _git_clone_denial_reason(argv: tuple[str, ...], cwd: str) -> str:
+    if not argv or argv[0] != "clone":
+        return "git_args_not_allowed"
+    if len(argv) != 3:
+        return "git_clone_requires_repo_and_destination"
+    if not cwd:
+        return "git_clone_requires_cwd"
+    repo_url, destination = argv[1], argv[2]
+    if not SAFE_GIT_URL.fullmatch(repo_url):
+        return "git_url_not_allowed"
+    if not _destination_within_cwd(destination, cwd):
+        return "git_destination_not_within_cwd"
+    return "git_args_not_allowed"
+
+
 def _git_pull_allowed(argv: tuple[str, ...], cwd: str) -> bool:
     if not cwd or not argv or argv[0] != "pull":
         return False
@@ -314,6 +372,71 @@ def _destination_in_system_install_dir(destination: str) -> bool:
         return False
     resolved = path.resolve(strict=False)
     return any(_is_relative_to(resolved, root) for root in SYSTEM_INSTALL_DIRS)
+
+
+def _workspace_destination_allowed(destination: str, cwd: str) -> bool:
+    if any(char in destination for char in "\x00\n\r"):
+        return False
+    if not _valid_cwd(cwd):
+        return False
+    root = Path(cwd).expanduser().resolve(strict=False)
+    if not _safe_workspace_write_base(root):
+        return False
+    candidate = Path(destination).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _safe_workspace_write_base(root: Path) -> bool:
+    resolved = root.resolve(strict=False)
+    if resolved in SYSTEM_WRITE_BASE_DENYLIST:
+        return False
+    return not any(_is_relative_to(resolved, denied) for denied in (Path("/etc"), Path("/usr"), Path("/var"), Path("/root")))
+
+
+def _mkdir_destinations(argv: tuple[str, ...]) -> tuple[str, ...]:
+    if not argv:
+        return ()
+    destinations = []
+    for item in argv:
+        if item in {"-p", "--parents", "-v", "--verbose"}:
+            continue
+        if item.startswith("--mode="):
+            continue
+        if item == "-m":
+            return ()
+        if item.startswith("-"):
+            return ()
+        destinations.append(item)
+    return tuple(destinations)
+
+
+def _install_directory_destinations(argv: tuple[str, ...]) -> tuple[str, ...]:
+    if "-d" not in argv and "--directory" not in argv:
+        return ()
+    destinations = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in {"-d", "--directory", "-v", "--verbose"}:
+            index += 1
+            continue
+        if item in {"-m", "--mode", "-o", "--owner", "-g", "--group"}:
+            index += 2
+            continue
+        if item.startswith("--mode=") or item.startswith("--owner=") or item.startswith("--group="):
+            index += 1
+            continue
+        if item.startswith("-"):
+            return ()
+        destinations.append(item)
+        index += 1
+    return tuple(destinations)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

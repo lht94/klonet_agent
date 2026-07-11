@@ -24,6 +24,9 @@ SAFE_PROGRAMS = {
     "ps",
     "ss",
     "systemctl",
+    "git",
+    "hostname",
+    "ip",
 }
 
 
@@ -117,7 +120,42 @@ def _validate_program_args(program: str, argv: list[str]) -> str:
     if program == "systemctl":
         if not argv or argv[0] not in {"status", "is-active", "is-enabled", "show", "list-units"}:
             return "systemctl only allows read-only status operations"
+    if program == "git":
+        return _validate_git_args(argv)
+    if program == "hostname":
+        return "" if tuple(argv) in {(), ("-I",), ("--fqdn",)} else "hostname only allows no args, -I or --fqdn"
+    if program == "ip":
+        return _validate_ip_args(argv)
     return ""
+
+
+def _validate_git_args(argv: list[str]) -> str:
+    args = tuple(argv)
+    if args in {("status", "--short"), ("status", "-sb"), ("rev-parse", "--show-toplevel")}:
+        return ""
+    if argv[:1] == ["remote"] and tuple(argv[1:]) in {("-v",), ("get-url", "origin")}:
+        return ""
+    if argv[:2] == ["config", "--get"] and len(argv) == 3:
+        allowed_keys = {
+            "remote.origin.url",
+            "branch.main.remote",
+            "branch.master.remote",
+            "branch.main.merge",
+            "branch.master.merge",
+        }
+        return "" if argv[2] in allowed_keys else "git config key is not allowlisted"
+    return "git only allows status, rev-parse, remote read, or selected config --get"
+
+
+def _validate_ip_args(argv: list[str]) -> str:
+    if tuple(argv[:1]) in {("addr",), ("address",), ("route",), ("link",)}:
+        if len(argv) == 1:
+            return ""
+        if len(argv) == 2 and argv[1] in {"show", "list"}:
+            return ""
+    if tuple(argv[:2]) in {("-brief", "addr"), ("-br", "addr"), ("-brief", "link"), ("-br", "link")}:
+        return "" if len(argv) == 2 or (len(argv) == 3 and argv[2] == "show") else "ip brief form only allows show"
+    return "ip only allows addr/link/route show"
 
 
 def _is_python(program: str) -> bool:
