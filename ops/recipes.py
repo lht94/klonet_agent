@@ -36,6 +36,7 @@ INSTALL_NGINX_CONFIG = "install_nginx_config"
 RELOAD_NGINX = "reload_nginx"
 START_DOCKER_CONTAINER = "start_docker_container"
 RUN_OPS_COMMAND = "run_ops_command"
+RUN_OPS_COMMAND_TIMEOUT_SECONDS = 120
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -857,6 +858,21 @@ class ControlledActionRunner:
                 output = self.command_runner(command)
         except subprocess.CalledProcessError as exc:
             return _helper_failure_result(exc)
+        except subprocess.TimeoutExpired as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={RUN_OPS_COMMAND} command_timed_out "
+                    f"timeout_seconds={int(exc.timeout or RUN_OPS_COMMAND_TIMEOUT_SECONDS)} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        except OSError as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_OPS_COMMAND} command_os_error={_one_line(str(exc))}; environment unchanged",
+            )
         return RecipeExecutionResult(
             "completed",
             (
@@ -1141,8 +1157,24 @@ def _run_command(command: list, cwd: str | None = None) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=_command_env(command),
+        timeout=RUN_OPS_COMMAND_TIMEOUT_SECONDS,
     )
     return completed.stdout.strip()
+
+
+def _command_env(command: list) -> dict | None:
+    if not command or Path(str(command[0])).name != "git":
+        return None
+    import os
+
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault(
+        "GIT_SSH_COMMAND",
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15",
+    )
+    return env
 
 
 def _run_command_streaming(command: list) -> str:

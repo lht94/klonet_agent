@@ -49,3 +49,38 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 - OperationPlan 中无 action 的部署步骤不应被当作“已执行成功”，尤其是标题/目的明显描述会修改环境时。
 - prompt 或 planner 应明确要求 `run_ops_command.argv` 使用 JSON array，而不是字符串形式。
 - 意图抽取需要避免把引用的历史平台号识别成端口，把条件性的“停止”识别成当前操作。
+
+## 2026-07-11 第二轮：真实 clone 卡死
+
+### 测试结果
+
+第一版优化后，agent 重新生成计划 `deploy-eeb03e7c45`：
+
+- `mkdir -p /home/klonet-agent/platforms/lht_project` 成功。
+- `git clone gitee:uestc-minenet/vemu_uestc.git .` 成功，后端源码已拉取。
+- `mkdir -p /home/klonet-agent/platforms/lht_project/vemu_frontend` 成功。
+- `git clone git@github.com:lht94/vemu-web.git .` 长时间无输出，外部进程显示卡在 `ssh git@github.com git-upload-pack 'lht94/vemu-web.git'`。
+
+这说明第一版策略解决了目录和 git clone 放行问题，但真实执行层缺少超时和非交互认证保护。
+
+### 第二版优化思路
+
+受控命令执行必须保证“失败可返回”，不能让交互式 SSH、网络连接或认证等待拖住整个 agent：
+
+- 默认 `_run_command` 增加 `timeout=120`。
+- git 命令执行时设置 `GIT_TERMINAL_PROMPT=0`，禁止 Git 交互式提示用户名/密码。
+- git 命令执行时设置 `GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15`，让 SSH 缺密钥或连接失败快速返回。
+- 捕获 `subprocess.TimeoutExpired`，将步骤置为 `blocked` 并要求 `inspect_runtime`，而不是让异常或挂起中断对话。
+- 同步更新 `/usr/local/bin/klonet-agent-op` 对应脚本源码中的 `run-ops-command`，保持 sudo helper 路径和普通路径一致。
+
+### 实现文件
+
+- `ops/recipes.py`
+  - 新增 `RUN_OPS_COMMAND_TIMEOUT_SECONDS`。
+  - `_run_command` 增加 timeout 和 Git 非交互环境。
+  - `_run_ops_command` 捕获 timeout / OSError 并返回结构化 blocked。
+- `scripts/klonet-agent-op`
+  - helper 侧 `run-ops-command` 同样增加 Git 非交互环境。
+- `tests/test_ops_command_policy.py`
+  - 覆盖 Git 命令 env/timeout。
+  - 覆盖 timeout 会变成 blocked。

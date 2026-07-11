@@ -274,6 +274,92 @@ def test_run_ops_command_git_push_requires_confirm_step(tmp_path):
     assert f"confirm-step {plan.plan_id} push" in result
 
 
+def test_run_ops_command_git_uses_noninteractive_env_and_timeout(tmp_path, monkeypatch):
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="cloned\n", stderr="")
+
+    monkeypatch.setattr("klonet_agent.ops.recipes.subprocess.run", fake_run)
+    work = tmp_path / "repo"
+    work.mkdir()
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "clone",
+                "title": "clone",
+                "action": "run_ops_command",
+                "args": {
+                    "program": "git",
+                    "argv": ["clone", "https://github.com/org/repo.git", "."],
+                    "cwd": str(work),
+                },
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    result = store.execute_step(plan.plan_id, "clone")
+
+    assert "command_output=cloned" in result
+    assert calls
+    _command, kwargs = calls[0]
+    assert kwargs["timeout"] == 120
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert "BatchMode=yes" in kwargs["env"]["GIT_SSH_COMMAND"]
+
+
+def test_run_ops_command_timeout_blocks_instead_of_hanging(tmp_path, monkeypatch):
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr("klonet_agent.ops.recipes.subprocess.run", fake_run)
+    work = tmp_path / "repo"
+    work.mkdir()
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "clone",
+                "title": "clone",
+                "action": "run_ops_command",
+                "args": {
+                    "program": "git",
+                    "argv": ["clone", "https://github.com/org/repo.git", "."],
+                    "cwd": str(work),
+                },
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    result = store.execute_step(plan.plan_id, "clone")
+
+    assert "result_status=blocked" in result
+    assert "command_timed_out" in result
+    assert "next_required_action=inspect_runtime" in result
+
+
 def test_helper_run_ops_command_dry_run_contract(tmp_path):
     result = subprocess.run(
         [
