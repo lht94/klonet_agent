@@ -538,3 +538,27 @@ def test_helper_run_ops_command_dry_run_contract(tmp_path):
     assert "action=run-ops-command" in result.stdout
     assert "program=apt" in result.stdout
     assert "environment_changed=false" in result.stdout
+
+
+def test_helper_run_ops_command_allows_apt_reinstall_dry_run():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "run-ops-command",
+            "--dry-run",
+            "--program",
+            "apt",
+            "--argv-json",
+            '["install","--reinstall","-y","python3.8-minimal"]',
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "program=apt" in result.stdout
+    assert "python3.8-minimal" in result.stdout
+    assert "environment_changed=false" in result.stdout

@@ -323,3 +323,28 @@ python3.8 -m pip install gunicorn celery gevent gevent-websocket
 - `tests/test_ops_command_policy.py`
   - 覆盖 apt reinstall 强制二次确认。
   - 覆盖被拒绝的 `run_ops_command` 无法创建计划。
+
+## 2026-07-11 第十轮：计划端允许的 apt reinstall 被 helper 端拒绝
+
+### 测试结果
+
+第九版后，新计划 `deploy-3c328e7676` 正确把 `reinstall-python38` 标成 `dangerous` 且要求 `confirm-step`。确认执行后，真实 helper 返回：
+
+```text
+apt_args_not_allowed
+```
+
+说明 Python 计划端 `ops/command_policy.py` 已允许 `apt install --reinstall ...`，但服务器执行端 `scripts/klonet-agent-op` 仍使用旧白名单，拒绝了同一命令。这是执行链路中的策略漂移。
+
+### 第十版优化思路
+
+- 不绕过到 `dpkg` 手工解包；那会扩大恢复动作的危险面。
+- 同步 helper 端 apt 参数白名单，允许 `--reinstall`，并保持由计划端负责 `dangerous` + `confirm-step`。
+- 增加直接执行 helper dry-run 的测试，确保真正 sudo helper 合同也接受该命令。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - `_validate_ops_command` 的 apt install 选项允许 `--reinstall`。
+- `tests/test_ops_command_policy.py`
+  - 新增 helper dry-run 覆盖 `apt install --reinstall -y python3.8-minimal`。

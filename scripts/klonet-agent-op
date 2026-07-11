@@ -693,7 +693,7 @@ def _validate_ops_command(program: str, argv_json: str, cwd: str) -> tuple[str, 
         if argv[:1] == ["install"]:
             options = {item for item in argv[1:] if item.startswith("-")}
             packages = [item for item in argv[1:] if not item.startswith("-")]
-            if packages and options <= {"-y", "--yes", "--no-install-recommends"}:
+            if packages and options <= {"-y", "--yes", "--no-install-recommends", "--reinstall"}:
                 return "", command, cwd
         return "apt_args_not_allowed", [], ""
     if program == "cp":
