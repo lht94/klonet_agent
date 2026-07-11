@@ -133,6 +133,18 @@ def test_ops_prompt_uses_dedicated_account_platform_path():
 
     assert "/home/klonet-agent/platforms/<platform>_project" in OPS_PROMPT
     assert "不要把历史服务器用户名" in OPS_PROMPT
+    assert "后端仓库通常应 clone 到其下的 `vemu_uestc/`" in OPS_PROMPT
+
+
+def test_ops_prompt_respects_user_pause_before_plan_execution():
+    """Explicit pause requests must not be converted into execution tools."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "暂停" in OPS_PROMPT
+    assert "本轮不得调用 approve_ops_operation_plan" in OPS_PROMPT
+    assert "execute_ops_next_step" in OPS_PROMPT
+    assert "resolve_ops_blocked_step" in OPS_PROMPT
 
 
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():

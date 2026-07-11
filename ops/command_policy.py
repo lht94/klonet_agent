@@ -94,6 +94,8 @@ def decide_ops_command(args: Mapping | None) -> OpsCommandDecision:
         return _decide_apt(program, argv, cwd)
     if program == "mkdir":
         return _decide_mkdir(program, argv, cwd)
+    if program == "ln":
+        return _decide_ln(program, argv, cwd)
     if program in {"cp", "install"}:
         return _decide_file_install(program, argv, cwd)
     if program == "insmod":
@@ -167,6 +169,17 @@ def _decide_mkdir(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDe
     return _allow(program, argv, cwd, risk="controlled", category="workspace_directory_create")
 
 
+def _decide_ln(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
+    if len(argv) != 3 or argv[0] != "-s":
+        return _deny("ln_args_not_allowed")
+    if not cwd:
+        return _deny("ln_requires_cwd")
+    source, link_name = argv[1], argv[2]
+    if not _source_within_cwd(source, cwd) or not _workspace_destination_allowed(link_name, cwd):
+        return _deny("ln_path_not_allowlisted")
+    return _allow(program, argv, cwd, risk="controlled", category="workspace_symlink_create")
+
+
 def _decide_file_install(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
     if program == "install":
         mkdir_destinations = _install_directory_destinations(argv)
@@ -180,18 +193,22 @@ def _decide_file_install(program: str, argv: tuple[str, ...], cwd: str) -> OpsCo
                 return _deny("destination_not_allowlisted")
             return _allow(program, argv, cwd, risk="controlled", category="workspace_directory_create")
     if program == "cp":
-        if len(argv) != 2:
+        if len(argv) < 2:
             return _deny("cp_requires_source_and_destination")
-        source, destination = argv
+        sources = argv[:-1]
+        destination = argv[-1]
     else:
         filtered = tuple(item for item in argv if item not in {"-m", "0644", "0755"})
         if len(filtered) != 2:
             return _deny("install_requires_source_and_destination")
-        source, destination = filtered
+        sources = (filtered[0],)
+        destination = filtered[1]
     if not cwd:
         return _deny(f"{program}_requires_cwd")
-    if not _source_within_cwd(source, cwd):
+    if any(not _source_within_cwd(source, cwd) for source in sources):
         return _deny("source_must_be_within_cwd")
+    if program == "cp" and _workspace_destination_allowed(destination, cwd):
+        return _allow(program, argv, cwd, risk="controlled", category="workspace_file_copy")
     if not _destination_in_system_install_dir(destination):
         return _deny("destination_not_allowlisted")
     return _allow(program, argv, cwd, risk="privileged", sudo=True, step=True, category="system_file_install")

@@ -101,6 +101,35 @@ def test_command_policy_allows_workspace_directory_creation(tmp_path):
     assert unsafe.reason == "destination_not_allowlisted"
 
 
+def test_command_policy_allows_workspace_multi_copy_and_symlink(tmp_path):
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    work = tmp_path / "lht_project"
+    mains = work / "vemu_uestc" / "mains"
+    mains.mkdir(parents=True)
+    copy_decision = decide_ops_command(
+        {
+            "program": "cp",
+            "argv": ["vemu_uestc/mains/gun.py", "vemu_uestc/mains/master_main.py", "."],
+            "cwd": str(work),
+        }
+    )
+    symlink_decision = decide_ops_command(
+        {"program": "ln", "argv": ["-s", ".", "vemu_uestc"], "cwd": str(work)}
+    )
+    unsafe_symlink = decide_ops_command(
+        {"program": "ln", "argv": ["-s", "/etc", "vemu_uestc"], "cwd": str(work)}
+    )
+
+    assert copy_decision.allowed
+    assert copy_decision.category == "workspace_file_copy"
+    assert copy_decision.requires_sudo is False
+    assert symlink_decision.allowed
+    assert symlink_decision.category == "workspace_symlink_create"
+    assert not unsafe_symlink.allowed
+    assert unsafe_symlink.reason == "ln_path_not_allowlisted"
+
+
 def test_command_policy_allows_git_clone_dot_with_cwd_and_reports_missing_cwd():
     from klonet_agent.ops.command_policy import decide_ops_command
 

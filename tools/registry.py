@@ -561,7 +561,7 @@ TOOLS = [
             },
             "steps": {
                 "type": "array",
-                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。需要执行 make、git clone/pull/push/checkout/submodule、apt、cp/install、insmod/rmmod 或 tc qdisc 时，使用 action=run_ops_command，args 使用 program、argv 数组和 cwd。省略 steps 时才使用兼容的默认步骤模板。",
+                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。需要执行 make、git clone/pull/push/checkout/submodule、mkdir、cp/install、ln -s、apt、insmod/rmmod 或 tc qdisc 时，使用 action=run_ops_command，args 使用 program、argv 数组和 cwd。省略 steps 时才使用兼容的默认步骤模板。",
                 "items": {
                     "type": "object",
                     "properties": {

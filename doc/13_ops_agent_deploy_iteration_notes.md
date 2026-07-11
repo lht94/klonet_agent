@@ -84,3 +84,41 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 - `tests/test_ops_command_policy.py`
   - 覆盖 Git 命令 env/timeout。
   - 覆盖 timeout 会变成 blocked。
+
+## 2026-07-11 第三轮：部分部署恢复与暂停指令
+
+### 测试结果
+
+第二版后继续执行旧计划：
+
+- agent 能识别后端已 clone、前端目录为空，并通过 `confirm deploy-eeb03e7c45` 把上次中断的 `running` 步骤转为 `blocked`。
+- agent 做了只读检查后恢复 `clone-frontend`，前端最终 clone 成功。
+- 后续 `copy-startup-files` 被拒，原因是计划使用了多源 `cp`：`cp file1 file2 ... .`，而策略只支持单源单目标。
+- 更重要的是，首版部署计划把后端仓库直接 clone 到 `/home/klonet-agent/platforms/lht_project`。但 `mains/gun.py`、`web_terminal_main.py` 等文件引用 `from vemu_uestc...`，标准结构应区分平台父目录和后端包目录。
+- 当用户明确说“暂停，不要继续执行旧计划，只总结”时，agent 仍继续调用 `resolve_ops_blocked_step` 和读取文件，没有尊重暂停指令。
+
+### 第三版优化思路
+
+本轮优化两个通用方向：
+
+1. 文件整理能力应覆盖 Klonet 部署常见原子操作：
+   - 允许工作区内多源 `cp` 到 cwd 内目标。
+   - 允许工作区内 `ln -s <source> <link>`，但 source 和 link 都必须在 cwd 内，拒绝指向 `/etc` 等外部路径。
+2. 决策提示应防止继续扩大错误计划：
+   - 用户明确暂停时，本轮禁止 approve/execute/resolve，只做总结。
+   - 标准 VEMU 后端应 clone 到平台父目录下的 `vemu_uestc/`，不要直接 clone 到父目录后靠 symlink 掩盖结构问题。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - `cp` 支持多源到工作区目标，分类为 `workspace_file_copy`。
+  - 新增 `ln -s` 受控策略，分类为 `workspace_symlink_create`。
+- `prompts.py`
+  - 增加暂停指令硬约束。
+  - 增加标准 VEMU 后端目录结构要求。
+- `tools/registry.py`
+  - 更新工具说明中的受控命令清单。
+- `tests/test_ops_command_policy.py`
+  - 覆盖多源 `cp`、安全/不安全 symlink。
+- `tests/test_prompt_style.py`
+  - 覆盖暂停规则和 `vemu_uestc/` 目录结构规则。
