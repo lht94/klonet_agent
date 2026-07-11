@@ -370,3 +370,26 @@ apt_args_not_allowed
 - `tests/test_ops_command_policy.py`
   - 覆盖 helper 策略漂移阻塞并提示升级 helper。
   - 覆盖 sudoers/password 问题阻塞并提示安装 sudoers。
+
+## 2026-07-11 第十二轮：helper 策略漂移后模型尝试 apt-get/dpkg 绕路
+
+### 测试结果
+
+第十一版提交前的旧 agent 在 `apt_args_not_allowed` 后继续尝试：
+
+- 生成 `dpkg` 恢复计划，被 `program_not_allowlisted=dpkg` 拒绝。
+- 随后生成 `apt-get install --reinstall ...` 新计划，试图绕过 helper 对 `apt` 的拒绝。
+
+这说明仅靠执行器把 helper mismatch 标为 blocked 还不够，prompt 也需要明确：基础设施合约漂移不是业务恢复路径的一部分。
+
+### 第十二版优化思路
+
+- 当结果包含 `helper_policy_mismatch` 或 helper 返回 `*_args_not_allowed`，且 Python 计划端已允许该命令时，必须停止业务部署并要求升级 installed helper。
+- 禁止把 `apt` 换成 `apt-get`、改用 `dpkg` 解包、手工 sudo 或其它同类系统包命令来绕过 helper 版本漂移。
+
+### 实现文件
+
+- `prompts.py`
+  - 增加 helper policy mismatch 的处理规则。
+- `tests/test_prompt_style.py`
+  - 覆盖不得通过 apt-get/dpkg 绕过 helper 版本漂移。

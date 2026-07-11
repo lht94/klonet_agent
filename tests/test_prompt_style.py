@@ -160,6 +160,18 @@ def test_ops_prompt_routes_python_environment_recovery_through_controlled_plan()
     assert "用受控 `python3.8 -m pip install`" in OPS_PROMPT
 
 
+def test_ops_prompt_blocks_helper_policy_mismatch_workarounds():
+    """Helper contract drift should stop at infrastructure repair."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "helper_policy_mismatch" in OPS_PROMPT
+    assert "升级 installed helper" in OPS_PROMPT
+    assert "apt-get" in OPS_PROMPT
+    assert "dpkg" in OPS_PROMPT
+    assert "绕过 helper 版本漂移" in OPS_PROMPT
+
+
 def test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps():
     """Deploy plans should not defer bindings for later."""
 
