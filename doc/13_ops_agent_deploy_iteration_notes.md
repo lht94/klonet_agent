@@ -152,3 +152,47 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 - `tests/test_ops_operations.py`
   - 更新 root 脚本 helper 测试。
   - 新增 helper 返回成功但后置条件缺失时 blocked 的回归测试。
+
+## 2026-07-11 第五轮：环境恢复建议绕过受控计划
+
+### 测试结果
+
+第四版后重新启动 ops agent，并要求“不要继续旧计划、不要再运行 base_requ_setup.sh，只做只读检查”。agent 表现有明显改善：
+
+- 遵守了暂停要求，只做只读诊断。
+- 正确指出 `python3.8`、`pip3.8`、`gunicorn`、`celery` 均不可用，`/usr/local/python3/bin/` 不存在。
+- 正确指出前端已 clone，后端被直接 clone 到 `lht_project` 根目录。
+
+但在恢复建议中，agent 给出了类似：
+
+```bash
+curl -sS https://bootstrap.pypa.io/get-pip.py | python3.8
+python3.8 -m pip install gunicorn celery gevent gevent-websocket
+```
+
+这违反了 Ops 的受控执行边界：不能建议用户复制 shell 管道，也不能把环境修复选择题丢给用户。环境恢复应进入 OperationPlan，并使用结构化 `run_ops_command`。
+
+### 第五版优化思路
+
+- 将受控 Python 包安装纳入 `run_ops_command`：
+  - 允许 `pythonX -m pip install <安全包名>`。
+  - 允许 `pipX install <安全包名>`。
+  - 禁止 `-r requirements.txt`、URL wheel、任意 `python -c`。
+  - pip 安装标记为 `dangerous`，需要 `confirm-step`。
+- 更新 Ops prompt 和工具说明：
+  - 环境恢复必须用 OperationPlan。
+  - 禁止建议 `curl | python`、手工 sudo 或绕过 helper 的 shell。
+  - base_requ_setup 后置条件失败时，优先用受控 apt + 受控 pip 步骤恢复；缺能力时明确报告通用能力缺失。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - 新增 Python/pip 受控安装策略。
+- `prompts.py`
+  - 增加环境恢复边界和禁止 shell 管道规则。
+- `tools/registry.py`
+  - 更新工具 schema 描述中的受控命令清单。
+- `tests/test_ops_command_policy.py`
+  - 覆盖允许的 Python/pip 安装形式和拒绝的非受控形式。
+- `tests/test_prompt_style.py`
+  - 覆盖环境恢复必须走受控计划。

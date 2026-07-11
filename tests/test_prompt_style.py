@@ -147,6 +147,18 @@ def test_ops_prompt_respects_user_pause_before_plan_execution():
     assert "resolve_ops_blocked_step" in OPS_PROMPT
 
 
+def test_ops_prompt_routes_python_environment_recovery_through_controlled_plan():
+    """Environment recovery should not suggest shell-pipe bypasses."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "python -m pip install" in OPS_PROMPT
+    assert "pip install" in OPS_PROMPT
+    assert "不得建议 `curl | python`" in OPS_PROMPT
+    assert "用受控 apt 安装系统包" in OPS_PROMPT
+    assert "用受控 `python3.8 -m pip install`" in OPS_PROMPT
+
+
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():
     """Port/PID/cwd questions should prefer precise process evidence first."""
 

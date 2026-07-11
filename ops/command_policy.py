@@ -92,6 +92,10 @@ def decide_ops_command(args: Mapping | None) -> OpsCommandDecision:
         return _decide_git(program, argv, cwd)
     if program in {"apt", "apt-get"}:
         return _decide_apt(program, argv, cwd)
+    if _is_python(program):
+        return _decide_python(program, argv, cwd)
+    if _is_pip(program):
+        return _decide_pip(program, argv, cwd)
     if program == "mkdir":
         return _decide_mkdir(program, argv, cwd)
     if program == "ln":
@@ -156,6 +160,42 @@ def _decide_apt(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
             return _deny("apt_package_not_allowed")
         return _allow(program, argv, cwd, risk="dangerous", sudo=True, step=True, category="system_package_install")
     return _deny("apt_args_not_allowed")
+
+
+def _decide_python(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
+    if len(argv) >= 4 and argv[:3] == ("-m", "pip", "install"):
+        return _decide_pip_install(program, argv[3:], cwd, category="python_package_install")
+    return _deny("python_args_not_allowed")
+
+
+def _decide_pip(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
+    if len(argv) >= 2 and argv[0] == "install":
+        return _decide_pip_install(program, argv[1:], cwd, category="python_package_install")
+    return _deny("pip_args_not_allowed")
+
+
+def _decide_pip_install(
+    program: str,
+    raw_args: tuple[str, ...],
+    cwd: str,
+    *,
+    category: str,
+) -> OpsCommandDecision:
+    if not raw_args:
+        return _deny("pip_install_requires_packages")
+    options = [item for item in raw_args if item.startswith("-")]
+    packages = [item for item in raw_args if not item.startswith("-")]
+    if not packages:
+        return _deny("pip_install_requires_packages")
+    if any(item in {"-r", "--requirement"} or item.startswith("-r") for item in options):
+        return _deny("pip_requirements_file_not_allowed")
+    allowed_options = {"--no-cache-dir", "--disable-pip-version-check", "--upgrade", "-U"}
+    if any(item not in allowed_options for item in options):
+        return _deny("pip_option_not_allowed")
+    if any(not SAFE_PACKAGE.fullmatch(item) for item in packages):
+        return _deny("pip_package_not_allowed")
+    argv = ("-m", "pip", "install", *raw_args) if _is_python(program) else ("install", *raw_args)
+    return _allow(program, argv, cwd, risk="dangerous", step=True, category=category)
 
 
 def _decide_mkdir(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
@@ -279,6 +319,14 @@ def _valid_cwd(cwd: str) -> bool:
 
 def _safe_arg(value: str) -> bool:
     return bool(value and SAFE_NAME.fullmatch(value)) or value == ""
+
+
+def _is_python(program: str) -> bool:
+    return bool(re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", program))
+
+
+def _is_pip(program: str) -> bool:
+    return bool(re.fullmatch(r"pip(?:\d+(?:\.\d+)*)?", program))
 
 
 def _normalize_argv(raw) -> object:

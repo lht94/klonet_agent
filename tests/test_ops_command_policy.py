@@ -44,6 +44,73 @@ def test_command_policy_classifies_apt_install_as_step_confirmed_sudo():
     assert decision.requires_step_confirmation is True
 
 
+def test_command_policy_allows_controlled_python_package_install():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    python = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": [
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "gunicorn",
+                "celery",
+                "gevent-websocket",
+            ],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    pip = decide_ops_command(
+        {
+            "program": "pip3.8",
+            "argv": ["install", "--no-cache-dir", "gunicorn"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+
+    assert python.allowed
+    assert python.category == "python_package_install"
+    assert python.requires_step_confirmation is True
+    assert python.requires_sudo is False
+    assert pip.allowed
+    assert pip.category == "python_package_install"
+
+
+def test_command_policy_rejects_uncontrolled_python_package_install_forms():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    requirements = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-m", "pip", "install", "-r", "requirements.txt"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    url = decide_ops_command(
+        {
+            "program": "pip3.8",
+            "argv": ["install", "https://example.com/pkg.whl"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    code = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-c", "print(1)"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+
+    assert not requirements.allowed
+    assert requirements.reason == "pip_requirements_file_not_allowed"
+    assert not url.allowed
+    assert url.reason == "pip_package_not_allowed"
+    assert not code.allowed
+    assert code.reason == "python_args_not_allowed"
+
+
 def test_command_policy_allows_selected_git_workflows():
     from klonet_agent.ops.command_policy import decide_ops_command
 
