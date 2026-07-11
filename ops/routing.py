@@ -133,15 +133,30 @@ def _looks_like_platform_number(text: str, start: int, end: int) -> bool:
 
 
 def _action_for(lowered: str) -> str:
+    action_text = _strip_conditional_stop_constraints(lowered)
     if any(term in lowered for term in ("销毁", "destroy", "删除平台")):
         return "destroy"
     if any(term in lowered for term in ("部署", "新平台", "deploy")):
         return "deploy"
     if any(term in lowered for term in ("重启", "restart")):
         return "restart"
-    if any(term in lowered for term in ("kill", "停止", "停掉", "stop")):
+    if any(term in action_text for term in ("kill", "停止", "停掉", "stop")):
         return "stop"
     return "inspect"
+
+
+def _strip_conditional_stop_constraints(text: str) -> str:
+    """Remove safety constraints such as "stop if it fails" before action routing."""
+
+    patterns = [
+        r"(?:如果|若|如若|一旦|遇到|碰到|发现)[^。；;\n]*(?:失败|报错|错误|异常|阻塞|blocked)[^。；;\n]*(?:停止|停下|暂停|stop)",
+        r"(?:失败|报错|错误|异常|阻塞|blocked)[^。；;\n]*(?:停止|停下|暂停|stop)",
+        r"(?:不要|别|禁止)[^。；;\n]*(?:继续|自行|自动)[^。；;\n]*(?:执行|推进|运行)",
+    ]
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+    return cleaned
 
 
 def _dedupe(items) -> List[str]:

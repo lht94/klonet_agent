@@ -261,3 +261,38 @@ python3.8 -m pip install gunicorn celery gevent gevent-websocket
   - 强化敏感字段脱敏和继承规则。
 - `tests/test_prompt_style.py`
   - 覆盖 Nginx 直写禁令和明文密钥禁令。
+
+## 2026-07-11 第八轮：只读诊断误报 allowlist，条件性停止误触发
+
+### 测试结果
+
+第七版后，agent 生成 `deploy-c30bb6e1a9`：
+
+- 所有修改步骤都已绑定 action + args。
+- 后端路径纠正为 `/home/klonet-agent/platforms/lht_project/vemu_config/config.py`。
+- Nginx 使用 staging conf -> `install_nginx_config` -> `reload_nginx`，未直接写 `/etc/nginx`。
+- `LhtConfig` 不再写入明文 `redis_password`。
+- 用户要求“只生成 OperationPlan，不执行”时，计划保持 pending，未自动执行。
+
+继续确认计划并执行到 `pip-install-deps` 后，新暴露两个通用问题：
+
+- `python3.8` 不在 PATH，agent 诊断 `/usr/bin/python3.8` 时，`run_readonly_command` 返回 `program_not_allowlisted=/usr/bin/python3.8`。实际问题是绝对路径允许但可能不存在、不可执行或是断链；把它报成 allowlist 问题会误导后续判断。
+- 用户说“如果任何步骤失败，先停止并报告原因”时，Ops 路由摘要出现 `action=stop`。这是条件性安全约束，不是当前停止平台操作。
+
+### 第八版优化思路
+
+- 只读终端解析绝对路径时先按 basename 走同一套允许程序和参数校验，再区分 `program_path_not_found`、`program_path_broken_symlink`、`program_path_not_executable` 等可诊断错误。
+- 增加只读 `dpkg -l/-s`，使 agent 能诊断 apt 包安装状态，而不是只能靠 `which` 和 `ls`。
+- Ops 路由在判断 stop action 前剔除“如果失败/报错/阻塞就停止”这类条件性停止短语，避免把恢复策略中的安全约束误解为当前操作。
+
+### 实现文件
+
+- `tools/read_only_terminal.py`
+  - 绝对路径程序返回具体路径问题，不再混同为 `program_not_allowlisted`。
+  - 新增安全 `dpkg` 诊断。
+- `ops/routing.py`
+  - 新增条件性停止约束清洗。
+- `tests/test_read_only_terminal.py`
+  - 覆盖断链绝对路径、允许的绝对路径执行、安全 `dpkg`。
+- `tests/test_ops_routing.py`
+  - 覆盖“失败就停止”不触发 `action=stop`。
