@@ -348,3 +348,25 @@ apt_args_not_allowed
   - `_validate_ops_command` 的 apt install 选项允许 `--reinstall`。
 - `tests/test_ops_command_policy.py`
   - 新增 helper dry-run 覆盖 `apt install --reinstall -y python3.8-minimal`。
+
+## 2026-07-11 第十一轮：helper 未升级应阻塞而不是生成替代高危方案
+
+### 测试结果
+
+第十版代码提交后，仓库内 `scripts/klonet-agent-op` 已支持 `--reinstall`，但实际执行路径 `/usr/local/bin/klonet-agent-op` 仍是旧 root-owned helper。当前账号无法通过 `sudo -n install ... /usr/local/bin/klonet-agent-op` 覆盖它，手动 sudo 返回 `sudo: a password is required`。
+
+这说明部署继续阻塞在“受控执行基础设施未升级”，而不是业务平台配置问题。agent 在 helper 返回 `apt_args_not_allowed` 后曾倾向于建议 `dpkg` 解包等替代方案，这不合适：问题是 helper 版本漂移，应先升级 helper 或修 sudoers。
+
+### 第十一版优化思路
+
+- helper 端返回 `*_args_not_allowed` 时，Python runner 将其识别为 `helper_policy_mismatch`，状态为 blocked，下一步明确为 `upgrade_installed_ops_helper`。
+- sudo 返回 password/no tty 时，识别为 `helper_sudo_not_configured`，下一步明确为 `install_ops_helper_sudoers`。
+- 这类基础设施阻塞不应被包装成业务步骤失败，也不应引导模型改走更宽泛、更危险的系统修复命令。
+
+### 实现文件
+
+- `ops/recipes.py`
+  - `_helper_failure_result` 增加 helper policy mismatch 和 sudoers/password failure 的 blocked 分类。
+- `tests/test_ops_command_policy.py`
+  - 覆盖 helper 策略漂移阻塞并提示升级 helper。
+  - 覆盖 sudoers/password 问题阻塞并提示安装 sudoers。

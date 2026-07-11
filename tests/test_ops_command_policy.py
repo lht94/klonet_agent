@@ -516,6 +516,87 @@ def test_run_ops_command_timeout_blocks_instead_of_hanging(tmp_path, monkeypatch
     assert "next_required_action=inspect_runtime" in result
 
 
+def test_run_ops_command_helper_policy_mismatch_blocks_for_upgrade(tmp_path):
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(
+            2,
+            command,
+            output="",
+            stderr="klonet_agent_op error=apt_args_not_allowed environment_changed=false",
+        )
+
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False, command_runner=command_runner),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "reinstall-python",
+                "title": "reinstall python",
+                "action": "run_ops_command",
+                "args": {
+                    "program": "apt",
+                    "argv": ["install", "--reinstall", "-y", "python3.8-minimal"],
+                },
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    store.approve_step(plan.plan_id, "reinstall-python")
+    result = store.execute_step(plan.plan_id, "reinstall-python")
+
+    assert "result_status=blocked" in result
+    assert "helper_policy_mismatch" in result
+    assert "next_required_action=upgrade_installed_ops_helper" in result
+
+
+def test_run_ops_command_sudo_password_failure_blocks_for_sudoers(tmp_path):
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output="",
+            stderr="sudo: a password is required",
+        )
+
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False, command_runner=command_runner),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "apt-update",
+                "title": "apt update",
+                "action": "run_ops_command",
+                "args": {"program": "apt", "argv": ["update"]},
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    store.approve_step(plan.plan_id, "apt-update")
+    result = store.execute_step(plan.plan_id, "apt-update")
+
+    assert "result_status=blocked" in result
+    assert "helper_sudo_not_configured" in result
+    assert "next_required_action=install_ops_helper_sudoers" in result
+
+
 def test_helper_run_ops_command_dry_run_contract(tmp_path):
     result = subprocess.run(
         [

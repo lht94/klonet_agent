@@ -1233,6 +1233,18 @@ def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
         f"stderr={stderr} "
         f"stdout={stdout}"
     )
+    if _looks_like_sudo_password_failure(stderr):
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_sudo_not_configured {output}",
+            "install_ops_helper_sudoers",
+        )
+    if _looks_like_helper_policy_mismatch(stderr):
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_policy_mismatch {output}",
+            "upgrade_installed_ops_helper",
+        )
     if "environment_changed=unknown" in stderr:
         return RecipeExecutionResult(
             "blocked",
@@ -1240,6 +1252,20 @@ def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
             "inspect_runtime",
         )
     return RecipeExecutionResult("failed", output)
+
+
+def _looks_like_sudo_password_failure(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    return "sudo:" in lowered and (
+        "password is required" in lowered
+        or "a password is required" in lowered
+        or "no tty present" in lowered
+    )
+
+
+def _looks_like_helper_policy_mismatch(stderr: str) -> bool:
+    text = stderr or ""
+    return bool(re.search(r"\berror=[A-Za-z0-9_]+_args_not_allowed\b", text))
 
 
 def _nginx_helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
