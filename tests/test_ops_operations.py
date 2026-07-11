@@ -818,6 +818,65 @@ def test_store_completes_normal_unbound_step_as_readonly_checkpoint():
     assert _status_by_step(loaded)["precheck-runtime"] == "completed"
 
 
+def test_custom_deploy_mutating_checkpoint_without_action_blocks():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="deploy lht",
+            steps=[
+                {
+                    "step_id": "config-lht",
+                    "title": "配置 LhtConfig",
+                    "purpose": "增量编辑 config.py 并切换 PROJ_CONFIG",
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "config-lht")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "mutating_checkpoint_requires_action_binding" in result
+    assert "next_required_action=attach an allowlisted action before retrying" in result
+    assert _status_by_step(loaded)["config-lht"] == "blocked"
+
+
+def test_custom_deploy_readonly_checkpoint_without_action_can_complete():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="deploy lht",
+            steps=[
+                {
+                    "step_id": "verify-deps",
+                    "title": "验证依赖可用",
+                    "purpose": "只读检查 python3.8 gunicorn celery 是否可用",
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "verify-deps")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "readonly_or_manual_checkpoint_completed" in result
+    assert _status_by_step(loaded)["verify-deps"] == "completed"
+
+
 def test_store_execute_next_step_uses_current_execution_order():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir

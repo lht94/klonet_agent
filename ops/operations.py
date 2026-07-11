@@ -289,6 +289,23 @@ class OperationPlanStore:
                         "provide operation_args.project_root or bind a readonly precheck recipe"
                     ),
                 )
+            if _unbound_step_looks_mutating(plan, step):
+                step.status = "blocked"
+                _record_observation(
+                    step,
+                    "mutating_checkpoint_requires_action_binding; environment unchanged",
+                )
+                self.save_plan(plan)
+                return _render_step_execution(
+                    plan,
+                    step,
+                    previous_status=previous_status,
+                    result_status="blocked",
+                    execution_result=(
+                        "mutating_checkpoint_requires_action_binding; environment unchanged"
+                    ),
+                    next_required_action="attach an allowlisted action before retrying",
+                )
             if not step.requires_step_confirmation and step.risk == "normal":
                 step.status = "completed"
                 _record_observation(
@@ -760,6 +777,46 @@ def _action_type_for_recipe(recipe_id: str) -> str:
     if not spec:
         return recipe_id
     return spec.aliases[0] if spec.aliases else spec.name
+
+
+def _unbound_step_looks_mutating(plan: OperationPlan, step: OperationStep) -> bool:
+    if plan.steps_source != "custom" or plan.operation != "deploy_platform":
+        return False
+    text = " ".join([step.step_id, step.title, step.purpose]).lower()
+    mutating_markers = (
+        "install",
+        "安装",
+        "copy",
+        "复制",
+        "config",
+        "configure",
+        "配置",
+        "write",
+        "写",
+        "修改",
+        "生成",
+        "install_nginx",
+        "nginx",
+        "reload",
+        "重载",
+        "start",
+        "启动",
+        "clone",
+        "克隆",
+    )
+    readonly_markers = (
+        "verify",
+        "验证",
+        "check",
+        "检查",
+        "inspect",
+        "只读",
+        "precheck",
+        "预检",
+    )
+    return any(marker in text for marker in mutating_markers) and not any(
+        marker in text for marker in readonly_markers
+    )
 
 
 def _default_permission(step: OperationStep) -> str:

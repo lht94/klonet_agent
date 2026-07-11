@@ -196,3 +196,34 @@ python3.8 -m pip install gunicorn celery gevent gevent-websocket
   - 覆盖允许的 Python/pip 安装形式和拒绝的非受控形式。
 - `tests/test_prompt_style.py`
   - 覆盖环境恢复必须走受控计划。
+
+## 2026-07-11 第六轮：修改步骤被建成 checkpoint 占位
+
+### 测试结果
+
+第五版后，agent 已经不再建议 `curl | python`，而是生成了受控恢复计划 `deploy-5e17f42af1`：
+
+- `apt-install-pip` 使用 `run_ops_command`，需要 `confirm-step`。
+- `pip-install-deps` 使用 `python3.8 -m pip install`，需要 `confirm-step`。
+- 没有继续运行 `base_requ_setup.sh`。
+
+但计划中 `config-lht`、`config-terminal-port`、`config-nginx`、`config-frontend` 被创建成无 action 的 checkpoint，并且 agent 说明“执行前我会补充 action binding”。这会复发早期问题：无 action 的普通 checkpoint 会被状态机当成已完成，造成配置并未写入但计划显示成功。
+
+### 第六版优化思路
+
+- 状态机层兜底：自定义 `deploy_platform` 计划中，标题/目的看起来会修改环境的无 action 步骤必须 blocked，不能 completed。
+- 只读验证类 checkpoint 仍允许完成，例如 `verify-deps`。
+- Prompt 明确：安装、clone、复制、写配置、Nginx、reload、启动服务等修改步骤必须在创建计划时就绑定 action + args，不得先占位后补。
+
+### 实现文件
+
+- `ops/operations.py`
+  - 新增 `_unbound_step_looks_mutating`。
+  - 修改步骤无 action 时的执行分支，对 mutating checkpoint 返回 blocked。
+- `prompts.py`
+  - 增加“创建计划时必须绑定 action”的规则。
+- `tests/test_ops_operations.py`
+  - 覆盖修改型 checkpoint blocked。
+  - 覆盖只读 checkpoint 仍可完成。
+- `tests/test_prompt_style.py`
+  - 覆盖 prompt 规则。

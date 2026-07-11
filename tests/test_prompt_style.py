@@ -159,6 +159,16 @@ def test_ops_prompt_routes_python_environment_recovery_through_controlled_plan()
     assert "用受控 `python3.8 -m pip install`" in OPS_PROMPT
 
 
+def test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps():
+    """Deploy plans should not defer bindings for later."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "必须在创建计划时就绑定具体 action 和 args" in OPS_PROMPT
+    assert "不得创建“checkpoint 占位步骤”" in OPS_PROMPT
+    assert "未绑定 action 的修改步骤会被状态机阻塞" in OPS_PROMPT
+
+
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():
     """Port/PID/cwd questions should prefer precise process evidence first."""
 
