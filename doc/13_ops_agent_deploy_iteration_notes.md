@@ -690,3 +690,31 @@ python3.8 -s -m pip install --user flask-socketio
   - `_decide_pip_install` 允许 `--user` 并保留 Python 前缀。
 - `tests/test_ops_command_policy.py`
   - 覆盖 `python3.8 -s -m pip install --user flask-socketio` 被允许且需要二次确认。
+
+## 2026-07-12 第二十二轮：受控写文件过窄导致 agent 试图绕到 sed/python -c
+
+### 测试结果
+
+Docker socket 权限问题来自 `config_prometheus.py` 顶层 `import docker`。agent 正确选择“小范围代码修复”，但 `write_ops_file` 拒绝了普通项目 `.py`：
+
+```text
+unsupported_file_type=config_prometheus.py
+```
+
+随后 agent 尝试改用 `sed`，又被 `program_not_allowlisted=sed` 拒绝；再尝试 `python3.8 -c` 过滤文件，也会被 Python 策略拒绝。  
+这说明结构化写文件能力太窄，反而诱导 agent 寻找更不透明的 shell/脚本绕路。
+
+### 第二十二版优化思路
+
+- 允许非系统路径下的普通 `.py` 通过 `write_ops_file` 修改。
+- 继续拒绝 `/etc`、`/usr`、`/bin`、`/sbin`、`/lib*` 等系统 Python 路径。
+- 保留敏感文件名拒绝、Nginx 直接写入限制和备份机制。
+
+### 实现文件
+
+- `ops/recipes.py`
+  - `.py` 文件支持从固定启动文件白名单扩展到非系统路径。
+  - 新增 `_is_system_ops_write_path`。
+- `tests/test_ops_operations.py`
+  - 更新普通项目 `.py` 可写契约。
+  - 新增系统 `.py` 路径仍被拒绝的测试。

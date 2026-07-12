@@ -2250,7 +2250,7 @@ def test_write_ops_file_recipe_allows_klonet_startup_source_files():
         assert all(target.read_text(encoding="utf-8") == "# startup config\n" for target in targets)
 
 
-def test_write_ops_file_recipe_blocks_non_startup_python_source_files():
+def test_write_ops_file_recipe_allows_project_python_source_files():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
     from tests.helpers import local_temp_dir
@@ -2282,10 +2282,44 @@ def test_write_ops_file_recipe_blocks_non_startup_python_source_files():
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "prepare-files")
+        assert "result_status=completed" in result
+        assert target.read_text(encoding="utf-8") == "# business logic\n"
+
+
+def test_write_ops_file_recipe_blocks_system_python_source_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write system source",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": "/usr/lib/python3/dist-packages/topo.py",
+                        "content": "# system logic\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
 
     assert "result_status=blocked" in result
     assert "unsupported_file_type=topo.py" in result
-    assert not target.exists()
 
 
 def test_write_ops_file_recipe_blocks_sensitive_paths():

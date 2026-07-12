@@ -1174,8 +1174,17 @@ def _is_supported_ops_write_path(path: Path) -> bool:
     if lower_name in SAFE_OPS_WRITE_NAMES or lower_name.startswith("dockerfile"):
         return True
     if path.suffix.lower() == ".py":
-        return False
+        return not _is_system_ops_write_path(path)
     return path.suffix.lower() in SAFE_OPS_WRITE_SUFFIXES
+
+
+def _is_system_ops_write_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path.absolute()
+    system_roots = (Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64"))
+    return any(resolved == root or root in resolved.parents for root in system_roots)
 
 
 def _ops_backup_path(path: Path) -> Path:
