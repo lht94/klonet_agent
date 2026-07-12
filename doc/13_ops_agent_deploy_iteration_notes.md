@@ -800,3 +800,40 @@ program_not_allowlisted=usermod
   - 覆盖 sudoers 项。
 - `tests/test_ops_operations.py`
   - 覆盖 action 需要二次确认并调用 helper。
+
+## 2026-07-12 第二十五轮：pip 版本约束被误判为不安全包名
+
+### 测试结果
+
+安装 `flask-uploads` 后，启动预检出现：
+
+```text
+ImportError: cannot import name 'secure_filename' from 'werkzeug'
+```
+
+agent 正确判断需要降级 Werkzeug，但：
+
+```text
+pip install werkzeug<3.0
+```
+
+被 `pip_package_not_allowed` 拒绝。agent 随后改用：
+
+```text
+pip install werkzeug==2.3.7
+```
+
+同样会被旧的包名正则拒绝，因为正则只允许裸包名，不允许 PEP 440 版本 specifier。
+
+### 第二十五版优化思路
+
+- 允许安全的 pip 版本约束字符：`==`、`<`、`>=`、`!=`、`~=`、逗号范围等。
+- 仍然拒绝 URL、路径、requirements 文件和未 allowlist 的 pip 选项。
+- 风险级别保持 `dangerous`，继续要求 `confirm-step`。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - 扩展 `SAFE_PACKAGE` 正则，支持版本 specifier。
+- `tests/test_ops_command_policy.py`
+  - 覆盖 `werkzeug==2.3.7` 和 `werkzeug<3.0,>=2.3`。

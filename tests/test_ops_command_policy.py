@@ -129,6 +129,30 @@ def test_command_policy_allows_python_no_user_site_package_install():
     assert decision.requires_step_confirmation is True
 
 
+def test_command_policy_allows_safe_python_package_version_specifiers():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    exact = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-s", "-m", "pip", "install", "--user", "werkzeug==2.3.7"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    range_spec = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-m", "pip", "install", "werkzeug<3.0,>=2.3"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+
+    assert exact.allowed
+    assert exact.requires_step_confirmation is True
+    assert range_spec.allowed
+    assert range_spec.requires_step_confirmation is True
+
+
 def test_command_policy_rejects_uncontrolled_python_package_install_forms():
     from klonet_agent.ops.command_policy import decide_ops_command
 

@@ -25,7 +25,7 @@ SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./@+:-]{0,200}$")
 SAFE_GIT_URL = re.compile(
     r"^(?:https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|(?:git@)?[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+\.git)$"
 )
-SAFE_PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:-]{0,120}$")
+SAFE_PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:!<>=~,-]{0,120}$")
 SAFE_MODULE = re.compile(r"^[A-Za-z0-9_][-A-Za-z0-9_]{0,120}$")
 ALLOWED_COMMAND_ENV = {"PYTHONNOUSERSITE": {"1"}}
 SYSTEM_INSTALL_DIRS = (
