@@ -718,3 +718,40 @@ unsupported_file_type=config_prometheus.py
 - `tests/test_ops_operations.py`
   - 更新普通项目 `.py` 可写契约。
   - 新增系统 `.py` 路径仍被拒绝的测试。
+
+## 2026-07-12 第二十三轮：write_ops_file 的 anchor 被清洗丢失缩进
+
+### 测试结果
+
+agent 在 `link_operate.py` 中尝试把：
+
+```python
+    client =  docker.from_env()
+```
+
+替换成：
+
+```python
+    import docker
+    client =  docker.from_env()
+```
+
+但 `write_ops_file` 连续返回：
+
+```text
+anchor_match_count=0 expected=1
+```
+
+根因不是文件内容不匹配，而是 OperationPlan 保存 action args 时对所有字符串做 `_one_line(...).strip()`，导致 `anchor` 的前导缩进被清掉。对 Python 代码来说，anchor 的空白是语义和匹配的一部分。
+
+### 第二十三版优化思路
+
+- `write_ops_file.content` 已经保留原始字符串，`anchor` 也应同样保留。
+- 只对 `write_ops_file.anchor` 放宽，避免影响其它 action 参数的紧凑化/安全展示。
+
+### 实现文件
+
+- `ops/operations.py`
+  - `_apply_action_bindings` 对 `write_ops_file.anchor` 保留原始字符串。
+- `tests/test_ops_operations.py`
+  - 覆盖带前导空格的 `replace_text` anchor 可以成功匹配并保留缩进。

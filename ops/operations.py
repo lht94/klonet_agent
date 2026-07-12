@@ -903,6 +903,9 @@ def _apply_action_bindings(plan: OperationPlan, action_bindings: dict) -> None:
             if effective_action == "write_ops_file" and normalized_key == "content":
                 step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
                 continue
+            if effective_action == "write_ops_file" and normalized_key == "anchor":
+                step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+                continue
             step.args[normalized_key] = _one_line(str(value), 300)
         problem = _validate_plan_action_args(effective_action, step.args)
         if problem:

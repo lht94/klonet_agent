@@ -2286,6 +2286,50 @@ def test_write_ops_file_recipe_allows_project_python_source_files():
         assert target.read_text(encoding="utf-8") == "# business logic\n"
 
 
+def test_write_ops_file_recipe_preserves_indented_anchor():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / "link_operate.py"
+        target.write_text("def delete_ovs_port():\n    client =  docker.from_env()\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="insert lazy import",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "mode": "replace_text",
+                        "anchor": "    client =  docker.from_env()",
+                        "content": "    import docker\n    client =  docker.from_env()",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+        assert "result_status=completed" in result
+        assert target.read_text(encoding="utf-8") == (
+            "def delete_ovs_port():\n"
+            "    import docker\n"
+            "    client =  docker.from_env()\n"
+        )
+
+
 def test_write_ops_file_recipe_blocks_system_python_source_files():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
