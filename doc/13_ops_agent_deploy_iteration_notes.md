@@ -546,6 +546,7 @@ start_postcondition_failed missing_started_screens=lht_m,lht_c,lht_web,lht_w mis
   - gunicorn master/worker 使用 `--check-config`。
   - celery 和 web terminal 做入口导入检查。
   - 预检失败时返回 `startup_preflight_failed component=... detail=...`，并保持 `environment_changed=false`。
+  - 预检详情使用更长的单行摘要，保留 `No module named '...'` 这类可直接行动的包名线索。
 - 这样 agent 下一轮可以基于具体异常安装缺失依赖、修正包名/部署目录，而不是对“screen 秒退”盲猜。
 
 ### 实现文件

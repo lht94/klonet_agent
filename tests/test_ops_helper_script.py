@@ -699,6 +699,25 @@ def test_start_platform_screens_helper_execute_blocks_on_startup_preflight(monke
     assert "environment_changed=false" in captured.err
 
 
+def test_startup_preflight_keeps_import_error_package_name(monkeypatch):
+    helper = _load_helper_module()
+
+    class Completed:
+        returncode = 1
+        stdout = ""
+        stderr = (
+            "Traceback " + "frame " * 120 +
+            "ModuleNotFoundError: No module named 'numpy'"
+        )
+
+    monkeypatch.setattr(helper.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    problem = helper.startup_preflight_problem("/home/adminis/lht/103_project/vemu_uestc")
+
+    assert "startup_preflight_failed component=master" in problem
+    assert "No module named 'numpy'" in problem
+
+
 def test_start_platform_screens_helper_execute_rejects_existing_screen_session(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []

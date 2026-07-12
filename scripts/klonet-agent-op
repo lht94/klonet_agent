@@ -1022,7 +1022,8 @@ def startup_preflight_problem(project_root: str) -> str:
         except subprocess.TimeoutExpired as exc:
             return (
                 f"startup_preflight_failed component={component} "
-                f"reason=timeout stdout={_one_line(exc.stdout or '')} stderr={_one_line(exc.stderr or '')}"
+                f"reason=timeout stdout={_one_line(exc.stdout or '', limit=1200)} "
+                f"stderr={_one_line(exc.stderr or '', limit=1200)}"
             )
         except OSError as exc:
             return (
@@ -1030,7 +1031,7 @@ def startup_preflight_problem(project_root: str) -> str:
                 f"reason={exc.__class__.__name__} message={_one_line(str(exc))}"
             )
         if completed.returncode != 0:
-            detail = _one_line((completed.stderr or completed.stdout or "").strip())
+            detail = _one_line((completed.stderr or completed.stdout or "").strip(), limit=1200)
             return (
                 f"startup_preflight_failed component={component} "
                 f"returncode={completed.returncode} detail={detail or 'empty_output'}"
@@ -1128,8 +1129,8 @@ def runtime_user() -> str:
     return user
 
 
-def _one_line(text: str) -> str:
-    return " ".join(str(text or "").split())[:500]
+def _one_line(text: str, *, limit: int = 500) -> str:
+    return " ".join(str(text or "").split())[:limit]
 
 
 if __name__ == "__main__":
