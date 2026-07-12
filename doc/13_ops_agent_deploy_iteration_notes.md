@@ -452,3 +452,35 @@ apt_args_not_allowed
   - 覆盖 reload-nginx 精确 sudoers 项。
 - `tests/test_ops_operations.py`
   - 覆盖 reload_nginx sudoers 缺失时 blocked。
+
+## 2026-07-12 第十五轮：start-platform-screens 命令成功但服务未存活
+
+### 测试结果
+
+修复 sudoers 后，前端配置收尾完成，agent 进入平台冷启动。它先错误尝试 `restart_platform`、`screen`、`gunicorn`、`python3.8 -m gunicorn`、`bash` 等路径，最终在用户纠正后用 `deploy_platform` 默认模板触发 `start_platform_screens`。
+
+`start_platform_screens` 返回 completed，但健康验收显示：
+
+- `screen` 在 `klonet-agent` 用户下不可见。
+- 27700/27701/27702 均未监听。
+- `gunicorn/celery/web_terminal` 进程不存在。
+
+根因是 helper 只检查了 `screen -dmS ...` 命令是否返回成功，没有检查 screen 会话和端口是否在短时间后仍存活。服务启动后立即崩溃时，计划会被误标为完成。
+
+### 第十五版优化思路
+
+- helper 执行 `start-platform-screens --execute` 后，等待短时间做后置条件验证。
+- 验证目标：
+  - `lht_m/lht_c/lht_web/lht_w` screen 会话存在。
+  - `master_port`、`worker_port`、`web_terminal_port`/`terminal_port` 监听。
+- 不把 `public_port`/Nginx 8380 或 data server 端口作为后端 screen 必须监听的条件。
+- 后置条件失败时返回非 0，并输出 `environment_changed=unknown`，让 Python runner blocked，而不是 completed。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 新增 `runtime_required_ports` 和 `wait_for_started_platform`。
+  - `start-platform-screens` 执行后检查 screen 和核心端口。
+- `tests/test_ops_helper_script.py`
+  - 更新成功用例以覆盖启动后 screen/端口验收。
+  - 新增 screen/端口后置条件失败时返回 blocked 信号。

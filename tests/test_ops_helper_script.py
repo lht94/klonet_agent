@@ -528,12 +528,19 @@ def test_stop_platform_screens_helper_execute_stops_only_existing_platform_scree
 def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []
+    screen_checks = iter([[], ["103_m", "103_c", "103_web", "103_w"]])
+    port_checks = iter([[], [5000, 5001]])
 
     monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
-    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(
+        helper,
+        "existing_screen_sessions",
+        lambda sessions: next(screen_checks, ["103_m", "103_c", "103_web", "103_w"]),
+    )
     monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
     monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
-    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
+    monkeypatch.setattr(helper, "runtime_required_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: next(port_checks, [5000, 5001]))
 
     code = helper.main(
         [
@@ -584,6 +591,40 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
     ]
     assert "dry_run=false" in captured.out
     assert "environment_changed=true" in captured.out
+
+
+def test_start_platform_screens_helper_execute_blocks_when_postcondition_fails(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "runtime_required_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
+    ticks = iter([0.0, 6.0])
+    monkeypatch.setattr(helper.time, "monotonic", lambda: next(ticks, 6.0))
+    monkeypatch.setattr(helper.time, "sleep", lambda seconds: None)
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert commands
+    assert "start_postcondition_failed" in captured.err
+    assert "missing_started_screens=103_m,103_c,103_web,103_w" in captured.err
+    assert "missing_listening_ports=5000,5001" in captured.err
+    assert "environment_changed=unknown" in captured.err
 
 
 def test_start_platform_screens_helper_execute_rejects_existing_screen_session(monkeypatch, capsys):

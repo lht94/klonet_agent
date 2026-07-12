@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -490,6 +491,11 @@ def _start_platform_screens(args) -> int:
     if args.execute:
         if not _run_commands(_start_platform_commands(args.platform, args.project_root)):
             return 1
+        problem = wait_for_started_platform(args.platform, args.project_root)
+        if problem:
+            _print_error(problem)
+            print("environment_changed=unknown", file=sys.stderr)
+            return 1
     print("klonet_agent_op")
     print("action=start-platform-screens")
     print(f"dry_run={str(args.dry_run).lower()}")
@@ -922,6 +928,26 @@ def configured_ports(project_root: str) -> list:
     return ports
 
 
+def runtime_required_ports(project_root: str) -> list:
+    config_path = Path(project_root) / "vemu_config" / "config.py"
+    if not config_path.is_file():
+        return []
+    try:
+        content = config_path.read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return []
+    port_names = ("master_port", "worker_port", "web_terminal_port", "terminal_port")
+    pattern = re.compile(
+        rf"\b({'|'.join(re.escape(name) for name in port_names)})\s*=\s*['\"]?(\d+)['\"]?"
+    )
+    ports = []
+    for match in pattern.finditer(content):
+        port = int(match.group(2))
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    return ports
+
+
 def listening_ports(ports: list) -> list:
     if not ports:
         return []
@@ -942,6 +968,28 @@ def listening_ports(ports: list) -> list:
         if re.search(rf"(?<!\d):{port}\b", output):
             occupied.append(port)
     return occupied
+
+
+def wait_for_started_platform(platform: str, project_root: str, *, timeout_seconds: float = 5.0) -> str:
+    screen_sessions = _start_screen_sessions(platform)
+    required_ports = runtime_required_ports(project_root)
+    deadline = time.monotonic() + timeout_seconds
+    missing_screens = screen_sessions
+    missing_ports = required_ports
+    while time.monotonic() <= deadline:
+        existing = set(existing_screen_sessions(screen_sessions))
+        listening = set(listening_ports(required_ports))
+        missing_screens = [session for session in screen_sessions if session not in existing]
+        missing_ports = [port for port in required_ports if port not in listening]
+        if not missing_screens and not missing_ports:
+            return ""
+        time.sleep(0.5)
+    problems = []
+    if missing_screens:
+        problems.append("missing_started_screens=" + ",".join(missing_screens))
+    if missing_ports:
+        problems.append("missing_listening_ports=" + ",".join(str(port) for port in missing_ports))
+    return "start_postcondition_failed " + " ".join(problems)
 
 
 def archive_members(archive: Path) -> list:
