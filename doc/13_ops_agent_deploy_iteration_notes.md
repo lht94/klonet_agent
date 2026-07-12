@@ -663,3 +663,30 @@ PYTHONNOUSERSITE=1 python3.8 -m pip --version
   - `run_ops_command` 结果显示 env。
 - `tests/test_ops_command_policy.py`
   - 覆盖安全 env 允许、危险 env 拒绝、执行时 env 传入 subprocess。
+
+## 2026-07-12 第二十一轮：等价的 `python -s -m pip` 恢复形态被拒
+
+### 测试结果
+
+agent 在 pip 被用户 site 污染后选择了：
+
+```text
+python3.8 -s -m pip install --user flask-socketio
+```
+
+这是与 `PYTHONNOUSERSITE=1 python3.8 -m pip ...` 等价的恢复思路：`-s` 禁用用户 site，避免 pip 自身导入坏掉的用户依赖；`--user` 仍把目标包安装到运行用户 site。  
+但命令策略只允许 `python -m pip install`，因此返回 `python_args_not_allowed`。
+
+### 第二十一版优化思路
+
+- 允许 Python 安全前缀 `-s`，但只允许出现在 `-m pip install` 前。
+- 允许 pip 的 `--user` 选项。
+- 风险级别仍是 `dangerous`，并保持 `confirm-step`，因为它仍然会修改 Python 环境。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - `_decide_python` 支持 `python -s -m pip install ...`。
+  - `_decide_pip_install` 允许 `--user` 并保留 Python 前缀。
+- `tests/test_ops_command_policy.py`
+  - 覆盖 `python3.8 -s -m pip install --user flask-socketio` 被允许且需要二次确认。

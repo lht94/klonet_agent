@@ -179,8 +179,19 @@ def _decide_apt(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
 
 
 def _decide_python(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
-    if len(argv) >= 4 and argv[:3] == ("-m", "pip", "install"):
-        return _decide_pip_install(program, argv[3:], cwd, category="python_package_install")
+    python_flags = ()
+    rest = argv
+    if rest and rest[0] == "-s":
+        python_flags = ("-s",)
+        rest = rest[1:]
+    if len(rest) >= 4 and rest[:3] == ("-m", "pip", "install"):
+        return _decide_pip_install(
+            program,
+            rest[3:],
+            cwd,
+            category="python_package_install",
+            python_flags=python_flags,
+        )
     return _deny("python_args_not_allowed")
 
 
@@ -196,6 +207,7 @@ def _decide_pip_install(
     cwd: str,
     *,
     category: str,
+    python_flags: tuple[str, ...] = (),
 ) -> OpsCommandDecision:
     if not raw_args:
         return _deny("pip_install_requires_packages")
@@ -205,12 +217,12 @@ def _decide_pip_install(
         return _deny("pip_install_requires_packages")
     if any(item in {"-r", "--requirement"} or item.startswith("-r") for item in options):
         return _deny("pip_requirements_file_not_allowed")
-    allowed_options = {"--no-cache-dir", "--disable-pip-version-check", "--upgrade", "-U"}
+    allowed_options = {"--no-cache-dir", "--disable-pip-version-check", "--upgrade", "-U", "--user"}
     if any(item not in allowed_options for item in options):
         return _deny("pip_option_not_allowed")
     if any(not SAFE_PACKAGE.fullmatch(item) for item in packages):
         return _deny("pip_package_not_allowed")
-    argv = ("-m", "pip", "install", *raw_args) if _is_python(program) else ("install", *raw_args)
+    argv = (*python_flags, "-m", "pip", "install", *raw_args) if _is_python(program) else ("install", *raw_args)
     return _allow(program, argv, cwd, risk="dangerous", step=True, category=category)
 
 

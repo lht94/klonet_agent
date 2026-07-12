@@ -112,6 +112,23 @@ def test_command_policy_allows_python_package_install_with_safe_env():
     assert unsafe.reason == "env_key_not_allowed=PYTHONPATH"
 
 
+def test_command_policy_allows_python_no_user_site_package_install():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    decision = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-s", "-m", "pip", "install", "--user", "flask-socketio"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+
+    assert decision.allowed
+    assert decision.argv == ("-s", "-m", "pip", "install", "--user", "flask-socketio")
+    assert decision.risk == "dangerous"
+    assert decision.requires_step_confirmation is True
+
+
 def test_command_policy_rejects_uncontrolled_python_package_install_forms():
     from klonet_agent.ops.command_policy import decide_ops_command
 
