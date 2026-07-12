@@ -85,6 +85,33 @@ def test_command_policy_allows_controlled_python_package_install():
     assert pip.category == "python_package_install"
 
 
+def test_command_policy_allows_python_package_install_with_safe_env():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    decision = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-m", "pip", "install", "nsenter"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+            "env": {"PYTHONNOUSERSITE": "1"},
+        }
+    )
+    unsafe = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-m", "pip", "install", "nsenter"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+            "env": {"PYTHONPATH": "/tmp"},
+        }
+    )
+
+    assert decision.allowed
+    assert decision.env == (("PYTHONNOUSERSITE", "1"),)
+    assert decision.category == "python_package_install"
+    assert unsafe.allowed is False
+    assert unsafe.reason == "env_key_not_allowed=PYTHONPATH"
+
+
 def test_command_policy_rejects_uncontrolled_python_package_install_forms():
     from klonet_agent.ops.command_policy import decide_ops_command
 
@@ -474,6 +501,51 @@ def test_run_ops_command_git_uses_noninteractive_env_and_timeout(tmp_path, monke
     assert kwargs["timeout"] == 120
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert "BatchMode=yes" in kwargs["env"]["GIT_SSH_COMMAND"]
+
+
+def test_run_ops_command_python_install_can_set_safe_env(tmp_path, monkeypatch):
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="installed\n", stderr="")
+
+    monkeypatch.setattr("klonet_agent.ops.recipes.subprocess.run", fake_run)
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "install-nsenter",
+                "title": "install nsenter",
+                "action": "run_ops_command",
+                "args": {
+                    "program": "python3.8",
+                    "argv": ["-m", "pip", "install", "nsenter"],
+                    "cwd": str(tmp_path),
+                    "env": {"PYTHONNOUSERSITE": "1"},
+                },
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    store.approve_step(plan.plan_id, "install-nsenter")
+    result = store.execute_step(plan.plan_id, "install-nsenter")
+
+    assert "command_output=installed" in result
+    assert "env=PYTHONNOUSERSITE=1" in result
+    assert calls
+    _command, kwargs = calls[0]
+    assert kwargs["env"]["PYTHONNOUSERSITE"] == "1"
 
 
 def test_run_ops_command_timeout_blocks_instead_of_hanging(tmp_path, monkeypatch):

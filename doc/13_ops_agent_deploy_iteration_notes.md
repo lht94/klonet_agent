@@ -626,3 +626,40 @@ ModuleNotFoundError: No module named 'nsenter'
   - `startup_preflight_failed` detail 改为优先包含 `last_error=...`。
 - `tests/test_ops_helper_script.py`
   - 覆盖 warning + traceback 场景下保留最后缺失模块名。
+
+## 2026-07-12 第二十轮：pip 被用户 site 依赖污染后缺少受控恢复路径
+
+### 测试结果
+
+批量安装依赖后，`python3.8 -m pip` 自身开始崩溃：
+
+```text
+AttributeError: module 'lib' has no attribute 'X509_V_FLAG_NOTIFY_POLICY'
+```
+
+原因是用户 site-packages 中安装了新版 `cryptography 47.0.0`，但系统 `pyOpenSSL 19.0.0` 会优先混用它，导致 pip 导入链崩溃。验证发现：
+
+```text
+PYTHONNOUSERSITE=1 python3.8 -m pip --version
+```
+
+可以恢复 pip，因为 pip 运行时忽略用户 site，仅使用系统 Python 包。
+
+### 第二十版优化思路
+
+- 不允许 agent 通过 shell 前缀随意注入环境变量。
+- 在 `run_ops_command` 的结构化参数中增加很窄的 env allowlist。
+- 目前仅允许 `PYTHONNOUSERSITE=1`，且只允许用于非 sudo 的 `python/pip install` 类受控命令。
+- 执行器将 allowlist env 合并进 subprocess 环境，并在 dry-run/执行结果中显示 `env=...`，方便审计。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - `OpsCommandDecision` 新增 `env`。
+  - 新增 env 校验，仅允许 `PYTHONNOUSERSITE=1`。
+  - env 只可附加到 `python_package_install`，不支持 sudo 命令。
+- `ops/recipes.py`
+  - `_run_command` 支持合并受控 env。
+  - `run_ops_command` 结果显示 env。
+- `tests/test_ops_command_policy.py`
+  - 覆盖安全 env 允许、危险 env 拒绝、执行时 env 传入 subprocess。

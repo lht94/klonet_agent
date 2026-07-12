@@ -859,6 +859,7 @@ class ControlledActionRunner:
                     f"category={decision.category} risk={decision.risk} "
                     f"requires_sudo={str(decision.requires_sudo).lower()} "
                     f"command_preview={_format_command(command)} "
+                    f"env={_format_env(decision.env) or 'default'} "
                     f"cwd={_one_line(decision.cwd or '.')} "
                     "environment unchanged"
                 ),
@@ -867,7 +868,7 @@ class ControlledActionRunner:
             if decision.requires_sudo:
                 output = self.command_runner(command)
             elif self._uses_default_command_runner:
-                output = _run_command(command, cwd=decision.cwd or None)
+                output = _run_command(command, cwd=decision.cwd or None, extra_env=decision.env)
             else:
                 output = self.command_runner(command)
         except subprocess.CalledProcessError as exc:
@@ -894,6 +895,7 @@ class ControlledActionRunner:
                 f"category={decision.category} risk={decision.risk} "
                 f"requires_sudo={str(decision.requires_sudo).lower()} "
                 f"command={_format_command(command)} "
+                f"env={_format_env(decision.env) or 'default'} "
                 f"cwd={_one_line(decision.cwd or '.')} "
                 f"command_output={_one_line(output)} "
                 "environment_changed=unknown"
@@ -1185,7 +1187,11 @@ def _format_command(command: list) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
-def _run_command(command: list, cwd: str | None = None) -> str:
+def _format_env(env: tuple[tuple[str, str], ...]) -> str:
+    return ",".join(f"{key}={value}" for key, value in env)
+
+
+def _run_command(command: list, cwd: str | None = None, extra_env: tuple[tuple[str, str], ...] = ()) -> str:
     completed = subprocess.run(
         command,
         cwd=cwd,
@@ -1194,23 +1200,26 @@ def _run_command(command: list, cwd: str | None = None) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
-        env=_command_env(command),
+        env=_command_env(command, extra_env),
         timeout=RUN_OPS_COMMAND_TIMEOUT_SECONDS,
     )
     return completed.stdout.strip()
 
 
-def _command_env(command: list) -> dict | None:
-    if not command or Path(str(command[0])).name != "git":
+def _command_env(command: list, extra_env: tuple[tuple[str, str], ...] = ()) -> dict | None:
+    if not extra_env and (not command or Path(str(command[0])).name != "git"):
         return None
     import os
 
     env = dict(os.environ)
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    env.setdefault(
-        "GIT_SSH_COMMAND",
-        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15",
-    )
+    if command and Path(str(command[0])).name == "git":
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env.setdefault(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15",
+        )
+    for key, value in extra_env:
+        env[key] = value
     return env
 
 

@@ -8,7 +8,7 @@ must be confirmed explicitly.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import re
 import shutil
@@ -27,6 +27,7 @@ SAFE_GIT_URL = re.compile(
 )
 SAFE_PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:-]{0,120}$")
 SAFE_MODULE = re.compile(r"^[A-Za-z0-9_][-A-Za-z0-9_]{0,120}$")
+ALLOWED_COMMAND_ENV = {"PYTHONNOUSERSITE": {"1"}}
 SYSTEM_INSTALL_DIRS = (
     Path("/usr/lib"),
     Path("/usr/local/lib"),
@@ -62,6 +63,7 @@ class OpsCommandDecision:
     requires_sudo: bool = False
     requires_step_confirmation: bool = False
     category: str = ""
+    env: tuple[tuple[str, str], ...] = ()
 
     def argv_json(self) -> str:
         return json.dumps(list(self.argv), ensure_ascii=False)
@@ -72,10 +74,13 @@ def decide_ops_command(args: Mapping | None) -> OpsCommandDecision:
     program = _basename(str(values.get("program") or "").strip())
     argv = _normalize_argv(values.get("argv", []))
     cwd = str(values.get("cwd") or "").strip()
+    env = _normalize_env(values.get("env"))
     if not program:
         return _deny("program_required")
     if not isinstance(argv, list):
         return _deny("argv_must_be_array")
+    if isinstance(env, str):
+        return _deny(env)
     argv = tuple(str(item) for item in argv)
     if len(argv) > MAX_ARGV:
         return _deny("argv_too_long")
@@ -87,27 +92,38 @@ def decide_ops_command(args: Mapping | None) -> OpsCommandDecision:
         return _deny(f"program_not_allowed={program}")
 
     if program == "make":
-        return _decide_make(program, argv, cwd)
+        decision = _decide_make(program, argv, cwd)
+        return _with_env(decision, env)
     if program == "git":
-        return _decide_git(program, argv, cwd)
+        decision = _decide_git(program, argv, cwd)
+        return _with_env(decision, env)
     if program in {"apt", "apt-get"}:
-        return _decide_apt(program, argv, cwd)
+        decision = _decide_apt(program, argv, cwd)
+        return _with_env(decision, env)
     if _is_python(program):
-        return _decide_python(program, argv, cwd)
+        decision = _decide_python(program, argv, cwd)
+        return _with_env(decision, env)
     if _is_pip(program):
-        return _decide_pip(program, argv, cwd)
+        decision = _decide_pip(program, argv, cwd)
+        return _with_env(decision, env)
     if program == "mkdir":
-        return _decide_mkdir(program, argv, cwd)
+        decision = _decide_mkdir(program, argv, cwd)
+        return _with_env(decision, env)
     if program == "ln":
-        return _decide_ln(program, argv, cwd)
+        decision = _decide_ln(program, argv, cwd)
+        return _with_env(decision, env)
     if program in {"cp", "install"}:
-        return _decide_file_install(program, argv, cwd)
+        decision = _decide_file_install(program, argv, cwd)
+        return _with_env(decision, env)
     if program == "insmod":
-        return _decide_insmod(program, argv, cwd)
+        decision = _decide_insmod(program, argv, cwd)
+        return _with_env(decision, env)
     if program == "rmmod":
-        return _decide_rmmod(program, argv, cwd)
+        decision = _decide_rmmod(program, argv, cwd)
+        return _with_env(decision, env)
     if program == "tc":
-        return _decide_tc(program, argv, cwd)
+        decision = _decide_tc(program, argv, cwd)
+        return _with_env(decision, env)
     return _deny(f"program_not_allowlisted={program}")
 
 
@@ -305,6 +321,33 @@ def _allow(
 
 def _deny(reason: str) -> OpsCommandDecision:
     return OpsCommandDecision(False, reason=reason)
+
+
+def _with_env(decision: OpsCommandDecision, env: tuple[tuple[str, str], ...]) -> OpsCommandDecision:
+    if not env or not decision.allowed:
+        return decision
+    if decision.requires_sudo:
+        return _deny("env_not_supported_for_sudo_command")
+    if decision.category != "python_package_install":
+        return _deny("env_only_allowed_for_python_package_install")
+    return replace(decision, env=env)
+
+
+def _normalize_env(raw) -> tuple[tuple[str, str], ...] | str:
+    if raw in (None, "", {}):
+        return ()
+    if not isinstance(raw, Mapping):
+        return "env_must_be_object"
+    env = []
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        text = str(value or "").strip()
+        if name not in ALLOWED_COMMAND_ENV:
+            return f"env_key_not_allowed={name or 'missing'}"
+        if text not in ALLOWED_COMMAND_ENV[name]:
+            return f"env_value_not_allowed={name}"
+        env.append((name, text))
+    return tuple(sorted(env))
 
 
 def _basename(program: str) -> str:
