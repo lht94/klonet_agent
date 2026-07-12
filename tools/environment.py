@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import platform
@@ -1152,6 +1153,9 @@ def _read_config_ports(config_path: Path) -> dict:
         text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return {}
+    active_ports = _read_active_config_class_ports(text)
+    if active_ports:
+        return active_ports
     ports = {}
     for key in KLONET_PORT_KEYS:
         match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*['\"]?(\d+)['\"]?", text)
@@ -1163,7 +1167,9 @@ def _read_config_ports(config_path: Path) -> dict:
 def _read_config_ports_from_root(root: Path) -> dict:
     candidates = (
         root / "config.py",
+        root / "vemu_config" / "config.py",
         root / "vemu_uestc" / "config.py",
+        root / "vemu_uestc" / "vemu_config" / "config.py",
         root / "mains" / "config.py",
     )
     for config_path in candidates:
@@ -1171,6 +1177,59 @@ def _read_config_ports_from_root(root: Path) -> dict:
         if ports:
             return ports
     return {}
+
+
+def _read_active_config_class_ports(text: str) -> dict:
+    try:
+        tree = ast.parse(text or "")
+    except SyntaxError:
+        return {}
+    classes: dict[str, ast.ClassDef] = {}
+    active_class = ""
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            classes[node.name] = node
+        elif isinstance(node, ast.Assign):
+            names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            if "PROJ_CONFIG" in names and isinstance(node.value, ast.Call):
+                func = node.value.func
+                if isinstance(func, ast.Name):
+                    active_class = func.id
+    if not active_class or active_class not in classes:
+        return {}
+    return _class_ports(active_class, classes, set())
+
+
+def _class_ports(class_name: str, classes: dict[str, ast.ClassDef], seen: set[str]) -> dict:
+    if class_name in seen:
+        return {}
+    seen.add(class_name)
+    node = classes.get(class_name)
+    if node is None:
+        return {}
+    ports = {}
+    for base in node.bases:
+        if isinstance(base, ast.Name):
+            ports.update(_class_ports(base.id, classes, seen))
+    for item in node.body:
+        if not isinstance(item, ast.Assign):
+            continue
+        for target in item.targets:
+            if isinstance(target, ast.Name) and target.id in KLONET_PORT_KEYS:
+                value = _literal_port_value(item.value)
+                if value is not None:
+                    ports[target.id] = str(value)
+    return ports
+
+
+def _literal_port_value(node: ast.AST) -> Optional[int]:
+    if isinstance(node, ast.Constant):
+        value = node.value
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
 
 
 def _ordered_ports(ports: dict) -> list:

@@ -724,6 +724,67 @@ def test_platform_health_verifier_blocks_missing_configured_port(monkeypatch):
     assert "overall_status=blocked" in result
 
 
+def test_platform_health_reads_ports_from_active_vemu_config_class(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "lht_project"
+        config_dir = project_root / "vemu_config"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.py").write_text(
+            "\n".join(
+                [
+                    "class CommonConfig:",
+                    "    master_port = 12000",
+                    "    worker_port = 12001",
+                    "    public_port = '80'",
+                    "class LhtConfig(CommonConfig):",
+                    "    master_port = 27700",
+                    "    worker_port = 27701",
+                    "    web_terminal_port = 27702",
+                    "    public_port = 8380",
+                    "PROJ_CONFIG = LhtConfig()",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            environment,
+            "_screen_instance_rows",
+            lambda: [
+                {"platform": "lht", "role": "master", "session": "lht_m"},
+                {"platform": "lht", "role": "worker", "session": "lht_w"},
+                {"platform": "lht", "role": "celery", "session": "lht_c"},
+                {"platform": "lht", "role": "web_terminal", "session": "lht_web"},
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {"platform": "lht", "role": "master", "pid": 1, "cwd": str(project_root)},
+                {"platform": "lht", "role": "worker", "pid": 2, "cwd": str(project_root)},
+                {"platform": "lht", "role": "celery", "pid": 3, "cwd": str(project_root)},
+                {"platform": "lht", "role": "web_terminal", "pid": 4, "cwd": str(project_root)},
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_inspect_port_owners",
+            lambda args: [
+                environment.ProbeResult("port_owner", "detected", f"port={port} pid={port}")
+                for port in args["ports"]
+            ],
+        )
+
+        result = environment.inspect_platform_health({"platform": "lht", "project_root": str(project_root)})
+
+    assert "config_ports=master_port:27700,worker_port:27701,public_port:8380,web_terminal_port:27702" in result
+    assert "port_status=ready ports=8380,27700,27701,27702" in result
+    assert "overall_status=unchecked" in result
+
+
 def test_executor_dispatches_platform_health_tool():
     from klonet_agent.tools.executor import ToolExecutor
 

@@ -1035,3 +1035,78 @@ python -m pytest tests/test_ops_helper_script.py::test_start_platform_screens_he
 ```
 
 结果：`4 passed`。
+
+## 2026-07-12 第三十轮：health 验收工具未解析 active 配置类端口
+
+### 测试结果
+
+lht 平台实际已启动：
+
+- screen：`lht_m`、`lht_w`、`lht_c`、`lht_web` 全部存在。
+- 端口：`27700`、`27701`、`27702`、`8380` 均监听。
+
+但独立运行 `inspect_platform_health` 时返回：
+
+```text
+config_ports=missing
+port_status=unchecked
+overall_status=unchecked
+```
+
+根因是 health 工具只检查：
+
+```text
+config.py
+vemu_uestc/config.py
+mains/config.py
+```
+
+且只用正则读取顶层端口赋值。而真实部署配置位于：
+
+```text
+vemu_config/config.py
+PROJ_CONFIG = LhtConfig()
+class LhtConfig(CommonConfig):
+    master_port = 27700
+    worker_port = 27701
+    web_terminal_port = 27702
+    public_port = 8380
+```
+
+helper 端此前已修过 active `PROJ_CONFIG` 类解析，但 health 工具未同步，导致验收证据被误降级为 unchecked。
+
+### 第三十版优化思路
+
+- `inspect_platform_health` 的 config 候选路径加入：
+  - `vemu_config/config.py`
+  - `vemu_uestc/vemu_config/config.py`
+- 使用 AST 解析 `PROJ_CONFIG = SomeConfig()` 指向的 active 配置类。
+- 递归合并父类端口，子类覆盖父类。
+- 若 AST 解析失败或没有 active 类，再回退旧的顶层正则解析。
+
+### 实现文件
+
+- `tools/environment.py`
+  - 新增 `_read_active_config_class_ports`、`_class_ports`、`_literal_port_value`。
+  - `_read_config_ports_from_root` 增加 VEMU 标准配置路径。
+- `tests/test_ops_environment_tools.py`
+  - 覆盖 active `PROJ_CONFIG` 类端口解析。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_environment_tools.py::test_platform_health_verifier_summarizes_config_screen_process_ports_and_nginx tests/test_ops_environment_tools.py::test_platform_health_reads_ports_from_active_vemu_config_class -q --basetemp=/tmp/klonet_agent_pytest_tmp
+```
+
+结果：`2 passed`。
+
+真实 lht 验收：
+
+```text
+screen_status=ready roles=celery,master,web_terminal,worker
+process_status=ready roles=celery,master,web_terminal,worker
+config_ports=master_port:27700,worker_port:27701,public_port:8380,web_terminal_port:27702
+port_status=ready ports=8380,27700,27701,27702
+nginx_status=detected
+overall_status=ready
+```
