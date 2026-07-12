@@ -768,6 +768,34 @@ def test_configured_ports_reads_vemu_config_ports(tmp_path):
     assert helper.configured_ports(str(tmp_path)) == [5000, 5001, 8080, 5045]
 
 
+def test_configured_ports_prefers_active_proj_config_class(tmp_path):
+    helper = _load_helper_module()
+    config_dir = tmp_path / "vemu_config"
+    config_dir.mkdir()
+    (config_dir / "config.py").write_text(
+        "\n".join(
+            [
+                "class OldConfig:",
+                "    master_port = 12000",
+                "    worker_port = 12001",
+                "    web_terminal_port = 5005",
+                "",
+                "class LhtConfig:",
+                "    master_port = 27700",
+                "    worker_port = 27701",
+                "    web_terminal_port = 27702",
+                "    public_port = 8380",
+                "",
+                "PROJ_CONFIG = LhtConfig()",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert helper.configured_ports(str(tmp_path)) == [27700, 27701, 27702, 8380]
+    assert helper.runtime_required_ports(str(tmp_path)) == [27700, 27701, 27702]
+
+
 def test_extract_archive_helper_execute_extracts_safe_tar_members(tmp_path, capsys):
     import tarfile
 

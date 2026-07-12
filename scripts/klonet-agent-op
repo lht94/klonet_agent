@@ -910,33 +910,39 @@ def project_entry_files_missing(project_root: str) -> list:
 
 
 def configured_ports(project_root: str) -> list:
-    config_path = Path(project_root) / "vemu_config" / "config.py"
-    if not config_path.is_file():
-        return []
-    try:
-        content = config_path.read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
-        return []
-    pattern = re.compile(
-        rf"\b({'|'.join(re.escape(name) for name in CONFIG_PORT_NAMES)})\s*=\s*['\"]?(\d+)['\"]?"
-    )
-    ports = []
-    for match in pattern.finditer(content):
-        port = int(match.group(2))
-        if 1 <= port <= 65535 and port not in ports:
-            ports.append(port)
-    return ports
+    content = active_config_content(project_root)
+    return _ports_from_content(content, CONFIG_PORT_NAMES)
 
 
 def runtime_required_ports(project_root: str) -> list:
+    content = active_config_content(project_root)
+    port_names = ("master_port", "worker_port", "web_terminal_port", "terminal_port")
+    return _ports_from_content(content, port_names)
+
+
+def active_config_content(project_root: str) -> str:
     config_path = Path(project_root) / "vemu_config" / "config.py"
     if not config_path.is_file():
-        return []
+        return ""
     try:
         content = config_path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
+        return ""
+    match = re.search(r"\bPROJ_CONFIG\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", content)
+    if not match:
+        return content
+    class_name = match.group(1)
+    class_match = re.search(rf"^class\s+{re.escape(class_name)}\b.*?:\s*$", content, flags=re.MULTILINE)
+    if not class_match:
+        return content
+    next_class = re.search(r"^class\s+[A-Za-z_][A-Za-z0-9_]*\b.*?:\s*$", content[class_match.end():], flags=re.MULTILINE)
+    end = class_match.end() + next_class.start() if next_class else len(content)
+    return content[class_match.start():end]
+
+
+def _ports_from_content(content: str, port_names: tuple[str, ...]) -> list:
+    if not content:
         return []
-    port_names = ("master_port", "worker_port", "web_terminal_port", "terminal_port")
     pattern = re.compile(
         rf"\b({'|'.join(re.escape(name) for name in port_names)})\s*=\s*['\"]?(\d+)['\"]?"
     )

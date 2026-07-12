@@ -484,3 +484,35 @@ apt_args_not_allowed
 - `tests/test_ops_helper_script.py`
   - 更新成功用例以覆盖启动后 screen/端口验收。
   - 新增 screen/端口后置条件失败时返回 blocked 信号。
+
+## 2026-07-12 第十六轮：端口解析扫描了所有配置类
+
+### 测试结果
+
+第十五版 helper 安装后，真实执行 `start-platform-screens` 的后置条件失败输出包含大量端口：
+
+```text
+missing_listening_ports=12000,12001,5005,45551,...
+```
+
+这些端口来自 `config.py` 中其它历史配置类，而当前文件底部实际是：
+
+```python
+PROJ_CONFIG = LhtConfig()
+```
+
+`LhtConfig` 的核心端口只有 27700、27701、27702。
+
+### 第十六版优化思路
+
+- `configured_ports` 和 `runtime_required_ports` 优先解析 `PROJ_CONFIG = <Class>()` 指向的类体。
+- 找不到 `PROJ_CONFIG` 或类定义时才回退到全文扫描，保持旧配置兼容。
+- 后置条件只要求 master/worker/web_terminal/terminal 端口，不要求 Nginx public_port。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 新增 `active_config_content` 和 `_ports_from_content`。
+  - 端口解析限定到激活配置类。
+- `tests/test_ops_helper_script.py`
+  - 覆盖只读取 `PROJ_CONFIG` 激活类端口。
