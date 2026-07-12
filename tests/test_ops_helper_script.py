@@ -757,7 +757,11 @@ def test_startup_preflight_keeps_import_error_package_name(monkeypatch):
             "ModuleNotFoundError: No module named 'numpy'"
         )
 
-    monkeypatch.setattr(helper.subprocess, "run", lambda *args, **kwargs: Completed())
+    monkeypatch.setattr(
+        helper,
+        "run_startup_preflight_command",
+        lambda *args, **kwargs: Completed(),
+    )
 
     problem = helper.startup_preflight_problem("/home/adminis/lht/103_project/vemu_uestc")
 
@@ -904,6 +908,39 @@ def test_start_platform_screens_helper_execute_rejects_missing_config_ports(monk
     assert commands == []
     assert "missing_config_ports=vemu_config/config.py" in captured.err
     assert "environment_changed=false" in captured.err
+
+
+def test_startup_preflight_timeout_kills_process_group(monkeypatch):
+    helper = _load_helper_module()
+    killed = []
+
+    class FakeProcess:
+        pid = 43210
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None:
+                raise helper.subprocess.TimeoutExpired(["preflight"], timeout)
+            self.returncode = -15
+            return "partial stdout", "partial stderr"
+
+        def wait(self, timeout=None):
+            self.returncode = -15
+            return self.returncode
+
+    monkeypatch.setattr(helper.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+    monkeypatch.setattr(helper.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    try:
+        helper.run_startup_preflight_command(["python3.8", "-c", "import worker"], "/tmp", timeout=0.01)
+    except helper.subprocess.TimeoutExpired as exc:
+        error = exc
+    else:
+        raise AssertionError("expected TimeoutExpired")
+
+    assert killed == [(43210, helper.signal.SIGTERM)]
+    assert error.output == "partial stdout"
+    assert error.stderr == "partial stderr"
 
 
 def test_configured_ports_reads_vemu_config_ports(tmp_path):

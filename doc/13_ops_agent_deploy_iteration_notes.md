@@ -991,3 +991,47 @@ python -m pytest tests/test_ops_operations.py::test_remove_python_package_entrie
 ```
 
 结果：`3 passed`。
+
+## 2026-07-12 第二十九轮：启动预检 timeout 后遗留子进程
+
+### 测试结果
+
+补齐依赖后，`start_platform_screens` 进入 worker 预检 timeout：
+
+```text
+startup_preflight_failed component=worker reason=timeout
+```
+
+外部复现发现 worker 预检实际触发了源码导入副作用：
+
+```text
+/usr/bin/python3.8 -m gunicorn --check-config -c worker_gun.py worker_main:flask_app
+  -> sudo bash .../Service_layer/rsync_init.sh vemu vemu
+```
+
+helper 的 `subprocess.run(..., timeout=20)` 超时后只结束直接子进程，没有杀掉整个进程树，现场残留多组 `gunicorn --check-config` 和等待 sudo 的 `rsync_init.sh` 子进程。这会污染后续部署判断，也会让 agent 误以为只是“worker 启动慢”。
+
+### 第二十九版优化思路
+
+- 启动预检进程使用新进程组启动。
+- 超时时先 `SIGTERM` 整个进程组，短等待后再 `SIGKILL`。
+- `TimeoutExpired` 仍保留 stdout/stderr，继续给上层 `startup_preflight_failed` 摘要。
+- 保持既有 import error 诊断能力不变。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 新增 `run_startup_preflight_command`。
+  - 新增 `_kill_process_group`。
+  - `startup_preflight_problem` 改用该函数。
+- `tests/test_ops_helper_script.py`
+  - 覆盖 preflight timeout 会 kill 进程组并保留 stdout/stderr。
+  - 调整旧测试以适配新的预检执行函数。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_helper_script.py::test_start_platform_screens_helper_execute_blocks_on_startup_preflight tests/test_ops_helper_script.py::test_startup_preflight_keeps_import_error_package_name tests/test_ops_helper_script.py::test_startup_preflight_detail_prefers_last_python_error tests/test_ops_helper_script.py::test_startup_preflight_timeout_kills_process_group -q --basetemp=/tmp/klonet_agent_pytest_tmp
+```
+
+结果：`4 passed`。

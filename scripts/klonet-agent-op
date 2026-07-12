@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
@@ -1073,16 +1074,7 @@ def startup_preflight_problem(project_root: str) -> str:
     for component in START_COMPONENT_ORDER:
         command = STARTUP_PREFLIGHT_COMMANDS[component]
         try:
-            completed = subprocess.run(
-                _as_runtime_user(command),
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=20,
-                check=False,
-            )
+            completed = run_startup_preflight_command(command, project_root, timeout=20)
         except subprocess.TimeoutExpired as exc:
             return (
                 f"startup_preflight_failed component={component} "
@@ -1101,6 +1093,50 @@ def startup_preflight_problem(project_root: str) -> str:
                 f"returncode={completed.returncode} detail={detail or 'empty_output'}"
             )
     return ""
+
+
+def run_startup_preflight_command(command: list, project_root: str, *, timeout: float) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        _as_runtime_user(command),
+        cwd=project_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_group(process)
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            exc.cmd,
+            exc.timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    return subprocess.CompletedProcess(
+        _as_runtime_user(command),
+        process.returncode,
+        stdout,
+        stderr,
+    )
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def startup_preflight_detail(output: str) -> str:
