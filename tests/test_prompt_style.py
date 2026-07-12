@@ -155,6 +155,8 @@ def test_ops_prompt_routes_python_environment_recovery_through_controlled_plan()
 
     assert "python -m pip install" in OPS_PROMPT
     assert "pip install" in OPS_PROMPT
+    assert "pip uninstall" in OPS_PROMPT
+    assert "--force-reinstall" in OPS_PROMPT
     assert "用受控 apt 安装系统包" in OPS_PROMPT
     assert "用受控 `python3.8 -m pip install`" in OPS_PROMPT
     assert "最后备选" in OPS_PROMPT

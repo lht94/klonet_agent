@@ -153,6 +153,68 @@ def test_command_policy_allows_safe_python_package_version_specifiers():
     assert range_spec.requires_step_confirmation is True
 
 
+def test_command_policy_allows_controlled_python_package_maintenance():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    uninstall = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-s", "-m", "pip", "uninstall", "-y", "werkzeug"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    reinstall = decide_ops_command(
+        {
+            "program": "pip3.8",
+            "argv": ["install", "--force-reinstall", "--user", "werkzeug==1.0.1"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+            "env": {"PYTHONNOUSERSITE": "1"},
+        }
+    )
+
+    assert uninstall.allowed
+    assert uninstall.category == "python_package_uninstall"
+    assert uninstall.risk == "dangerous"
+    assert uninstall.requires_step_confirmation is True
+    assert reinstall.allowed
+    assert reinstall.category == "python_package_install"
+    assert reinstall.env == (("PYTHONNOUSERSITE", "1"),)
+    assert reinstall.requires_step_confirmation is True
+
+
+def test_command_policy_rejects_uncontrolled_python_package_maintenance_forms():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    editable = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-m", "pip", "install", "-e", "."],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    all_packages = decide_ops_command(
+        {
+            "program": "pip3.8",
+            "argv": ["uninstall", "-y", "*"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+    no_confirm = decide_ops_command(
+        {
+            "program": "python3.8",
+            "argv": ["-m", "pip", "uninstall", "werkzeug"],
+            "cwd": "/home/klonet-agent/platforms/lht_project",
+        }
+    )
+
+    assert not editable.allowed
+    assert editable.reason == "pip_option_not_allowed"
+    assert not all_packages.allowed
+    assert all_packages.reason == "pip_package_not_allowed"
+    assert not no_confirm.allowed
+    assert no_confirm.reason == "pip_uninstall_requires_yes"
+
+
 def test_command_policy_rejects_uncontrolled_python_package_install_forms():
     from klonet_agent.ops.command_policy import decide_ops_command
 

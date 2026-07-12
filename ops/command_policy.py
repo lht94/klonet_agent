@@ -192,12 +192,22 @@ def _decide_python(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandD
             category="python_package_install",
             python_flags=python_flags,
         )
+    if len(rest) >= 4 and rest[:3] == ("-m", "pip", "uninstall"):
+        return _decide_pip_uninstall(
+            program,
+            rest[3:],
+            cwd,
+            category="python_package_uninstall",
+            python_flags=python_flags,
+        )
     return _deny("python_args_not_allowed")
 
 
 def _decide_pip(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecision:
     if len(argv) >= 2 and argv[0] == "install":
         return _decide_pip_install(program, argv[1:], cwd, category="python_package_install")
+    if len(argv) >= 2 and argv[0] == "uninstall":
+        return _decide_pip_uninstall(program, argv[1:], cwd, category="python_package_uninstall")
     return _deny("pip_args_not_allowed")
 
 
@@ -217,12 +227,44 @@ def _decide_pip_install(
         return _deny("pip_install_requires_packages")
     if any(item in {"-r", "--requirement"} or item.startswith("-r") for item in options):
         return _deny("pip_requirements_file_not_allowed")
-    allowed_options = {"--no-cache-dir", "--disable-pip-version-check", "--upgrade", "-U", "--user"}
+    allowed_options = {
+        "--no-cache-dir",
+        "--disable-pip-version-check",
+        "--upgrade",
+        "-U",
+        "--user",
+        "--force-reinstall",
+    }
     if any(item not in allowed_options for item in options):
         return _deny("pip_option_not_allowed")
     if any(not SAFE_PACKAGE.fullmatch(item) for item in packages):
         return _deny("pip_package_not_allowed")
     argv = (*python_flags, "-m", "pip", "install", *raw_args) if _is_python(program) else ("install", *raw_args)
+    return _allow(program, argv, cwd, risk="dangerous", step=True, category=category)
+
+
+def _decide_pip_uninstall(
+    program: str,
+    raw_args: tuple[str, ...],
+    cwd: str,
+    *,
+    category: str,
+    python_flags: tuple[str, ...] = (),
+) -> OpsCommandDecision:
+    if not raw_args:
+        return _deny("pip_uninstall_requires_packages")
+    options = [item for item in raw_args if item.startswith("-")]
+    packages = [item for item in raw_args if not item.startswith("-")]
+    if not packages:
+        return _deny("pip_uninstall_requires_packages")
+    allowed_options = {"-y", "--yes", "--disable-pip-version-check"}
+    if any(item not in allowed_options for item in options):
+        return _deny("pip_uninstall_option_not_allowed")
+    if "-y" not in options and "--yes" not in options:
+        return _deny("pip_uninstall_requires_yes")
+    if any(not SAFE_PACKAGE.fullmatch(item) for item in packages):
+        return _deny("pip_package_not_allowed")
+    argv = (*python_flags, "-m", "pip", "uninstall", *raw_args) if _is_python(program) else ("uninstall", *raw_args)
     return _allow(program, argv, cwd, risk="dangerous", step=True, category=category)
 
 
@@ -340,8 +382,8 @@ def _with_env(decision: OpsCommandDecision, env: tuple[tuple[str, str], ...]) ->
         return decision
     if decision.requires_sudo:
         return _deny("env_not_supported_for_sudo_command")
-    if decision.category != "python_package_install":
-        return _deny("env_only_allowed_for_python_package_install")
+    if not decision.category.startswith("python_package_"):
+        return _deny("env_only_allowed_for_python_package_commands")
     return replace(decision, env=env)
 
 

@@ -837,3 +837,68 @@ pip install werkzeug==2.3.7
   - 扩展 `SAFE_PACKAGE` 正则，支持版本 specifier。
 - `tests/test_ops_command_policy.py`
   - 覆盖 `werkzeug==2.3.7` 和 `werkzeug<3.0,>=2.3`。
+
+## 2026-07-12 第二十六轮：包冲突恢复只支持 install，缺少受控维护能力
+
+### 测试结果
+
+Werkzeug 降级后，用户 site 中同时存在 1.x 文件和 3.x 残留目录：
+
+```text
+werkzeug/datastructures.py
+werkzeug/datastructures/
+werkzeug/wrappers/
+werkzeug/sansio/
+...
+```
+
+启动预检因此报：
+
+```text
+ImportError: cannot import name 'Accept' from partially initialized module 'werkzeug.datastructures'
+```
+
+agent 先生成了 `rm` 清理目录计划，被 `program_not_allowlisted=rm` 正确拦住。随后它改用更合理的 pip 包管理恢复：
+
+```text
+pip uninstall -y werkzeug
+pip install --force-reinstall --user werkzeug==1.0.1
+```
+
+但现有 command policy 只支持 `pip install`，导致 `pip uninstall` 被 `python_args_not_allowed` 拒绝。问题不是 Werkzeug 特例，而是 Ops 环境恢复只建模了“安装包”，没有建模“卸载/重装明确包名”的受控包维护。
+
+### 第二十六版优化思路
+
+- 扩展受控 Python 包维护能力：
+  - 允许 `python -m pip uninstall -y <明确包名>` 和 `pip uninstall -y <明确包名>`。
+  - 允许 `pip install --force-reinstall <明确包名/版本约束>`。
+  - `python -s -m pip ...` 和 `PYTHONNOUSERSITE=1` 同样适用于卸载/重装，以便 pip 自身被用户 site 污染时仍能恢复。
+- 仍然拒绝不受控形态：
+  - `pip install -e .`
+  - requirements 文件、URL/path wheel。
+  - 通配包名或无 `-y/--yes` 的交互式 uninstall。
+- 风险级别保持 `dangerous`，继续要求 `confirm-step`。
+- Prompt 和工具描述从“pip 安装”扩展为“安装/重装/卸载明确包名”，减少模型靠失败试错。
+
+### 实现文件
+
+- `ops/command_policy.py`
+  - 新增 `_decide_pip_uninstall`。
+  - `pip install` 允许 `--force-reinstall`。
+  - `PYTHONNOUSERSITE=1` 允许用于所有 `python_package_*` 类命令。
+- `prompts.py`
+  - 补充包版本冲突、混合安装、残留文件恢复时的受控 pip 维护路径。
+- `tools/registry.py`
+  - 更新 `create_ops_operation_plan.steps` 描述，明确 `pip install/uninstall` 都走 `run_ops_command`。
+- `tests/test_ops_command_policy.py`
+  - 覆盖受控 uninstall、force-reinstall、no-user-site 环境和不受控维护形态拒绝。
+- `tests/test_prompt_style.py`
+  - 覆盖 prompt 中出现 `pip uninstall` 与 `--force-reinstall`。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_command_policy.py tests/test_prompt_style.py -q --basetemp=/tmp/klonet_agent_pytest_tmp
+```
+
+结果：`48 passed`。
