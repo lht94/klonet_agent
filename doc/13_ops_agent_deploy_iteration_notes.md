@@ -592,3 +592,37 @@ error=startup_preflight_failed component=master ... ModuleNotFoundError: No modu
   - helper stderr 摘要放宽到 1200 字符。
 - `tests/test_ops_operations.py`
   - 覆盖 start platform 预检失败时计划步骤 blocked，且保留缺失模块名。
+
+## 2026-07-12 第十九轮：warning 和长 traceback 遮蔽最后异常
+
+### 测试结果
+
+继续启动后，helper 预检输出变成：
+
+```text
+CryptographyDeprecationWarning: Python 3.8 is no longer supported ...
+Failed to read config file: gun.py
+Traceback ...
+```
+
+由于摘要取前 1200 字，真正的最后异常：
+
+```text
+ModuleNotFoundError: No module named 'nsenter'
+```
+
+被截断掉了。agent 因此推断到 pip/OpenSSL 冲突等旁支，没能直接处理当前缺失模块。
+
+### 第十九版优化思路
+
+- 启动预检摘要不能只保留开头，因为 Python traceback 的根因通常在最后一行。
+- 从完整 stderr/stdout 中提取最后一个 `*Error:` 或 `*Exception:` 行，作为 `last_error=...` 放在摘要最前。
+- 仍保留一段 compact detail，方便看到 warning 和导入链上下文。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 新增 `startup_preflight_detail` 和 `last_python_error_line`。
+  - `startup_preflight_failed` detail 改为优先包含 `last_error=...`。
+- `tests/test_ops_helper_script.py`
+  - 覆盖 warning + traceback 场景下保留最后缺失模块名。

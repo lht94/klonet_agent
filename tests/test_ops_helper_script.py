@@ -718,6 +718,26 @@ def test_startup_preflight_keeps_import_error_package_name(monkeypatch):
     assert "No module named 'numpy'" in problem
 
 
+def test_startup_preflight_detail_prefers_last_python_error():
+    helper = _load_helper_module()
+    output = (
+        "/home/klonet-agent/.local/lib/python3.8/site-packages/redis/utils.py:29: "
+        "CryptographyDeprecationWarning: Python 3.8 is no longer supported\n"
+        "Failed to read config file: gun.py\n"
+        "Traceback (most recent call last):\n"
+        "  File \"gun.py\", line 6, in <module>\n"
+        "    from vemu_uestc.Function_layer.server_health_master import x\n"
+        "  File \"link_operate.py\", line 3, in <module>\n"
+        "    from nsenter import Namespace\n"
+        "ModuleNotFoundError: No module named 'nsenter'\n"
+    )
+
+    detail = helper.startup_preflight_detail(output)
+
+    assert detail.startswith("last_error=ModuleNotFoundError: No module named 'nsenter'")
+    assert "CryptographyDeprecationWarning" in detail
+
+
 def test_start_platform_screens_helper_execute_rejects_existing_screen_session(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []

@@ -1031,12 +1031,29 @@ def startup_preflight_problem(project_root: str) -> str:
                 f"reason={exc.__class__.__name__} message={_one_line(str(exc))}"
             )
         if completed.returncode != 0:
-            detail = _one_line((completed.stderr or completed.stdout or "").strip(), limit=1200)
+            detail = startup_preflight_detail(completed.stderr or completed.stdout or "")
             return (
                 f"startup_preflight_failed component={component} "
                 f"returncode={completed.returncode} detail={detail or 'empty_output'}"
             )
     return ""
+
+
+def startup_preflight_detail(output: str) -> str:
+    text = str(output or "").strip()
+    compact = _one_line(text, limit=1200)
+    last_error = last_python_error_line(text)
+    if not last_error:
+        return compact
+    return _one_line(f"last_error={last_error} detail={compact}", limit=1400)
+
+
+def last_python_error_line(text: str) -> str:
+    matches = re.findall(
+        r"(?m)^(?:[A-Za-z_][A-Za-z0-9_.]*Error|[A-Za-z_][A-Za-z0-9_.]*Exception):\s+.+$",
+        str(text or ""),
+    )
+    return " ".join(matches[-1].split()) if matches else ""
 
 
 def archive_members(archive: Path) -> list:
