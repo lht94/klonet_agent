@@ -20,6 +20,7 @@ Cmnd_Alias KLONET_AGENT_OP = /usr/local/bin/klonet-agent-op restart-screen-compo
     /usr/local/bin/klonet-agent-op extract-archive --execute *, \
     /usr/local/bin/klonet-agent-op run-install-script --execute *, \
     /usr/local/bin/klonet-agent-op run-ops-command --execute *, \
+    /usr/local/bin/klonet-agent-op ensure-user-group --execute *, \
     /usr/local/bin/klonet-agent-op inspect-docker-containers --execute, \
     /usr/local/bin/klonet-agent-op inspect-docker-containers --execute *, \
     /usr/local/bin/klonet-agent-op start-docker-container --execute *

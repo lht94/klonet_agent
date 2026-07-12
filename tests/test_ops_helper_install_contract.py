@@ -23,6 +23,7 @@ def test_sudoers_template_only_allows_fixed_helper_entrypoint():
     assert "/usr/local/bin/klonet-agent-op extract-archive --execute" in text
     assert "/usr/local/bin/klonet-agent-op run-install-script --execute" in text
     assert "/usr/local/bin/klonet-agent-op run-ops-command --execute" in text
+    assert "/usr/local/bin/klonet-agent-op ensure-user-group --execute" in text
     assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute" in text
     assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute," in text
     assert "/usr/local/bin/klonet-agent-op start-docker-container --execute" in text

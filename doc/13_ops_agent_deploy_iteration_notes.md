@@ -755,3 +755,48 @@ anchor_match_count=0 expected=1
   - `_apply_action_bindings` 对 `write_ops_file.anchor` 保留原始字符串。
 - `tests/test_ops_operations.py`
   - 覆盖带前导空格的 `replace_text` anchor 可以成功匹配并保留缩进。
+
+## 2026-07-12 第二十四轮：缺少受控 Docker 组授权 action
+
+### 测试结果
+
+Python 依赖和若干顶层 Docker 导入问题修复后，平台仍在启动预检中访问 Docker socket。源码中存在大量模块级 `docker.from_env()`，逐个 lazy import 工作量大且风险高；Klonet 平台运行本身也需要 Docker 权限。
+
+agent 正确提出：
+
+```text
+usermod -aG docker klonet-agent
+```
+
+但 `run_ops_command` 拒绝 `usermod`：
+
+```text
+program_not_allowlisted=usermod
+```
+
+于是 agent 只能要求管理员外部执行，这不满足“通过受控 helper 自主完成部署”的目标。
+
+### 第二十四版优化思路
+
+- 不把 `usermod` 加进通用命令白名单。
+- 新增专用 helper action：`ensure-user-group --user klonet-agent --group docker`。
+- helper 内部只允许 `("klonet-agent", "docker")` 这一组 membership，防止变成任意提权工具。
+- agent 侧 action 标记为 `dangerous` 且 `confirm-step`，因为 docker 组约等于 root 权限。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 新增 `ensure-user-group` 子命令。
+  - 新增窄 allowlist `ALLOWED_USER_GROUP_MEMBERSHIPS`。
+- `scripts/klonet-agent-op.sudoers`
+  - 允许 helper 的 `ensure-user-group --execute *`。
+- `ops/actions.py`
+  - 注册 `ensure_user_group` action。
+- `ops/recipes.py`
+  - 新增 `_ensure_user_group` handler。
+- `tests/test_ops_helper_script.py`
+  - 覆盖 dry-run contract 和非 allowlist membership 拒绝。
+- `tests/test_ops_helper_install_contract.py`
+  - 覆盖 sudoers 项。
+- `tests/test_ops_operations.py`
+  - 覆盖 action 需要二次确认并调用 helper。

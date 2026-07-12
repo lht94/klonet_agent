@@ -31,6 +31,53 @@ def test_docker_container_helper_dry_run_contracts():
     assert "environment_changed=false" in start_result.stdout
 
 
+def test_ensure_user_group_helper_dry_run_contract():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "ensure-user-group",
+            "--dry-run",
+            "--user",
+            "klonet-agent",
+            "--group",
+            "docker",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "action=ensure-user-group" in result.stdout
+    assert "user=klonet-agent" in result.stdout
+    assert "group=docker" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
+def test_ensure_user_group_helper_rejects_unallowlisted_membership():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "ensure-user-group",
+            "--dry-run",
+            "--user",
+            "klonet-agent",
+            "--group",
+            "sudo",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 2
+    assert "user_group_membership_not_allowlisted" in result.stderr
+
+
 def test_read_file_helper_execute_reads_regular_file(tmp_path):
     target = tmp_path / "secret.env"
     target.write_text("TOKEN=visible-to-root-read\n", encoding="utf-8")

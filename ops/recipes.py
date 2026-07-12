@@ -35,6 +35,7 @@ WRITE_OPS_FILE = "write_ops_file"
 INSTALL_NGINX_CONFIG = "install_nginx_config"
 RELOAD_NGINX = "reload_nginx"
 START_DOCKER_CONTAINER = "start_docker_container"
+ENSURE_USER_GROUP = "ensure_user_group"
 RUN_OPS_COMMAND = "run_ops_command"
 RUN_OPS_COMMAND_TIMEOUT_SECONDS = 120
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
@@ -186,6 +187,7 @@ class ControlledActionRunner:
             WRITE_OPS_FILE,
             INSTALL_NGINX_CONFIG,
             START_DOCKER_CONTAINER,
+            ENSURE_USER_GROUP,
             RUN_OPS_COMMAND,
         }
         if spec.name in step_only_actions:
@@ -825,6 +827,24 @@ class ControlledActionRunner:
             )
         command = self._helper_command("start-docker-container", "--name", name)
         return self._helper_result(START_DOCKER_CONTAINER, command)
+
+    def _ensure_user_group(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.args or step.recipe_args or {}
+        user = str(args.get("user") or "").strip()
+        group = str(args.get("group") or "").strip()
+        if (user, group) != ("klonet-agent", "docker"):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={ENSURE_USER_GROUP} user_group_membership_not_allowlisted user={user or 'missing'} group={group or 'missing'}; environment unchanged",
+            )
+        command = self._helper_command(
+            "ensure-user-group",
+            "--user",
+            user,
+            "--group",
+            group,
+        )
+        return self._helper_result(ENSURE_USER_GROUP, command)
 
     def _run_ops_command(self, step: OperationStep) -> RecipeExecutionResult:
         args = step.args or step.recipe_args or {}

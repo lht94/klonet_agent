@@ -62,6 +62,7 @@ ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
     "docker_service.sh": (),
 }
+ALLOWED_USER_GROUP_MEMBERSHIPS = {("klonet-agent", "docker")}
 
 
 def main(argv=None) -> int:
@@ -145,6 +146,12 @@ def main(argv=None) -> int:
     run_ops.add_argument("--program", required=True)
     run_ops.add_argument("--argv-json", required=True)
     run_ops.add_argument("--cwd", default="")
+    ensure_group = subcommands.add_parser("ensure-user-group")
+    ensure_group_mode = ensure_group.add_mutually_exclusive_group(required=True)
+    ensure_group_mode.add_argument("--dry-run", action="store_true")
+    ensure_group_mode.add_argument("--execute", action="store_true")
+    ensure_group.add_argument("--user", required=True)
+    ensure_group.add_argument("--group", required=True)
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
@@ -172,6 +179,8 @@ def main(argv=None) -> int:
         return _start_docker_container(args)
     if args.action == "run-ops-command":
         return _run_ops_command(args)
+    if args.action == "ensure-user-group":
+        return _ensure_user_group(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
 
@@ -291,6 +300,61 @@ def _run_ops_command(args) -> int:
         return completed.returncode
     print("environment_changed=false")
     return 0
+
+
+def _ensure_user_group(args) -> int:
+    user = str(args.user or "").strip()
+    group = str(args.group or "").strip()
+    problem = _validate_user_group(user, group)
+    if problem:
+        _print_error(problem)
+        return 2
+    already_member = user_in_group(user, group)
+    changed = False
+    if args.execute and not already_member:
+        try:
+            run_checked(["usermod", "-aG", group, user])
+        except (subprocess.CalledProcessError, OSError) as exc:
+            _print_command_failure(["usermod", "-aG", group, user], exc)
+            return 1
+        changed = True
+        already_member = user_in_group(user, group)
+        if not already_member:
+            _print_error(f"group_membership_not_applied user={user} group={group}")
+            return 1
+    print("klonet_agent_op")
+    print("action=ensure-user-group")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"user={user}")
+    print(f"group={group}")
+    print(f"already_member={str(already_member).lower()}")
+    print(f"environment_changed={str(changed).lower()}")
+    return 0
+
+
+def _validate_user_group(user: str, group: str) -> str:
+    if (user, group) not in ALLOWED_USER_GROUP_MEMBERSHIPS:
+        return f"user_group_membership_not_allowlisted user={user or 'missing'} group={group or 'missing'}"
+    if not SAFE_RUNTIME_USER.fullmatch(user) or not SAFE_RUNTIME_USER.fullmatch(group):
+        return f"invalid_user_group user={user or 'missing'} group={group or 'missing'}"
+    return ""
+
+
+def user_in_group(user: str, group: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["id", "-nG", user],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+    return group in set(completed.stdout.split())
 
 
 def _command_env(command: list) -> dict | None:

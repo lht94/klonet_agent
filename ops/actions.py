@@ -187,6 +187,14 @@ DEFAULT_OPS_ACTIONS = (
         True,
     ),
     OpsActionSpec(
+        "ensure_user_group",
+        "_ensure_user_group",
+        "dangerous",
+        True,
+        aliases=("ensure-user-group", "add_user_to_group", "add-user-to-group"),
+        confirmation_scope="step",
+    ),
+    OpsActionSpec(
         "run_ops_command",
         "_run_ops_command",
         "controlled",

@@ -3015,6 +3015,60 @@ def test_start_platform_preflight_failure_blocks_with_helper_diagnostic():
     assert loaded.status == "approved"
 
 
+def test_ensure_user_group_recipe_requires_step_confirmation_and_calls_helper():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    commands = []
+
+    def command_runner(command):
+        commands.append(command)
+        return "klonet_agent_op\naction=ensure-user-group\nenvironment_changed=true\n"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="add docker group",
+            steps=[
+                {
+                    "step_id": "add-docker-group",
+                    "title": "将 klonet-agent 加入 docker 组",
+                    "action": "ensure_user_group",
+                    "args": {"user": "klonet-agent", "group": "docker"},
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        waiting = store.execute_step(plan.plan_id, "add-docker-group")
+        store.approve_step(plan.plan_id, "add-docker-group")
+        result = store.execute_step(plan.plan_id, "add-docker-group")
+
+    assert "requires explicit confirm-step" in waiting
+    assert "result_status=completed" in result
+    assert commands == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "ensure-user-group",
+            "--execute",
+            "--user",
+            "klonet-agent",
+            "--group",
+            "docker",
+        ]
+    ]
+
+
 def test_restart_recipe_unknown_environment_blocks_plan_until_reinspection():
     import subprocess
 
