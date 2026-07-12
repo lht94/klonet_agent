@@ -576,7 +576,7 @@ TOOLS = [
             },
             "action_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；run_ops_command 使用 {program,argv,cwd}；remove_python_package_entries 使用 {site_packages_dir,package,entries} 删除 Python 包目录下一层明确残留条目。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
+                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；run_ops_command 使用 {program,argv,cwd}；restart_screen_component 用于已有 screen 内重启单组件，start_screen_component 用于缺失 screen 时创建单组件，remove_python_package_entries 使用 {site_packages_dir,package,entries} 删除 Python 包目录下一层明确残留条目。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
             },
             "recipe_bindings": {
                 "type": "object",

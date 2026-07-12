@@ -789,7 +789,11 @@ def _action_type_for_recipe(recipe_id: str) -> str:
 
 
 def _unbound_step_looks_mutating(plan: OperationPlan, step: OperationStep) -> bool:
-    if plan.steps_source != "custom" or plan.operation != "deploy_platform":
+    if plan.steps_source != "custom" or plan.operation not in {
+        "deploy_platform",
+        "restart_platform",
+        "destroy_platform",
+    }:
         return False
     text = " ".join([step.step_id, step.title, step.purpose]).lower()
     mutating_markers = (
@@ -812,6 +816,16 @@ def _unbound_step_looks_mutating(plan: OperationPlan, step: OperationStep) -> bo
         "启动",
         "clone",
         "克隆",
+        "restart",
+        "重启",
+        "stop",
+        "停止",
+        "kill",
+        "杀",
+        "清理",
+        "cleanup",
+        "destroy",
+        "销毁",
     )
     readonly_markers = (
         "verify",

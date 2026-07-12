@@ -77,6 +77,14 @@ def main(argv=None) -> int:
     restart.add_argument("--component", required=True)
     restart.add_argument("--screen", required=True, dest="screen_session")
     restart.add_argument("--project-root", required=True)
+    start_component = subcommands.add_parser("start-screen-component")
+    start_component_mode = start_component.add_mutually_exclusive_group(required=True)
+    start_component_mode.add_argument("--dry-run", action="store_true")
+    start_component_mode.add_argument("--execute", action="store_true")
+    start_component.add_argument("--platform", required=True)
+    start_component.add_argument("--component", required=True)
+    start_component.add_argument("--screen", required=True, dest="screen_session")
+    start_component.add_argument("--project-root", required=True)
     stop = subcommands.add_parser("stop-screen-component")
     stop_mode = stop.add_mutually_exclusive_group(required=True)
     stop_mode.add_argument("--dry-run", action="store_true")
@@ -156,6 +164,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
+    if args.action == "start-screen-component":
+        return _start_screen_component(args)
     if args.action == "stop-screen-component":
         return _stop_screen_component(args)
     if args.action == "stop-platform-screens":
@@ -481,6 +491,38 @@ def _restart_screen_component(args) -> int:
             return 1
     print("klonet_agent_op")
     print("action=restart-screen-component")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"platform={args.platform}")
+    print(f"component={args.component}")
+    print(f"screen_session={args.screen_session}")
+    print(f"project_root={args.project_root}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
+def _start_screen_component(args) -> int:
+    problem = _validate_restart_args(
+        args.platform,
+        args.component,
+        args.screen_session,
+        args.project_root,
+    )
+    if problem:
+        _print_error(problem)
+        return 2
+    if args.execute:
+        existing = existing_screen_sessions([args.screen_session])
+        if existing:
+            _print_error(f"screen_session_already_exists={args.screen_session}")
+            return 2
+        missing = project_entry_files_missing(args.project_root)
+        if missing:
+            _print_error(f"missing_project_entry_files={','.join(missing)}")
+            return 2
+        if not _run_commands(_start_component_commands(args.component, args.screen_session, args.project_root)):
+            return 1
+    print("klonet_agent_op")
+    print("action=start-screen-component")
     print(f"dry_run={str(args.dry_run).lower()}")
     print(f"platform={args.platform}")
     print(f"component={args.component}")
@@ -920,10 +962,16 @@ def _run_commands(commands: list) -> bool:
 def _restart_commands(component: str, screen_session: str, project_root: str) -> list:
     return [
         *_stop_commands(screen_session),
+        *_start_component_commands(component, screen_session, project_root),
+    ]
+
+
+def _start_component_commands(component: str, screen_session: str, project_root: str) -> list:
+    return [
         _screen_command(
             screen_session,
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
-        ),
+        )
     ]
 
 

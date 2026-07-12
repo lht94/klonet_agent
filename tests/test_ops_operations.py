@@ -848,6 +848,35 @@ def test_custom_deploy_mutating_checkpoint_without_action_blocks():
     assert _status_by_step(loaded)["config-lht"] == "blocked"
 
 
+def test_custom_restart_mutating_checkpoint_without_action_blocks():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="lht",
+            objective="restart lht master",
+            steps=[
+                {
+                    "step_id": "kill-old-master-screen",
+                    "title": "清理旧的 lht_m screen",
+                    "purpose": "kill stale master screen before restart",
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "kill-old-master-screen")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "mutating_checkpoint_requires_action_binding" in result
+    assert _status_by_step(loaded)["kill-old-master-screen"] == "blocked"
+
+
 def test_custom_deploy_readonly_checkpoint_without_action_can_complete():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir
@@ -2909,6 +2938,67 @@ def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     assert statuses["precheck-runtime"] == "completed"
     assert statuses["restart-worker"] == "pending"
     assert statuses["verify-health"] == "pending"
+
+
+def test_start_screen_component_recipe_execute_calls_fixed_helper_command():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return "helper stdout ok"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="start missing master screen",
+            steps=[
+                {
+                    "step_id": "start-master",
+                    "title": "启动缺失 master screen",
+                    "action": "start_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        result = store.execute_step(plan.plan_id, "start-master")
+
+    assert calls == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "start-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    ]
+    assert "result_status=completed" in result
+    assert "helper stdout ok" in result
 
 
 def test_restart_screen_component_recipe_execute_reports_helper_failure():

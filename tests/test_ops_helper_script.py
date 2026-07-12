@@ -1097,6 +1097,69 @@ def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(mon
     assert "environment_changed=true" in captured.out
 
 
+def test_start_screen_component_helper_execute_creates_missing_component(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+
+    code = helper.main(
+        [
+            "start-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert commands == [
+        [
+            "screen",
+            "-dmS",
+            "102_m",
+            "bash",
+            "-lc",
+            "cd /home/adminis/lht/102_project && /usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+        ],
+    ]
+    assert "action=start-screen-component" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_start_screen_component_helper_rejects_existing_screen(monkeypatch, capsys):
+    helper = _load_helper_module()
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: ["102_m"])
+
+    code = helper.main(
+        [
+            "start-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert "screen_session_already_exists=102_m" in captured.err
+
+
 def test_restart_screen_component_helper_execute_reports_command_failure(monkeypatch, capsys):
     helper = _load_helper_module()
     commands = []

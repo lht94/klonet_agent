@@ -23,6 +23,7 @@ from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExec
 
 
 RESTART_SCREEN_COMPONENT = "restart_screen_component"
+START_SCREEN_COMPONENT = "start_screen_component"
 MANUAL_CHECKPOINT = "manual_checkpoint"
 STOP_SCREEN_COMPONENT = "stop_screen_component"
 STOP_PLATFORM_SCREENS = "stop_platform_screens"
@@ -188,6 +189,7 @@ class ControlledActionRunner:
             EXTRACT_ARCHIVE,
             RUN_INSTALL_SCRIPT,
             ENSURE_SHARED_SERVICES,
+            START_SCREEN_COMPONENT,
             WRITE_OPS_FILE,
             INSTALL_NGINX_CONFIG,
             START_DOCKER_CONTAINER,
@@ -257,6 +259,28 @@ class ControlledActionRunner:
                 "environment unchanged"
             ),
         )
+
+    def _start_screen_component(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        platform = str(args.get("platform") or "").strip()
+        component = str(args.get("component") or "").strip()
+        screen_session = str(args.get("screen_session") or "").strip()
+        project_root = str(args.get("project_root") or "").strip()
+        problem = _validate_restart_args(platform, component, screen_session, project_root)
+        if problem:
+            return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
+        command = self._helper_command(
+            "start-screen-component",
+            "--platform",
+            platform,
+            "--component",
+            component,
+            "--screen",
+            screen_session,
+            "--project-root",
+            project_root,
+        )
+        return self._helper_result(START_SCREEN_COMPONENT, command)
 
     def _stop_screen_component(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}

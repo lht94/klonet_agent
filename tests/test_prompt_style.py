@@ -190,6 +190,16 @@ def test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps():
     assert "未绑定 action 的修改步骤会被状态机阻塞" in OPS_PROMPT
 
 
+def test_ops_prompt_routes_single_component_screen_recovery():
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "restart_screen_component" in OPS_PROMPT
+    assert "start_screen_component" in OPS_PROMPT
+    assert "screen 里只剩 shell" in OPS_PROMPT
+    assert "不要改用 `screen`、`kill`、`python -c`" in OPS_PROMPT
+    assert "全量 `start_platform_screens`" in OPS_PROMPT
+
+
 def test_ops_prompt_forbids_plaintext_secrets_in_plans():
     """Plans and summaries should not leak config secrets."""
 

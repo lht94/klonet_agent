@@ -1110,3 +1110,73 @@ port_status=ready ports=8380,27700,27701,27702
 nginx_status=detected
 overall_status=ready
 ```
+
+## 2026-07-12 第三十一轮：单组件 screen 恢复计划选错 action
+
+### 测试结果
+
+用户报告 master 掉线，希望“进入 screen 重新帮我启动”。agent 正确诊断到：
+
+```text
+lht_m screen 存在，但里面只剩 shell
+27700 未监听
+worker/celery/web_terminal 正常
+```
+
+但计划中出现两个问题：
+
+- `kill-old-master-screen` 是无 action 的 checkpoint，执行后显示“已完成，没有修改环境”，实际上没有清理 `lht_m`。
+- `start-master` 错用 `start_platform_screens`，该 helper 是全平台启动，遇到已有 `lht_m/lht_w/lht_c/lht_web` 会拒绝 `screen_session_already_exists`。
+
+随后 agent 尝试 `screen`、`kill`、`python -c` 等绕路，均被 allowlist 正确拒绝。真正应该使用的能力其实已经存在：`restart_screen_component` 会受控关闭已有 screen 并用固定模板重建单组件。
+
+同时还缺少另一种通用能力：当目标组件 screen 已不存在，但其它组件仍在运行时，没有“只创建一个组件 screen”的 action，只能误用全量 `start_platform_screens`。
+
+### 第三十一版优化思路
+
+- Prompt 明确单组件恢复决策：
+  - screen 存在但端口未监听、screen 内只剩 shell 或旧进程退出：使用 `restart_screen_component`。
+  - screen 不存在但只需补一个组件：使用 `start_screen_component`。
+  - 多个组件都缺失或用户明确要求全量启动时，才使用 `start_platform_screens`。
+- 状态机兜底从 deploy 扩展到 restart/destroy：自定义 restart 计划中的“kill/stop/restart/清理/启动”无 action 步骤必须 blocked，不能 checkpoint 完成。
+- 新增窄 helper action `start-screen-component`：
+  - 只接受固定 component、screen、project_root 参数。
+  - 目标 screen 已存在则拒绝，避免覆盖正在运行组件。
+  - 使用与 restart 相同的固定启动模板，不开放任意 `screen` 或 shell。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 新增 `start-screen-component` 子命令。
+  - 抽取 `_start_component_commands` 复用固定模板。
+- `scripts/klonet-agent-op.sudoers`
+  - 增加 helper 子命令白名单，不放开 `/usr/bin/screen` 或 `/usr/bin/kill`。
+- `ops/actions.py`
+  - 注册 `start_screen_component`。
+- `ops/recipes.py`
+  - 新增 `_start_screen_component` recipe。
+- `ops/operations.py`
+  - 自定义 restart/destroy 的修改性 checkpoint 也会被阻塞。
+- `prompts.py`
+  - 增加单组件 screen 恢复规则，禁止 screen/kill/python-c 绕路和不必要全量启动。
+- `tools/registry.py`
+  - action binding 描述补充 `restart_screen_component` 与 `start_screen_component`。
+- `tests/test_ops_helper_script.py`
+  - 覆盖单组件 start 创建缺失 screen 和拒绝已有 screen。
+- `tests/test_ops_operations.py`
+  - 覆盖 recipe 调用 helper，以及 restart 修改性 checkpoint 阻塞。
+- `tests/test_prompt_style.py`
+  - 覆盖 prompt 单组件恢复规则。
+- `tests/test_ops_helper_install_contract.py`
+  - 覆盖 sudoers 合同。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_helper_script.py::test_start_screen_component_helper_execute_creates_missing_component tests/test_ops_helper_script.py::test_start_screen_component_helper_rejects_existing_screen tests/test_ops_helper_install_contract.py::test_sudoers_template_only_allows_fixed_helper_entrypoint -q --basetemp=/tmp/klonet_agent_pytest_tmp
+python -m pytest tests/test_ops_operations.py::test_start_screen_component_recipe_execute_calls_fixed_helper_command tests/test_ops_operations.py::test_custom_restart_mutating_checkpoint_without_action_blocks tests/test_prompt_style.py::test_ops_prompt_routes_single_component_screen_recovery -q --basetemp=/tmp/klonet_agent_pytest_tmp2
+python -m pytest tests/test_ops_operations.py::test_restart_screen_component_recipe_execute_calls_fixed_helper_command tests/test_ops_operations.py::test_start_screen_component_recipe_execute_calls_fixed_helper_command tests/test_ops_operations.py::test_custom_deploy_mutating_checkpoint_without_action_blocks tests/test_ops_operations.py::test_custom_restart_mutating_checkpoint_without_action_blocks tests/test_ops_operations.py::test_custom_deploy_readonly_checkpoint_without_action_can_complete tests/test_prompt_style.py::test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps tests/test_prompt_style.py::test_ops_prompt_routes_single_component_screen_recovery -q --basetemp=/tmp/klonet_agent_pytest_tmp4
+python -m pytest tests/test_ops_helper_script.py::test_restart_screen_component_helper_execute_uses_fixed_screen_templates tests/test_ops_helper_script.py::test_start_screen_component_helper_execute_creates_missing_component tests/test_ops_helper_script.py::test_start_screen_component_helper_rejects_existing_screen tests/test_ops_helper_script.py::test_restart_screen_component_helper_execute_reports_command_failure -q --basetemp=/tmp/klonet_agent_pytest_tmp3
+```
+
+结果：`3 passed`，`3 passed`，`7 passed`，`4 passed`。

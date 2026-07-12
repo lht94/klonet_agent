@@ -109,6 +109,14 @@ DEFAULT_OPS_ACTIONS = (
         ("restart_component",),
     ),
     OpsActionSpec(
+        "start_screen_component",
+        "_start_screen_component",
+        "privileged",
+        True,
+        ("project_root",),
+        ("start_component",),
+    ),
+    OpsActionSpec(
         "stop_screen_component",
         "_stop_screen_component",
         "dangerous",
