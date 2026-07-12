@@ -149,19 +149,21 @@ def test_ops_prompt_respects_user_pause_before_plan_execution():
 
 
 def test_ops_prompt_routes_python_environment_recovery_through_controlled_plan():
-    """Environment recovery should not suggest shell-pipe bypasses."""
+    """Environment recovery should prefer controlled plans but preserve fallback agency."""
 
     from klonet_agent.prompts import OPS_PROMPT
 
     assert "python -m pip install" in OPS_PROMPT
     assert "pip install" in OPS_PROMPT
-    assert "不得建议 `curl | python`" in OPS_PROMPT
     assert "用受控 apt 安装系统包" in OPS_PROMPT
     assert "用受控 `python3.8 -m pip install`" in OPS_PROMPT
+    assert "最后备选" in OPS_PROMPT
+    assert "安全风险" in OPS_PROMPT
+    assert "需要管理员显式选择" in OPS_PROMPT
 
 
 def test_ops_prompt_blocks_helper_policy_mismatch_workarounds():
-    """Helper contract drift should stop at infrastructure repair."""
+    """Helper contract drift should not be silently bypassed as a controlled step."""
 
     from klonet_agent.prompts import OPS_PROMPT
 
@@ -169,7 +171,8 @@ def test_ops_prompt_blocks_helper_policy_mismatch_workarounds():
     assert "升级 installed helper" in OPS_PROMPT
     assert "apt-get" in OPS_PROMPT
     assert "dpkg" in OPS_PROMPT
-    assert "绕过 helper 版本漂移" in OPS_PROMPT
+    assert "外部管理员救援选项" in OPS_PROMPT
+    assert "需要用户明确改约束或管理员确认" in OPS_PROMPT
 
 
 def test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps():
