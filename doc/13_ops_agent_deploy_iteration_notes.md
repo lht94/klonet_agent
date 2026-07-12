@@ -417,3 +417,38 @@ apt_args_not_allowed
   - 将“不得建议/不得绕过”的绝对语气改为“默认受控计划；外部救援可列出但需风险说明和显式确认”。
 - `tests/test_prompt_style.py`
   - 将测试从绝对禁止改为覆盖分层 fallback 语义。
+
+## 2026-07-12 第十四轮：reload-nginx 无参数 sudoers 匹配失败
+
+### 测试结果
+
+按用户补充的管理员路径重新安装 helper/service 后，`apt install --reinstall -y python3.8-minimal` 成功恢复 `/usr/bin/python3.8`，pip 依赖安装、启动文件复制、后端配置、Nginx staging 都完成。
+
+新阻塞出现在 `reload_nginx`：
+
+- `install-nginx-config --execute --source-path ... --config-name ...` 可以通过 sudoers。
+- `reload-nginx --execute` 返回 `sudo: a password is required`。
+
+根因是 sudoers 模板只有：
+
+```text
+/usr/local/bin/klonet-agent-op reload-nginx --execute *
+```
+
+但 `reload-nginx` 没有额外参数，`--execute *` 不能匹配无参数命令。
+
+### 第十四版优化思路
+
+- 对无额外参数的 helper 子命令，在 sudoers 中增加精确命令项。
+- Nginx helper 遇到 sudo password/no tty 时，应和通用 helper 一样归类为基础设施 blocked，而不是 failed。
+
+### 实现文件
+
+- `scripts/klonet-agent-op.sudoers`
+  - 增加 `/usr/local/bin/klonet-agent-op reload-nginx --execute,` 精确项。
+- `ops/recipes.py`
+  - `_nginx_helper_failure_result` 识别 sudoers/password failure，返回 `helper_sudo_not_configured` blocked。
+- `tests/test_ops_helper_install_contract.py`
+  - 覆盖 reload-nginx 精确 sudoers 项。
+- `tests/test_ops_operations.py`
+  - 覆盖 reload_nginx sudoers 缺失时 blocked。

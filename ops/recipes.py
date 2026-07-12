@@ -1276,6 +1276,12 @@ def _nginx_helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeEx
         f"stderr={stderr} "
         f"stdout={stdout}"
     )
+    if _looks_like_sudo_password_failure(stderr):
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_sudo_not_configured {output}",
+            "install_ops_helper_sudoers",
+        )
     if "nginx_test_failed" in stderr or "environment_changed=false" in stderr:
         return RecipeExecutionResult("blocked", output)
     if "environment_changed=unknown" in stderr:

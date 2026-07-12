@@ -2551,6 +2551,55 @@ def test_reload_nginx_recipe_blocks_when_config_test_fails_without_reload():
     assert loaded.status == "approved"
 
 
+def test_reload_nginx_recipe_blocks_when_sudoers_missing():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output="",
+            stderr="sudo: a password is required",
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="reload nginx",
+            recipe_bindings={
+                "start-services": {
+                    "recipe_id": "reload_nginx",
+                    "args": {},
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "start-services")
+        step.status = "approved"
+        _complete_steps_before(plan, "start-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-services")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "helper_sudo_not_configured" in result
+    assert "next_required_action=install_ops_helper_sudoers" in result
+    assert loaded.status == "approved"
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
