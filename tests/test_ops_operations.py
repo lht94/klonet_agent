@@ -3069,6 +3069,99 @@ def test_ensure_user_group_recipe_requires_step_confirmation_and_calls_helper():
     ]
 
 
+def test_remove_python_package_entries_requires_step_confirmation_and_removes_entries():
+    import shutil
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    root = Path("/home/klonet-agent/workspaces/test_remove_python_package_entries")
+    site_packages = root / ".venv" / "lib" / "python3.8" / "site-packages"
+    package_dir = site_packages / "werkzeug"
+    stale_dir = package_dir / "datastructures"
+    stale_file = package_dir / "legacy.py"
+    keep_file = package_dir / "datastructures.py"
+    shutil.rmtree(root, ignore_errors=True)
+    stale_dir.mkdir(parents=True)
+    stale_file.write_text("old\n", encoding="utf-8")
+    keep_file.write_text("keep\n", encoding="utf-8")
+
+    try:
+        store = OperationPlanStore(
+            root / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="remove stale package entries",
+            steps=[
+                {
+                    "step_id": "cleanup-werkzeug",
+                    "title": "删除 werkzeug 残留条目",
+                    "action": "remove_python_package_entries",
+                    "args": {
+                        "site_packages_dir": str(site_packages),
+                        "package": "werkzeug",
+                        "entries": ["datastructures", "legacy.py", "missing"],
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        waiting = store.execute_step(plan.plan_id, "cleanup-werkzeug")
+        store.approve_step(plan.plan_id, "cleanup-werkzeug")
+        result = store.execute_step(plan.plan_id, "cleanup-werkzeug")
+        stale_dir_exists = stale_dir.exists()
+        stale_file_exists = stale_file.exists()
+        keep_file_exists = keep_file.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    assert "requires explicit confirm-step" in waiting
+    assert "result_status=completed" in result
+    assert "recipe_id=remove_python_package_entries" in result
+    assert "removed=datastructures,legacy.py" in result
+    assert not stale_dir_exists
+    assert not stale_file_exists
+    assert keep_file_exists
+
+
+def test_remove_python_package_entries_blocks_unallowlisted_entries():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="reject unsafe package cleanup",
+            steps=[
+                {
+                    "step_id": "cleanup",
+                    "title": "unsafe cleanup",
+                    "action": "remove_python_package_entries",
+                    "args": {
+                        "site_packages_dir": "/home/klonet-agent/.local/lib/python3.8/site-packages",
+                        "package": "werkzeug",
+                        "entries": ["../flask"],
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        store.approve_step(plan.plan_id, "cleanup")
+        result = store.execute_step(plan.plan_id, "cleanup")
+
+    assert "result_status=blocked" in result
+    assert "invalid_package_entry=../flask" in result
+
+
 def test_restart_recipe_unknown_environment_blocks_plan_until_reinspection():
     import subprocess
 

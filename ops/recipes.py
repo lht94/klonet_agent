@@ -36,6 +36,7 @@ INSTALL_NGINX_CONFIG = "install_nginx_config"
 RELOAD_NGINX = "reload_nginx"
 START_DOCKER_CONTAINER = "start_docker_container"
 ENSURE_USER_GROUP = "ensure_user_group"
+REMOVE_PYTHON_PACKAGE_ENTRIES = "remove_python_package_entries"
 RUN_OPS_COMMAND = "run_ops_command"
 RUN_OPS_COMMAND_TIMEOUT_SECONDS = 120
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
@@ -99,6 +100,8 @@ SENSITIVE_OPS_WRITE_NAME_PARTS = (
     "password",
 )
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+_SAFE_PYTHON_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}$")
+_SAFE_PYTHON_PACKAGE_ENTRY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}$")
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
@@ -188,6 +191,7 @@ class ControlledActionRunner:
             INSTALL_NGINX_CONFIG,
             START_DOCKER_CONTAINER,
             ENSURE_USER_GROUP,
+            REMOVE_PYTHON_PACKAGE_ENTRIES,
             RUN_OPS_COMMAND,
         }
         if spec.name in step_only_actions:
@@ -846,6 +850,81 @@ class ControlledActionRunner:
         )
         return self._helper_result(ENSURE_USER_GROUP, command)
 
+    def _remove_python_package_entries(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.args or step.recipe_args or {}
+        site_packages_dir = str(args.get("site_packages_dir") or "").strip()
+        package = str(args.get("package") or "").strip()
+        entries = _python_package_entries_arg(args.get("entries"))
+        problem = _validate_python_package_entries(site_packages_dir, package, entries)
+        if problem:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} {problem}; environment unchanged",
+            )
+        site_root = Path(site_packages_dir).resolve(strict=False)
+        package_dir = site_root / package
+        if not package_dir.is_dir():
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                    f"package_dir_not_found={_one_line(str(package_dir))}; "
+                    "environment unchanged"
+                ),
+            )
+        targets = [package_dir / entry for entry in entries]
+        resolved_targets = [target.resolve(strict=False) for target in targets]
+        if any(not _path_is_relative_to(target, package_dir) for target in resolved_targets):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} entry_path_not_allowlisted; environment unchanged",
+            )
+        missing = [entries[index] for index, target in enumerate(targets) if not target.exists()]
+        existing = [(entries[index], target) for index, target in enumerate(targets) if target.exists()]
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                    f"site_packages_dir={_one_line(str(site_root))} "
+                    f"package={package} "
+                    f"remove_preview={','.join(entry for entry, _target in existing) or 'none'} "
+                    f"missing={','.join(missing) or 'none'} "
+                    "environment unchanged"
+                ),
+            )
+        removed = []
+        try:
+            for entry, target in existing:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                removed.append(entry)
+        except OSError as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                    f"remove_failed={_one_line(str(exc))} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        return RecipeExecutionResult(
+            "completed",
+            (
+                "dry_run=false "
+                f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                f"site_packages_dir={_one_line(str(site_root))} "
+                f"package={package} "
+                f"removed={','.join(removed) or 'none'} "
+                f"missing={','.join(missing) or 'none'} "
+                "environment_changed=true"
+            ),
+        )
+
     def _run_ops_command(self, step: OperationStep) -> RecipeExecutionResult:
         args = step.args or step.recipe_args or {}
         decision = decide_ops_command(args)
@@ -1158,6 +1237,46 @@ def _path_is_relative_to(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _python_package_entries_arg(raw_entries) -> list[str]:
+    if isinstance(raw_entries, list):
+        return [str(item).strip() for item in raw_entries if str(item).strip()]
+    if isinstance(raw_entries, str):
+        return [item.strip() for item in raw_entries.split(",") if item.strip()]
+    return []
+
+
+def _validate_python_package_entries(site_packages_dir: str, package: str, entries: list[str]) -> str:
+    if not site_packages_dir or _looks_unsafe_path(site_packages_dir):
+        return f"invalid_site_packages_dir={site_packages_dir or 'missing'}"
+    site_root = Path(site_packages_dir).resolve(strict=False)
+    if not _allowed_site_packages_root(site_root):
+        return "site_packages_dir_not_allowlisted"
+    if not package or not _SAFE_PYTHON_PACKAGE_NAME.fullmatch(package):
+        return f"invalid_package={package or 'missing'}"
+    if not entries:
+        return "entries_required"
+    if len(entries) > 40:
+        return "entries_too_many"
+    for entry in entries:
+        if not _SAFE_PYTHON_PACKAGE_ENTRY.fullmatch(entry):
+            return f"invalid_package_entry={entry or 'missing'}"
+        if entry in {".", "..", package}:
+            return f"invalid_package_entry={entry}"
+    return ""
+
+
+def _allowed_site_packages_root(path: Path) -> bool:
+    text = str(path).replace("\\", "/").rstrip("/")
+    if re.fullmatch(r"/home/klonet-agent/\.local/lib/python\d+(?:\.\d+)?/site-packages", text):
+        return True
+    return bool(
+        re.fullmatch(
+            r"/home/klonet-agent/(?:platforms|workspace|workspaces)/[^/]+/(?:\.venv|venv)/lib/python\d+(?:\.\d+)?/site-packages",
+            text,
+        )
+    )
 
 
 def _looks_unsafe_path(value: str) -> bool:

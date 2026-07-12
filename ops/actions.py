@@ -195,6 +195,19 @@ DEFAULT_OPS_ACTIONS = (
         confirmation_scope="step",
     ),
     OpsActionSpec(
+        "remove_python_package_entries",
+        "_remove_python_package_entries",
+        "dangerous",
+        True,
+        ("site_packages_dir",),
+        aliases=(
+            "remove-python-package-entries",
+            "cleanup_python_package_entries",
+            "cleanup-python-package-entries",
+        ),
+        confirmation_scope="step",
+    ),
+    OpsActionSpec(
         "run_ops_command",
         "_run_ops_command",
         "controlled",

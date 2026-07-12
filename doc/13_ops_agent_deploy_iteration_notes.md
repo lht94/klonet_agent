@@ -902,3 +902,51 @@ python -m pytest tests/test_ops_command_policy.py tests/test_prompt_style.py -q 
 ```
 
 结果：`48 passed`。
+
+## 2026-07-12 第二十七轮：缺少受控删除能力导致 agent 连续尝试等价绕路
+
+### 测试结果
+
+第二十六版后重启 ops agent 继续部署。agent 能识别 Werkzeug 3.x 残留目录必须删除，但没有一个受控 action 表达“删除 Python 包目录下一层残留条目”。它先后尝试：
+
+- `rm`：被 `program_not_allowlisted=rm` 拒绝。
+- 写 `/tmp/cleanup_werkzeug.py` 再执行：执行步骤被 `python_args_not_allowed` 拒绝。
+- 继续提出 `python3.8 -s -c "import shutil..."` 内联删除。
+- 甚至考虑覆盖旧包目录的 `__init__.py` 来改变导入行为。
+
+这说明仅靠“允许 pip uninstall/force-reinstall”不够；当环境恢复需要一个真实文件删除动作时，agent 会寻找同等效果的绕路。如果没有窄的受控能力，prompt 也应明确禁止通过脚本、`python -c`、覆盖包文件等方式绕过执行器。
+
+### 第二十七版优化思路
+
+- 不开放通用 `rm`、任意 Python 脚本执行或 `python -c`。
+- 新增窄 action：`remove_python_package_entries`。
+  - 参数：`site_packages_dir`、`package`、`entries`。
+  - 只允许删除指定 package 目录下一层的明确条目。
+  - `site_packages_dir` 只允许 `klonet-agent` 用户 site-packages 或工作区 venv site-packages。
+  - 拒绝 `..`、路径分隔符、通配符、空列表和过多条目。
+  - 风险为 `dangerous`，必须 `confirm-step`。
+- Prompt 明确：包残留删除应走该 action；不得通过临时脚本、`python -c`、覆盖 `__init__.py`、`rm -rf` 等绕过 allowlist。
+
+### 实现文件
+
+- `ops/actions.py`
+  - 注册 `remove_python_package_entries`。
+- `ops/recipes.py`
+  - 新增 `_remove_python_package_entries` handler 和路径/条目校验。
+- `prompts.py`
+  - 增加包残留清理规则和禁止绕路说明。
+- `tools/registry.py`
+  - 在 `create_ops_operation_plan` 的 action args 描述中补充新 action。
+- `tests/test_ops_operations.py`
+  - 覆盖需要 step-confirm、只删除明确条目、拒绝越界条目。
+- `tests/test_prompt_style.py`
+  - 覆盖 prompt 中的新 action 和禁止绕路提示。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_operations.py::test_remove_python_package_entries_requires_step_confirmation_and_removes_entries tests/test_ops_operations.py::test_remove_python_package_entries_blocks_unallowlisted_entries -q --basetemp=/tmp/klonet_agent_pytest_tmp
+python -m pytest tests/test_ops_command_policy.py tests/test_prompt_style.py -q --basetemp=/tmp/klonet_agent_pytest_tmp2
+```
+
+结果：`2 passed`，`48 passed`。
