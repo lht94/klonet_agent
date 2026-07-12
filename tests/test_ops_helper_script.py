@@ -541,6 +541,7 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
     monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
     monkeypatch.setattr(helper, "runtime_required_ports", lambda project_root: [5000, 5001])
     monkeypatch.setattr(helper, "listening_ports", lambda ports: next(port_checks, [5000, 5001]))
+    monkeypatch.setattr(helper, "startup_preflight_problem", lambda project_root: "")
 
     code = helper.main(
         [
@@ -562,7 +563,7 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
             "103_m",
             "bash",
             "-lc",
-            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/bin/gunicorn -c gun.py master_main:flask_app",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
         ],
         [
             "screen",
@@ -570,7 +571,7 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
             "103_c",
             "bash",
             "-lc",
-            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/bin/python3.8 -m celery -A celery_worker.celery worker --loglevel=info",
         ],
         [
             "screen",
@@ -578,7 +579,7 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
             "103_web",
             "bash",
             "-lc",
-            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/python3/bin/python3.8 web_terminal_main.py",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/bin/python3.8 web_terminal_main.py",
         ],
         [
             "screen",
@@ -586,10 +587,47 @@ def test_start_platform_screens_helper_execute_uses_fixed_screen_templates(monke
             "103_w",
             "bash",
             "-lc",
-            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app",
+            "cd /home/adminis/lht/103_project/vemu_uestc && /usr/bin/python3.8 -m gunicorn -c worker_gun.py worker_main:flask_app",
         ],
     ]
     assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_start_platform_screens_helper_execute_runs_screen_as_sudo_user(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+    screen_checks = iter([[], ["103_m", "103_c", "103_web", "103_w"]])
+    port_checks = iter([[], [5000, 5001]])
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "klonet-agent")
+    monkeypatch.setattr(
+        helper,
+        "existing_screen_sessions",
+        lambda sessions: next(screen_checks, ["103_m", "103_c", "103_web", "103_w"]),
+    )
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "runtime_required_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: next(port_checks, [5000, 5001]))
+    monkeypatch.setattr(helper, "startup_preflight_problem", lambda project_root: "")
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert all(command[:5] == ["runuser", "-u", "klonet-agent", "--", "screen"] for command in commands)
     assert "environment_changed=true" in captured.out
 
 
@@ -603,6 +641,7 @@ def test_start_platform_screens_helper_execute_blocks_when_postcondition_fails(m
     monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
     monkeypatch.setattr(helper, "runtime_required_ports", lambda project_root: [5000, 5001])
     monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
+    monkeypatch.setattr(helper, "startup_preflight_problem", lambda project_root: "")
     ticks = iter([0.0, 6.0])
     monkeypatch.setattr(helper.time, "monotonic", lambda: next(ticks, 6.0))
     monkeypatch.setattr(helper.time, "sleep", lambda seconds: None)
@@ -625,6 +664,39 @@ def test_start_platform_screens_helper_execute_blocks_when_postcondition_fails(m
     assert "missing_started_screens=103_m,103_c,103_web,103_w" in captured.err
     assert "missing_listening_ports=5000,5001" in captured.err
     assert "environment_changed=unknown" in captured.err
+
+
+def test_start_platform_screens_helper_execute_blocks_on_startup_preflight(monkeypatch, capsys):
+    helper = _load_helper_module()
+    commands = []
+
+    monkeypatch.setattr(helper, "run_checked", lambda command: commands.append(command))
+    monkeypatch.setattr(helper, "existing_screen_sessions", lambda sessions: [])
+    monkeypatch.setattr(helper, "project_entry_files_missing", lambda project_root: [])
+    monkeypatch.setattr(helper, "configured_ports", lambda project_root: [5000, 5001])
+    monkeypatch.setattr(helper, "listening_ports", lambda ports: [])
+    monkeypatch.setattr(
+        helper,
+        "startup_preflight_problem",
+        lambda project_root: "startup_preflight_failed component=master returncode=1 detail=ModuleNotFoundError",
+    )
+
+    code = helper.main(
+        [
+            "start-platform-screens",
+            "--execute",
+            "--platform",
+            "103",
+            "--project-root",
+            "/home/adminis/lht/103_project/vemu_uestc",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert commands == []
+    assert "startup_preflight_failed component=master" in captured.err
+    assert "environment_changed=false" in captured.err
 
 
 def test_start_platform_screens_helper_execute_rejects_existing_screen_session(monkeypatch, capsys):
@@ -895,7 +967,7 @@ def test_restart_screen_component_helper_execute_uses_fixed_screen_templates(mon
             "102_m",
             "bash",
             "-lc",
-            "cd /home/adminis/lht/102_project && /usr/local/bin/gunicorn -c gun.py master_main:flask_app",
+            "cd /home/adminis/lht/102_project && /usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
         ],
     ]
     assert "dry_run=false" in captured.out
@@ -940,7 +1012,7 @@ def test_restart_screen_component_helper_execute_reports_command_failure(monkeyp
     assert "Traceback" not in captured.err
 
 
-def test_restart_web_terminal_helper_uses_server_python_path(monkeypatch):
+def test_restart_web_terminal_helper_uses_system_python_module_path(monkeypatch):
     helper = _load_helper_module()
     commands = []
 
@@ -970,7 +1042,7 @@ def test_restart_web_terminal_helper_uses_server_python_path(monkeypatch):
         "102_web",
         "bash",
         "-lc",
-        "cd /home/adminis/lht/102_project && /usr/local/python3/bin/python3.8 web_terminal_main.py",
+        "cd /home/adminis/lht/102_project && /usr/bin/python3.8 web_terminal_main.py",
     ]
 
 

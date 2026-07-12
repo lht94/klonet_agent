@@ -516,3 +516,45 @@ PROJ_CONFIG = LhtConfig()
   - 端口解析限定到激活配置类。
 - `tests/test_ops_helper_script.py`
   - 覆盖只读取 `PROJ_CONFIG` 激活类端口。
+
+## 2026-07-12 第十七轮：平台启动失败缺少真实 Python 异常
+
+### 测试结果
+
+第十六版 helper 安装后，真实执行：
+
+```text
+start-platform-screens --execute --platform lht --project-root /home/klonet-agent/platforms/lht_project
+```
+
+后置条件已经能正确失败，但输出仍只有：
+
+```text
+start_postcondition_failed missing_started_screens=lht_m,lht_c,lht_web,lht_w missing_listening_ports=27700,27701,27702
+```
+
+继续以前台方式运行组件入口后发现两个更具体的问题：
+
+- helper 启动模板仍使用 `/usr/local/bin/gunicorn`、`/usr/local/bin/celery`、`/usr/local/python3/bin/python3.8`，但当前机器实际 Python 是 `/usr/bin/python3.8`，依赖安装在 `klonet-agent` 用户的 `~/.local`。
+- 应用入口还存在真实导入错误，例如 master 预检报 `ModuleNotFoundError`，首先缺少 `numpy`；其它组件还暴露出部署目录名和源码内 `vemu_uestc` 包名不匹配的问题。
+
+### 第十七版优化思路
+
+- helper 通过 sudo 获得 root 授权时，不应把平台 screen 和 Python 进程直接启动成 root；应回到发起 sudo 的 `SUDO_USER` 下执行 screen 的 start/stop/list。
+- 启动模板不要依赖历史安装目录中的 `gunicorn/celery/python3.8` 绝对路径，改为用 `/usr/bin/python3.8 -m gunicorn`、`/usr/bin/python3.8 -m celery`，让 Python 使用运行用户自己的 site-packages。
+- `start-platform-screens` 在真正创建 screen 前做启动预检：
+  - gunicorn master/worker 使用 `--check-config`。
+  - celery 和 web terminal 做入口导入检查。
+  - 预检失败时返回 `startup_preflight_failed component=... detail=...`，并保持 `environment_changed=false`。
+- 这样 agent 下一轮可以基于具体异常安装缺失依赖、修正包名/部署目录，而不是对“screen 秒退”盲猜。
+
+### 实现文件
+
+- `scripts/klonet-agent-op`
+  - 启动命令改为 `/usr/bin/python3.8 -m ...`。
+  - 新增 `runtime_user`、`_as_runtime_user`、`_screen_command`，将 screen 操作统一归属到 `SUDO_USER`。
+  - 新增 `STARTUP_PREFLIGHT_COMMANDS` 和 `startup_preflight_problem`。
+- `tests/test_ops_helper_script.py`
+  - 更新启动命令 contract。
+  - 覆盖 root helper 回到 `SUDO_USER` 执行 screen。
+  - 覆盖启动预检失败时不创建 screen、返回可诊断错误。

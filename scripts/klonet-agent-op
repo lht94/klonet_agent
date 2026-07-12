@@ -26,10 +26,16 @@ MAX_READ_FILE_CHARS = 20000
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 START_COMPONENT_ORDER = ("master", "celery", "web_terminal", "worker")
 COMPONENT_COMMANDS = {
-    "master": "/usr/local/bin/gunicorn -c gun.py master_main:flask_app",
-    "worker": "/usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app",
-    "celery": "/usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
-    "web_terminal": "/usr/local/python3/bin/python3.8 web_terminal_main.py",
+    "master": "/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+    "worker": "/usr/bin/python3.8 -m gunicorn -c worker_gun.py worker_main:flask_app",
+    "celery": "/usr/bin/python3.8 -m celery -A celery_worker.celery worker --loglevel=info",
+    "web_terminal": "/usr/bin/python3.8 web_terminal_main.py",
+}
+STARTUP_PREFLIGHT_COMMANDS = {
+    "master": ["/usr/bin/python3.8", "-m", "gunicorn", "--check-config", "-c", "gun.py", "master_main:flask_app"],
+    "worker": ["/usr/bin/python3.8", "-m", "gunicorn", "--check-config", "-c", "worker_gun.py", "worker_main:flask_app"],
+    "celery": ["/usr/bin/python3.8", "-c", "from celery_worker import celery"],
+    "web_terminal": ["/usr/bin/python3.8", "-c", "import web_terminal_main"],
 }
 CONFIG_PORT_NAMES = (
     "master_port",
@@ -49,6 +55,7 @@ REQUIRED_PROJECT_ENTRY_FILES = (
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+SAFE_RUNTIME_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
 SAFE_OPS_ARG = re.compile(r"^[A-Za-z0-9_.:+/@=-]{0,500}$")
 ALLOWED_INSTALL_SCRIPTS = {
@@ -488,6 +495,10 @@ def _start_platform_screens(args) -> int:
         if occupied_ports:
             _print_error(f"port_already_listening={','.join(str(port) for port in occupied_ports)}")
             return 2
+        problem = startup_preflight_problem(args.project_root)
+        if problem:
+            _print_error(problem)
+            return 2
     if args.execute:
         if not _run_commands(_start_platform_commands(args.platform, args.project_root)):
             return 1
@@ -844,19 +855,15 @@ def _run_commands(commands: list) -> bool:
 def _restart_commands(component: str, screen_session: str, project_root: str) -> list:
     return [
         *_stop_commands(screen_session),
-        [
-            "screen",
-            "-dmS",
+        _screen_command(
             screen_session,
-            "bash",
-            "-lc",
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
-        ],
+        ),
     ]
 
 
 def _stop_commands(screen_session: str) -> list:
-    return [["screen", "-S", screen_session, "-X", "quit"]]
+    return [_as_runtime_user(["screen", "-S", screen_session, "-X", "quit"])]
 
 
 def _stop_platform_commands(platform: str) -> list:
@@ -883,7 +890,7 @@ def _start_screen_sessions(platform: str) -> list:
 def existing_screen_sessions(screen_sessions: list) -> list:
     try:
         completed = subprocess.run(
-            ["screen", "-ls"],
+            _as_runtime_user(["screen", "-ls"]),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -998,6 +1005,39 @@ def wait_for_started_platform(platform: str, project_root: str, *, timeout_secon
     return "start_postcondition_failed " + " ".join(problems)
 
 
+def startup_preflight_problem(project_root: str) -> str:
+    for component in START_COMPONENT_ORDER:
+        command = STARTUP_PREFLIGHT_COMMANDS[component]
+        try:
+            completed = subprocess.run(
+                _as_runtime_user(command),
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return (
+                f"startup_preflight_failed component={component} "
+                f"reason=timeout stdout={_one_line(exc.stdout or '')} stderr={_one_line(exc.stderr or '')}"
+            )
+        except OSError as exc:
+            return (
+                f"startup_preflight_failed component={component} "
+                f"reason={exc.__class__.__name__} message={_one_line(str(exc))}"
+            )
+        if completed.returncode != 0:
+            detail = _one_line((completed.stderr or completed.stdout or "").strip())
+            return (
+                f"startup_preflight_failed component={component} "
+                f"returncode={completed.returncode} detail={detail or 'empty_output'}"
+            )
+    return ""
+
+
 def archive_members(archive: Path) -> list:
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as handle:
@@ -1056,20 +1096,36 @@ def install_script_command(script_dir: str, script_name: str, script_args: list)
 def _start_platform_commands(platform: str, project_root: str) -> list:
     screen_sessions = dict(zip(START_COMPONENT_ORDER, _start_screen_sessions(platform)))
     return [
-        [
-            "screen",
-            "-dmS",
+        _screen_command(
             screen_sessions[component],
-            "bash",
-            "-lc",
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
-        ]
+        )
         for component in START_COMPONENT_ORDER
     ]
 
 
 def run_checked(command: list) -> None:
     subprocess.run(command, check=True)
+
+
+def _screen_command(screen_session: str, shell_command: str) -> list:
+    return _as_runtime_user(["screen", "-dmS", screen_session, "bash", "-lc", shell_command])
+
+
+def _as_runtime_user(command: list) -> list:
+    user = runtime_user()
+    if not user:
+        return command
+    return ["runuser", "-u", user, "--", *command]
+
+
+def runtime_user() -> str:
+    if os.geteuid() != 0:
+        return ""
+    user = os.environ.get("SUDO_USER", "")
+    if not user or user == "root" or not SAFE_RUNTIME_USER.fullmatch(user):
+        return ""
+    return user
 
 
 def _one_line(text: str) -> str:
