@@ -950,3 +950,44 @@ python -m pytest tests/test_ops_command_policy.py tests/test_prompt_style.py -q 
 ```
 
 结果：`2 passed`，`48 passed`。
+
+## 2026-07-12 第二十八轮：结构化列表参数被模型写成字符串化列表
+
+### 测试结果
+
+第二十七版后，agent 正确创建了 `remove_python_package_entries` 计划，但执行时 blocked：
+
+```text
+recipe_id=remove_python_package_entries invalid_package_entry=['datastructures'
+```
+
+根因是模型把 `entries` 写成了字符串化列表，例如：
+
+```text
+"['datastructures', 'debug', ...]"
+```
+
+而 handler 只支持真正的 JSON array 或逗号分隔字符串，导致按逗号切分后的第一个条目带有 `[` 和引号。这个问题不是 Werkzeug 特例，LLM 在结构化参数中偶尔会把列表序列化成字符串，action 层应能兼容这种安全可解析形态。
+
+### 第二十八版优化思路
+
+- `remove_python_package_entries.entries` 支持三种形态：
+  - 真正的 list。
+  - JSON/Python literal 风格的字符串列表、元组或集合。
+  - 逗号分隔字符串。
+- 解析后仍逐项走原有安全校验，继续拒绝路径分隔符、`..`、通配符等危险条目。
+
+### 实现文件
+
+- `ops/recipes.py`
+  - `_python_package_entries_arg` 使用 `ast.literal_eval` 解析字符串化集合/列表。
+- `tests/test_ops_operations.py`
+  - 新增字符串化列表的回归测试。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_operations.py::test_remove_python_package_entries_requires_step_confirmation_and_removes_entries tests/test_ops_operations.py::test_remove_python_package_entries_blocks_unallowlisted_entries tests/test_ops_operations.py::test_remove_python_package_entries_accepts_stringified_entry_list -q --basetemp=/tmp/klonet_agent_pytest_tmp
+```
+
+结果：`3 passed`。

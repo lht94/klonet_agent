@@ -7,6 +7,7 @@ shell commands.
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 import shutil
@@ -1243,7 +1244,15 @@ def _python_package_entries_arg(raw_entries) -> list[str]:
     if isinstance(raw_entries, list):
         return [str(item).strip() for item in raw_entries if str(item).strip()]
     if isinstance(raw_entries, str):
-        return [item.strip() for item in raw_entries.split(",") if item.strip()]
+        text = raw_entries.strip()
+        if text.startswith(("[", "(", "{")) and text.endswith(("]", ")", "}")):
+            try:
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in text.split(",") if item.strip()]
     return []
 
 

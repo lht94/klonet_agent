@@ -3162,6 +3162,53 @@ def test_remove_python_package_entries_blocks_unallowlisted_entries():
     assert "invalid_package_entry=../flask" in result
 
 
+def test_remove_python_package_entries_accepts_stringified_entry_list():
+    import shutil
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    root = Path("/home/klonet-agent/workspaces/test_remove_python_package_entries_string")
+    site_packages = root / ".venv" / "lib" / "python3.8" / "site-packages"
+    package_dir = site_packages / "werkzeug"
+    stale_dir = package_dir / "wrappers"
+    shutil.rmtree(root, ignore_errors=True)
+    stale_dir.mkdir(parents=True)
+
+    try:
+        store = OperationPlanStore(
+            root / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="remove stringified entries",
+            steps=[
+                {
+                    "step_id": "cleanup",
+                    "title": "cleanup",
+                    "action": "remove_python_package_entries",
+                    "args": {
+                        "site_packages_dir": str(site_packages),
+                        "package": "werkzeug",
+                        "entries": "['wrappers']",
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        store.approve_step(plan.plan_id, "cleanup")
+        result = store.execute_step(plan.plan_id, "cleanup")
+        stale_dir_exists = stale_dir.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    assert "result_status=completed" in result
+    assert "removed=wrappers" in result
+    assert not stale_dir_exists
+
+
 def test_restart_recipe_unknown_environment_blocks_plan_until_reinspection():
     import subprocess
 
