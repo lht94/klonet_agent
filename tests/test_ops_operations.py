@@ -2882,6 +2882,61 @@ def test_restart_screen_component_recipe_execute_reports_helper_failure():
     assert loaded.status == "failed"
 
 
+def test_start_platform_preflight_failure_blocks_with_helper_diagnostic():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    helper_stderr = (
+        "klonet_agent_op\n"
+        "error=startup_preflight_failed component=master returncode=1 "
+        "detail=Traceback ModuleNotFoundError: No module named 'concurrent_log_handler'\n"
+        "environment_changed=false"
+    )
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(2, command, output="", stderr=helper_stderr)
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="start lht",
+            steps=[
+                {
+                    "step_id": "start-screens",
+                    "title": "启动 lht 平台四个 screen",
+                    "risk": "controlled",
+                    "action": "start_platform_screens",
+                    "args": {
+                        "platform": "lht",
+                        "project_root": "/home/klonet-agent/platforms/lht_project",
+                    },
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-screens")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "helper_startup_preflight_failed returncode=2" in result
+    assert "No module named 'concurrent_log_handler'" in result
+    assert "next_required_action=inspect_startup_preflight" in result
+    assert loaded.status == "approved"
+
+
 def test_restart_recipe_unknown_environment_blocks_plan_until_reinspection():
     import subprocess
 

@@ -559,3 +559,36 @@ start_postcondition_failed missing_started_screens=lht_m,lht_c,lht_web,lht_w mis
   - 更新启动命令 contract。
   - 覆盖 root helper 回到 `SUDO_USER` 执行 screen。
   - 覆盖启动预检失败时不创建 screen、返回可诊断错误。
+
+## 2026-07-12 第十八轮：计划执行层吞掉 helper 预检诊断
+
+### 测试结果
+
+第十七版 helper 安装后，真实 `start_platform_screens` 已经能返回：
+
+```text
+error=startup_preflight_failed component=master ... ModuleNotFoundError: No module named 'concurrent_log_handler'
+```
+
+但 agent 执行 `deploy_platform` 计划时只向模型展示：
+
+```text
+结果：命令执行失败，返回码 2。
+```
+
+于是 agent 没法直接利用 helper 的诊断，转而反复读配置、搜索源码，并误判到 `mask_indices`。这说明诊断能力已经在 helper 层具备，但在 OperationPlan runner 的失败分类/摘要中丢失了。
+
+### 第十八版优化思路
+
+- 将 helper 的 `startup_preflight_failed` 从普通 `helper_failed` 中单独分类。
+- 返回 `blocked` 而不是 `failed`，因为环境未改变，下一步应继续修依赖/导入错误，而不是把计划终结为不可恢复失败。
+- 保留更长 stderr 摘要，让 `No module named '...'` 传回模型。
+- 设置 `next_required_action=inspect_startup_preflight`，提示 agent 围绕启动预检继续恢复。
+
+### 实现文件
+
+- `ops/recipes.py`
+  - `_helper_failure_result` 识别 `startup_preflight_failed`，返回 `helper_startup_preflight_failed ...`。
+  - helper stderr 摘要放宽到 1200 字符。
+- `tests/test_ops_operations.py`
+  - 覆盖 start platform 预检失败时计划步骤 blocked，且保留缺失模块名。

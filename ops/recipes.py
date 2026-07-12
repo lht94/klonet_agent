@@ -1226,7 +1226,7 @@ def _run_command_streaming(command: list) -> str:
 
 
 def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
-    stderr = _one_line(exc.stderr)
+    stderr = _one_line(exc.stderr, limit=1200)
     stdout = _one_line(exc.output)
     output = (
         f"helper_failed returncode={exc.returncode} "
@@ -1244,6 +1244,17 @@ def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
             "blocked",
             f"helper_policy_mismatch {output}",
             "upgrade_installed_ops_helper",
+        )
+    if "startup_preflight_failed" in stderr:
+        preflight_output = (
+            f"helper_startup_preflight_failed returncode={exc.returncode} "
+            f"stderr={stderr} "
+            f"stdout={stdout}"
+        )
+        return RecipeExecutionResult(
+            "blocked",
+            preflight_output,
+            "inspect_startup_preflight",
         )
     if "environment_changed=unknown" in stderr:
         return RecipeExecutionResult(
@@ -1304,5 +1315,5 @@ def _script_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
     )
 
 
-def _one_line(text: str) -> str:
-    return " ".join(str(text or "").split())[:500]
+def _one_line(text: str, *, limit: int = 500) -> str:
+    return " ".join(str(text or "").split())[:limit]
