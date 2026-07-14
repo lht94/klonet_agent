@@ -433,3 +433,4 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 更新 helper/sudoers：
 cd /home/klonet-agent/klonet_agent
 sudo bash scripts/install-klonet-agent-service.sh --project-root "$PWD" --python "$PWD/.venv/bin/python"
+systemctl start klonet-agent.service
