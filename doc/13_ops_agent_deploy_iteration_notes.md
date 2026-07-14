@@ -1180,3 +1180,67 @@ python -m pytest tests/test_ops_helper_script.py::test_restart_screen_component_
 ```
 
 结果：`3 passed`，`3 passed`，`7 passed`，`4 passed`。
+
+## 2026-07-14 第三十二轮：Redis 数据库查询缺少 8368 端口知识
+
+### 测试结果
+
+用户在排查 `worker_list` 时问“查看数据库的端口应该是 8368 吧？为什么你没有指定呢”。历史对话显示 agent 先检索 `redis 密码 认证 NOAUTH requirepass Klonet`，知识库返回“未检索到可靠 Klonet 证据”，于是 agent 给出了通用命令：
+
+```bash
+redis-cli -n 0 keys "*worker*"
+```
+
+这个命令没有带 `-p 8368`，会默认连接 `6379`。随后读取 lht 当前运行项目的配置可确认：
+
+```text
+MysqlConfig.mysql_port = 3307
+RedisConfig.redis_port = 8368
+RedisConfig.redis_user = default
+worker_list = worker_list_lht
+```
+
+手动验证：
+
+```text
+redis-cli -p 8368 ping -> NOAUTH Authentication required.
+AUTH <redis_password>; PING -> OK / PONG
+```
+
+说明 `8368` 是当前 Klonet 运行态 Redis 端口，且需要认证。这里用户口中的“数据库”指 Klonet 运行态 Redis 状态库，不是 MySQL。
+
+### 根因
+
+- 机器索引里有 `RedisConfig.redis_port = 8368`，但 curated 运维知识没有把“查 worker_list/用户 DB/进度表前必须先读当前 config.py 并显式指定 Redis 端口”写成操作规则。
+- 检索 query 偏向 `NOAUTH/认证/密码`，没有命中 `config_items.jsonl` 中的 Redis 端口索引，导致 agent 退回通用 Redis 默认端口。
+- Ops prompt 只说 Redis 是共享依赖，缺少“Redis 数据库查询必须核对 PROJ_CONFIG”的行为约束。
+
+### 第三十二版优化思路
+
+- 在常见排障文档中新增“查询 Redis 运行态数据库”规则，明确 Klonet 常把 Redis 称为数据库，`worker_list`/用户 DB/进度表/资源表通常查 Redis。
+- 写清 `RedisConfig.redis_port` 历史常见值为 `8368`、MySQL 常见端口为 `3307`，但必须以当前运行项目 `vemu_config/config.py`/`PROJ_CONFIG` 为准。
+- Prompt 增加通用行为规则：涉及 Redis 数据查询时先读当前配置，给 `redis-cli` 命令必须显式带当前端口，不默认 `6379`；认证和密码只从当前配置读取并脱敏。
+
+### 实现文件
+
+- `knowledge/klonet/ops/common_troubleshooting.md`
+- `knowledge/klonet/ops/environment_setup.md`
+- `prompts.py`
+- `doc/13_ops_agent_deploy_iteration_notes.md`
+
+### 验证
+
+```bash
+redis-cli -p 8368 ping
+python3 - <<'PY'
+from pathlib import Path
+import re, subprocess
+text = Path('/home/klonet-agent/platforms/lht_project/vemu_config/config.py').read_text(encoding='utf-8')
+port = re.search(r"redis_port\s*=\s*(\d+)", text).group(1)
+password = re.search(r"redis_password\s*=\s*'([^']+)'", text).group(1)
+proc = subprocess.run(['redis-cli', '-p', port], input=f'AUTH {password}\nPING\n', text=True, capture_output=True)
+print(proc.stdout.replace(password, '[REDACTED]'))
+PY
+```
+
+结果：未认证 `PING` 返回 `NOAUTH Authentication required`；读取配置后对 `8368` 执行 `AUTH <redis_password>; PING` 返回 `OK` 和 `PONG`。

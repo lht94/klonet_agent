@@ -200,6 +200,17 @@ def test_ops_prompt_routes_single_component_screen_recovery():
     assert "全量 `start_platform_screens`" in OPS_PROMPT
 
 
+def test_ops_prompt_requires_configured_redis_port_for_database_queries():
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "worker_list" in OPS_PROMPT
+    assert "PROJ_CONFIG" in OPS_PROMPT
+    assert "Redis 端口" in OPS_PROMPT
+    assert "8368" in OPS_PROMPT
+    assert "不得默认使用 Redis 6379" in OPS_PROMPT
+    assert "redis-cli" in OPS_PROMPT
+
+
 def test_ops_prompt_forbids_plaintext_secrets_in_plans():
     """Plans and summaries should not leak config secrets."""
 

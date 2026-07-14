@@ -155,7 +155,7 @@ sudo /usr/local/bin/redis-server redis.conf &
 ps aux | grep '[r]edis'
 ~~~
 
-端口和鉴权方式必须从当前 `redis.conf` 与 Klonet 配置读取，不使用历史文档中的端口或密码。
+端口和鉴权方式必须从当前 `redis.conf` 与 Klonet 配置读取，不使用历史文档中的端口或密码。Klonet 运行态 Redis 的历史常见配置是 `RedisConfig.redis_port = 8368`，但仍应以当前运行项目的 `vemu_config/config.py`/`PROJ_CONFIG` 为准；排查 `worker_list`、用户 DB、进度表或拓扑状态时，`redis-cli` 必须显式带 `-p <redis_port>`，不能默认连接 `6379`。
 
 ## 部署验收
 
