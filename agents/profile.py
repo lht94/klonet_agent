@@ -6,7 +6,12 @@ Profile 只描述行为差异，不承载复杂业务逻辑。真正的工具执
 from dataclasses import dataclass, field
 from typing import Set
 
-from klonet_agent.prompts import CODING_PROMPT, MENTOR_PROMPT, OPS_PROMPT
+from klonet_agent.prompts import (
+    CODING_PROMPT,
+    MENTOR_PROMPT,
+    OPS_PRIVILEGE_PROMPT,
+    OPS_PROMPT,
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,10 @@ OPS_TOOLS = {
     "web_fetch",
 } | ENVIRONMENT_TOOLS | OPS_OPERATION_TOOLS
 
+OPS_PRIVILEGE_TOOLS = OPS_TOOLS | {
+    "run_privileged_command",
+}
+
 CODING_TOOLS = MENTOR_TOOLS | {
     "update_todos",
     "list_files",
@@ -117,6 +126,15 @@ def get_profile(name: str) -> AgentProfile:
             mode_prompt=OPS_PROMPT,
             allowed_tools=OPS_TOOLS,
             default_workflow="route -> retrieve runbook -> inspect read-only environment -> plan -> confirm -> execute controlled recipe",
+            requires_rag=True,
+            requires_review=False,
+        )
+    if normalized == "ops-privilege":
+        return AgentProfile(
+            name="ops-privilege",
+            mode_prompt=OPS_PRIVILEGE_PROMPT,
+            allowed_tools=OPS_PRIVILEGE_TOOLS,
+            default_workflow="inspect if useful -> run shell/sudo command directly -> verify result",
             requires_rag=True,
             requires_review=False,
         )

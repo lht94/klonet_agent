@@ -52,6 +52,17 @@ TOOLS = [
         },
     },
     _tool(
+        "run_privileged_command",
+        "Ops-Privilege 专用：直接在当前终端执行 shell 命令，包括 sudo 命令。stdin/stdout/stderr 继承当前终端；如果 sudo 需要密码，用户会在命令行提示中手动输入。不要把密码写入 command。",
+        {
+            "command": {
+                "type": "string",
+                "description": "要直接执行的完整 shell 命令，例如 sudo systemctl restart nginx。",
+            }
+        },
+        ["command"],
+    ),
+    _tool(
         "search_knowledge",
         "仅检索 Klonet 专属知识。明确不需要 Klonet 的通用技术问题不要调用；Klonet 域内问题和 Coding 规范查询再使用。",
         {

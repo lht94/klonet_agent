@@ -52,6 +52,23 @@ def run_command_linux(command: str) -> str:
     return result.stdout or result.stderr
 
 
+def run_privileged_command(command: str) -> str:
+    """Run an unrestricted shell command in the current terminal.
+
+    This is only exposed by the explicit ops-privilege profile. It intentionally
+    inherits stdin/stdout/stderr so sudo can prompt the human user directly.
+    """
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    return f"privileged_command returncode={result.returncode}"
+
+
 def run_tests(session: AgentSession, command: str = "pytest -q") -> str:
     """在当前 workspace 内运行测试命令。
 

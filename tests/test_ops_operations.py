@@ -3813,6 +3813,34 @@ def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypa
     assert operation_store.recipe_runner.execution_config == "enabled"
 
 
+def test_ops_privilege_executor_runs_unrestricted_command(monkeypatch):
+    import subprocess
+
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("klonet_agent.tools.shell.subprocess.run", fake_run)
+    executor = ToolExecutor(
+        session=AgentSession(mode="ops-privilege"),
+        allowed_tools={"run_privileged_command"},
+    )
+
+    result = executor.run("run_privileged_command", {"command": "sudo systemctl restart nginx"})
+
+    assert "privileged_command returncode=0" in result
+    assert calls
+    command, kwargs = calls[0]
+    assert command == "sudo systemctl restart nginx"
+    assert kwargs["shell"] is True
+    assert "capture_output" not in kwargs
+
+
 def _extract_plan_id(text: str) -> str:
     for line in text.splitlines():
         if line.startswith("plan_id="):

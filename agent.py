@@ -25,7 +25,7 @@ def main():
     admin_parser = subparsers.add_parser("admin", help="管理本地用户、对话和项目数据")
     _add_admin_arguments(admin_parser)
 
-    parser.add_argument("--mode", choices=["mentor", "coding", "ops"], default="mentor")
+    parser.add_argument("--mode", choices=["mentor", "coding", "ops", "ops-privilege"], default="mentor")
     parser.add_argument("--user-id", default="default")
     parser.add_argument("--project-id", default="default")
     args = parser.parse_args()

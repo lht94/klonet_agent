@@ -22,6 +22,18 @@ def test_ops_profile_uses_read_only_environment_tools():
     assert "read_klonet_logs" in profile.allowed_tools
     assert "run_command" not in profile.allowed_tools
     assert "write_file" in profile.allowed_tools
+    assert "run_privileged_command" not in profile.allowed_tools
+
+
+def test_ops_privilege_profile_can_run_direct_sudo_commands():
+    from klonet_agent.agents import get_profile
+
+    profile = get_profile("ops-privilege")
+
+    assert profile.name == "ops-privilege"
+    assert "run_privileged_command" in profile.allowed_tools
+    assert "run_readonly_command" in profile.allowed_tools
+    assert "create_ops_operation_plan" in profile.allowed_tools
 
 
 def test_ops_tool_round_limit_is_higher_than_default():
@@ -63,3 +75,19 @@ def test_agent_cli_accepts_ops_mode(monkeypatch):
     main()
 
     assert captured["mode"] == "ops"
+
+
+def test_agent_cli_accepts_ops_privilege_mode(monkeypatch):
+    from klonet_agent.agent import main
+
+    captured = {}
+
+    def fake_run_chat(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("klonet_agent.app.run_chat", fake_run_chat)
+    monkeypatch.setattr("sys.argv", ["agent.py", "--mode", "ops-privilege"])
+
+    main()
+
+    assert captured["mode"] == "ops-privilege"

@@ -1244,3 +1244,45 @@ PY
 ```
 
 结果：未认证 `PING` 返回 `NOAUTH Authentication required`；读取配置后对 `8368` 执行 `AUTH <redis_password>; PING` 返回 `OK` 和 `PONG`。
+
+## 2026-07-15 第三十三轮：新增 ops-privilege 直接 sudo 模式
+
+### 需求
+
+用户希望有一个单独权限模式，不走 helper/sudoers、OperationPlan 或 allowlist，而是让 agent 直接运行真实 shell/sudo 命令；如果 sudo 需要密码，用户就在当前命令行提示中手动输入。
+
+### 第三十三版优化思路
+
+- 不修改普通 `ops` 模式。普通 `ops` 继续使用受控 OperationPlan/helper 白名单链路。
+- 新增独立模式 `ops-privilege`，显式表达这是高权限运维模式。
+- 新增专属工具 `run_privileged_command`：
+  - 直接执行完整 shell 命令。
+  - 继承当前终端 stdin/stdout/stderr。
+  - sudo 密码提示直接出现在用户终端，不进入聊天、计划或日志。
+- Prompt 明确 `ops-privilege` 不需要 OperationPlan、helper、sudoers NOPASSWD 或 allowlist，但仍不得让用户把 sudo 密码发到聊天中。
+
+### 实现文件
+
+- `agent.py`
+  - CLI `--mode` 增加 `ops-privilege`。
+- `agents/profile.py`
+  - 新增 `OPS_PRIVILEGE_PROMPT` profile，开放 `run_privileged_command`。
+- `prompts.py`
+  - 新增 Ops-Privilege 模式提示词和全局安全例外说明。
+- `tools/registry.py`
+  - 注册 `run_privileged_command` 工具 schema。
+- `tools/executor.py`
+  - 分发执行 `run_privileged_command`。
+- `tools/shell.py`
+  - 新增直接 shell 执行实现，继承当前终端 IO。
+- `README.md`
+  - 记录启动方式和边界。
+
+### 验证
+
+```bash
+python -m pytest tests/test_ops_agent.py tests/test_imports.py::test_core_imports tests/test_prompt_style.py::test_ops_privilege_prompt_allows_direct_terminal_sudo tests/test_ops_operations.py::test_ops_privilege_executor_runs_unrestricted_command -q --basetemp=/tmp/klonet_agent_pytest_ops_privilege2
+python -m pytest tests/test_ops_command_policy.py::test_run_ops_command_sudo_password_failure_blocks_for_sudoers tests/test_ops_operations.py::test_executor_operation_plan_store_can_enable_real_execution_by_env tests/test_ops_operations.py::test_executor_operation_plan_store_blocks_when_real_execution_env_is_missing tests/test_ops_operations.py::test_helper_backed_recipes_use_sudo_only_for_real_execution -q --basetemp=/tmp/klonet_agent_pytest_ops_privilege_regression
+```
+
+结果：`10 passed`，`4 passed`。

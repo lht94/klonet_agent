@@ -383,7 +383,13 @@ mentor、coding 或 ops 模式：
 python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
 python -m klonet_agent.agent --mode coding --user-id lht --project-id test
 python -m klonet_agent.agent --mode ops --user-id lht --project-id test
+python -m klonet_agent.agent --mode ops-privilege --user-id lht --project-id test
 ```
+
+`ops-privilege` 是单独的高权限运维模式，会直接运行 shell/sudo 命令，不走
+OperationPlan、helper 或 allowlist。适合用户坐在当前终端前操作：如果 sudo 需要密码，
+就在终端提示里手动输入；不要把密码发到聊天里。普通 `ops` 模式仍然使用受控计划和
+helper/sudoers 链路。
 
 部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
 `KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。
