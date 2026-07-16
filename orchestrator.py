@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 from time import perf_counter
 from types import SimpleNamespace
 
@@ -40,8 +41,10 @@ from klonet_agent.knowledge.turn_intent import (
     TurnIntentBuilder,
 )
 from klonet_agent.knowledge import SKILL_LOADER, route_query
+from klonet_agent.journal import ProjectJournal, ProjectJournalMaintainer
 from klonet_agent.llm import LLMClient
 from klonet_agent.memory import MemoryStore
+from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.routing import OpsRoute, route_ops_request
 from klonet_agent.prompts import build_system_prompts
@@ -66,6 +69,7 @@ class AgentOrchestrator:
         trace_logger: TraceLogger | None = None,
         memory_store: MemoryStore | None = None,
         intent_analyzer: IntentAnalyzer | None = None,
+        journal_maintainer: ProjectJournalMaintainer | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
@@ -92,6 +96,10 @@ class AgentOrchestrator:
         self._paused_turn_state: dict | None = None
         self._last_turn_state: dict | None = None
         self._ops_route: OpsRoute | None = None
+        self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
+            ProjectJournal.from_session(self.session),
+            llm=self.llm,
+        )
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
             # 执行层再次检查工具权限，避免模型绕过可见工具列表。
@@ -165,6 +173,9 @@ class AgentOrchestrator:
         return response
 
     def _complete_llm(self, history: list[dict], *, stream: bool):
+        sanitized_history = sanitize_openai_tool_history(history)
+        if len(sanitized_history) != len(history):
+            history[:] = sanitized_history
         tools = self._visible_tools()
         if not stream:
             return self.llm.complete(messages=history, tools=tools)
@@ -339,7 +350,16 @@ class AgentOrchestrator:
                 # 执行归档压缩中的工具调用。
                 for tool_call in compress_response.choices[0].message.tool_calls:
                     tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments)
+                    tool_args, parse_error = self._parse_tool_arguments(tool_call)
+                    if parse_error:
+                        comp_tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": parse_error,
+                        }
+                        history.append(comp_tool_msg)
+                        self.memory_store.append_history(comp_tool_msg)
+                        continue
 
                     tool_result = self.use_tool(tool_name, tool_args)
 
@@ -630,7 +650,20 @@ class AgentOrchestrator:
                     # 工具名，即 schema 中 function.name。
                     tool_name = tool_call.function.name
                     # 工具参数，即 schema 中 function.parameters 约束出的标准 JSON。
-                    tool_args = json.loads(tool_call.function.arguments)
+                    tool_args, parse_error = self._parse_tool_arguments(tool_call)
+                    if parse_error:
+                        self._print_tool_loop_observation(tool_name, parse_error)
+                        tool_events.append(
+                            {"name": tool_name, "args": {}, "result": parse_error}
+                        )
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": parse_error,
+                        }
+                        history.append(tool_msg)
+                        self.memory_store.append_history(tool_msg)
+                        continue
                     if tool_name == "search_knowledge":
                         candidate_intent = QueryIntent.from_mapping(
                             tool_args.get("intent")
@@ -761,6 +794,7 @@ class AgentOrchestrator:
 
                 history.append(assistant_msg)
                 self.memory_store.append_history(assistant_msg)
+                self._maintain_project_journal(effective_user_input, reply)
                 self._record_ops_shared_turn(effective_user_input, tool_events, reply)
                 self._last_turn_state = self._snapshot_turn_state(effective_user_input)
                 self._paused_turn_state = None
@@ -774,6 +808,7 @@ class AgentOrchestrator:
             assistant_msg = {"role": "assistant", "content": reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
+            self._maintain_project_journal(effective_user_input, reply)
             print(f"Klonet Agent\uff1a{reply}")
 
         # 本轮作用域只约束当前用户输入，不写入长期历史，避免影响下一轮。
@@ -795,6 +830,26 @@ class AgentOrchestrator:
             history, token = self.compress_memory(history, token)
 
         return reply, history, token
+
+    def _parse_tool_arguments(self, tool_call) -> tuple[dict, str]:
+        """Parse model tool JSON without allowing malformed output to crash the CLI."""
+
+        raw = str(getattr(tool_call.function, "arguments", "") or "")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {}, (
+                "Error: invalid_tool_arguments_json "
+                f"tool={tool_call.function.name} position={exc.pos}. "
+                "The tool was not executed. Resubmit one valid JSON object matching the tool schema; "
+                "do not embed a Shell command, and prefer incremental write_ops_file edits over large file content."
+            )
+        if not isinstance(parsed, dict):
+            return {}, (
+                "Error: invalid_tool_arguments_type "
+                f"tool={tool_call.function.name}. The tool was not executed; arguments must be one JSON object."
+            )
+        return parsed, ""
 
     def _show_visible_reasoning_trace(self) -> bool:
         """默认输出用户可见思考摘要；brief 模式只输出最终答案。"""
@@ -839,6 +894,8 @@ class AgentOrchestrator:
             "read_klonet_logs": ("正在读取 Klonet 日志", "path"),
             "inspect_screen_session": ("正在检查 screen 会话", "session"),
             "inspect_system_environment": ("正在检查系统环境", "checks"),
+            "inspect_docker_containers": ("正在查看 Docker 容器", "name"),
+            "run_readonly_command": ("正在执行只读诊断命令", "program"),
             "inspect_ops_context": ("正在检查运维环境", "checks"),
             "inspect_platform_instances": ("正在盘点 Klonet 平台实例", "project_roots"),
             "inspect_klonet_runtime": ("正在检查 Klonet 运行状态", "checks"),
@@ -902,12 +959,24 @@ class AgentOrchestrator:
         tool_name: str,
         result: str,
     ) -> tuple[list[str], bool]:
-        """Extract at most three meaningful, bounded lines from a tool result."""
+        """Extract meaningful, bounded lines from a tool result."""
 
         if tool_name == "search_knowledge":
             knowledge_lines = self._knowledge_observation_lines(result)
             if knowledge_lines:
                 return knowledge_lines, False
+        if tool_name in {
+            "create_ops_operation_plan",
+            "list_ops_operation_plans",
+            "describe_ops_operation_plan",
+            "approve_ops_operation_plan",
+            "execute_ops_operation_step",
+            "execute_ops_next_step",
+            "resolve_ops_blocked_step",
+        }:
+            ops_lines = self._ops_operation_observation_lines(result)
+            if ops_lines:
+                return ops_lines
 
         candidates = []
         for raw_line in (result or "").splitlines():
@@ -922,6 +991,195 @@ class AgentOrchestrator:
         if not candidates:
             return ["工具未返回可展示结果。"], False
         return candidates[:3], len(candidates) > 3
+
+    def _ops_operation_observation_lines(self, result: str) -> tuple[list[str], bool]:
+        """Summarize OperationPlan state-machine output for humans."""
+
+        blocks = []
+        current = []
+        for raw_line in (result or "").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped in {"```", "```text"}:
+                continue
+            if stripped == "---":
+                if current:
+                    blocks.append(current)
+                    current = []
+                continue
+            current.append(stripped)
+        if current:
+            blocks.append(current)
+        if not blocks:
+            return [], False
+
+        candidates = []
+        for block in blocks:
+            header = block[0] if block else ""
+            if header == "ops_operation_plan":
+                candidates.extend(self._summarize_ops_plan_block(block))
+            elif header == "ops_operation_execution":
+                candidates.extend(self._summarize_ops_execution_block(block))
+            elif header == "ops_operation_resolution":
+                candidates.extend(self._summarize_ops_resolution_block(block))
+            elif header == "ops_operation_plan_list":
+                candidates.extend(self._summarize_ops_plan_list_block(block))
+            else:
+                candidates.extend(block[:6])
+        max_lines = 40
+        return candidates[:max_lines], len(candidates) > max_lines
+
+    def _summarize_ops_plan_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        lines = [
+            (
+                f"计划 {fields.get('plan_id', 'unknown')}："
+                f"{fields.get('operation', 'unknown')} / {fields.get('target', 'unknown')}，"
+                f"状态 {fields.get('status', 'unknown')}"
+            )
+        ]
+        if fields.get("objective"):
+            lines.append(f"目标：{self._compact_observation_text(fields['objective'], 180)}")
+        execution_order = self._first_prefixed_value(block, "execution_order=")
+        if execution_order:
+            lines.append(f"执行顺序：{execution_order}")
+        step_summaries = self._ops_step_summaries(block)
+        if step_summaries:
+            lines.append("步骤概览：")
+            lines.extend(f"  - {item}" for item in step_summaries[:8])
+        binding_summaries = self._ops_binding_summaries(block)
+        if binding_summaries:
+            lines.append("执行绑定：")
+            lines.extend(f"  - {item}" for item in binding_summaries[:6])
+        return lines
+
+    def _summarize_ops_execution_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        step = fields.get("execute_step", "unknown")
+        title = fields.get("step_title", "")
+        status = fields.get("result_status", fields.get("step_status", "unknown"))
+        prefix = f"执行 {step}"
+        if title:
+            prefix += f"（{title}）"
+        lines = [f"{prefix}：{status}"]
+        result = fields.get("execution_result") or fields.get("observation")
+        if result:
+            lines.append(f"结果：{self._compact_observation_text(result, 220)}")
+        action = fields.get("action_type")
+        permission = fields.get("permission")
+        if action or permission:
+            detail = []
+            if action:
+                detail.append(f"动作 {action}")
+            if permission:
+                detail.append(f"权限 {permission}")
+            lines.append("依据：" + "；".join(detail))
+        next_action = fields.get("next_required_action")
+        if next_action:
+            lines.append(f"下一步：{next_action}")
+        return lines
+
+    def _summarize_ops_resolution_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        lines = [
+            (
+                f"解除阻塞 {fields.get('resolved_step', 'unknown')}："
+                f"{fields.get('result_status', fields.get('step_status', 'unknown'))}"
+            )
+        ]
+        if fields.get("resolution_evidence"):
+            lines.append(
+                "依据："
+                + self._compact_observation_text(fields["resolution_evidence"], 220)
+            )
+        if fields.get("next_required_action"):
+            lines.append(f"下一步：{fields['next_required_action']}")
+        return lines
+
+    def _summarize_ops_plan_list_block(self, block: list[str]) -> list[str]:
+        fields = self._ops_key_values(block)
+        lines = [f"计划列表：共 {fields.get('count', '0')} 个"]
+        for line in block:
+            if not line.startswith("plan "):
+                continue
+            lines.append(
+                "  - "
+                + self._compact_observation_text(line[len("plan ") :], 220)
+            )
+        return lines
+
+    @staticmethod
+    def _ops_key_values(lines: list[str]) -> dict[str, str]:
+        fields = {}
+        for line in lines:
+            if "=" not in line or line.startswith("  - "):
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key and re.fullmatch(r"[A-Za-z0-9_.-]+", key):
+                fields[key] = value.strip()
+        return fields
+
+    @staticmethod
+    def _first_prefixed_value(lines: list[str], prefix: str) -> str:
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                return stripped[len(prefix) :].strip()
+        return ""
+
+    def _ops_step_summaries(self, lines: list[str]) -> list[str]:
+        summaries = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("- ") or ":" not in stripped:
+                continue
+            if " risk=" not in stripped or " status=" not in stripped:
+                continue
+            step_id, rest = stripped[2:].split(":", 1)
+            title = rest.split(" risk=", 1)[0].strip()
+            status = self._ops_token_value(rest, "status")
+            action = self._ops_token_value(rest, "action")
+            permission = self._ops_token_value(rest, "permission")
+            pieces = [title]
+            if status:
+                pieces.append(f"状态 {status}")
+            if action:
+                pieces.append(f"动作 {action}")
+            if permission:
+                pieces.append(f"权限 {permission}")
+            summaries.append(f"{step_id}：" + "；".join(pieces))
+        return summaries
+
+    def _ops_binding_summaries(self, lines: list[str]) -> list[str]:
+        summaries = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("- ") or ":" not in stripped:
+                continue
+            if " recipe=" not in stripped:
+                continue
+            step_id, rest = stripped[2:].split(":", 1)
+            action = self._ops_token_value(rest, "action")
+            recipe = self._ops_token_value(rest, "recipe")
+            args = [
+                part
+                for part in rest.split()
+                if part.startswith("recipe_args.")
+            ]
+            pieces = []
+            if action:
+                pieces.append(f"动作 {action}")
+            if recipe:
+                pieces.append(f"执行器 {recipe}")
+            if args:
+                pieces.append(self._compact_observation_text(" ".join(args), 180))
+            summaries.append(f"{step_id}：" + "；".join(pieces))
+        return summaries
+
+    @staticmethod
+    def _ops_token_value(text: str, key: str) -> str:
+        match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", text)
+        return match.group(1) if match else ""
 
     def _knowledge_observation_lines(self, result: str) -> list[str]:
         """Summarize knowledge retrieval by cited source and evidence snippet."""
@@ -1319,6 +1577,22 @@ class AgentOrchestrator:
             if todo["status"] in {"pending", "in_progress"}:
                 todo["status"] = status
 
+    def _maintain_project_journal(self, user_input: str, reply: str) -> None:
+        """让项目日志维护子 Agent 在 Mentor 回答后沉淀项目事实。"""
+
+        if self.profile.name != "mentor":
+            return
+        try:
+            decision = self.journal_maintainer.maintain_turn(
+                user_input,
+                reply,
+                mode=self.profile.name,
+            )
+            if decision.should_update:
+                print("Klonet Agent：项目日志已自动更新。")
+        except Exception:
+            return
+
     def _visible_tools(self) -> list[dict]:
         """根据 profile 和当前问题范围过滤模型可见工具。"""
 
@@ -1388,6 +1662,7 @@ class AgentOrchestrator:
                     f"- paths: {', '.join(ops_route.paths[:3]) or 'none'}",
                     f"- components: {', '.join(ops_route.components[:5]) or 'none'}",
                     f"- recommended_tools: {', '.join(ops_route.recommended_tools) or 'none'}",
+                    *self._ops_tool_arg_hints(ops_route),
                     "- Ops must treat these as tool-routing hints, not as final diagnosis.",
                 ]
             )
@@ -1460,6 +1735,19 @@ class AgentOrchestrator:
                 ]
             )
         return {"role": "system", "content": "\n".join(rules)}
+
+    def _ops_tool_arg_hints(self, ops_route: OpsRoute) -> list[str]:
+        """Return deterministic argument hints for high-risk Ops diagnostic routes."""
+
+        hints = []
+        if "inspect_process_detail" in ops_route.recommended_tools and ops_route.ports:
+            port_list = ", ".join(str(port) for port in ops_route.ports)
+            hints.append(
+                "- tool_args_hint: inspect_process_detail "
+                f'{{"ports":[{port_list}]}} '
+                "purpose=confirm realtime listener PID/cmd/cwd before relying on screen or broad runtime output"
+            )
+        return hints
 
     def _refresh_memory_prompt(self, history: list[dict]):
         """刷新上下文里的记忆系统提示词。"""

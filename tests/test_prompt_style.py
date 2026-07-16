@@ -88,20 +88,79 @@ def test_mentor_prompt_forbids_operation_plan_generation():
 
 
 
-def test_ops_prompt_prefers_next_step_tool_for_approved_operation_plans():
-    """Ops should drive approved OperationPlans with the next-step tool."""
+def test_ops_prompt_says_confirm_auto_advances_operation_plans():
+    """Ops should rely on plan confirmation auto-advancing safe steps."""
 
     from klonet_agent.prompts import OPS_PROMPT
 
-    assert "execute_ops_next_step" in OPS_PROMPT
     assert "execute_ops_operation_step" in OPS_PROMPT
     assert "list_ops_operation_plans" in OPS_PROMPT
     assert "describe_ops_operation_plan" in OPS_PROMPT
     assert "resolve_ops_blocked_step" in OPS_PROMPT
     assert "blocked" in OPS_PROMPT
+    assert "running" in OPS_PROMPT
     assert "不得直接 confirm-step" in OPS_PROMPT
-    assert "批准后的 OperationPlan 默认调用 execute_ops_next_step" in OPS_PROMPT
-    assert "只有用户明确指定 step_id" in OPS_PROMPT
+    assert "approve_ops_operation_plan 会自动按状态机连续执行" in OPS_PROMPT
+    assert "不要在刚 confirm 后再要求用户确认普通步骤" in OPS_PROMPT
+    assert "不要自行重建计划绕过当前计划" in OPS_PROMPT
+
+
+def test_ops_prompt_allows_controlled_startup_file_edits_but_not_business_development():
+    """Ops can modify deployment startup files through OperationPlan only."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "不得做普通业务源码开发修改" in OPS_PROMPT
+    assert "允许通过 OperationPlan + write_ops_file 修改平台启动必需文件" in OPS_PROMPT
+    assert "vemu_config/config.py" in OPS_PROMPT
+    assert "mains/web_terminal_main.py" in OPS_PROMPT
+
+
+def test_ops_prompt_routes_nginx_install_and_reload_through_actions():
+    """Ops should not ask the user to sudo-copy nginx config by hand."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "install_nginx_config" in OPS_PROMPT
+    assert "reload_nginx" in OPS_PROMPT
+    assert "不得要求用户手工 `sudo cp`" in OPS_PROMPT
+
+
+def test_ops_prompt_uses_dedicated_account_platform_path():
+    """Ops should not reuse historical adminis paths as deployment defaults."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "/home/klonet-agent/platforms/<platform>_project" in OPS_PROMPT
+    assert "不要把历史服务器用户名" in OPS_PROMPT
+
+
+def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():
+    """Port/PID/cwd questions should prefer precise process evidence first."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "inspect_process_detail" in OPS_PROMPT
+    assert "PID、命令或 cwd" in OPS_PROMPT
+    assert "不得先用 screen 存在、历史日志" in OPS_PROMPT
+
+
+def test_tool_descriptions_do_not_suggest_adminis_paths():
+    """Model-visible tool examples should use neutral or klonet-agent paths."""
+
+    from klonet_agent.tools.registry import TOOLS
+
+    descriptions = []
+    for tool in TOOLS:
+        function = tool.get("function", {})
+        descriptions.append(function.get("description", ""))
+        properties = function.get("parameters", {}).get("properties", {})
+        for value in properties.values():
+            descriptions.append(value.get("description", ""))
+
+    joined = "\n".join(descriptions)
+
+    assert "/home/adminis" not in joined
 
 
 def test_memory_prompt_uses_teaching_agent_language():

@@ -293,7 +293,7 @@ class MemoryStore:
                 if max_messages > 0 and len(unarchived_reversed) >= max_messages:
                     break
 
-        messages = list(reversed(unarchived_reversed))
+        messages = sanitize_openai_tool_history(list(reversed(unarchived_reversed)))
         while messages and messages[0].get("role") == "tool":
             messages.pop(0)
         return messages
@@ -454,6 +454,52 @@ def _json_safe(obj: Any):
             if not key.startswith("_")
         }
     return str(obj)
+
+
+def sanitize_openai_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop invalid assistant/tool fragments before sending history to OpenAI.
+
+    OpenAI requires an assistant message with tool_calls to be followed
+    immediately by one tool message for each tool_call_id. Long-running Ops
+    steps can be interrupted after the assistant tool_calls were persisted but
+    before the tool result was appended. Loading that fragment later would make
+    the next request fail with a 400, so we discard incomplete fragments.
+    """
+
+    sanitized: list[dict[str, Any]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = message.get("role")
+        tool_calls = message.get("tool_calls") or []
+        if role == "assistant" and tool_calls:
+            expected_ids = [
+                str(tool_call.get("id") or "")
+                for tool_call in tool_calls
+                if isinstance(tool_call, dict)
+            ]
+            if not expected_ids:
+                index += 1
+                continue
+            following = messages[index + 1 : index + 1 + len(expected_ids)]
+            following_ids = [
+                str(item.get("tool_call_id") or "")
+                for item in following
+                if item.get("role") == "tool"
+            ]
+            if following_ids == expected_ids:
+                sanitized.append(message)
+                sanitized.extend(following)
+                index += 1 + len(expected_ids)
+                continue
+            index += 1
+            continue
+        if role == "tool":
+            index += 1
+            continue
+        sanitized.append(message)
+        index += 1
+    return sanitized
 
 
 MEMORY_STORE = MemoryStore.for_session(MEMORY_DIR, "default", "default")

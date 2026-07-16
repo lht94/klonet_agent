@@ -164,7 +164,7 @@ TOOLS = [
             "public_port": {"type": "integer", "description": "Nginx 对外监听端口，也就是浏览器访问的 public_port。"},
             "terminal_port": {"type": "integer", "description": "Web Terminal 端口。"},
             "frontend_alias": {"type": "string", "description": "Nginx 前端 location，例如 /VEMU2/ 或 /VEMU2-103/，必须以 / 开始。"},
-            "frontend_path": {"type": "string", "description": "前端静态目录绝对路径，例如 /home/adminis/lht/103_project/vemu_frontend/VEMU2。"},
+            "frontend_path": {"type": "string", "description": "前端静态目录绝对路径，例如 /home/klonet-agent/platforms/103_project/vemu_frontend/VEMU2。"},
             "frontend_config_path": {"type": "string", "description": "Optional existing frontend config.js absolute path; when provided, render_klonet_config aligns the draft to existing field names without writing files."},
         },
         ["platform", "server_name", "master_port", "worker_port", "public_port", "terminal_port", "frontend_alias", "frontend_path"],
@@ -272,7 +272,7 @@ TOOLS = [
             "project_roots": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "可选：已知 Klonet 项目根目录列表，用于读取各自 config.py 中的端口配置，例如 /home/adminis/lht/102_project。",
+                "description": "可选：已知 Klonet 项目根目录列表，用于读取各自 config.py 中的端口配置，例如 /home/klonet-agent/platforms/102_project。",
             },
             "max_instances": {
                 "type": "integer",
@@ -291,7 +291,7 @@ TOOLS = [
             },
             "project_root": {
                 "type": "string",
-                "description": "Runtime project root, for example /home/adminis/lht/103_project.",
+                "description": "Runtime project root, for example /home/klonet-agent/platforms/103_project/vemu_uestc.",
             },
             "nginx_paths": {
                 "type": "array",
@@ -308,6 +308,45 @@ TOOLS = [
             },
         },
         ["platform", "project_root"],
+    ),
+    _tool(
+        "run_readonly_command",
+        "执行结构化只读诊断命令或有限管道。只允许 which、ls、find、stat、grep、rg、head、tail、ps、ss、systemctl 只读子命令，以及 Python/pip 的版本和 pip list/show/freeze；使用 argv 数组且 shell=False。禁止 python -c、安装卸载、find -exec/-delete 和 Shell 字符串。",
+        {
+            "program": {"type": "string", "description": "单命令程序名或绝对路径。"},
+            "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "单命令参数数组，不含程序名。",
+            },
+            "pipeline": {
+                "type": "array",
+                "description": "可选的结构化管道，最多 4 段；提供后忽略顶层 program/argv。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "program": {"type": "string"},
+                        "argv": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["program", "argv"],
+                },
+            },
+            "cwd": {"type": "string", "description": "可选的绝对工作目录。"},
+            "stderr": {"type": "string", "enum": ["capture", "discard"]},
+            "timeout_seconds": {"type": "integer", "description": "1 到 30 秒。"},
+        },
+        [],
+    ),
+    _tool(
+        "inspect_docker_containers",
+        "通过 root-owned helper 只读查看 Docker 容器名称、状态、镜像和端口。用于 klonet-agent 用户无权访问 Docker socket 的环境；不会启动、停止或修改容器。",
+        {
+            "name": {
+                "type": "string",
+                "description": "可选的精确容器名，例如 mysql-vemu；省略则列出全部容器。",
+            }
+        },
+        [],
     ),
     _tool(
         "inspect_service_health",
@@ -401,13 +440,22 @@ TOOLS = [
     ),
     _tool(
         "read_ops_file",
-        "只读读取 Klonet 运维相关配置/源码/部署文件并脱敏，例如 config.py、nginx .conf、Compose、Dockerfile、systemd service、启动脚本和前端 config.js。可用于核对端口、路径、Nginx 路由和启动参数；不能读取 .env、私钥、token 或密码文件，也不能单独替代进程/端口/screen 的运行态证据。",
+        "只读读取 Klonet 运维相关配置/源码/部署文件并脱敏，例如 config.py、nginx .conf、Compose、Dockerfile、systemd service、启动脚本和前端 config.js。可用于核对端口、路径、Nginx 路由和启动参数；遇到普通用户无权读取的 root 文件时会尝试走受控 root 只读 helper；不能单独替代进程/端口/screen 的运行态证据。",
         {
             "path": {
                 "type": "string",
                 "description": "要读取的配置/源码/部署文件路径，可为服务器绝对路径；支持常见 .py/.conf/.yml/.yaml/.json/.ini/.service/.sh/.js 等运维文本文件。",
             },
             "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000"},
+        },
+        ["path"],
+    ),
+    _tool(
+        "read_root_file",
+        "通过受控 root helper 只读读取任意 root 可读的普通文件尾部内容，不写入、不执行命令。用于排查 /root 部署包、root-owned 配置、安装脚本和其他普通权限无法读取的文件。",
+        {
+            "path": {"type": "string", "description": "要读取的服务器绝对路径。"},
+            "max_chars": {"type": "integer", "description": "最多返回尾部字符数，默认 8000，上限 20000。"},
         },
         ["path"],
     ),
@@ -483,7 +531,7 @@ TOOLS = [
     ),
     _tool(
         "create_ops_operation_plan",
-        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。只保存计划，不执行任何环境修改；可为步骤绑定白名单 recipe_id 和结构化参数，但必须等用户确认后才能执行。",
+        "为 deploy_platform、restart_platform 或 destroy_platform 创建受控 Ops 操作计划。LLM 只提交结构化 action + args，系统通过 OpsActionRegistry 校验操作、路径和权限并选择固定实现；不接受模型生成的 Shell 命令。通用命令使用 action=run_ops_command 且 args={program,argv,cwd}。创建时只保存计划，确认后才能执行。",
         {
             "operation": {
                 "type": "string",
@@ -509,11 +557,30 @@ TOOLS = [
             },
             "operation_args": {
                 "type": "object",
-                "description": "可选：计划级结构化参数，用于生成受控默认 recipe，不直接执行。deploy_platform 支持 {\"project_root\":\"/home/adminis/lht/103_project/vemu_uestc\"} 自动绑定 prepare_project_files/start_platform_screens；支持 {\"archive_path\":\"/home/adminis/vemu_install_2024_12_5.tar\",\"destination_dir\":\"/root\"} 自动绑定 prepare-files=extract_archive；支持 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"} 自动绑定 prepare-files=run_install_script。",
+                "description": "计划级结构化参数，用于由注册表生成默认 action，不直接执行。可提供 project_root、archive_path/destination_dir、script_dir/script_name/script_args、shared_services_script_dir 或 skip_shared_services。",
+            },
+            "steps": {
+                "type": "array",
+                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。需要执行 make、git clone/pull/push/checkout/submodule、apt、cp/install、insmod/rmmod 或 tc qdisc 时，使用 action=run_ops_command，args 使用 program、argv 数组和 cwd。省略 steps 时才使用兼容的默认步骤模板。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "step_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "purpose": {"type": "string"},
+                        "action": {"type": "string"},
+                        "args": {"type": "object"},
+                    },
+                    "required": ["step_id", "title"],
+                },
+            },
+            "action_bindings": {
+                "type": "object",
+                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；run_ops_command 使用 {program,argv,cwd}。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
             },
             "recipe_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定受控 recipe，例如 restart_screen_component、prepare_project_files、extract_archive、run_install_script、write_ops_file、reload_nginx。extract_archive 参数为 {\"archive_path\":\"/path/pkg.tar\",\"destination_dir\":\"/root\"}；run_install_script 只允许 base_requ_setup.sh NORMAL 或 docker_service.sh，参数为 {\"script_dir\":\"/root/vemu_install_new_gen\",\"script_name\":\"base_requ_setup.sh\",\"script_args\":\"NORMAL\"}；write_ops_file 参数为 {\"path\":\"/path/config.py\",\"content\":\"...\"}，dry-run 时只脱敏预览，真实执行会备份原文件并拒绝 .env、密钥、token、password 等敏感路径；reload_nginx 无参数，通过 helper 固定执行 nginx -t 成功后再 nginx -s reload。只保存绑定，不执行。",
+                "description": "已弃用的旧计划兼容字段。新调用必须使用 action_bindings。",
             },
         },
         ["operation", "target"],
@@ -553,7 +620,7 @@ TOOLS = [
     ),
     _tool(
         "approve_ops_operation_plan",
-        "记录用户对 Ops 操作计划或单个特权步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>，模型不能自行授权。",
+        "记录用户对 Ops 操作计划或单个高风险步骤的确认。执行器会校验本轮用户原文必须精确为 confirm <plan_id> 或 confirm-step <plan_id> <step_id>；confirm <plan_id> 会立即按状态机连续执行计划内已授权的非破坏性步骤，直到完成、阻塞或遇到 destructive/high-risk 步骤；模型不能自行授权。",
         {
             "plan_id": {"type": "string", "description": "要确认的计划 ID。"},
             "scope": {
@@ -570,7 +637,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_operation_step",
-        "执行已确认 Ops 计划中的一个受控 recipe 步骤。需要先完成 confirm <plan_id>；特权步骤还必须 confirm-step <plan_id> <step_id>。只会运行该步骤绑定 recipe_id 的白名单 runner；未知、未绑定或未接入 recipe 的步骤会 blocked，不会执行任意 shell。",
+        "执行已确认 Ops 计划中的一个操作白名单步骤。需要先完成 confirm <plan_id>；destructive/high-risk 步骤还必须 confirm-step。系统只运行注册表中的 action，未知或未绑定 action 会 blocked，不会执行模型生成的 Shell。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
             "step_id": {"type": "string", "description": "要执行的步骤 ID。"},
@@ -579,7 +646,7 @@ TOOLS = [
     ),
     _tool(
         "execute_ops_next_step",
-        "按 OperationPlan 的 execution_order 执行当前下一步。模型不需要也不应该猜 step_id；如果下一步是特权步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
+        "按 OperationPlan 的 execution_order 执行当前下一步。通常 confirm <plan_id> 已经会自动推进到阻塞点；本工具主要用于人工恢复、resolve 后继续执行或调试。模型不需要也不应该猜 step_id；如果下一步是 destructive/high-risk 步骤，仍必须先完成 confirm-step <plan_id> <step_id>。",
         {
             "plan_id": {"type": "string", "description": "已创建并确认的计划 ID。"},
         },
@@ -587,7 +654,7 @@ TOOLS = [
     ),
     _tool(
         "resolve_ops_blocked_step",
-        "Reset a blocked Ops OperationPlan step to pending after runtime reinspection evidence has been collected. This does not authorize execution; privileged steps still require confirm-step again.",
+        "Reset a blocked Ops OperationPlan step to pending after runtime reinspection evidence has been collected. This does not authorize new destructive/high-risk execution; non-destructive steps keep the already confirmed plan authorization.",
         {
             "plan_id": {"type": "string", "description": "Existing Ops operation plan id."},
             "step_id": {"type": "string", "description": "Blocked step id to resolve."},
@@ -648,7 +715,7 @@ TOOLS = [
     ),
     _tool(
         "write_file",
-        "写入当前 workspace 内的文本文件。只能用于 Coding 模式。",
+        "写入当前 workspace 内的文本文件。适合生成讨论总结、草稿、报告和普通项目文档；只能写 workspace 沙箱内路径，不能修改服务器运行环境。服务器配置、部署脚本、Nginx、平台源码等运维文件仍必须走 OperationPlan/write_ops_file。",
         {
             "path": {"type": "string", "description": "workspace 内相对路径"},
             "content": {"type": "string", "description": "完整文件内容"},

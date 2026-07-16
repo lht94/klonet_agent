@@ -231,6 +231,12 @@ class KnowledgeRetriever:
         if not self.index_file.exists():
             return
 
+        if (
+            self.index_file.resolve() == KNOWLEDGE_INDEX_FILE.resolve()
+            and _index_is_older_than_sources(self.index_file, PROJECT_ROOT)
+        ):
+            KnowledgeIndexer(index_file=self.index_file).build()
+
         mtime_ns = self.index_file.stat().st_mtime_ns
         if self._mtime_ns == mtime_ns:
             return
@@ -357,6 +363,24 @@ def _read_index_rows(index_file: Path) -> list[dict[str, Any]]:
             if isinstance(row, dict):
                 rows.append(row)
     return rows
+
+
+def _index_is_older_than_sources(index_file: Path, root: Path = PROJECT_ROOT) -> bool:
+    """Return whether the default JSONL index should be rebuilt from source docs."""
+
+    try:
+        index_mtime_ns = index_file.stat().st_mtime_ns
+    except OSError:
+        return True
+
+    indexer = KnowledgeIndexer(root=root, index_file=index_file)
+    for source_path in indexer._iter_source_files():
+        try:
+            if source_path.stat().st_mtime_ns > index_mtime_ns:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _indexable_project_path_exists(path: str) -> bool:

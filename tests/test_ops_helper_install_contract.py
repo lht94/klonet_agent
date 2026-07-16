@@ -15,9 +15,16 @@ def test_sudoers_template_only_allows_fixed_helper_entrypoint():
     assert "/usr/local/bin/klonet-agent-op stop-screen-component --execute" in text
     assert "/usr/local/bin/klonet-agent-op stop-platform-screens --execute" in text
     assert "/usr/local/bin/klonet-agent-op start-platform-screens --execute" in text
+    assert "/usr/local/bin/klonet-agent-op install-nginx-config --execute" in text
     assert "/usr/local/bin/klonet-agent-op reload-nginx --execute" in text
+    assert "/usr/local/bin/klonet-agent-op read-file --execute" in text
+    assert "/usr/local/bin/klonet-agent-op inspect-install-scripts --execute" in text
     assert "/usr/local/bin/klonet-agent-op extract-archive --execute" in text
     assert "/usr/local/bin/klonet-agent-op run-install-script --execute" in text
+    assert "/usr/local/bin/klonet-agent-op run-ops-command --execute" in text
+    assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute" in text
+    assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute," in text
+    assert "/usr/local/bin/klonet-agent-op start-docker-container --execute" in text
     assert "NOPASSWD:" in text
     assert "/bin/bash" not in text
     assert "/usr/bin/screen" not in text
@@ -33,7 +40,7 @@ def test_install_doc_requires_root_owned_helper_and_visudo_validation():
     assert "chown root:root /usr/local/bin/klonet-agent-op" in text
     assert "chmod 0755 /usr/local/bin/klonet-agent-op" in text
     assert "visudo -cf /etc/sudoers.d/klonet-agent-op" in text
-    assert "Agent 侧默认仍然 dry-run" in text
+    assert "部署脚本会默认开启受控真实执行" in text
     assert "KLONET_AGENT_OPS_REAL_EXECUTION=1" in text
     assert "不要直接放行 screen、kill、bash、python、nginx" in text
     assert "sudo -n /usr/local/bin/klonet-agent-op" in text

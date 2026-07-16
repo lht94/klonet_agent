@@ -46,5 +46,18 @@ DEFAULT_MODE = "mentor"
 def ops_real_execution_enabled() -> bool:
     """Return whether Ops recipes may call the real server-side helper."""
 
-    value = os.getenv("KLONET_AGENT_OPS_REAL_EXECUTION", "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    return ops_real_execution_mode() == "enabled"
+
+
+def ops_real_execution_mode() -> str:
+    """Return enabled, disabled, missing, or invalid for Ops execution config."""
+
+    raw = os.getenv("KLONET_AGENT_OPS_REAL_EXECUTION")
+    if raw is None or not raw.strip():
+        return "missing"
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return "enabled"
+    if value in {"0", "false", "no", "off"}:
+        return "disabled"
+    return "invalid"

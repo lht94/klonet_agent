@@ -385,6 +385,51 @@ python -m klonet_agent.agent --mode coding --user-id lht --project-id test
 python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 ```
 
-真实 Ops 执行默认仍然关闭。只有完成 helper、sudoers 和计划确认链路验证后，
-才应在 `/etc/klonet-agent/klonet-agent.env` 中启用
-`KLONET_AGENT_OPS_REAL_EXECUTION=1`。
+部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
+`KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。
+真实环境修改仍然必须经过 OperationPlan、计划确认、特权步骤确认和 sudoers
+白名单 helper。
+
+先用管理员账户确认 helper、sudoers 和专用账户权限：
+
+```bash
+ls -l /usr/local/bin/klonet-agent-op
+sudo visudo -cf /etc/sudoers.d/klonet-agent-op
+sudo -l -U klonet-agent
+grep -E '^(TMPDIR|KLONET_AGENT_OPS_REAL_EXECUTION)=' /etc/klonet-agent/klonet-agent.env
+```
+
+重新登录 `klonet-agent`，或在当前 shell 手动加载：
+
+```bash
+set -a
+source /etc/klonet-agent/klonet-agent.env
+set +a
+
+echo "$KLONET_AGENT_OPS_REAL_EXECUTION"
+echo "$TMPDIR"
+```
+
+确认 helper 的 dry-run 和真实执行链路都能跑：
+
+```bash
+/usr/local/bin/klonet-agent-op reload-nginx --dry-run
+sudo -n /usr/local/bin/klonet-agent-op reload-nginx --execute
+```
+
+`base_requ_setup.sh NORMAL` 这类耗时安装步骤会把脚本输出直接流到当前终端；
+如果看到 Docker 镜像解压、`docker load`、OVS/Docker 服务启动等日志，说明仍在执行，
+不是 Agent 已经卡死。
+
+最后用 `klonet-agent` 身份启动 Ops：
+
+```bash
+python -m klonet_agent.agent --mode ops --user-id lht --project-id test
+```
+
+如果之前已经生成过 dry-run 的部署计划，重新部署并启用默认真实执行后建议创建一个新计划，
+不要继续复用已把步骤标记为 completed 的旧计划。
+
+更新 helper/sudoers：
+cd /home/klonet-agent/klonet_agent
+sudo bash scripts/install-klonet-agent-service.sh --project-root "$PWD" --python "$PWD/.venv/bin/python"

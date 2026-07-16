@@ -52,6 +52,8 @@ grep -R "proxy_pass\|listen\|alias" /etc/nginx
 <frontend_path>  新前端目录
 ```
 
+如果 `<project_root>` 还不存在，先按启动 runbook 的“第零步”获取平台源码：优先从 Git 仓库克隆，仓库信息不明确时从已验证服务器复制完整项目副本。不要从 `vemu_install_new_gen` 环境安装包推断或抽取平台源码；安装包只作为依赖、镜像和辅助脚本来源。复制或克隆完成后，先确认目录中存在 `mains/` 与 `vemu_uestc/`，再修改配置。
+
 修改 `<project_root>/vemu_uestc/vemu_config/config.py`、`<project_root>/mains/web_terminal_main.py`、前端 `scripts/config.js` 和 Nginx 配置时，必须使用同一组参数。启动前需要把 `mains/` 中的启动入口文件复制到 `<project_root>` 根目录，后续 Gunicorn、Celery 和 Web Terminal 命令也在 `<project_root>` 下执行。
 
 ## 第三步：准备运行目录

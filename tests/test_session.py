@@ -115,6 +115,37 @@ def test_memory_history_only_loads_recent_messages():
     assert history[0]["content"] == "message-10"
 
 
+def test_memory_history_drops_unclosed_tool_calls():
+    """中断的工具调用不能再次进入 OpenAI 请求历史。"""
+
+    from klonet_agent.memory.store import MemoryStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = MemoryStore.for_session(temp_dir, "u1", "p1")
+        store.append_history({"role": "user", "content": "start deploy"})
+        store.append_history(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "execute_ops_operation_step",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        )
+
+        history = store.load_unarchived_history(max_messages=20)
+
+    assert history == [{"role": "user", "content": "start deploy"}]
+
+
 def test_shared_ops_memory_is_visible_across_users():
     """Ops 工具证据应能沉淀到多用户共享记忆，但不混入用户画像。"""
 

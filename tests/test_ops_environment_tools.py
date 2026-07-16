@@ -1,6 +1,7 @@
 """Read-only environment diagnostic tool tests."""
 
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -943,6 +944,35 @@ def test_ops_file_reader_allows_config_and_redacts_secrets():
     assert "[REDACTED]" in result
 
 
+def test_ops_file_reader_redacts_source_secret_assignments():
+    from klonet_agent.tools.environment import read_ops_file
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        config = temp_dir / "app_factory.py"
+        config.write_text(
+            "\n".join(
+                [
+                    "master_port = 12000",
+                    "flask_app.config['SECRET_KEY'] = b'raw-secret-bytes'",
+                    'settings = {"api_token": "json-token-value"}',
+                    'headers = {"Authorization": "Bearer bearer-token-value"}',
+                    "client_secret: yaml-secret-value",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = read_ops_file({"path": str(config), "max_chars": 1000})
+
+    assert "master_port = 12000" in result
+    assert "raw-secret-bytes" not in result
+    assert "json-token-value" not in result
+    assert "bearer-token-value" not in result
+    assert "yaml-secret-value" not in result
+    assert result.count("[REDACTED]") >= 4
+
+
 def test_ops_file_reader_rejects_env_files():
     from klonet_agent.tools.environment import read_ops_file
     from tests.helpers import local_temp_dir
@@ -955,6 +985,96 @@ def test_ops_file_reader_rejects_env_files():
 
     assert result.startswith("Error:")
     assert "refused" in result.lower()
+
+
+def test_root_file_reader_uses_helper_without_sensitive_name_filter(monkeypatch):
+    from klonet_agent.tools.environment import read_root_file
+
+    def fake_run(command, **kwargs):
+        assert command[:4] == ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "read-file"]
+        assert "--path" in command
+        assert "/root/.ssh/id_rsa" in command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "klonet_agent_op\n"
+                "action=read-file\n"
+                "dry_run=false\n"
+                "path=/root/.ssh/id_rsa\n"
+                "environment_changed=false\n"
+                "content:\n"
+                "PRIVATE KEY TEST\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("klonet_agent.tools.environment.subprocess.run", fake_run)
+
+    result = read_root_file({"path": "/root/.ssh/id_rsa", "max_chars": 200})
+
+    assert "read_root_file" in result
+    assert "environment_changed=false" in result
+    assert "PRIVATE KEY TEST" in result
+
+
+def test_ops_file_reader_falls_back_to_root_helper_on_permission_error(monkeypatch):
+    from klonet_agent.tools.environment import read_ops_file
+
+    def fake_run(command, **kwargs):
+        assert command[:4] == ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "read-file"]
+        assert "/root/vemu_install_new_gen/base_requ_setup.sh" in command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "klonet_agent_op\n"
+                "action=read-file\n"
+                "dry_run=false\n"
+                "path=/root/vemu_install_new_gen/base_requ_setup.sh\n"
+                "environment_changed=false\n"
+                "content:\n"
+                "#!/bin/bash\n"
+                "install python\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("klonet_agent.tools.environment.subprocess.run", fake_run)
+
+    result = read_ops_file({"path": "/root/vemu_install_new_gen/base_requ_setup.sh"})
+
+    assert "read_ops_file" in result
+    assert "environment_changed=false" in result
+    assert "install python" in result
+
+
+def test_install_script_inspection_falls_back_to_root_helper(monkeypatch):
+    from klonet_agent.tools.environment import inspect_install_scripts
+
+    def fake_run(command, **kwargs):
+        assert command[:4] == ["sudo", "-n", "/usr/local/bin/klonet-agent-op", "inspect-install-scripts"]
+        assert "/root/vemu_install_new_gen" in command
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "klonet_agent_op\n"
+                "action=inspect-install-scripts\n"
+                "dry_run=false\n"
+                "script_dir=/root/vemu_install_new_gen\n"
+                "environment_changed=false\n"
+                "- script=base_requ_setup.sh status=detected executable=false shebang=#!/bin/bash recommended_recipe=run_install_script allowed_args=NORMAL risk_markers=apt-get\n"
+                "preflight_status=ready\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("klonet_agent.tools.environment.subprocess.run", fake_run)
+
+    result = inspect_install_scripts({"script_dir": "/root/vemu_install_new_gen"})
+
+    assert "inspect_install_scripts" in result
+    assert "root_helper=true" in result
+    assert "script=base_requ_setup.sh status=detected" in result
+    assert "preflight_status=ready" in result
 
 
 def test_screen_inspection_rejects_unsafe_session_name():
@@ -1123,6 +1243,45 @@ def test_process_detail_tool_returns_target_pid_cmd_and_cwd(monkeypatch):
     assert "pid=1467095" in result
     assert "cmd=python3.8 web_terminal_main.py" in result
     assert "cwd=/home/adminis/lht/102_project" in result
+
+
+def test_process_detail_reports_unchecked_when_proc_cwd_is_unreadable(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout='LISTEN 0 128 0.0.0.0:5045 0.0.0.0:* users:(("python3.8",pid=1467095,fd=7))',
+                stderr="",
+            )
+        if command[:2] == ["ps", "-p"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_text",
+        lambda path: "python3.8 web_terminal_main.py"
+        if path.endswith("/cmdline")
+        else "",
+    )
+    monkeypatch.setattr(environment.os, "readlink", lambda path: (_ for _ in ()).throw(PermissionError("denied")))
+
+    result = environment.inspect_process_detail({"ports": [5045]})
+
+    assert "pid=1467095" in result
+    assert "cwd=unchecked" in result
+    assert "/proc/1467095/cwd" not in result
 
 
 def test_executor_dispatches_environment_tool():

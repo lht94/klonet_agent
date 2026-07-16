@@ -1,6 +1,6 @@
 ﻿# klonet-agent-op 安装契约
 
-`klonet-agent-op` 是 Ops Agent 修改服务器环境时唯一应该被 sudoers 放行的入口。Agent 侧默认仍然 dry-run；只有 OperationPlan 已确认、单步已确认，并且服务端明确安装 helper 与 sudoers 后，才允许进入真实执行链路。
+`klonet-agent-op` 是 Ops Agent 修改服务器环境时唯一应该被 sudoers 放行的入口。部署脚本会默认开启受控真实执行；但每次环境修改仍必须先经过 OperationPlan、计划确认、单步确认，并且只能通过 helper 与 sudoers 白名单进入真实执行链路。
 
 ## 一键部署专用账户与服务
 
@@ -28,6 +28,7 @@ sudo ./scripts/install-klonet-agent-service.sh \
   下其他用户创建的缓存文件；
 - 安装 root-owned helper 与 sudoers 白名单并通过 `visudo` 校验；
 - 安装并 enable `klonet-agent.service`；
+- 在 root 管理的环境文件中写入 `KLONET_AGENT_OPS_REAL_EXECUTION=1`；
 - 执行 helper 的 `reload-nginx --dry-run` 验证，不执行任何 `--execute` 操作。
 
 ## 配置为专用 SSH 登录账户
@@ -75,8 +76,8 @@ python -m klonet_agent.agent --mode coding --user-id lht --project-id test
 python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 ```
 
-只有 ops 模式会使用 `klonet-ops` 能力，而且仍受 helper、sudoers 白名单、计划确认
-和 `KLONET_AGENT_OPS_REAL_EXECUTION` 开关约束。
+只有 ops 模式会使用 `klonet-ops` 能力，而且仍受 helper、sudoers 白名单、
+OperationPlan 和单步确认约束。
 
 重复执行会更新 helper、sudoers 和 systemd unit，但保留已有的
 `/etc/klonet-agent/klonet-agent.env`。脚本默认不启动服务；只有显式加入
@@ -106,8 +107,7 @@ sudoedit /etc/klonet-agent/klonet-agent.env
 OPENAI_API_KEY=替换为服务器密钥
 OPENAI_BASE_URL=https://api.deepseek.com
 TMPDIR=/home/klonet-agent/.cache/tmp
-# 完成 helper、sudoers 和计划确认链路验收后，才可手动取消下一行注释：
-# KLONET_AGENT_OPS_REAL_EXECUTION=1
+KLONET_AGENT_OPS_REAL_EXECUTION=1
 ```
 
 该文件权限为 `root:klonet-agent 0640`。密钥不会出现在模型对话或 Git
@@ -188,9 +188,16 @@ sudo visudo -cf /etc/sudoers.d/klonet-agent-op
 /usr/local/bin/klonet-agent-op stop-platform-screens --execute *
 /usr/local/bin/klonet-agent-op start-platform-screens --execute *
 /usr/local/bin/klonet-agent-op reload-nginx --execute *
+/usr/local/bin/klonet-agent-op read-file --execute *
+/usr/local/bin/klonet-agent-op inspect-install-scripts --execute *
+/usr/local/bin/klonet-agent-op inspect-docker-containers --execute *
+/usr/local/bin/klonet-agent-op start-docker-container --execute *
 ```
 
-原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护、启动命令模板都在 helper 内完成。放行底层命令会绕过这些校验。
+查看全部容器时 helper 没有额外参数，因此 sudoers 同时包含精确的
+`inspect-docker-containers --execute` 规则；按名称过滤时使用带参数规则。
+
+`read-file` 和 `inspect-install-scripts` 是 root 只读诊断入口，只读取普通文件和安装脚本元信息，不写入、不执行脚本。原因是参数校验、组件白名单、screen 与平台名匹配、project_root 注入防护、启动命令模板都在 helper 内完成。放行底层命令会绕过这些校验。
 
 ## Agent 调用方式
 
@@ -208,15 +215,15 @@ sudo -n /usr/local/bin/klonet-agent-op <action> --execute ...
 
 `-n` 禁止 sudo 弹出密码提示；如果专用账户、用户组或 sudoers 未正确配置，命令会立即失败。不要通过对话、stdin、环境变量或工具参数向 Agent 提供 sudo 密码。只有运行 Agent 的专用 `klonet-agent` 账户应加入 `klonet-ops`，日常登录账户不应加入该组。
 
-## 启用真实执行
+## 真实执行开关
 
-Agent 侧默认仍然 dry-run。即使 helper 和 sudoers 已安装，`execute_ops_operation_step` 也只会生成预览，除非运行 Agent 的环境显式设置：
+使用 `install-klonet-agent-service.sh` 部署时，环境文件会默认包含：
 
 ```bash
-export KLONET_AGENT_OPS_REAL_EXECUTION=1
+KLONET_AGENT_OPS_REAL_EXECUTION=1
 ```
 
-建议只在完成以下检查后设置该变量：
+如果未使用部署脚本，需要手动把该变量加入运行 Agent 的环境。真实执行仍然必须满足：
 
 - `/usr/local/bin/klonet-agent-op` 已安装并归属 `root:root`
 - `/etc/sudoers.d/klonet-agent-op` 已通过 `visudo -cf`

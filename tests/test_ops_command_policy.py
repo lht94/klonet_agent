@@ -1,0 +1,244 @@
+from pathlib import Path
+import subprocess
+import sys
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+HELPER = PROJECT_ROOT / "scripts" / "klonet-agent-op"
+
+
+def test_run_ops_command_action_is_registered():
+    from klonet_agent.ops.actions import DEFAULT_OPS_ACTION_REGISTRY
+
+    spec = DEFAULT_OPS_ACTION_REGISTRY.get("run_ops_command")
+
+    assert spec is not None
+    assert spec.handler_name == "_run_ops_command"
+
+
+def test_command_policy_classifies_make_as_controlled_without_step_confirm():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    decision = decide_ops_command(
+        {"program": "make", "argv": ["all"], "cwd": "/home/klonet-agent/workspaces/demo"}
+    )
+
+    assert decision.allowed
+    assert decision.category == "workspace_build"
+    assert decision.risk == "controlled"
+    assert decision.requires_sudo is False
+    assert decision.requires_step_confirmation is False
+
+
+def test_command_policy_classifies_apt_install_as_step_confirmed_sudo():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    decision = decide_ops_command(
+        {"program": "apt", "argv": ["install", "-y", "build-essential"], "cwd": ""}
+    )
+
+    assert decision.allowed
+    assert decision.category == "system_package_install"
+    assert decision.risk == "dangerous"
+    assert decision.requires_sudo is True
+    assert decision.requires_step_confirmation is True
+
+
+def test_command_policy_allows_selected_git_workflows():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    cwd = "/home/klonet-agent/workspaces/demo"
+
+    clone = decide_ops_command(
+        {"program": "git", "argv": ["clone", "https://github.com/org/repo.git", "repo"], "cwd": cwd}
+    )
+    pull = decide_ops_command(
+        {"program": "git", "argv": ["pull", "origin", "main"], "cwd": cwd}
+    )
+    checkout = decide_ops_command(
+        {"program": "git", "argv": ["checkout", "feature/theaterq"], "cwd": cwd}
+    )
+    push = decide_ops_command(
+        {"program": "git", "argv": ["push", "origin", "main"], "cwd": cwd}
+    )
+
+    assert clone.allowed and clone.category == "git_clone"
+    assert pull.allowed and pull.category == "git_pull"
+    assert checkout.allowed and checkout.category == "git_checkout"
+    assert push.allowed and push.category == "git_push"
+    assert push.requires_step_confirmation is True
+    assert push.risk == "dangerous"
+
+
+def test_command_policy_accepts_legacy_string_argv_and_gitee_alias_url():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    decision = decide_ops_command(
+        {
+            "program": "git",
+            "argv": "['clone', 'gitee:uestc-minenet/vemu_uestc.git', '/home/klonet-agent/102']",
+            "cwd": "/home/klonet-agent",
+        }
+    )
+
+    assert decision.allowed
+    assert decision.argv == (
+        "clone",
+        "gitee:uestc-minenet/vemu_uestc.git",
+        "/home/klonet-agent/102",
+    )
+    assert decision.category == "git_clone"
+
+
+def test_command_policy_rejects_unapproved_git_commands():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    reset = decide_ops_command(
+        {"program": "git", "argv": ["reset", "--hard"], "cwd": "/home/klonet-agent/workspaces/demo"}
+    )
+    unsafe_clone = decide_ops_command(
+        {"program": "git", "argv": ["clone", "https://github.com/org/repo.git", "/etc/repo"], "cwd": "/home/klonet-agent/workspaces/demo"}
+    )
+
+    assert not reset.allowed
+    assert reset.reason == "git_args_not_allowed"
+    assert not unsafe_clone.allowed
+    assert unsafe_clone.reason == "git_args_not_allowed"
+
+
+def test_operation_plan_preserves_run_ops_command_argv_and_sets_risk(tmp_path):
+    from klonet_agent.ops.operations import OperationPlanStore
+
+    plan = OperationPlanStore(tmp_path).create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "apt-update",
+                "title": "刷新 apt 索引",
+                "action": "run_ops_command",
+                "args": {"program": "apt", "argv": ["update"], "cwd": ""},
+            }
+        ],
+    )
+
+    step = plan.steps[0]
+    assert step.args["argv"] == ["update"]
+    assert step.risk == "dangerous"
+    assert step.requires_step_confirmation is True
+
+
+def test_run_ops_command_make_executes_after_plan_confirm(tmp_path):
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    calls = []
+
+    def runner(command):
+        calls.append(command)
+        return "built"
+
+    work = tmp_path / "work"
+    work.mkdir()
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False, command_runner=runner),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "build",
+                "title": "编译",
+                "action": "run_ops_command",
+                "args": {"program": "make", "argv": ["all"], "cwd": str(work)},
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    result = store.execute_step(plan.plan_id, "build")
+
+    assert calls == [["make", "all"]]
+    assert "category=workspace_build" in result
+    assert "command_output=built" in result
+
+
+def test_run_ops_command_apt_requires_confirm_step(tmp_path):
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False, command_runner=lambda command: "ok"),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "apt-update",
+                "title": "刷新 apt",
+                "action": "run_ops_command",
+                "args": {"program": "apt", "argv": ["update"], "cwd": ""},
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    result = store.execute_step(plan.plan_id, "apt-update")
+
+    assert "requires explicit confirm-step" in result
+    assert f"confirm-step {plan.plan_id} apt-update" in result
+
+
+def test_run_ops_command_git_push_requires_confirm_step(tmp_path):
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledActionRunner
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    store = OperationPlanStore(
+        tmp_path / "plans",
+        action_runner=ControlledActionRunner(dry_run=False, command_runner=lambda command: "ok"),
+    )
+    plan = store.create_plan(
+        operation="deploy_platform",
+        target="demo",
+        steps=[
+            {
+                "step_id": "push",
+                "title": "上传分支",
+                "action": "run_ops_command",
+                "args": {"program": "git", "argv": ["push", "origin", "main"], "cwd": str(repo)},
+            }
+        ],
+    )
+    store.approve_plan(plan.plan_id)
+    result = store.execute_step(plan.plan_id, "push")
+
+    assert "requires explicit confirm-step" in result
+    assert f"confirm-step {plan.plan_id} push" in result
+
+
+def test_helper_run_ops_command_dry_run_contract(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "run-ops-command",
+            "--dry-run",
+            "--program",
+            "apt",
+            "--argv-json",
+            '["update"]',
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "action=run-ops-command" in result.stdout
+    assert "program=apt" in result.stdout
+    assert "environment_changed=false" in result.stdout

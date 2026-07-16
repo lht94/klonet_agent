@@ -12,6 +12,89 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HELPER = PROJECT_ROOT / "scripts" / "klonet-agent-op"
 
 
+def test_docker_container_helper_dry_run_contracts():
+    inspect_result = subprocess.run(
+        [sys.executable, str(HELPER), "inspect-docker-containers", "--dry-run", "--name", "mysql-vemu"],
+        capture_output=True,
+        text=True,
+    )
+    start_result = subprocess.run(
+        [sys.executable, str(HELPER), "start-docker-container", "--dry-run", "--name", "mysql-vemu"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert inspect_result.returncode == 0
+    assert "container_filter=mysql-vemu" in inspect_result.stdout
+    assert start_result.returncode == 0
+    assert "container=mysql-vemu" in start_result.stdout
+    assert "environment_changed=false" in start_result.stdout
+
+
+def test_read_file_helper_execute_reads_regular_file(tmp_path):
+    target = tmp_path / "secret.env"
+    target.write_text("TOKEN=visible-to-root-read\n", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "read-file",
+            "--execute",
+            "--path",
+            str(target),
+            "--max-chars",
+            "200",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "action=read-file" in result.stdout
+    assert "environment_changed=false" in result.stdout
+    assert "content:" in result.stdout
+    assert "TOKEN=visible-to-root-read" in result.stdout
+
+
+def test_inspect_install_scripts_helper_execute_reads_scripts(tmp_path):
+    install_dir = tmp_path / "vemu_install_new_gen"
+    install_dir.mkdir()
+    (install_dir / "base_requ_setup.sh").write_text(
+        "#!/usr/bin/env bash\napt-get update\n",
+        encoding="utf-8",
+    )
+    (install_dir / "docker_service.sh").write_text(
+        "#!/bin/bash\ndocker ps\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "inspect-install-scripts",
+            "--execute",
+            "--script-dir",
+            str(install_dir),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "action=inspect-install-scripts" in result.stdout
+    assert "script=base_requ_setup.sh status=detected" in result.stdout
+    assert "risk_markers=apt-get" in result.stdout
+    assert "script=docker_service.sh status=detected" in result.stdout
+    assert "risk_markers=docker" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
 def test_restart_screen_component_helper_dry_run_outputs_command_contract():
     result = subprocess.run(
         [
@@ -149,6 +232,92 @@ def test_reload_nginx_helper_dry_run_outputs_command_contract():
     assert "test_command=nginx -t" in result.stdout
     assert "reload_command=nginx -s reload" in result.stdout
     assert "environment_changed=false" in result.stdout
+
+
+def test_install_nginx_config_helper_dry_run_outputs_destination():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "install-nginx-config",
+            "--dry-run",
+            "--source-path",
+            "/tmp/103.conf",
+            "--config-name",
+            "103.conf",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 0
+    assert "klonet_agent_op" in result.stdout
+    assert "action=install-nginx-config" in result.stdout
+    assert "dry_run=true" in result.stdout
+    assert "source_path=/tmp/103.conf" in result.stdout
+    assert "destination_path=/etc/nginx/conf.d/103.conf" in result.stdout
+    assert "environment_changed=false" in result.stdout
+
+
+def test_install_nginx_config_helper_execute_copies_valid_conf(monkeypatch, tmp_path, capsys):
+    helper = _load_helper_module()
+    source = tmp_path / "103.conf"
+    source.write_text("server {}", encoding="utf-8")
+    copied = []
+
+    monkeypatch.setattr(
+        helper,
+        "_validate_nginx_config_install_args",
+        lambda source_path, config_name: "",
+    )
+    monkeypatch.setattr(
+        helper.shutil,
+        "copy2",
+        lambda source_path, destination_path: copied.append((source_path, destination_path)),
+    )
+
+    code = helper.main(
+        [
+            "install-nginx-config",
+            "--execute",
+            "--source-path",
+            str(source),
+            "--config-name",
+            "103.conf",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert copied == [(source, helper.Path("/etc/nginx/conf.d/103.conf"))]
+    assert "action=install-nginx-config" in captured.out
+    assert "dry_run=false" in captured.out
+    assert "environment_changed=true" in captured.out
+
+
+def test_install_nginx_config_helper_rejects_source_outside_staging_area():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(HELPER),
+            "install-nginx-config",
+            "--dry-run",
+            "--source-path",
+            "/etc/passwd.conf",
+            "--config-name",
+            "103.conf",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == 2
+    assert "source_path_not_allowlisted" in result.stderr
+    assert "environment_changed=false" in result.stderr
 
 
 def test_reload_nginx_helper_execute_tests_config_before_reload(monkeypatch, capsys):

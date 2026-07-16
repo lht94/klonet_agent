@@ -4,6 +4,15 @@
 """
 
 from klonet_agent.journal.project_journal import ProjectJournal, get_project_journal
+from klonet_agent.journal.maintainer import (
+    JournalUpdateDecision,
+    ProjectJournalMaintainer,
+)
 
 
-__all__ = ["ProjectJournal", "get_project_journal"]
+__all__ = [
+    "JournalUpdateDecision",
+    "ProjectJournal",
+    "ProjectJournalMaintainer",
+    "get_project_journal",
+]

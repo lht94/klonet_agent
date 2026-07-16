@@ -30,6 +30,28 @@ def test_knowledge_index_and_search():
     assert "验收" in results[0].snippet
 
 
+def test_knowledge_index_staleness_detects_newer_source_files():
+    import os
+
+    from klonet_agent.knowledge.indexer import KnowledgeIndexer
+    from klonet_agent.knowledge.retriever import _index_is_older_than_sources
+
+    with local_temp_dir() as temp_dir:
+        root = temp_dir / "repo"
+        root.mkdir()
+        readme = root / "README.md"
+        readme.write_text("# Klonet\n\n旧知识。", encoding="utf-8")
+        index_file = temp_dir / "index.jsonl"
+
+        KnowledgeIndexer(root=root, index_file=index_file).build()
+        assert not _index_is_older_than_sources(index_file, root)
+
+        newer_ns = index_file.stat().st_mtime_ns + 1_000_000_000
+        os.utime(readme, ns=(newer_ns, newer_ns))
+
+        assert _index_is_older_than_sources(index_file, root)
+
+
 def test_knowledge_index_skips_runtime_memory_files():
     """运行时记忆不应该进入 Klonet 知识库索引。"""
 
@@ -122,6 +144,23 @@ def test_multi_platform_startup_runbook_is_retrievable():
     assert results
     assert results[0].path == "knowledge/klonet/ops/multi_platform_startup.md"
     assert "/usr/local/python3/bin/gunicorn" in results[0].snippet
+
+
+def test_source_acquisition_runbook_is_retrievable_for_git_questions():
+    """Git/source-copy questions should not fall back to the install package."""
+
+    from klonet_agent.knowledge.retriever import KnowledgeRetriever
+
+    results = KnowledgeRetriever().search(
+        "Klonet 平台源码 git clone 仓库 ssh .ssh gitee vemu_uestc",
+        top_k=5,
+        task_type="operation_guide",
+        domains=("runtime",),
+    )
+
+    assert results
+    assert results[0].path == "knowledge/klonet/ops/source_acquisition_git.md"
+    assert "git clone gitee:uestc-minenet/vemu_uestc.git" in results[0].snippet
 
 
 def test_general_query_does_not_force_klonet_results():

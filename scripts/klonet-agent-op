@@ -2,13 +2,14 @@
 """Server-side Klonet Ops helper.
 
 This helper is intended to be installed as /usr/local/bin/klonet-agent-op and
-allowlisted in sudoers later. The current contract is validation-only dry-run:
-it does not modify the host.
+allowlisted in sudoers. Dry-run validates and previews; execute performs only
+the allowlisted, argument-validated host operations.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shlex
 import shutil
@@ -19,6 +20,7 @@ import zipfile
 from pathlib import Path
 
 
+MAX_READ_FILE_CHARS = 20000
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 START_COMPONENT_ORDER = ("master", "celery", "web_terminal", "worker")
 COMPONENT_COMMANDS = {
@@ -44,7 +46,9 @@ REQUIRED_PROJECT_ENTRY_FILES = (
     "worker_main.py",
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
+SAFE_OPS_ARG = re.compile(r"^[A-Za-z0-9_.:+/@=-]{0,500}$")
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
     "docker_service.sh": (),
@@ -84,6 +88,24 @@ def main(argv=None) -> int:
     reload_nginx_mode = reload_nginx.add_mutually_exclusive_group(required=True)
     reload_nginx_mode.add_argument("--dry-run", action="store_true")
     reload_nginx_mode.add_argument("--execute", action="store_true")
+    install_nginx = subcommands.add_parser("install-nginx-config")
+    install_nginx_mode = install_nginx.add_mutually_exclusive_group(required=True)
+    install_nginx_mode.add_argument("--dry-run", action="store_true")
+    install_nginx_mode.add_argument("--execute", action="store_true")
+    install_nginx.add_argument("--source-path", required=True)
+    install_nginx.add_argument("--config-name", required=True)
+    read_file = subcommands.add_parser("read-file")
+    read_file_mode = read_file.add_mutually_exclusive_group(required=True)
+    read_file_mode.add_argument("--dry-run", action="store_true")
+    read_file_mode.add_argument("--execute", action="store_true")
+    read_file.add_argument("--path", required=True)
+    read_file.add_argument("--max-chars", type=int, default=8000)
+    inspect_install = subcommands.add_parser("inspect-install-scripts")
+    inspect_install_mode = inspect_install.add_mutually_exclusive_group(required=True)
+    inspect_install_mode.add_argument("--dry-run", action="store_true")
+    inspect_install_mode.add_argument("--execute", action="store_true")
+    inspect_install.add_argument("--script-dir", required=True)
+    inspect_install.add_argument("--scripts", default="")
     extract_archive = subcommands.add_parser("extract-archive")
     extract_archive_mode = extract_archive.add_mutually_exclusive_group(required=True)
     extract_archive_mode.add_argument("--dry-run", action="store_true")
@@ -97,6 +119,23 @@ def main(argv=None) -> int:
     run_install.add_argument("--script-dir", required=True)
     run_install.add_argument("--script-name", required=True)
     run_install.add_argument("--script-args", default="")
+    inspect_containers = subcommands.add_parser("inspect-docker-containers")
+    inspect_containers_mode = inspect_containers.add_mutually_exclusive_group(required=True)
+    inspect_containers_mode.add_argument("--dry-run", action="store_true")
+    inspect_containers_mode.add_argument("--execute", action="store_true")
+    inspect_containers.add_argument("--name", default="")
+    start_container = subcommands.add_parser("start-docker-container")
+    start_container_mode = start_container.add_mutually_exclusive_group(required=True)
+    start_container_mode.add_argument("--dry-run", action="store_true")
+    start_container_mode.add_argument("--execute", action="store_true")
+    start_container.add_argument("--name", required=True)
+    run_ops = subcommands.add_parser("run-ops-command")
+    run_ops_mode = run_ops.add_mutually_exclusive_group(required=True)
+    run_ops_mode.add_argument("--dry-run", action="store_true")
+    run_ops_mode.add_argument("--execute", action="store_true")
+    run_ops.add_argument("--program", required=True)
+    run_ops.add_argument("--argv-json", required=True)
+    run_ops.add_argument("--cwd", default="")
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
@@ -106,14 +145,230 @@ def main(argv=None) -> int:
         return _stop_platform_screens(args)
     if args.action == "start-platform-screens":
         return _start_platform_screens(args)
+    if args.action == "install-nginx-config":
+        return _install_nginx_config(args)
     if args.action == "reload-nginx":
         return _reload_nginx(args)
+    if args.action == "read-file":
+        return _read_file(args)
+    if args.action == "inspect-install-scripts":
+        return _inspect_install_scripts(args)
     if args.action == "extract-archive":
         return _extract_archive(args)
     if args.action == "run-install-script":
         return _run_install_script(args)
+    if args.action == "inspect-docker-containers":
+        return _inspect_docker_containers(args)
+    if args.action == "start-docker-container":
+        return _start_docker_container(args)
+    if args.action == "run-ops-command":
+        return _run_ops_command(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
+
+
+def _inspect_docker_containers(args) -> int:
+    if args.name and not SAFE_CONTAINER_NAME.fullmatch(args.name):
+        _print_error(f"invalid_container_name={args.name}")
+        return 2
+    print("klonet_agent_op")
+    print("action=inspect-docker-containers")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    if args.dry_run:
+        print(f"container_filter={args.name or 'all'}")
+        print("environment_changed=false")
+        return 0
+    command = [
+        "docker",
+        "ps",
+        "-a",
+        "--format",
+        "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}",
+    ]
+    if args.name:
+        command.extend(["--filter", f"name=^/{args.name}$"])
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        _print_error(f"docker_inspect_failed={exc}")
+        return 1
+    if completed.returncode != 0:
+        _print_error(f"docker_inspect_failed={completed.stderr.strip() or completed.returncode}")
+        return 1
+    output = completed.stdout.strip()
+    print(f"container_filter={args.name or 'all'}")
+    print(f"containers={output or 'none'}")
+    print("environment_changed=false")
+    return 0
+
+
+def _start_docker_container(args) -> int:
+    if not SAFE_CONTAINER_NAME.fullmatch(args.name):
+        _print_error(f"invalid_container_name={args.name}")
+        return 2
+    if args.execute:
+        try:
+            inspected = subprocess.run(
+                ["docker", "inspect", "--format", "{{.State.Running}}", args.name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if inspected.returncode != 0:
+                _print_error(f"container_not_found={args.name}")
+                return 1
+            already_running = inspected.stdout.strip().lower() == "true"
+            if not already_running:
+                run_checked(["docker", "start", args.name])
+        except (subprocess.CalledProcessError, OSError) as exc:
+            _print_command_failure(["docker", "start", args.name], exc)
+            return 1
+    else:
+        already_running = False
+    print("klonet_agent_op")
+    print("action=start-docker-container")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"container={args.name}")
+    print(f"already_running={str(already_running).lower()}")
+    print(f"environment_changed={str(args.execute and not already_running).lower()}")
+    return 0
+
+
+def _run_ops_command(args) -> int:
+    problem, command, cwd = _validate_ops_command(args.program, args.argv_json, args.cwd)
+    if problem:
+        _print_error(problem)
+        return 2
+    print("klonet_agent_op")
+    print("action=run-ops-command")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"program={command[0]}")
+    print(f"argv_json={json.dumps(command[1:], ensure_ascii=False)}")
+    if cwd:
+        print(f"cwd={cwd}")
+    if args.execute:
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd or None,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=600,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _print_error(f"ops_command_failed={_one_line(str(exc))}")
+            return 1
+        print(f"returncode={completed.returncode}")
+        if completed.stdout:
+            print("stdout:")
+            print(completed.stdout[:12000], end="" if completed.stdout.endswith("\n") else "\n")
+        if completed.stderr:
+            print("stderr:")
+            print(completed.stderr[:4000], end="" if completed.stderr.endswith("\n") else "\n")
+        print(f"environment_changed={str(completed.returncode == 0).lower()}")
+        return completed.returncode
+    print("environment_changed=false")
+    return 0
+
+
+def _read_file(args) -> int:
+    raw_path = args.path
+    if _unsafe_path(raw_path):
+        _print_error(f"invalid_path={raw_path or 'missing'}")
+        return 2
+    max_chars = max(1, min(args.max_chars, MAX_READ_FILE_CHARS))
+    path = Path(raw_path)
+    print("klonet_agent_op")
+    print("action=read-file")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"path={raw_path}")
+    print("environment_changed=false")
+    if args.dry_run:
+        return 0
+    if not path.is_file():
+        _print_error(f"file_not_found={raw_path}")
+        return 2
+    try:
+        stat = path.stat()
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        _print_error(f"read_failed={_one_line(str(exc))}")
+        return 1
+    snippet = text[-max_chars:]
+    print(f"resolved_path={path.resolve()}")
+    print(f"size_bytes={stat.st_size}")
+    print(f"showing_last_chars={len(snippet)}")
+    print("content:")
+    print(snippet, end="" if snippet.endswith("\n") else "\n")
+    return 0
+
+
+def _inspect_install_scripts(args) -> int:
+    script_dir = args.script_dir
+    if _unsafe_path(script_dir):
+        _print_error(f"invalid_script_dir={script_dir or 'missing'}")
+        return 2
+    requested = [
+        item.strip()
+        for item in (args.scripts or "").split(",")
+        if item.strip()
+    ]
+    scripts = [
+        item
+        for item in (requested or list(ALLOWED_INSTALL_SCRIPTS))
+        if item in ALLOWED_INSTALL_SCRIPTS
+    ]
+    if not scripts:
+        scripts = list(ALLOWED_INSTALL_SCRIPTS)
+    directory = Path(script_dir)
+    print("klonet_agent_op")
+    print("action=inspect-install-scripts")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"script_dir={script_dir}")
+    print("environment_changed=false")
+    if args.dry_run:
+        print("preflight_status=unchecked")
+        return 0
+    if not directory.is_dir():
+        print(f"script_dir_missing={script_dir}")
+        print("preflight_status=blocked")
+        return 0
+    blocked = False
+    for script_name in scripts:
+        path = directory / script_name
+        if not path.is_file():
+            blocked = True
+            print(f"- script={script_name} status=missing recommendation=do_not_bind_recipe")
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            blocked = True
+            print(f"- script={script_name} status=unchecked error={_one_line(str(exc))}")
+            continue
+        print(
+            "- "
+            f"script={script_name} status=detected "
+            f"executable={str(path.stat().st_mode & 0o111 != 0).lower()} "
+            f"shebang={_script_shebang(text) or 'missing'} "
+            "recommended_recipe=run_install_script "
+            f"allowed_args={','.join(ALLOWED_INSTALL_SCRIPTS[script_name]) if ALLOWED_INSTALL_SCRIPTS[script_name] else 'none'} "
+            f"risk_markers={','.join(_script_risk_markers(text)) if _script_risk_markers(text) else 'none'}"
+        )
+    print(f"preflight_status={'blocked' if blocked else 'ready'}")
+    return 0
 
 
 def _restart_screen_component(args) -> int:
@@ -227,6 +482,32 @@ def _start_platform_screens(args) -> int:
     print(f"platform={args.platform}")
     print(f"project_root={args.project_root}")
     print(f"screen_sessions={','.join(screen_sessions)}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
+def _install_nginx_config(args) -> int:
+    problem = _validate_nginx_config_install_args(args.source_path, args.config_name)
+    if problem:
+        _print_error(problem)
+        return 2
+    source = Path(args.source_path)
+    destination_text = f"/etc/nginx/conf.d/{args.config_name}"
+    destination = Path(destination_text)
+    if args.execute:
+        try:
+            if not source.is_file():
+                _print_error(f"source_not_found={args.source_path}")
+                return 2
+            shutil.copy2(source, destination)
+        except OSError as exc:
+            _print_error(f"install_nginx_config_failed={_one_line(str(exc))}")
+            return 1
+    print("klonet_agent_op")
+    print("action=install-nginx-config")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"source_path={args.source_path}")
+    print(f"destination_path={destination_text}")
     print(f"environment_changed={str(args.execute).lower()}")
     return 0
 
@@ -351,6 +632,108 @@ def _validate_start_platform_args(platform: str, project_root: str) -> str:
     return ""
 
 
+def _validate_nginx_config_install_args(source_path: str, config_name: str) -> str:
+    if not source_path or _unsafe_path(source_path):
+        return f"invalid_source_path={source_path or 'missing'}"
+    source_text = _normalized_path_text(source_path)
+    allowed_roots = (
+        "/tmp",
+        "/home/klonet-agent",
+        "/var/lib/klonet-agent",
+    )
+    if not any(_path_text_is_relative_to(source_text, root) for root in allowed_roots):
+        return "source_path_not_allowlisted"
+    if Path(source_path).suffix != ".conf":
+        return f"unsupported_source_file={Path(source_path).name or source_path}"
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}\.conf", config_name or ""):
+        return f"invalid_config_name={config_name or 'missing'}"
+    return ""
+
+
+def _normalized_path_text(value: str) -> str:
+    return str(value or "").replace("\\", "/").rstrip("/") or "/"
+
+
+def _path_text_is_relative_to(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _validate_ops_command(program: str, argv_json: str, cwd: str) -> tuple[str, list[str], str]:
+    program = Path(program).name
+    try:
+        argv = json.loads(argv_json)
+    except json.JSONDecodeError:
+        return "invalid_argv_json", [], ""
+    if not isinstance(argv, list) or len(argv) > 40:
+        return "invalid_argv", [], ""
+    argv = [str(item) for item in argv]
+    if any("\x00" in item or "\n" in item or "\r" in item or not SAFE_OPS_ARG.fullmatch(item) for item in argv):
+        return "invalid_argv_value", [], ""
+    if cwd:
+        if _unsafe_path(cwd) or not Path(cwd).is_dir():
+            return f"invalid_cwd={cwd or 'missing'}", [], ""
+    command = [program, *argv]
+    if program in {"apt", "apt-get"}:
+        if argv == ["update"]:
+            return "", command, cwd
+        if argv[:1] == ["install"]:
+            options = {item for item in argv[1:] if item.startswith("-")}
+            packages = [item for item in argv[1:] if not item.startswith("-")]
+            if packages and options <= {"-y", "--yes", "--no-install-recommends"}:
+                return "", command, cwd
+        return "apt_args_not_allowed", [], ""
+    if program == "cp":
+        if len(argv) == 2 and cwd and _source_within_cwd(argv[0], cwd) and _system_install_destination(argv[1]):
+            return "", command, cwd
+        return "cp_args_not_allowed", [], ""
+    if program == "install":
+        filtered = [item for item in argv if item not in {"-m", "0644", "0755"}]
+        if len(filtered) == 2 and cwd and _source_within_cwd(filtered[0], cwd) and _system_install_destination(filtered[1]):
+            return "", command, cwd
+        return "install_args_not_allowed", [], ""
+    if program == "insmod":
+        if len(argv) == 1 and cwd and argv[0].endswith(".ko") and _source_within_cwd(argv[0], cwd):
+            return "", command, cwd
+        return "insmod_args_not_allowed", [], ""
+    if program == "rmmod":
+        if len(argv) == 1 and re.fullmatch(r"^[A-Za-z0-9_][-A-Za-z0-9_]{0,120}$", argv[0]):
+            return "", command, cwd
+        return "rmmod_args_not_allowed", [], ""
+    if program == "tc":
+        if len(argv) >= 2 and argv[:2] == ["qdisc", "show"]:
+            return "", command, cwd
+        if len(argv) >= 5 and argv[:2] in (["qdisc", "add"], ["qdisc", "del"]) and "dev" in argv:
+            return "", command, cwd
+        return "tc_args_not_allowed", [], ""
+    return f"program_not_allowed={program}", [], ""
+
+
+def _source_within_cwd(source: str, cwd: str) -> bool:
+    root = Path(cwd).resolve(strict=False)
+    candidate = Path(source)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        candidate.resolve(strict=False).relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _system_install_destination(destination: str) -> bool:
+    path = Path(destination)
+    if not path.is_absolute():
+        return False
+    resolved = path.resolve(strict=False)
+    for root in (Path("/usr/lib"), Path("/usr/local/lib"), Path("/lib/modules")):
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _safe_name(value: str) -> bool:
     return bool(value and SAFE_NAME.match(value))
 
@@ -361,6 +744,38 @@ def _unsafe_path(value: str) -> bool:
     if value.startswith("/"):
         return not SAFE_ABSOLUTE_PATH.match(value)
     return not Path(value).is_absolute()
+
+
+def _script_shebang(text: str) -> str:
+    lines = (text or "").splitlines()
+    first_line = lines[0] if lines else ""
+    return first_line.strip() if first_line.startswith("#!") else ""
+
+
+def _script_risk_markers(text: str) -> list[str]:
+    lowered = (text or "").lower()
+    markers = (
+        "apt-get",
+        "yum",
+        "docker",
+        "systemctl",
+        "service ",
+        "redis-server",
+        "mysql",
+        "rabbitmq",
+        "ovs-",
+        "modprobe",
+    )
+    result = []
+    for marker in markers:
+        normalized = marker.strip()
+        if marker == "docker":
+            found = re.search(r"(?m)^\s*(?:sudo\s+)?docker\b", lowered) is not None
+        else:
+            found = marker in lowered
+        if found and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 def _print_error(problem: str) -> None:

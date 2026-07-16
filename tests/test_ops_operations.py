@@ -206,7 +206,23 @@ def test_deploy_operation_plan_default_binds_start_platform_recipe_when_project_
         "platform": "103",
         "project_root": "/home/adminis/lht/103_project/vemu_uestc",
     }
+    shared_step = next(
+        item for item in loaded.steps if item.step_id == "start-shared-services"
+    )
+    assert shared_step.status == "pending"
+    assert shared_step.recipe_id == "ensure_shared_services"
+    assert shared_step.recipe_args == {
+        "script_dir": "/root/vemu_install_new_gen",
+    }
+    assert [item.step_id for item in loaded.steps] == [
+        "precheck",
+        "prepare-files",
+        "start-shared-services",
+        "start-services",
+    ]
+    assert "execution_order=precheck -> prepare-files -> start-shared-services -> start-services" in rendered
     assert "recipe=start_platform_screens" in rendered
+    assert "recipe=ensure_shared_services" in rendered
     assert "recipe_args.platform=103" in rendered
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
 
@@ -230,7 +246,7 @@ def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
 
     step = next(item for item in loaded.steps if item.step_id == "prepare-files")
     assert step.status == "pending"
-    assert step.requires_step_confirmation is True
+    assert step.requires_step_confirmation is False
     assert step.recipe_id == "prepare_project_files"
     assert step.recipe_args == {
         "project_root": "/home/adminis/lht/103_project/vemu_uestc",
@@ -238,6 +254,271 @@ def test_deploy_operation_plan_default_binds_prepare_project_files_recipe():
     assert "prepare-files" in rendered
     assert "recipe=prepare_project_files" in rendered
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in rendered
+
+
+def test_deploy_operation_plan_can_start_shared_services_before_platform_screens():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+                "shared_services_script_dir": "/root/vemu_install_new_gen",
+            },
+        )
+        loaded = store.load_plan(plan.plan_id)
+        rendered = render_plan(loaded)
+
+    assert [step.step_id for step in loaded.steps] == [
+        "precheck",
+        "prepare-files",
+        "start-shared-services",
+        "start-services",
+    ]
+    step = next(item for item in loaded.steps if item.step_id == "start-shared-services")
+    assert step.requires_step_confirmation is False
+    assert step.risk == "controlled"
+    assert step.recipe_id == "ensure_shared_services"
+    assert step.recipe_args == {
+        "script_dir": "/root/vemu_install_new_gen",
+    }
+    assert "execution_order=precheck -> prepare-files -> start-shared-services -> start-services" in rendered
+    assert "recipe=ensure_shared_services" in rendered
+    assert "recipe_args.script_dir=/root/vemu_install_new_gen" in rendered
+
+
+def test_render_plan_separates_task_steps_from_execution_bindings():
+    from klonet_agent.ops.operations import OperationPlanStore, render_plan
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        rendered = render_plan(plan)
+
+    step_section = rendered.split("execution_bindings:", 1)[0]
+    step_lines = [
+        line
+        for line in step_section.splitlines()
+        if line.startswith("  - precheck:") or line.startswith("  - start-services:")
+    ]
+    assert step_lines
+    assert all("recipe=" not in line for line in step_lines)
+    assert all("recipe_args." not in line for line in step_lines)
+    assert "action=validate_project_files" in rendered
+    assert "permission=readonly_or_plan_confirmed" in rendered
+    assert "permission=plan_confirmed" in rendered
+    assert "execution_bindings:" in rendered
+    assert "  - precheck: action=validate_project_files recipe=validate_project_files" in rendered
+
+
+def test_deploy_operation_plan_non_destructive_steps_do_not_require_step_confirmation():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+
+    steps = {step.step_id: step for step in plan.steps}
+    assert steps["precheck"].requires_step_confirmation is False
+    assert steps["prepare-files"].requires_step_confirmation is False
+    assert steps["start-shared-services"].requires_step_confirmation is False
+    assert steps["start-services"].requires_step_confirmation is False
+
+
+def test_recipe_bindings_accept_recipe_args_and_clear_default_args():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write startup file",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "recipe_args": {
+                        "path": "/home/klonet-agent/vemu_uestc/mains/web_terminal_main.py",
+                        "content": "# patched\n",
+                    },
+                }
+            },
+        )
+
+    step = next(item for item in plan.steps if item.step_id == "prepare-files")
+    assert step.recipe_id == "write_ops_file"
+    assert step.recipe_args == {
+        "path": "/home/klonet-agent/vemu_uestc/mains/web_terminal_main.py",
+        "content": "# patched\n",
+    }
+
+
+def test_recipe_binding_without_args_preserves_same_default_recipe_args():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="prepare project files",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "prepare_project_files",
+                }
+            },
+        )
+
+    step = next(item for item in plan.steps if item.step_id == "prepare-files")
+    assert step.recipe_id == "prepare_project_files"
+    assert step.recipe_args == {
+        "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+    }
+
+
+def test_action_router_maps_action_type_to_recipe_when_args_are_present():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="route action",
+            recipe_bindings={
+                "prepare-files": {
+                    "action_type": "write_file",
+                    "args": {
+                        "path": "/home/klonet-agent/vemu_uestc/web_terminal_main.py",
+                        "content": "# patched\n",
+                    },
+                }
+            },
+        )
+
+    step = next(item for item in plan.steps if item.step_id == "prepare-files")
+    assert step.action_type == "write_file"
+    assert step.recipe_id == "write_ops_file"
+    assert step.recipe_args == {
+        "path": "/home/klonet-agent/vemu_uestc/web_terminal_main.py",
+        "content": "# patched\n",
+    }
+
+
+def test_confirmed_deploy_plan_executes_prepare_without_confirm_step():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        for filename in required_files:
+            (mains / filename).write_text(f"# {filename}\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        store.approve_plan(plan.plan_id)
+
+        precheck = store.execute_next_step(plan.plan_id)
+        prepare = store.execute_next_step(plan.plan_id)
+
+    assert "execute_step=precheck" in precheck
+    assert "result_status=completed" in precheck
+    assert "execute_step=prepare-files" in prepare
+    assert "step requires explicit confirm-step" not in prepare
+    assert "result_status=completed" in prepare
+    assert "recipe_id=prepare_project_files" in prepare
+
+
+def test_deploy_plan_execute_until_blocked_runs_all_controlled_steps():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    required_files = [
+        "gun.py",
+        "master_main.py",
+        "celery_worker.py",
+        "web_terminal_main.py",
+        "worker_gun.py",
+        "worker_main.py",
+    ]
+    with local_temp_dir() as temp_dir:
+        project_root = temp_dir / "103_project" / "vemu_uestc"
+        mains = project_root / "mains"
+        mains.mkdir(parents=True)
+        for filename in required_files:
+            (mains / filename).write_text(f"# {filename}\n", encoding="utf-8")
+            (project_root / filename).write_text(f"# root {filename}\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=True),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+            operation_args={"project_root": str(project_root)},
+        )
+        store.approve_plan(plan.plan_id)
+
+        result = store.execute_until_blocked(plan.plan_id)
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=precheck" in result
+    assert "execute_step=prepare-files" in result
+    assert "execute_step=start-shared-services" in result
+    assert "execute_step=start-services" in result
+    assert "step requires explicit confirm-step" not in result
+    assert loaded.status == "completed"
+    assert set(_status_by_step(loaded).values()) == {"completed"}
 
 
 def test_deploy_operation_plan_default_binds_extract_archive_recipe_for_prepare_files():
@@ -444,9 +725,17 @@ def test_executor_accepts_exact_user_confirm_text_and_requires_step_confirmation
         loaded_after_execute = executor._operation_plan_store().load_plan(plan_id)
 
     assert "status=approved" in approved
+    assert "execute_step=precheck-runtime" in approved
+    assert "result_status=waiting_for_confirmation" in approved
     assert blocked.startswith("Error:")
     assert "step requires explicit confirm-step" in blocked
-    assert set(_status_by_step(loaded_after_execute).values()) == {"pending"}
+    statuses = _status_by_step(loaded_after_execute)
+    assert statuses["precheck-runtime"] == "completed"
+    assert statuses["restart-master"] == "pending"
+    assert statuses["restart-worker"] == "pending"
+    assert statuses["restart-celery"] == "pending"
+    assert statuses["restart-web-terminal"] == "pending"
+    assert statuses["verify-health"] == "pending"
 
 
 def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
@@ -551,6 +840,32 @@ def test_store_execute_next_step_uses_current_execution_order():
     assert _status_by_step(loaded)["precheck-runtime"] == "completed"
 
 
+def test_deploy_precheck_without_recipe_blocks_instead_of_fake_completion():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="deploy platform 103",
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "precheck")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "execute_step=precheck" in result
+    assert "result_status=blocked" in result
+    assert "execution_result=deploy_precheck_requires_project_root_or_recipe; environment unchanged" in result
+    assert "next_required_action=provide operation_args.project_root or bind a readonly precheck recipe" in result
+    statuses = _status_by_step(loaded)
+    assert statuses["precheck"] == "blocked"
+    assert statuses["prepare-files"] == "pending"
+
+
 def test_store_execute_next_step_reports_required_confirm_step_command():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir
@@ -628,6 +943,61 @@ def test_store_does_not_approve_blocked_step_without_resolution_evidence():
             store.approve_step(plan.plan_id, "restart-master")
         loaded = store.load_plan(plan.plan_id)
 
+    assert _status_by_step(loaded)["restart-master"] == "blocked"
+
+
+def test_store_does_not_approve_running_step_without_reinspection():
+    import pytest
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        running_step = next(item for item in plan.steps if item.step_id == "restart-master")
+        running_step.status = "running"
+        store.save_plan(plan)
+
+        with pytest.raises(ValueError, match="running step"):
+            store.approve_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert _status_by_step(loaded)["restart-master"] == "running"
+
+
+def test_store_marks_interrupted_running_step_blocked_on_execute():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="restart platform 102",
+            operation_args={"project_root": "/home/adminis/lht/102_project"},
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "restart-master")
+        running_step = next(item for item in plan.steps if item.step_id == "restart-master")
+        running_step.status = "running"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "restart-master")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "previous_step_status=running" in result
+    assert "result_status=blocked" in result
+    assert "previous execution left this step running" in result
+    assert "next_required_action=inspect_runtime" in result
     assert _status_by_step(loaded)["restart-master"] == "blocked"
 
 
@@ -1397,6 +1767,161 @@ def test_run_install_script_recipe_execute_calls_fixed_command():
     assert "docker_service.sh" in calls[0][2]
 
 
+def test_ensure_shared_services_skips_install_when_ports_are_listening():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_runner(command):
+        calls.append(command)
+        return "\n".join(
+            [
+                "service=redis port=6379 status=listen",
+                "service=mysql port=3306 status=listen",
+                "service=rabbitmq port=5672 status=listen",
+            ]
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=fake_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="ensure shared services",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "start-shared-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-shared-services")
+
+    assert "result_status=completed" in result
+    assert "recipe_id=ensure_shared_services" in result
+    assert "environment unchanged" in result
+    assert len(calls) == 1
+    assert calls[0][0:2] == ["bash", "-lc"]
+
+
+def test_ensure_shared_services_runs_docker_service_when_any_port_is_missing():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_runner(command):
+        calls.append(command)
+        if len(calls) == 1:
+            return "\n".join(
+                [
+                    "service=redis port=6379 status=missing",
+                    "service=mysql port=3306 status=missing",
+                    "service=rabbitmq port=5672 status=missing",
+                ]
+            )
+        return "docker services started"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False, command_runner=fake_runner),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="ensure shared services",
+            operation_args={
+                "project_root": "/home/adminis/lht/103_project/vemu_uestc",
+            },
+        )
+        plan.status = "approved"
+        _complete_steps_before(plan, "start-shared-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-shared-services")
+
+    assert "result_status=completed" in result
+    assert "recipe_id=ensure_shared_services" in result
+    assert "missing_services=redis,mysql,rabbitmq" in result
+    assert "docker services started" in result
+    assert len(calls) == 2
+    assert calls[1][0:4] == [
+        "sudo",
+        "-n",
+        "/usr/local/bin/klonet-agent-op",
+        "run-install-script",
+    ]
+    assert "docker_service.sh" in calls[1]
+
+
+def test_run_install_script_recipe_default_runner_streams_output(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def fake_run(command, check, text, encoding, errors):
+        calls.append(
+            {
+                "command": command,
+                "check": check,
+                "text": text,
+                "encoding": encoding,
+                "errors": errors,
+            }
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("klonet_agent.ops.recipes.subprocess.run", fake_run)
+
+    with local_temp_dir() as temp_dir:
+        script_dir = temp_dir / "vemu_install_new_gen"
+        script_dir.mkdir()
+        (script_dir / "docker_service.sh").write_text("# docker\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="run docker service",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "run_install_script",
+                    "args": {
+                        "script_dir": str(script_dir),
+                        "script_name": "docker_service.sh",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert len(calls) == 1
+    assert "capture_output" not in calls[0]
+    assert calls[0]["command"][0:2] == ["bash", "-lc"]
+    assert "streamed_to_console=true" in result
+    assert "result_status=completed" in result
+
+
 def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -1579,6 +2104,86 @@ def test_write_ops_file_recipe_execute_writes_file_and_backs_up_existing_content
     assert old_content == "master_port = 5000\n"
 
 
+def test_write_ops_file_recipe_allows_klonet_startup_source_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        targets = [
+            temp_dir / "103_project" / "vemu_uestc" / "vemu_config" / "config.py",
+            temp_dir / "103_project" / "vemu_uestc" / "mains" / "web_terminal_main.py",
+            temp_dir / "103_project" / "vemu_uestc" / "web_terminal_main.py",
+        ]
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        results = []
+        for index, target in enumerate(targets):
+            plan = store.create_plan(
+                operation="deploy_platform",
+                target=f"103-{index}",
+                objective="write startup file",
+                recipe_bindings={
+                    "prepare-files": {
+                        "recipe_id": "write_ops_file",
+                        "args": {
+                            "path": str(target),
+                            "content": "# startup config\n",
+                        },
+                    }
+                },
+            )
+            plan.status = "approved"
+            prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+            prepare_step.status = "approved"
+            _complete_steps_before(plan, "prepare-files")
+            store.save_plan(plan)
+            results.append(store.execute_step(plan.plan_id, "prepare-files"))
+
+        assert all("result_status=completed" in result for result in results)
+        assert all(target.read_text(encoding="utf-8") == "# startup config\n" for target in targets)
+
+
+def test_write_ops_file_recipe_blocks_non_startup_python_source_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / "103_project" / "vemu_uestc" / "webserver" / "api" / "topo.py"
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write business source",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "content": "# business logic\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "unsupported_file_type=topo.py" in result
+    assert not target.exists()
+
+
 def test_write_ops_file_recipe_blocks_sensitive_paths():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -1654,6 +2259,87 @@ def test_reload_nginx_recipe_dry_run_generates_fixed_preview():
     assert "environment unchanged" in result
     statuses = _status_by_step(loaded)
     assert statuses["start-services"] == "completed"
+
+
+def test_install_nginx_config_recipe_execute_uses_sudo_helper():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return (
+            "klonet_agent_op action=install-nginx-config dry_run=false "
+            "destination_path=/etc/nginx/conf.d/103.conf environment_changed=true"
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="install nginx config",
+            action_bindings={
+                "prepare-files": {
+                    "action": "install_nginx_config",
+                    "args": {
+                        "source_path": "/tmp/103.conf",
+                        "config_name": "103.conf",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert calls == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "install-nginx-config",
+            "--execute",
+            "--source-path",
+            "/tmp/103.conf",
+            "--config-name",
+            "103.conf",
+        ]
+    ]
+    assert "result_status=completed" in result
+    assert "recipe_id=install_nginx_config" in result
+    assert "environment_changed=true" in result
+
+
+def test_install_nginx_config_recipe_blocks_invalid_config_name():
+    from klonet_agent.ops.operations import OperationPlan, OperationStep
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    result = ControlledRecipeRunner(dry_run=True)(
+        OperationPlan("p1", "deploy_platform", "103", "install nginx"),
+        OperationStep(
+            "install-nginx",
+            "install nginx",
+            "install nginx",
+            action="install_nginx_config",
+            args={"source_path": "/tmp/103.conf", "config_name": "../bad.conf"},
+        ),
+    )
+
+    assert result.status == "blocked"
+    assert "invalid_config_name" in result.output
 
 
 def test_reload_nginx_recipe_execute_tests_config_before_reload():
@@ -2149,12 +2835,13 @@ def test_restart_screen_component_recipe_blocks_unknown_component():
     assert statuses["verify-health"] == "pending"
 
 
-def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
+def test_executor_blocks_bound_restart_when_real_execution_is_disabled(monkeypatch):
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
     from tests.helpers import local_temp_dir
 
+    monkeypatch.setenv("KLONET_AGENT_OPS_REAL_EXECUTION", "0")
     with local_temp_dir() as temp_dir:
         session = AgentSession(user_id="u1", project_id="p1", mode="ops")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
@@ -2203,13 +2890,13 @@ def test_executor_create_plan_can_bind_restart_screen_recipe_for_dry_run():
             {"plan_id": plan_id, "step_id": "restart-master"},
         )
 
-    assert "result_status=completed" in result
-    assert "dry_run=true" in result
-    assert "recipe_id=restart_screen_component" in result
-    assert "command_preview=/usr/local/bin/klonet-agent-op restart-screen-component" in result
+    assert "result_status=blocked" in result
+    assert "ops_real_execution_not_configured" in result
+    assert "config_status=disabled" in result
+    assert "command_preview=" not in result
 
 
-def test_executor_execute_ops_next_step_runs_current_plan_step():
+def test_executor_execute_ops_next_step_stops_at_step_confirmation_after_auto_precheck():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
@@ -2241,8 +2928,10 @@ def test_executor_execute_ops_next_step_runs_current_plan_step():
 
         result = executor.run("execute_ops_next_step", {"plan_id": plan_id})
 
-    assert "execute_step=precheck-runtime" in result
-    assert "result_status=completed" in result
+    assert result.startswith("Error:")
+    assert "execute_step=precheck-runtime" not in result
+    assert "step requires explicit confirm-step" in result
+    assert "restart-master" in result
 
 
 def test_executor_resolve_ops_blocked_step_resets_step_to_pending():
@@ -2520,19 +3209,21 @@ def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
     assert "recipe_args.project_root=/home/adminis/lht/103_project/vemu_uestc" in result
 
 
-def test_executor_operation_plan_store_defaults_to_dry_run_recipe_runner():
+def test_executor_operation_plan_store_blocks_when_real_execution_env_is_missing(monkeypatch):
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
     from tests.helpers import local_temp_dir
 
+    monkeypatch.delenv("KLONET_AGENT_OPS_REAL_EXECUTION", raising=False)
     with local_temp_dir() as temp_dir:
         session = AgentSession(user_id="u1", project_id="p1", mode="ops")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(session=session, memory_store=store)
         operation_store = executor._operation_plan_store()
 
-    assert operation_store.recipe_runner.dry_run is True
+    assert operation_store.recipe_runner.dry_run is False
+    assert operation_store.recipe_runner.execution_config == "missing"
 
 
 def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypatch):
@@ -2549,6 +3240,7 @@ def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypa
         operation_store = executor._operation_plan_store()
 
     assert operation_store.recipe_runner.dry_run is False
+    assert operation_store.recipe_runner.execution_config == "enabled"
 
 
 def _extract_plan_id(text: str) -> str:

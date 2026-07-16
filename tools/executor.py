@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from time import perf_counter
 
-from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_enabled
+from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_mode
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
@@ -20,9 +20,11 @@ from klonet_agent.ops.operations import (
     render_plan_list,
     render_step_resolution,
 )
-from klonet_agent.ops.recipes import ControlledRecipeRunner
+from klonet_agent.ops.recipes import ControlledActionRunner
 from klonet_agent.session import AgentSession
 from klonet_agent.tools.file_ops import list_files, read_file, write_file
+from klonet_agent.tools.docker_ops import inspect_docker_containers
+from klonet_agent.tools.read_only_terminal import run_readonly_command
 from klonet_agent.tools.environment import (
     inspect_archive,
     inspect_frontend_config,
@@ -38,6 +40,7 @@ from klonet_agent.tools.environment import (
     inspect_system_environment,
     read_klonet_logs,
     read_ops_file,
+    read_root_file,
     render_docker_daemon_config,
     render_klonet_config,
 )
@@ -151,6 +154,12 @@ class ToolExecutor:
         if tool_name == "inspect_service_health":
             return inspect_service_health(tool_args)
 
+        if tool_name == "inspect_docker_containers":
+            return inspect_docker_containers(tool_args)
+
+        if tool_name == "run_readonly_command":
+            return run_readonly_command(tool_args)
+
         if tool_name == "inspect_install_scripts":
             return inspect_install_scripts(tool_args)
 
@@ -187,6 +196,9 @@ class ToolExecutor:
         if tool_name == "read_ops_file":
             return read_ops_file(tool_args)
 
+        if tool_name == "read_root_file":
+            return read_root_file(tool_args)
+
         if tool_name == "inspect_screen_session":
             return inspect_screen_session(tool_args)
 
@@ -203,6 +215,8 @@ class ToolExecutor:
                 objective=tool_args.get("objective", ""),
                 constraints=tool_args.get("constraints", ""),
                 operation_args=tool_args.get("operation_args"),
+                steps=tool_args.get("steps"),
+                action_bindings=tool_args.get("action_bindings"),
                 recipe_bindings=tool_args.get("recipe_bindings"),
                 evidence=[
                     str(item)
@@ -363,13 +377,18 @@ class ToolExecutor:
                     "模型不能自行授权计划。"
                 )
             plan = store.approve_plan(plan_id)
+            execution = store.execute_until_blocked(plan_id)
+            latest = store.load_plan(plan_id)
+            return render_plan(latest) + "\n---\n" + execution
         return render_plan(plan)
 
     def _operation_plan_store(self) -> OperationPlanStore:
+        execution_mode = ops_real_execution_mode()
         return OperationPlanStore(
             self.memory_store.memory_dir / "ops_operation_plans",
-            recipe_runner=ControlledRecipeRunner(
-                dry_run=not ops_real_execution_enabled()
+            action_runner=ControlledActionRunner(
+                dry_run=False,
+                execution_config=execution_mode,
             ),
         )
 

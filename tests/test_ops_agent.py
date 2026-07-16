@@ -21,7 +21,7 @@ def test_ops_profile_uses_read_only_environment_tools():
     assert "inspect_klonet_runtime" in profile.allowed_tools
     assert "read_klonet_logs" in profile.allowed_tools
     assert "run_command" not in profile.allowed_tools
-    assert "write_file" not in profile.allowed_tools
+    assert "write_file" in profile.allowed_tools
 
 
 def test_ops_tool_round_limit_is_higher_than_default():
