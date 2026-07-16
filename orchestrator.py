@@ -917,18 +917,21 @@ class AgentOrchestrator:
         if tool_name == "create_ops_operation_plan":
             operation = self._safe_action_value(tool_args.get("operation"), 80)
             target = self._safe_action_value(tool_args.get("target"), 80) or "unknown"
-            return f"Ops plan: create {operation or 'operation'} for {target}"
+            return f"创建运维计划：{operation or 'operation'} / {target}"
         if tool_name == "approve_ops_operation_plan":
             plan_id = self._safe_action_value(tool_args.get("plan_id"), 80) or "unknown"
             scope = self._safe_action_value(tool_args.get("scope"), 20) or "plan"
-            return f"Ops plan: approve {scope} {plan_id}"
+            if scope == "step":
+                step_id = self._safe_action_value(tool_args.get("step_id"), 80) or "unknown-step"
+                return f"确认高风险步骤：{step_id}（{plan_id}）"
+            return f"确认运维计划：{plan_id}"
         if tool_name == "execute_ops_next_step":
             plan_id = self._safe_action_value(tool_args.get("plan_id"), 80) or "unknown"
-            return f"Ops plan: execute next step for {plan_id}"
+            return f"执行下一步：{plan_id}"
         if tool_name == "execute_ops_operation_step":
             plan_id = self._safe_action_value(tool_args.get("plan_id"), 80) or "unknown"
             step_id = self._safe_action_value(tool_args.get("step_id"), 80) or "unknown-step"
-            return f"Ops plan: execute {step_id} for {plan_id}"
+            return f"执行步骤：{step_id}（{plan_id}）"
         return ""
 
     def _safe_action_value(self, value, limit: int) -> str:
@@ -940,19 +943,234 @@ class AgentOrchestrator:
         return text
 
     def _print_tool_loop_observation(self, tool_name: str, result: str) -> None:
-        """Print bounded real tool output as an Ops observation."""
+        """Print bounded real tool output as a user-facing Ops milestone."""
 
         if self.profile.name != "ops" or self.answer_style == "brief":
             return
         lines, omitted = self._tool_observation_lines(tool_name, result)
-        if len(lines) == 1 and not omitted:
-            print(f"Klonet Agent：观察：{lines[0]}")
+        llm_summary = self._llm_ops_milestone_summary(tool_name, result, lines, omitted)
+        if llm_summary:
+            print(f"Klonet Agent：{llm_summary}")
             return
-        print("Klonet Agent：观察：")
-        for line in lines:
-            print(f"  {line}")
-        if omitted:
-            print("  - 其余内容已省略")
+        print(f"Klonet Agent：{self._format_ops_milestone_summary(tool_name, lines, omitted)}")
+
+    def _llm_ops_milestone_summary(
+        self,
+        tool_name: str,
+        result: str,
+        lines: list[str],
+        omitted: bool,
+    ) -> str:
+        """Ask the real LLM to turn an Ops tool result into a short user summary."""
+
+        llm = getattr(self, "llm", None)
+        if not isinstance(llm, LLMClient):
+            return ""
+        raw_result = self._compact_observation_text(result, 1800)
+        extracted = "\n".join(lines[:6])
+        prompt = (
+            "你是 Klonet Agent 的命令行进度摘要器。"
+            "请把工具结果改写成面向普通用户的自然语言中文摘要。\n"
+            "要求：只输出一句话；不要输出 JSON、字段名、英文状态码或原始 stdout/stderr；"
+            "不要编造工具结果里没有的结论；如果结果不足以判断，就明确说还需要继续确认。\n\n"
+            f"工具名：{tool_name}\n"
+            f"是否省略了部分结果：{omitted}\n"
+            f"已抽取的关键行：\n{extracted}\n\n"
+            f"原始工具结果：\n{raw_result}"
+        )
+        try:
+            response = llm.complete(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你只负责把运维工具结果改写成一句用户能看懂的中文进度摘要。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+                stream=False,
+            )
+        except Exception:
+            return ""
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        summary = self._compact_observation_text(getattr(message, "content", ""), 180)
+        summary = summary.removeprefix("Klonet Agent：").strip()
+        if self._ops_summary_leaks_machine_trace(summary):
+            return ""
+        return summary
+
+    @staticmethod
+    def _ops_summary_leaks_machine_trace(summary: str) -> bool:
+        forbidden = {
+            "returncode",
+            "stdout",
+            "stderr",
+            "program_not_allowlisted",
+            "evidence_type",
+            "readonly_command",
+            "argv_json",
+            "current_state=",
+            "project_root_status",
+        }
+        return any(token in summary for token in forbidden)
+
+    def _format_ops_milestone_summary(
+        self,
+        tool_name: str,
+        lines: list[str],
+        omitted: bool,
+    ) -> str:
+        """Turn tool observations into a compact key-node summary."""
+
+        action = self._human_tool_result_action(tool_name)
+        if not lines:
+            return f"{action}，这一步没有返回可展示结果。"
+
+        raw_cleaned_lines = [
+            cleaned
+            for line in lines
+            if (cleaned := self._clean_ops_summary_line(line))
+        ]
+        cleaned_lines = self._naturalize_ops_summary_lines(
+            tool_name,
+            raw_cleaned_lines,
+        ) or [
+            natural
+            for cleaned in raw_cleaned_lines
+            if (natural := self._naturalize_ops_summary_line(tool_name, cleaned))
+        ]
+        details = "；".join(cleaned_lines)
+        details = self._compact_observation_text(details, 260)
+        if not details:
+            return f"{action}，这一步没有返回可展示结果。"
+
+        if len(lines) == 1 and not omitted:
+            return f"{action}：{details}"
+        suffix = "；其余内容已省略" if omitted else ""
+        return f"{action}，这一步的结论是：{details}{suffix}。"
+
+    @staticmethod
+    def _clean_ops_summary_line(line: str) -> str:
+        """Remove trace-style bullets while keeping the evidence text readable."""
+
+        text = " ".join(str(line or "").split())
+        while text.startswith("- "):
+            text = text[2:].strip()
+        return text
+
+    def _naturalize_ops_summary_line(self, tool_name: str, text: str) -> str:
+        """Translate machine-oriented trace fragments into plain operational Chinese."""
+
+        if not text:
+            return ""
+        if text.startswith("失败："):
+            return self._naturalize_ops_failure(text)
+        if "program_not_allowlisted=" in text:
+            program = self._extract_after(text, "program_not_allowlisted=")
+            return f"当前只读策略不允许执行 `{program}`，所以这一步没有拿到结果。"
+        if "file does not exist or is not a file" in text:
+            path = text.split(":", 1)[0].strip() if ":" in text else text.split()[0]
+            return f"没有找到日志文件 `{path}`。"
+        if "returncode=0" in text and "readonly_command" in text:
+            stdout = self._extract_semicolon_value(text, "stdout")
+            if stdout:
+                return f"只读命令执行成功，输出为：{self._compact_observation_text(stdout, 120)}。"
+            return "只读命令执行成功，但没有返回可用于判断的输出。"
+        if text.startswith("platform="):
+            fields = self._semicolon_key_values(text)
+            platform = fields.get("platform") or "当前平台"
+            project_root = fields.get("project_root")
+            status = fields.get("project_root_status")
+            if project_root and status == "detected":
+                return f"识别到 {platform} 平台目录 `{project_root}`。"
+        if "detected - evidence_type=screen_scrollback" in text:
+            session = text.split(":", 1)[0].strip()
+            return f"找到 `{session}` 的 screen 历史快照，但这不是实时运行状态，需要继续结合进程或端口确认。"
+        if ": detected -" in text:
+            name, detail = text.split(": detected -", 1)
+            return self._naturalize_detected_line(name.strip(), detail.strip())
+        return text
+
+    def _naturalize_ops_summary_lines(
+        self,
+        tool_name: str,
+        lines: list[str],
+    ) -> list[str]:
+        joined = "; ".join(lines)
+        if "readonly_command" in joined and "returncode=0" in joined:
+            stdout = self._extract_semicolon_value(joined, "stdout")
+            if stdout:
+                return [f"只读命令执行成功，输出为：{self._compact_observation_text(stdout, 120)}。"]
+            return ["只读命令执行成功，但没有返回可用于判断的输出。"]
+        return []
+
+    def _naturalize_ops_failure(self, text: str) -> str:
+        detail = text[len("失败：") :].strip()
+        if detail.startswith("ip only allows"):
+            return "这条 `ip` 命令超出只读白名单；当前只允许查看 addr、link 或 route。"
+        if detail.startswith("source index unavailable"):
+            return "源码索引暂时不可用。"
+        return f"执行失败：{detail}"
+
+    def _naturalize_detected_line(self, name: str, detail: str) -> str:
+        if name == "redis":
+            if "active" in detail:
+                return "Redis 服务处于运行状态。"
+            return f"Redis 状态：{detail}。"
+        if name == "docker":
+            return f"发现 Docker 容器信息：{detail}。"
+        if name == "ports":
+            return f"发现监听端口：{detail}。"
+        if name == "screen":
+            return f"发现 screen 会话：{detail}。"
+        return f"{name} 已检测到：{detail}。"
+
+    @staticmethod
+    def _extract_semicolon_value(text: str, key: str) -> str:
+        fields = AgentOrchestrator._semicolon_key_values(text)
+        return fields.get(key, "")
+
+    @staticmethod
+    def _semicolon_key_values(text: str) -> dict[str, str]:
+        fields = {}
+        for part in str(text or "").split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            fields[key.strip()] = value.strip()
+        return fields
+
+    @staticmethod
+    def _human_tool_result_action(tool_name: str) -> str:
+        actions = {
+            "search_knowledge": "我已经检索知识库",
+            "search_shared_ops_memory": "我已经检索历史诊断",
+            "search_code": "我已经搜索源码",
+            "list_source_files": "我已经查看源码目录",
+            "list_files": "我已经查看目录",
+            "read_source_file": "我已经读取源码",
+            "read_file": "我已经读取文件",
+            "read_ops_file": "我已经读取运维文件",
+            "read_klonet_logs": "我已经读取 Klonet 日志",
+            "inspect_screen_session": "我已经检查 screen 会话",
+            "inspect_system_environment": "我已经检查系统环境",
+            "inspect_docker_containers": "我已经查看 Docker 容器",
+            "run_readonly_command": "我已经执行只读诊断",
+            "inspect_ops_context": "我已经检查运维环境",
+            "inspect_platform_instances": "我已经盘点 Klonet 平台实例",
+            "inspect_klonet_runtime": "我已经检查 Klonet 运行状态",
+            "create_ops_operation_plan": "我已经创建运维计划",
+            "list_ops_operation_plans": "我已经查看运维计划",
+            "describe_ops_operation_plan": "我已经查看运维计划详情",
+            "approve_ops_operation_plan": "我已经确认运维计划",
+            "execute_ops_operation_step": "我已经执行运维步骤",
+            "execute_ops_next_step": "我已经推进运维计划",
+            "resolve_ops_blocked_step": "我已经处理阻塞步骤",
+        }
+        return actions.get(tool_name, "我已经完成这一步")
 
     def _tool_observation_lines(
         self,
@@ -1033,49 +1251,41 @@ class AgentOrchestrator:
         lines = [
             (
                 f"计划 {fields.get('plan_id', 'unknown')}："
-                f"{fields.get('operation', 'unknown')} / {fields.get('target', 'unknown')}，"
-                f"状态 {fields.get('status', 'unknown')}"
+                f"{self._human_operation(fields.get('operation', 'unknown'))} / "
+                f"{fields.get('target', 'unknown')}，"
+                f"{self._human_plan_status(fields.get('status', 'unknown'))}"
             )
         ]
         if fields.get("objective"):
             lines.append(f"目标：{self._compact_observation_text(fields['objective'], 180)}")
-        execution_order = self._first_prefixed_value(block, "execution_order=")
-        if execution_order:
-            lines.append(f"执行顺序：{execution_order}")
+        progress = self._ops_progress_line(block)
+        if progress:
+            lines.append(progress)
+        next_step = fields.get("next_step") or self._first_prefixed_value(block, "next_step=")
+        if next_step and next_step != "none":
+            lines.append(f"下一步：{next_step}")
         step_summaries = self._ops_step_summaries(block)
         if step_summaries:
-            lines.append("步骤概览：")
+            lines.append("步骤：")
             lines.extend(f"  - {item}" for item in step_summaries[:8])
-        binding_summaries = self._ops_binding_summaries(block)
-        if binding_summaries:
-            lines.append("执行绑定：")
-            lines.extend(f"  - {item}" for item in binding_summaries[:6])
         return lines
 
     def _summarize_ops_execution_block(self, block: list[str]) -> list[str]:
         fields = self._ops_key_values(block)
         step = fields.get("execute_step", "unknown")
         title = fields.get("step_title", "")
-        status = fields.get("result_status", fields.get("step_status", "unknown"))
+        raw_status = fields.get("result_status", fields.get("step_status", "unknown"))
+        status = self._human_step_status(raw_status)
         prefix = f"执行 {step}"
         if title:
             prefix += f"（{title}）"
         lines = [f"{prefix}：{status}"]
         result = fields.get("execution_result") or fields.get("observation")
         if result:
-            lines.append(f"结果：{self._compact_observation_text(result, 220)}")
-        action = fields.get("action_type")
-        permission = fields.get("permission")
-        if action or permission:
-            detail = []
-            if action:
-                detail.append(f"动作 {action}")
-            if permission:
-                detail.append(f"权限 {permission}")
-            lines.append("依据：" + "；".join(detail))
+            lines.extend(self._human_execution_result_lines(result, raw_status))
         next_action = fields.get("next_required_action")
         if next_action:
-            lines.append(f"下一步：{next_action}")
+            lines.append(f"需要你操作：{next_action}")
         return lines
 
     def _summarize_ops_resolution_block(self, block: list[str]) -> list[str]:
@@ -1138,15 +1348,10 @@ class AgentOrchestrator:
             step_id, rest = stripped[2:].split(":", 1)
             title = rest.split(" risk=", 1)[0].strip()
             status = self._ops_token_value(rest, "status")
-            action = self._ops_token_value(rest, "action")
             permission = self._ops_token_value(rest, "permission")
-            pieces = [title]
-            if status:
-                pieces.append(f"状态 {status}")
-            if action:
-                pieces.append(f"动作 {action}")
-            if permission:
-                pieces.append(f"权限 {permission}")
+            pieces = [title, self._human_step_status(status)]
+            if permission == "step_confirm_required":
+                pieces.append("需要二次确认")
             summaries.append(f"{step_id}：" + "；".join(pieces))
         return summaries
 
@@ -1175,6 +1380,89 @@ class AgentOrchestrator:
                 pieces.append(self._compact_observation_text(" ".join(args), 180))
             summaries.append(f"{step_id}：" + "；".join(pieces))
         return summaries
+
+    def _ops_progress_line(self, lines: list[str]) -> str:
+        fields = self._ops_key_values(lines)
+        total = fields.get("total_steps")
+        completed = fields.get("completed", "0")
+        failed = fields.get("failed", "0")
+        blocked = fields.get("blocked", "0")
+        running = fields.get("running", "0")
+        parts = []
+        if total:
+            parts.append(f"进度：已完成 {completed}/{total}")
+        if failed != "0":
+            parts.append(f"失败 {failed}")
+        if blocked != "0":
+            parts.append(f"阻塞 {blocked}")
+        if running != "0":
+            parts.append(f"执行中 {running}")
+        return "；".join(parts)
+
+    @staticmethod
+    def _human_operation(value: str) -> str:
+        return {
+            "deploy_platform": "部署/安装",
+            "restart_platform": "重启",
+            "destroy_platform": "销毁/清理",
+        }.get(value, value or "未知操作")
+
+    @staticmethod
+    def _human_plan_status(value: str) -> str:
+        return {
+            "pending": "等待确认",
+            "approved": "已确认，执行中",
+            "completed": "已完成",
+            "failed": "失败",
+            "aborted": "已取消",
+        }.get(value, value or "状态未知")
+
+    @staticmethod
+    def _human_step_status(value: str) -> str:
+        return {
+            "pending": "等待执行",
+            "approved": "已二次确认",
+            "running": "执行中",
+            "completed": "已完成",
+            "failed": "失败",
+            "blocked": "已阻塞",
+            "normal": "等待执行",
+        }.get(value, value or "状态未知")
+
+    def _human_execution_result_lines(self, result: str, status: str) -> list[str]:
+        compact = self._compact_observation_text(result, 260)
+        if "command_not_allowed=" in result:
+            reason = self._extract_after(result, "command_not_allowed=")
+            return [f"结果：未执行，命令不在当前策略范围内（{reason}）。"]
+        if "program_not_found=" in result:
+            program = self._extract_after(result, "program_not_found=")
+            return [f"结果：未执行，系统找不到命令 `{program}`。"]
+        if "helper_failed returncode=" in result:
+            code = self._extract_after(result, "helper_failed returncode=")
+            lines = [f"结果：命令执行失败，返回码 {code}。"]
+            if "action=run-ops-command" in result:
+                program = self._extract_after(result, "program=")
+                if program:
+                    lines.append(f"命令类型：{program}")
+            return lines
+        if "dry_run=true" in result:
+            return ["结果：这是预览，尚未修改环境。"]
+        if status == "completed":
+            if "environment unchanged" in result:
+                return ["结果：已完成，没有修改环境。"]
+            return ["结果：已完成。"]
+        if status in {"failed", "blocked"}:
+            return [f"结果：{compact}"]
+        return [f"结果：{compact}"]
+
+    @staticmethod
+    def _extract_after(text: str, marker: str) -> str:
+        if marker not in text:
+            return ""
+        value = text.split(marker, 1)[1].strip()
+        if not value:
+            return ""
+        return value.split()[0].strip("，。；;,.")
 
     @staticmethod
     def _ops_token_value(text: str, key: str) -> str:

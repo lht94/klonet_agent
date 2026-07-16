@@ -71,7 +71,7 @@ def test_plan_accepts_canonical_action_bindings_and_persists_action_args():
             action_bindings={
                 "prepare-files": {
                     "action": "write_ops_file",
-                    "args": {"path": "/etc/nginx/conf.d/103.conf", "content": "server {}"},
+                    "args": {"path": "/tmp/103.conf", "content": "server {}"},
                 }
             },
         )
@@ -79,9 +79,57 @@ def test_plan_accepts_canonical_action_bindings_and_persists_action_args():
 
     step = next(item for item in loaded.steps if item.step_id == "prepare-files")
     assert step.action == "write_ops_file"
-    assert step.args == {"path": "/etc/nginx/conf.d/103.conf", "content": "server {}"}
+    assert step.args == {"path": "/tmp/103.conf", "content": "server {}"}
     assert step.recipe_id == "write_ops_file"
     assert step.recipe_args == step.args
+
+
+def test_plan_rejects_direct_nginx_writes_and_sensitive_write_content():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        try:
+            store.create_plan(
+                operation="deploy_platform",
+                target="103",
+                steps=[
+                    {
+                        "step_id": "nginx",
+                        "title": "写 nginx",
+                        "action": "write_ops_file",
+                        "args": {"path": "/etc/nginx/sites-available/default", "content": "server {}"},
+                    }
+                ],
+            )
+        except ValueError as exc:
+            nginx_error = str(exc)
+        else:
+            nginx_error = ""
+        try:
+            store.create_plan(
+                operation="deploy_platform",
+                target="103",
+                steps=[
+                    {
+                        "step_id": "config",
+                        "title": "写 config",
+                        "action": "write_ops_file",
+                        "args": {
+                            "path": "/home/klonet-agent/platforms/103_project/vemu_config/config.py",
+                            "content": "redis_password = '123456'",
+                        },
+                    }
+                ],
+            )
+        except ValueError as exc:
+            sensitive_error = str(exc)
+        else:
+            sensitive_error = ""
+
+    assert "nginx_config_requires_install_nginx_config" in nginx_error
+    assert "sensitive_content_not_allowed" in sensitive_error
 
 
 def test_old_recipe_only_plan_is_migrated_when_loaded():

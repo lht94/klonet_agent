@@ -21,6 +21,7 @@ def test_core_imports():
     assert klonet_agent.__version__
     assert get_profile("mentor").name == "mentor"
     assert get_profile("coding").name == "coding"
+    assert get_profile("ops-privilege").name == "ops-privilege"
     assert AgentSession(user_id="u1", project_id="p1").user_id == "u1"
 
 

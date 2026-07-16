@@ -104,6 +104,34 @@ sudo ss -lntp
 6. 检查 Worker 注册、心跳和 Redis worker_list。
 7. 检查同一 Worker 是否以旧地址残留。
 
+### 查询 Redis 运行态数据库
+
+Klonet 文档和代码里经常把 Redis 称为“数据库”。排查 `worker_list`、用户 DB、拓扑状态、进度表和资源表时，通常是在查 Redis，不是 MySQL。
+
+查询前先读取当前运行项目的 `vemu_config/config.py` 或 `PROJ_CONFIG`，确认：
+
+- `RedisConfig.redis_port` 或当前配置类覆盖后的 Redis 端口。历史常见值是 `8368`，不能默认使用 Redis 标准端口 `6379`。
+- `redis_password`、`redis_user` 和当前 Redis 版本支持的认证方式。输出或记录时必须脱敏。
+- `worker_list` 名称是否被当前配置类覆盖，例如多实例会使用不同 worker list。
+- 目标 DB 编号。DB0 通常保存全局映射和 Worker 状态，用户拓扑数据在用户 DB 中。
+
+只读确认示例：
+
+~~~bash
+redis-cli -p <redis_port> PING
+~~~
+
+如果返回 `NOAUTH Authentication required`，说明端口正确但需要认证。旧 Redis 常用交互式认证：
+
+~~~text
+AUTH <redis_password>
+PING
+SELECT 0
+KEYS "*worker*"
+~~~
+
+不要在没有核对当前配置的情况下给出 `redis-cli -n 0 ...`，因为它会默认连接 `6379`，容易查到错误实例或直接失败。
+
 ## 拓扑部署进度卡住
 
 检查：

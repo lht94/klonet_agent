@@ -52,6 +52,17 @@ TOOLS = [
         },
     },
     _tool(
+        "run_privileged_command",
+        "Ops-Privilege 专用：直接在当前终端执行 shell 命令，包括 sudo 命令。stdin/stdout/stderr 继承当前终端；如果 sudo 需要密码，用户会在命令行提示中手动输入。不要把密码写入 command。",
+        {
+            "command": {
+                "type": "string",
+                "description": "要直接执行的完整 shell 命令，例如 sudo systemctl restart nginx。",
+            }
+        },
+        ["command"],
+    ),
+    _tool(
         "search_knowledge",
         "仅检索 Klonet 专属知识。明确不需要 Klonet 的通用技术问题不要调用；Klonet 域内问题和 Coding 规范查询再使用。",
         {
@@ -561,7 +572,7 @@ TOOLS = [
             },
             "steps": {
                 "type": "array",
-                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。需要执行 make、git clone/pull/push/checkout/submodule、apt、cp/install、insmod/rmmod 或 tc qdisc 时，使用 action=run_ops_command，args 使用 program、argv 数组和 cwd。省略 steps 时才使用兼容的默认步骤模板。",
+                "description": "可选：LLM 自定义任务步骤。每步包含 step_id、title、purpose，以及可选的 allowlisted action + args。不得包含 command 或 shell。需要执行 make、git clone/pull/push/checkout/submodule、mkdir、cp/install、ln -s、apt、python -m pip install/uninstall、pip install/uninstall、insmod/rmmod 或 tc qdisc 时，使用 action=run_ops_command，args 使用 program、argv 数组和 cwd。省略 steps 时才使用兼容的默认步骤模板。",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -576,7 +587,7 @@ TOOLS = [
             },
             "action_bindings": {
                 "type": "object",
-                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；run_ops_command 使用 {program,argv,cwd}。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
+                "description": "可选：按 step_id 绑定结构化操作。write_ops_file 支持整文件 {path,content}，也支持增量 {path,mode,anchor,content,expected_matches}；run_ops_command 使用 {program,argv,cwd}；restart_screen_component 用于已有 screen 内重启单组件，start_screen_component 用于缺失 screen 时创建单组件，remove_python_package_entries 使用 {site_packages_dir,package,entries} 删除 Python 包目录下一层明确残留条目。action 必须存在于 OpsActionRegistry；不得提交 command 或 Shell 字符串。",
             },
             "recipe_bindings": {
                 "type": "object",

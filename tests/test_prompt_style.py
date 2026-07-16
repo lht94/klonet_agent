@@ -123,6 +123,7 @@ def test_ops_prompt_routes_nginx_install_and_reload_through_actions():
 
     assert "install_nginx_config" in OPS_PROMPT
     assert "reload_nginx" in OPS_PROMPT
+    assert "不得通过 `write_ops_file` 直接修改 `/etc/nginx" in OPS_PROMPT
     assert "不得要求用户手工 `sudo cp`" in OPS_PROMPT
 
 
@@ -133,6 +134,102 @@ def test_ops_prompt_uses_dedicated_account_platform_path():
 
     assert "/home/klonet-agent/platforms/<platform>_project" in OPS_PROMPT
     assert "不要把历史服务器用户名" in OPS_PROMPT
+    assert "后端仓库通常应 clone 到其下的 `vemu_uestc/`" in OPS_PROMPT
+
+
+def test_ops_prompt_respects_user_pause_before_plan_execution():
+    """Explicit pause requests must not be converted into execution tools."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "暂停" in OPS_PROMPT
+    assert "本轮不得调用 approve_ops_operation_plan" in OPS_PROMPT
+    assert "execute_ops_next_step" in OPS_PROMPT
+    assert "resolve_ops_blocked_step" in OPS_PROMPT
+
+
+def test_ops_prompt_routes_python_environment_recovery_through_controlled_plan():
+    """Environment recovery should prefer controlled plans but preserve fallback agency."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "python -m pip install" in OPS_PROMPT
+    assert "pip install" in OPS_PROMPT
+    assert "pip uninstall" in OPS_PROMPT
+    assert "--force-reinstall" in OPS_PROMPT
+    assert "remove_python_package_entries" in OPS_PROMPT
+    assert "python -c" in OPS_PROMPT
+    assert "覆盖 `__init__.py`" in OPS_PROMPT
+    assert "用受控 apt 安装系统包" in OPS_PROMPT
+    assert "用受控 `python3.8 -m pip install`" in OPS_PROMPT
+    assert "最后备选" in OPS_PROMPT
+    assert "安全风险" in OPS_PROMPT
+    assert "需要管理员显式选择" in OPS_PROMPT
+
+
+def test_ops_prompt_blocks_helper_policy_mismatch_workarounds():
+    """Helper contract drift should not be silently bypassed as a controlled step."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "helper_policy_mismatch" in OPS_PROMPT
+    assert "升级 installed helper" in OPS_PROMPT
+    assert "apt-get" in OPS_PROMPT
+    assert "dpkg" in OPS_PROMPT
+    assert "外部管理员救援选项" in OPS_PROMPT
+    assert "需要用户明确改约束或管理员确认" in OPS_PROMPT
+
+
+def test_ops_prompt_requires_action_bindings_for_mutating_deploy_steps():
+    """Deploy plans should not defer bindings for later."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "必须在创建计划时就绑定具体 action 和 args" in OPS_PROMPT
+    assert "不得创建“checkpoint 占位步骤”" in OPS_PROMPT
+    assert "未绑定 action 的修改步骤会被状态机阻塞" in OPS_PROMPT
+
+
+def test_ops_prompt_routes_single_component_screen_recovery():
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "restart_screen_component" in OPS_PROMPT
+    assert "start_screen_component" in OPS_PROMPT
+    assert "screen 里只剩 shell" in OPS_PROMPT
+    assert "不要改用 `screen`、`kill`、`python -c`" in OPS_PROMPT
+    assert "全量 `start_platform_screens`" in OPS_PROMPT
+
+
+def test_ops_prompt_requires_configured_redis_port_for_database_queries():
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "worker_list" in OPS_PROMPT
+    assert "PROJ_CONFIG" in OPS_PROMPT
+    assert "Redis 端口" in OPS_PROMPT
+    assert "8368" in OPS_PROMPT
+    assert "不得默认使用 Redis 6379" in OPS_PROMPT
+    assert "redis-cli" in OPS_PROMPT
+
+
+def test_ops_prompt_forbids_plaintext_secrets_in_plans():
+    """Plans and summaries should not leak config secrets."""
+
+    from klonet_agent.prompts import OPS_PROMPT
+
+    assert "不得写入明文 password" in OPS_PROMPT
+    assert "[REDACTED]" in OPS_PROMPT
+    assert "敏感字段继承父类" in OPS_PROMPT
+
+
+def test_ops_privilege_prompt_allows_direct_terminal_sudo():
+    from klonet_agent.prompts import OPS_PRIVILEGE_PROMPT, SAFETY_PROMPT
+
+    assert "当前模式：Klonet Ops-Privilege Agent" in OPS_PRIVILEGE_PROMPT
+    assert "run_privileged_command" in OPS_PRIVILEGE_PROMPT
+    assert "不需要 OperationPlan、helper、sudoers NOPASSWD 或 allowlist" in OPS_PRIVILEGE_PROMPT
+    assert "用户会在当前终端手动输入密码" in OPS_PRIVILEGE_PROMPT
+    assert "不得要求用户在聊天里发送 sudo 密码" in OPS_PRIVILEGE_PROMPT
+    assert "当且仅当当前模式是 Ops-Privilege" in SAFETY_PROMPT
 
 
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():

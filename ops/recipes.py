@@ -7,6 +7,7 @@ shell commands.
 
 from __future__ import annotations
 
+import ast
 import re
 import shlex
 import shutil
@@ -22,6 +23,7 @@ from klonet_agent.ops.operations import OperationPlan, OperationStep, RecipeExec
 
 
 RESTART_SCREEN_COMPONENT = "restart_screen_component"
+START_SCREEN_COMPONENT = "start_screen_component"
 MANUAL_CHECKPOINT = "manual_checkpoint"
 STOP_SCREEN_COMPONENT = "stop_screen_component"
 STOP_PLATFORM_SCREENS = "stop_platform_screens"
@@ -35,7 +37,10 @@ WRITE_OPS_FILE = "write_ops_file"
 INSTALL_NGINX_CONFIG = "install_nginx_config"
 RELOAD_NGINX = "reload_nginx"
 START_DOCKER_CONTAINER = "start_docker_container"
+ENSURE_USER_GROUP = "ensure_user_group"
+REMOVE_PYTHON_PACKAGE_ENTRIES = "remove_python_package_entries"
 RUN_OPS_COMMAND = "run_ops_command"
+RUN_OPS_COMMAND_TIMEOUT_SECONDS = 120
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
@@ -97,6 +102,8 @@ SENSITIVE_OPS_WRITE_NAME_PARTS = (
     "password",
 )
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+_SAFE_PYTHON_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,120}$")
+_SAFE_PYTHON_PACKAGE_ENTRY = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,120}$")
 _SECRET_PATTERNS = (
     re.compile(
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
@@ -182,9 +189,12 @@ class ControlledActionRunner:
             EXTRACT_ARCHIVE,
             RUN_INSTALL_SCRIPT,
             ENSURE_SHARED_SERVICES,
+            START_SCREEN_COMPONENT,
             WRITE_OPS_FILE,
             INSTALL_NGINX_CONFIG,
             START_DOCKER_CONTAINER,
+            ENSURE_USER_GROUP,
+            REMOVE_PYTHON_PACKAGE_ENTRIES,
             RUN_OPS_COMMAND,
         }
         if spec.name in step_only_actions:
@@ -249,6 +259,28 @@ class ControlledActionRunner:
                 "environment unchanged"
             ),
         )
+
+    def _start_screen_component(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.recipe_args or {}
+        platform = str(args.get("platform") or "").strip()
+        component = str(args.get("component") or "").strip()
+        screen_session = str(args.get("screen_session") or "").strip()
+        project_root = str(args.get("project_root") or "").strip()
+        problem = _validate_restart_args(platform, component, screen_session, project_root)
+        if problem:
+            return RecipeExecutionResult("blocked", f"{problem}; environment unchanged")
+        command = self._helper_command(
+            "start-screen-component",
+            "--platform",
+            platform,
+            "--component",
+            component,
+            "--screen",
+            screen_session,
+            "--project-root",
+            project_root,
+        )
+        return self._helper_result(START_SCREEN_COMPONENT, command)
 
     def _stop_screen_component(self, plan: OperationPlan, step: OperationStep) -> RecipeExecutionResult:
         args = step.recipe_args or {}
@@ -554,6 +586,20 @@ class ControlledActionRunner:
             output = self._run_install_command(command)
         except subprocess.CalledProcessError as exc:
             return _script_failure_result(exc)
+        postcondition_problem = _install_script_postcondition_problem(script_name, script_args)
+        if postcondition_problem:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    "dry_run=false "
+                    f"recipe_id={RUN_INSTALL_SCRIPT} "
+                    f"command={_format_command(command)} "
+                    f"postcondition_failed={postcondition_problem} "
+                    f"script_output={_one_line(output)} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
         return RecipeExecutionResult(
             "completed",
             (
@@ -811,6 +857,99 @@ class ControlledActionRunner:
         command = self._helper_command("start-docker-container", "--name", name)
         return self._helper_result(START_DOCKER_CONTAINER, command)
 
+    def _ensure_user_group(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.args or step.recipe_args or {}
+        user = str(args.get("user") or "").strip()
+        group = str(args.get("group") or "").strip()
+        if (user, group) != ("klonet-agent", "docker"):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={ENSURE_USER_GROUP} user_group_membership_not_allowlisted user={user or 'missing'} group={group or 'missing'}; environment unchanged",
+            )
+        command = self._helper_command(
+            "ensure-user-group",
+            "--user",
+            user,
+            "--group",
+            group,
+        )
+        return self._helper_result(ENSURE_USER_GROUP, command)
+
+    def _remove_python_package_entries(self, step: OperationStep) -> RecipeExecutionResult:
+        args = step.args or step.recipe_args or {}
+        site_packages_dir = str(args.get("site_packages_dir") or "").strip()
+        package = str(args.get("package") or "").strip()
+        entries = _python_package_entries_arg(args.get("entries"))
+        problem = _validate_python_package_entries(site_packages_dir, package, entries)
+        if problem:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} {problem}; environment unchanged",
+            )
+        site_root = Path(site_packages_dir).resolve(strict=False)
+        package_dir = site_root / package
+        if not package_dir.is_dir():
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                    f"package_dir_not_found={_one_line(str(package_dir))}; "
+                    "environment unchanged"
+                ),
+            )
+        targets = [package_dir / entry for entry in entries]
+        resolved_targets = [target.resolve(strict=False) for target in targets]
+        if any(not _path_is_relative_to(target, package_dir) for target in resolved_targets):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} entry_path_not_allowlisted; environment unchanged",
+            )
+        missing = [entries[index] for index, target in enumerate(targets) if not target.exists()]
+        existing = [(entries[index], target) for index, target in enumerate(targets) if target.exists()]
+        if self.dry_run:
+            return RecipeExecutionResult(
+                "completed",
+                (
+                    "dry_run=true "
+                    f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                    f"site_packages_dir={_one_line(str(site_root))} "
+                    f"package={package} "
+                    f"remove_preview={','.join(entry for entry, _target in existing) or 'none'} "
+                    f"missing={','.join(missing) or 'none'} "
+                    "environment unchanged"
+                ),
+            )
+        removed = []
+        try:
+            for entry, target in existing:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink()
+                removed.append(entry)
+        except OSError as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                    f"remove_failed={_one_line(str(exc))} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        return RecipeExecutionResult(
+            "completed",
+            (
+                "dry_run=false "
+                f"recipe_id={REMOVE_PYTHON_PACKAGE_ENTRIES} "
+                f"site_packages_dir={_one_line(str(site_root))} "
+                f"package={package} "
+                f"removed={','.join(removed) or 'none'} "
+                f"missing={','.join(missing) or 'none'} "
+                "environment_changed=true"
+            ),
+        )
+
     def _run_ops_command(self, step: OperationStep) -> RecipeExecutionResult:
         args = step.args or step.recipe_args or {}
         decision = decide_ops_command(args)
@@ -844,6 +983,7 @@ class ControlledActionRunner:
                     f"category={decision.category} risk={decision.risk} "
                     f"requires_sudo={str(decision.requires_sudo).lower()} "
                     f"command_preview={_format_command(command)} "
+                    f"env={_format_env(decision.env) or 'default'} "
                     f"cwd={_one_line(decision.cwd or '.')} "
                     "environment unchanged"
                 ),
@@ -852,11 +992,26 @@ class ControlledActionRunner:
             if decision.requires_sudo:
                 output = self.command_runner(command)
             elif self._uses_default_command_runner:
-                output = _run_command(command, cwd=decision.cwd or None)
+                output = _run_command(command, cwd=decision.cwd or None, extra_env=decision.env)
             else:
                 output = self.command_runner(command)
         except subprocess.CalledProcessError as exc:
             return _helper_failure_result(exc)
+        except subprocess.TimeoutExpired as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                (
+                    f"recipe_id={RUN_OPS_COMMAND} command_timed_out "
+                    f"timeout_seconds={int(exc.timeout or RUN_OPS_COMMAND_TIMEOUT_SECONDS)} "
+                    "environment_changed=unknown"
+                ),
+                "inspect_runtime",
+            )
+        except OSError as exc:
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={RUN_OPS_COMMAND} command_os_error={_one_line(str(exc))}; environment unchanged",
+            )
         return RecipeExecutionResult(
             "completed",
             (
@@ -864,6 +1019,7 @@ class ControlledActionRunner:
                 f"category={decision.category} risk={decision.risk} "
                 f"requires_sudo={str(decision.requires_sudo).lower()} "
                 f"command={_format_command(command)} "
+                f"env={_format_env(decision.env) or 'default'} "
                 f"cwd={_one_line(decision.cwd or '.')} "
                 f"command_output={_one_line(output)} "
                 "environment_changed=unknown"
@@ -1030,6 +1186,29 @@ def _split_script_args(value) -> list:
     return shlex.split(text)
 
 
+def _install_script_postcondition_problem(script_name: str, script_args: list[str]) -> str:
+    if script_name != "base_requ_setup.sh" or tuple(script_args) != ("NORMAL",):
+        return ""
+    required = {
+        "python3.8": ("/usr/local/python3/bin/python3.8",),
+        "pip3.8": ("/usr/local/python3/bin/pip3.8",),
+        "gunicorn": ("/usr/local/bin/gunicorn",),
+        "celery": ("/usr/local/bin/celery",),
+    }
+    missing = [
+        name
+        for name, paths in required.items()
+        if not _command_or_known_path_exists(name, paths)
+    ]
+    return "missing_commands=" + ",".join(missing) if missing else ""
+
+
+def _command_or_known_path_exists(command: str, paths: tuple[str, ...]) -> bool:
+    if shutil.which(command):
+        return True
+    return any(Path(path).is_file() for path in paths)
+
+
 def _install_script_command(script_dir: str, script_name: str, script_args: list) -> list:
     args = " ".join(shlex.quote(item) for item in script_args)
     command = f"cd {shlex.quote(script_dir)} && bash ./{shlex.quote(script_name)}"
@@ -1085,6 +1264,54 @@ def _path_is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
+def _python_package_entries_arg(raw_entries) -> list[str]:
+    if isinstance(raw_entries, list):
+        return [str(item).strip() for item in raw_entries if str(item).strip()]
+    if isinstance(raw_entries, str):
+        text = raw_entries.strip()
+        if text.startswith(("[", "(", "{")) and text.endswith(("]", ")", "}")):
+            try:
+                parsed = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in text.split(",") if item.strip()]
+    return []
+
+
+def _validate_python_package_entries(site_packages_dir: str, package: str, entries: list[str]) -> str:
+    if not site_packages_dir or _looks_unsafe_path(site_packages_dir):
+        return f"invalid_site_packages_dir={site_packages_dir or 'missing'}"
+    site_root = Path(site_packages_dir).resolve(strict=False)
+    if not _allowed_site_packages_root(site_root):
+        return "site_packages_dir_not_allowlisted"
+    if not package or not _SAFE_PYTHON_PACKAGE_NAME.fullmatch(package):
+        return f"invalid_package={package or 'missing'}"
+    if not entries:
+        return "entries_required"
+    if len(entries) > 40:
+        return "entries_too_many"
+    for entry in entries:
+        if not _SAFE_PYTHON_PACKAGE_ENTRY.fullmatch(entry):
+            return f"invalid_package_entry={entry or 'missing'}"
+        if entry in {".", "..", package}:
+            return f"invalid_package_entry={entry}"
+    return ""
+
+
+def _allowed_site_packages_root(path: Path) -> bool:
+    text = str(path).replace("\\", "/").rstrip("/")
+    if re.fullmatch(r"/home/klonet-agent/\.local/lib/python\d+(?:\.\d+)?/site-packages", text):
+        return True
+    return bool(
+        re.fullmatch(
+            r"/home/klonet-agent/(?:platforms|workspace|workspaces)/[^/]+/(?:\.venv|venv)/lib/python\d+(?:\.\d+)?/site-packages",
+            text,
+        )
+    )
+
+
 def _looks_unsafe_path(value: str) -> bool:
     if any(part in value for part in ("\x00", "\n", "\r")):
         return True
@@ -1119,8 +1346,17 @@ def _is_supported_ops_write_path(path: Path) -> bool:
     if lower_name in SAFE_OPS_WRITE_NAMES or lower_name.startswith("dockerfile"):
         return True
     if path.suffix.lower() == ".py":
-        return False
+        return not _is_system_ops_write_path(path)
     return path.suffix.lower() in SAFE_OPS_WRITE_SUFFIXES
+
+
+def _is_system_ops_write_path(path: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError:
+        resolved = path.absolute()
+    system_roots = (Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64"))
+    return any(resolved == root or root in resolved.parents for root in system_roots)
 
 
 def _ops_backup_path(path: Path) -> Path:
@@ -1132,7 +1368,11 @@ def _format_command(command: list) -> str:
     return " ".join(shlex.quote(str(part)) for part in command)
 
 
-def _run_command(command: list, cwd: str | None = None) -> str:
+def _format_env(env: tuple[tuple[str, str], ...]) -> str:
+    return ",".join(f"{key}={value}" for key, value in env)
+
+
+def _run_command(command: list, cwd: str | None = None, extra_env: tuple[tuple[str, str], ...] = ()) -> str:
     completed = subprocess.run(
         command,
         cwd=cwd,
@@ -1141,8 +1381,27 @@ def _run_command(command: list, cwd: str | None = None) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=_command_env(command, extra_env),
+        timeout=RUN_OPS_COMMAND_TIMEOUT_SECONDS,
     )
     return completed.stdout.strip()
+
+
+def _command_env(command: list, extra_env: tuple[tuple[str, str], ...] = ()) -> dict | None:
+    if not extra_env and (not command or Path(str(command[0])).name != "git"):
+        return None
+    import os
+
+    env = dict(os.environ)
+    if command and Path(str(command[0])).name == "git":
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env.setdefault(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15",
+        )
+    for key, value in extra_env:
+        env[key] = value
+    return env
 
 
 def _run_command_streaming(command: list) -> str:
@@ -1157,13 +1416,36 @@ def _run_command_streaming(command: list) -> str:
 
 
 def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
-    stderr = _one_line(exc.stderr)
+    stderr = _one_line(exc.stderr, limit=1200)
     stdout = _one_line(exc.output)
     output = (
         f"helper_failed returncode={exc.returncode} "
         f"stderr={stderr} "
         f"stdout={stdout}"
     )
+    if _looks_like_sudo_password_failure(stderr):
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_sudo_not_configured {output}",
+            "install_ops_helper_sudoers",
+        )
+    if _looks_like_helper_policy_mismatch(stderr):
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_policy_mismatch {output}",
+            "upgrade_installed_ops_helper",
+        )
+    if "startup_preflight_failed" in stderr:
+        preflight_output = (
+            f"helper_startup_preflight_failed returncode={exc.returncode} "
+            f"stderr={stderr} "
+            f"stdout={stdout}"
+        )
+        return RecipeExecutionResult(
+            "blocked",
+            preflight_output,
+            "inspect_startup_preflight",
+        )
     if "environment_changed=unknown" in stderr:
         return RecipeExecutionResult(
             "blocked",
@@ -1171,6 +1453,20 @@ def _helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
             "inspect_runtime",
         )
     return RecipeExecutionResult("failed", output)
+
+
+def _looks_like_sudo_password_failure(stderr: str) -> bool:
+    lowered = (stderr or "").lower()
+    return "sudo:" in lowered and (
+        "password is required" in lowered
+        or "a password is required" in lowered
+        or "no tty present" in lowered
+    )
+
+
+def _looks_like_helper_policy_mismatch(stderr: str) -> bool:
+    text = stderr or ""
+    return bool(re.search(r"\berror=[A-Za-z0-9_]+_args_not_allowed\b", text))
 
 
 def _nginx_helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutionResult:
@@ -1181,6 +1477,12 @@ def _nginx_helper_failure_result(exc: subprocess.CalledProcessError) -> RecipeEx
         f"stderr={stderr} "
         f"stdout={stdout}"
     )
+    if _looks_like_sudo_password_failure(stderr):
+        return RecipeExecutionResult(
+            "blocked",
+            f"helper_sudo_not_configured {output}",
+            "install_ops_helper_sudoers",
+        )
     if "nginx_test_failed" in stderr or "environment_changed=false" in stderr:
         return RecipeExecutionResult("blocked", output)
     if "environment_changed=unknown" in stderr:
@@ -1203,5 +1505,5 @@ def _script_failure_result(exc: subprocess.CalledProcessError) -> RecipeExecutio
     )
 
 
-def _one_line(text: str) -> str:
-    return " ".join(str(text or "").split())[:500]
+def _one_line(text: str, *, limit: int = 500) -> str:
+    return " ".join(str(text or "").split())[:limit]

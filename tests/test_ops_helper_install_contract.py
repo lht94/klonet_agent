@@ -12,16 +12,19 @@ def test_sudoers_template_only_allows_fixed_helper_entrypoint():
     text = SUDOERS_TEMPLATE.read_text(encoding="utf-8")
 
     assert "/usr/local/bin/klonet-agent-op restart-screen-component --execute" in text
+    assert "/usr/local/bin/klonet-agent-op start-screen-component --execute" in text
     assert "/usr/local/bin/klonet-agent-op stop-screen-component --execute" in text
     assert "/usr/local/bin/klonet-agent-op stop-platform-screens --execute" in text
     assert "/usr/local/bin/klonet-agent-op start-platform-screens --execute" in text
     assert "/usr/local/bin/klonet-agent-op install-nginx-config --execute" in text
     assert "/usr/local/bin/klonet-agent-op reload-nginx --execute" in text
+    assert "/usr/local/bin/klonet-agent-op reload-nginx --execute," in text
     assert "/usr/local/bin/klonet-agent-op read-file --execute" in text
     assert "/usr/local/bin/klonet-agent-op inspect-install-scripts --execute" in text
     assert "/usr/local/bin/klonet-agent-op extract-archive --execute" in text
     assert "/usr/local/bin/klonet-agent-op run-install-script --execute" in text
     assert "/usr/local/bin/klonet-agent-op run-ops-command --execute" in text
+    assert "/usr/local/bin/klonet-agent-op ensure-user-group --execute" in text
     assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute" in text
     assert "/usr/local/bin/klonet-agent-op inspect-docker-containers --execute," in text
     assert "/usr/local/bin/klonet-agent-op start-docker-container --execute" in text

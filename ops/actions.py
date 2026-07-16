@@ -109,6 +109,14 @@ DEFAULT_OPS_ACTIONS = (
         ("restart_component",),
     ),
     OpsActionSpec(
+        "start_screen_component",
+        "_start_screen_component",
+        "privileged",
+        True,
+        ("project_root",),
+        ("start_component",),
+    ),
+    OpsActionSpec(
         "stop_screen_component",
         "_stop_screen_component",
         "dangerous",
@@ -185,6 +193,27 @@ DEFAULT_OPS_ACTIONS = (
         "_start_docker_container",
         "privileged",
         True,
+    ),
+    OpsActionSpec(
+        "ensure_user_group",
+        "_ensure_user_group",
+        "dangerous",
+        True,
+        aliases=("ensure-user-group", "add_user_to_group", "add-user-to-group"),
+        confirmation_scope="step",
+    ),
+    OpsActionSpec(
+        "remove_python_package_entries",
+        "_remove_python_package_entries",
+        "dangerous",
+        True,
+        ("site_packages_dir",),
+        aliases=(
+            "remove-python-package-entries",
+            "cleanup_python_package_entries",
+            "cleanup-python-package-entries",
+        ),
+        confirmation_scope="step",
     ),
     OpsActionSpec(
         "run_ops_command",

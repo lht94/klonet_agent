@@ -9,6 +9,7 @@ into arbitrary shell.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,9 @@ VALID_PLAN_STATUS = {"pending", "approved", "aborted", "completed", "failed"}
 VALID_STEP_STATUS = {"pending", "approved", "running", "completed", "failed", "blocked"}
 MAX_RECIPE_CONTENT_CHARS = 20000
 MAX_PLAN_STEPS = 20
+SENSITIVE_ACTION_CONTENT = re.compile(
+    r"(?i)\b[A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*\s*[:=]"
+)
 
 
 @dataclass
@@ -288,6 +292,23 @@ class OperationPlanStore:
                     next_required_action=(
                         "provide operation_args.project_root or bind a readonly precheck recipe"
                     ),
+                )
+            if _unbound_step_looks_mutating(plan, step):
+                step.status = "blocked"
+                _record_observation(
+                    step,
+                    "mutating_checkpoint_requires_action_binding; environment unchanged",
+                )
+                self.save_plan(plan)
+                return _render_step_execution(
+                    plan,
+                    step,
+                    previous_status=previous_status,
+                    result_status="blocked",
+                    execution_result=(
+                        "mutating_checkpoint_requires_action_binding; environment unchanged"
+                    ),
+                    next_required_action="attach an allowlisted action before retrying",
                 )
             if not step.requires_step_confirmation and step.risk == "normal":
                 step.status = "completed"
@@ -629,8 +650,13 @@ def _custom_steps(raw_steps: List[dict]) -> List[OperationStep]:
         if not isinstance(action_args, dict):
             raise ValueError(f"step {step_id} args must be an object")
         cleaned_args = _clean_action_args(action, action_args)
+        problem = _validate_plan_action_args(action, cleaned_args)
+        if problem:
+            raise ValueError(f"step {step_id} {problem}")
         spec = DEFAULT_OPS_ACTION_REGISTRY.get(action)
         command_decision = decide_ops_command(cleaned_args) if action == "run_ops_command" else None
+        if command_decision and not command_decision.allowed:
+            raise ValueError(f"step {step_id} {command_decision.reason}")
         if command_decision and command_decision.allowed:
             risk = command_decision.risk
         else:
@@ -762,6 +788,60 @@ def _action_type_for_recipe(recipe_id: str) -> str:
     return spec.aliases[0] if spec.aliases else spec.name
 
 
+def _unbound_step_looks_mutating(plan: OperationPlan, step: OperationStep) -> bool:
+    if plan.steps_source != "custom" or plan.operation not in {
+        "deploy_platform",
+        "restart_platform",
+        "destroy_platform",
+    }:
+        return False
+    text = " ".join([step.step_id, step.title, step.purpose]).lower()
+    mutating_markers = (
+        "install",
+        "安装",
+        "copy",
+        "复制",
+        "config",
+        "configure",
+        "配置",
+        "write",
+        "写",
+        "修改",
+        "生成",
+        "install_nginx",
+        "nginx",
+        "reload",
+        "重载",
+        "start",
+        "启动",
+        "clone",
+        "克隆",
+        "restart",
+        "重启",
+        "stop",
+        "停止",
+        "kill",
+        "杀",
+        "清理",
+        "cleanup",
+        "destroy",
+        "销毁",
+    )
+    readonly_markers = (
+        "verify",
+        "验证",
+        "check",
+        "检查",
+        "inspect",
+        "只读",
+        "precheck",
+        "预检",
+    )
+    return any(marker in text for marker in mutating_markers) and not any(
+        marker in text for marker in readonly_markers
+    )
+
+
 def _default_permission(step: OperationStep) -> str:
     if step.requires_step_confirmation:
         return "step_confirm_required"
@@ -837,7 +917,13 @@ def _apply_action_bindings(plan: OperationPlan, action_bindings: dict) -> None:
             if effective_action == "write_ops_file" and normalized_key == "content":
                 step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
                 continue
+            if effective_action == "write_ops_file" and normalized_key == "anchor":
+                step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
+                continue
             step.args[normalized_key] = _one_line(str(value), 300)
+        problem = _validate_plan_action_args(effective_action, step.args)
+        if problem:
+            raise ValueError(f"step {step.step_id} {problem}")
         step.recipe_args = dict(step.args)
 
 
@@ -860,6 +946,25 @@ def _clean_operation_args(args: dict) -> dict:
         for key, value in args.items()
         if key and value is not None
     }
+
+
+def _validate_plan_action_args(action: str, args: dict) -> str:
+    if action != "write_ops_file" or not isinstance(args, dict):
+        return ""
+    path = str(args.get("path") or "").strip()
+    content = str(args.get("content") or "")
+    if _is_direct_nginx_write_path(path):
+        return "nginx_config_requires_install_nginx_config"
+    if SENSITIVE_ACTION_CONTENT.search(content):
+        return "sensitive_content_not_allowed"
+    return ""
+
+
+def _is_direct_nginx_write_path(path: str) -> bool:
+    if not path:
+        return False
+    normalized = str(path).replace("\\", "/")
+    return normalized == "/etc/nginx" or normalized.startswith("/etc/nginx/")
 
 
 def _ensure_shared_services_step(plan: OperationPlan) -> None:

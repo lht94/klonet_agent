@@ -44,7 +44,12 @@ from klonet_agent.tools.environment import (
     render_docker_daemon_config,
     render_klonet_config,
 )
-from klonet_agent.tools.shell import run_command_linux, run_command_win, run_tests
+from klonet_agent.tools.shell import (
+    run_command_linux,
+    run_command_win,
+    run_privileged_command,
+    run_tests,
+)
 from klonet_agent.tools.source_code import (
     list_source_files,
     read_source_file,
@@ -120,6 +125,13 @@ class ToolExecutor:
             else:
                 result = run_command_linux(tool_args["command"])
             print(f"Klonet Agent：命令执行完成，结果为：\n{result}")
+            return result
+
+        if tool_name == "run_privileged_command":
+            command = str(tool_args["command"])
+            print(f"Klonet Agent：正在执行高权限命令\n{command}")
+            result = run_privileged_command(command)
+            print(f"Klonet Agent：高权限命令执行完成：{result}")
             return result
 
         if tool_name == "load_skill":

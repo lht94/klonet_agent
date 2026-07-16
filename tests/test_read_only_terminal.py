@@ -53,6 +53,66 @@ def test_readonly_terminal_rejects_ss_socket_kill():
     assert "ss socket-kill mode is not allowed" in result
 
 
+def test_readonly_terminal_allows_safe_ops_discovery_commands():
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    git = run_readonly_command({"program": "git", "argv": ["remote", "-v"]})
+    hostname = run_readonly_command({"program": "hostname", "argv": []})
+    ip = run_readonly_command({"program": "ip", "argv": ["route", "show"]})
+
+    assert "readonly_command" in git or "command returned non-zero status" in git
+    assert "program_not_allowlisted=git" not in git
+    assert "readonly_command" in hostname
+    assert "program_not_allowlisted=hostname" not in hostname
+    assert "program_not_allowlisted=ip" not in ip
+
+
+def test_readonly_terminal_rejects_mutating_or_broad_discovery_commands():
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    git = run_readonly_command({"program": "git", "argv": ["reset", "--hard"]})
+    ip = run_readonly_command({"program": "ip", "argv": ["link", "set", "eth0", "down"]})
+
+    assert "git only allows" in git
+    assert "ip only allows" in ip
+
+
+def test_readonly_terminal_reports_broken_absolute_program_symlink(tmp_path):
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    broken = tmp_path / "python3.8"
+    broken.symlink_to(tmp_path / "missing-python")
+
+    result = run_readonly_command({"program": str(broken), "argv": ["--version"]})
+
+    assert "program_path_broken_symlink=" in result
+    assert "program_not_allowlisted" not in result
+
+
+def test_readonly_terminal_runs_allowlisted_absolute_program(tmp_path):
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    executable = tmp_path / "python3"
+    executable.write_text("#!/bin/sh\nprintf 'Python 3.8.18\\n'\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    result = run_readonly_command({"program": str(executable), "argv": ["--version"]})
+
+    assert "readonly_command" in result
+    assert "Python 3.8.18" in result
+    assert "program_not_allowlisted" not in result
+
+
+def test_readonly_terminal_allows_safe_dpkg_package_checks():
+    from klonet_agent.tools.read_only_terminal import run_readonly_command
+
+    status = run_readonly_command({"program": "dpkg", "argv": ["-s", "python3.8"]})
+    mutating = run_readonly_command({"program": "dpkg", "argv": ["--configure", "-a"]})
+
+    assert "program_not_allowlisted=dpkg" not in status
+    assert "dpkg only allows" in mutating
+
+
 def test_ops_profile_exposes_readonly_terminal():
     from klonet_agent.agents.profile import get_profile
 

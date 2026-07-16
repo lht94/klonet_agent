@@ -818,6 +818,94 @@ def test_store_completes_normal_unbound_step_as_readonly_checkpoint():
     assert _status_by_step(loaded)["precheck-runtime"] == "completed"
 
 
+def test_custom_deploy_mutating_checkpoint_without_action_blocks():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="deploy lht",
+            steps=[
+                {
+                    "step_id": "config-lht",
+                    "title": "配置 LhtConfig",
+                    "purpose": "增量编辑 config.py 并切换 PROJ_CONFIG",
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "config-lht")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "mutating_checkpoint_requires_action_binding" in result
+    assert "next_required_action=attach an allowlisted action before retrying" in result
+    assert _status_by_step(loaded)["config-lht"] == "blocked"
+
+
+def test_custom_restart_mutating_checkpoint_without_action_blocks():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="lht",
+            objective="restart lht master",
+            steps=[
+                {
+                    "step_id": "kill-old-master-screen",
+                    "title": "清理旧的 lht_m screen",
+                    "purpose": "kill stale master screen before restart",
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "kill-old-master-screen")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "mutating_checkpoint_requires_action_binding" in result
+    assert _status_by_step(loaded)["kill-old-master-screen"] == "blocked"
+
+
+def test_custom_deploy_readonly_checkpoint_without_action_can_complete():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(temp_dir)
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="deploy lht",
+            steps=[
+                {
+                    "step_id": "verify-deps",
+                    "title": "验证依赖可用",
+                    "purpose": "只读检查 python3.8 gunicorn celery 是否可用",
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "verify-deps")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=completed" in result
+    assert "readonly_or_manual_checkpoint_completed" in result
+    assert _status_by_step(loaded)["verify-deps"] == "completed"
+
+
 def test_store_execute_next_step_uses_current_execution_order():
     from klonet_agent.ops.operations import OperationPlanStore
     from tests.helpers import local_temp_dir
@@ -1922,12 +2010,16 @@ def test_run_install_script_recipe_default_runner_streams_output(monkeypatch):
     assert "result_status=completed" in result
 
 
-def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir():
+def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir(monkeypatch):
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
     from tests.helpers import local_temp_dir
 
     calls = []
+    monkeypatch.setattr(
+        "klonet_agent.ops.recipes._install_script_postcondition_problem",
+        lambda script_name, script_args: "",
+    )
 
     def command_runner(command):
         calls.append(command)
@@ -1974,6 +2066,47 @@ def test_run_install_script_recipe_execute_uses_sudo_helper_for_root_script_dir(
     assert "dry_run=false" in result
     assert "recipe_id=run_install_script" in result
     assert "setup done" in result
+
+
+def test_run_install_script_blocks_when_base_setup_postconditions_are_missing(monkeypatch):
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.recipes._command_or_known_path_exists",
+        lambda command, paths: False,
+    )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=lambda command: "klonet_agent_op environment_changed=true",
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="env-setup",
+            objective="run base setup",
+            operation_args={
+                "script_dir": "/root/vemu_install_new_gen",
+                "script_name": "base_requ_setup.sh",
+                "script_args": "NORMAL",
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+    assert "result_status=blocked" in result
+    assert "postcondition_failed=missing_commands=python3.8,pip3.8,gunicorn,celery" in result
+    assert "next_required_action=inspect_runtime" in result
 
 
 def test_run_install_script_recipe_blocks_unsupported_script():
@@ -2146,7 +2279,7 @@ def test_write_ops_file_recipe_allows_klonet_startup_source_files():
         assert all(target.read_text(encoding="utf-8") == "# startup config\n" for target in targets)
 
 
-def test_write_ops_file_recipe_blocks_non_startup_python_source_files():
+def test_write_ops_file_recipe_allows_project_python_source_files():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
     from tests.helpers import local_temp_dir
@@ -2178,10 +2311,88 @@ def test_write_ops_file_recipe_blocks_non_startup_python_source_files():
         store.save_plan(plan)
 
         result = store.execute_step(plan.plan_id, "prepare-files")
+        assert "result_status=completed" in result
+        assert target.read_text(encoding="utf-8") == "# business logic\n"
+
+
+def test_write_ops_file_recipe_preserves_indented_anchor():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target = temp_dir / "link_operate.py"
+        target.write_text("def delete_ovs_port():\n    client =  docker.from_env()\n", encoding="utf-8")
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="insert lazy import",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": str(target),
+                        "mode": "replace_text",
+                        "anchor": "    client =  docker.from_env()",
+                        "content": "    import docker\n    client =  docker.from_env()",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
+
+        assert "result_status=completed" in result
+        assert target.read_text(encoding="utf-8") == (
+            "def delete_ovs_port():\n"
+            "    import docker\n"
+            "    client =  docker.from_env()\n"
+        )
+
+
+def test_write_ops_file_recipe_blocks_system_python_source_files():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="write system source",
+            recipe_bindings={
+                "prepare-files": {
+                    "recipe_id": "write_ops_file",
+                    "args": {
+                        "path": "/usr/lib/python3/dist-packages/topo.py",
+                        "content": "# system logic\n",
+                    },
+                }
+            },
+        )
+        plan.status = "approved"
+        prepare_step = next(item for item in plan.steps if item.step_id == "prepare-files")
+        prepare_step.status = "approved"
+        _complete_steps_before(plan, "prepare-files")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "prepare-files")
 
     assert "result_status=blocked" in result
     assert "unsupported_file_type=topo.py" in result
-    assert not target.exists()
 
 
 def test_write_ops_file_recipe_blocks_sensitive_paths():
@@ -2447,6 +2658,55 @@ def test_reload_nginx_recipe_blocks_when_config_test_fails_without_reload():
     assert loaded.status == "approved"
 
 
+def test_reload_nginx_recipe_blocks_when_sudoers_missing():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(
+            1,
+            command,
+            output="",
+            stderr="sudo: a password is required",
+        )
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="103",
+            objective="reload nginx",
+            recipe_bindings={
+                "start-services": {
+                    "recipe_id": "reload_nginx",
+                    "args": {},
+                }
+            },
+        )
+        plan.status = "approved"
+        step = next(item for item in plan.steps if item.step_id == "start-services")
+        step.status = "approved"
+        _complete_steps_before(plan, "start-services")
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-services")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "helper_sudo_not_configured" in result
+    assert "next_required_action=install_ops_helper_sudoers" in result
+    assert loaded.status == "approved"
+
+
 def test_stop_screen_component_recipe_dry_run_generates_safe_preview():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
@@ -2680,6 +2940,67 @@ def test_restart_screen_component_recipe_execute_calls_fixed_helper_command():
     assert statuses["verify-health"] == "pending"
 
 
+def test_start_screen_component_recipe_execute_calls_fixed_helper_command():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    calls = []
+
+    def command_runner(command):
+        calls.append(command)
+        return "helper stdout ok"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="restart_platform",
+            target="102",
+            objective="start missing master screen",
+            steps=[
+                {
+                    "step_id": "start-master",
+                    "title": "启动缺失 master screen",
+                    "action": "start_screen_component",
+                    "args": {
+                        "platform": "102",
+                        "component": "master",
+                        "screen_session": "102_m",
+                        "project_root": "/home/adminis/lht/102_project",
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        result = store.execute_step(plan.plan_id, "start-master")
+
+    assert calls == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "start-screen-component",
+            "--execute",
+            "--platform",
+            "102",
+            "--component",
+            "master",
+            "--screen",
+            "102_m",
+            "--project-root",
+            "/home/adminis/lht/102_project",
+        ]
+    ]
+    assert "result_status=completed" in result
+    assert "helper stdout ok" in result
+
+
 def test_restart_screen_component_recipe_execute_reports_helper_failure():
     import subprocess
 
@@ -2727,6 +3048,255 @@ def test_restart_screen_component_recipe_execute_reports_helper_failure():
     assert "helper_failed returncode=7" in result
     assert "screen failed" in result
     assert loaded.status == "failed"
+
+
+def test_start_platform_preflight_failure_blocks_with_helper_diagnostic():
+    import subprocess
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    helper_stderr = (
+        "klonet_agent_op\n"
+        "error=startup_preflight_failed component=master returncode=1 "
+        "detail=Traceback ModuleNotFoundError: No module named 'concurrent_log_handler'\n"
+        "environment_changed=false"
+    )
+
+    def command_runner(command):
+        raise subprocess.CalledProcessError(2, command, output="", stderr=helper_stderr)
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="start lht",
+            steps=[
+                {
+                    "step_id": "start-screens",
+                    "title": "启动 lht 平台四个 screen",
+                    "risk": "controlled",
+                    "action": "start_platform_screens",
+                    "args": {
+                        "platform": "lht",
+                        "project_root": "/home/klonet-agent/platforms/lht_project",
+                    },
+                }
+            ],
+        )
+        plan.status = "approved"
+        store.save_plan(plan)
+
+        result = store.execute_step(plan.plan_id, "start-screens")
+        loaded = store.load_plan(plan.plan_id)
+
+    assert "result_status=blocked" in result
+    assert "helper_startup_preflight_failed returncode=2" in result
+    assert "No module named 'concurrent_log_handler'" in result
+    assert "next_required_action=inspect_startup_preflight" in result
+    assert loaded.status == "approved"
+
+
+def test_ensure_user_group_recipe_requires_step_confirmation_and_calls_helper():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    commands = []
+
+    def command_runner(command):
+        commands.append(command)
+        return "klonet_agent_op\naction=ensure-user-group\nenvironment_changed=true\n"
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(
+                dry_run=False,
+                command_runner=command_runner,
+            ),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="add docker group",
+            steps=[
+                {
+                    "step_id": "add-docker-group",
+                    "title": "将 klonet-agent 加入 docker 组",
+                    "action": "ensure_user_group",
+                    "args": {"user": "klonet-agent", "group": "docker"},
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        waiting = store.execute_step(plan.plan_id, "add-docker-group")
+        store.approve_step(plan.plan_id, "add-docker-group")
+        result = store.execute_step(plan.plan_id, "add-docker-group")
+
+    assert "requires explicit confirm-step" in waiting
+    assert "result_status=completed" in result
+    assert commands == [
+        [
+            "sudo",
+            "-n",
+            "/usr/local/bin/klonet-agent-op",
+            "ensure-user-group",
+            "--execute",
+            "--user",
+            "klonet-agent",
+            "--group",
+            "docker",
+        ]
+    ]
+
+
+def test_remove_python_package_entries_requires_step_confirmation_and_removes_entries():
+    import shutil
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    root = Path("/home/klonet-agent/workspaces/test_remove_python_package_entries")
+    site_packages = root / ".venv" / "lib" / "python3.8" / "site-packages"
+    package_dir = site_packages / "werkzeug"
+    stale_dir = package_dir / "datastructures"
+    stale_file = package_dir / "legacy.py"
+    keep_file = package_dir / "datastructures.py"
+    shutil.rmtree(root, ignore_errors=True)
+    stale_dir.mkdir(parents=True)
+    stale_file.write_text("old\n", encoding="utf-8")
+    keep_file.write_text("keep\n", encoding="utf-8")
+
+    try:
+        store = OperationPlanStore(
+            root / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="remove stale package entries",
+            steps=[
+                {
+                    "step_id": "cleanup-werkzeug",
+                    "title": "删除 werkzeug 残留条目",
+                    "action": "remove_python_package_entries",
+                    "args": {
+                        "site_packages_dir": str(site_packages),
+                        "package": "werkzeug",
+                        "entries": ["datastructures", "legacy.py", "missing"],
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        waiting = store.execute_step(plan.plan_id, "cleanup-werkzeug")
+        store.approve_step(plan.plan_id, "cleanup-werkzeug")
+        result = store.execute_step(plan.plan_id, "cleanup-werkzeug")
+        stale_dir_exists = stale_dir.exists()
+        stale_file_exists = stale_file.exists()
+        keep_file_exists = keep_file.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    assert "requires explicit confirm-step" in waiting
+    assert "result_status=completed" in result
+    assert "recipe_id=remove_python_package_entries" in result
+    assert "removed=datastructures,legacy.py" in result
+    assert not stale_dir_exists
+    assert not stale_file_exists
+    assert keep_file_exists
+
+
+def test_remove_python_package_entries_blocks_unallowlisted_entries():
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        store = OperationPlanStore(
+            temp_dir,
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="reject unsafe package cleanup",
+            steps=[
+                {
+                    "step_id": "cleanup",
+                    "title": "unsafe cleanup",
+                    "action": "remove_python_package_entries",
+                    "args": {
+                        "site_packages_dir": "/home/klonet-agent/.local/lib/python3.8/site-packages",
+                        "package": "werkzeug",
+                        "entries": ["../flask"],
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        store.approve_step(plan.plan_id, "cleanup")
+        result = store.execute_step(plan.plan_id, "cleanup")
+
+    assert "result_status=blocked" in result
+    assert "invalid_package_entry=../flask" in result
+
+
+def test_remove_python_package_entries_accepts_stringified_entry_list():
+    import shutil
+
+    from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops.recipes import ControlledRecipeRunner
+
+    root = Path("/home/klonet-agent/workspaces/test_remove_python_package_entries_string")
+    site_packages = root / ".venv" / "lib" / "python3.8" / "site-packages"
+    package_dir = site_packages / "werkzeug"
+    stale_dir = package_dir / "wrappers"
+    shutil.rmtree(root, ignore_errors=True)
+    stale_dir.mkdir(parents=True)
+
+    try:
+        store = OperationPlanStore(
+            root / "plans",
+            recipe_runner=ControlledRecipeRunner(dry_run=False),
+        )
+        plan = store.create_plan(
+            operation="deploy_platform",
+            target="lht",
+            objective="remove stringified entries",
+            steps=[
+                {
+                    "step_id": "cleanup",
+                    "title": "cleanup",
+                    "action": "remove_python_package_entries",
+                    "args": {
+                        "site_packages_dir": str(site_packages),
+                        "package": "werkzeug",
+                        "entries": "['wrappers']",
+                    },
+                }
+            ],
+        )
+        store.approve_plan(plan.plan_id)
+        store.approve_step(plan.plan_id, "cleanup")
+        result = store.execute_step(plan.plan_id, "cleanup")
+        stale_dir_exists = stale_dir.exists()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+    assert "result_status=completed" in result
+    assert "removed=wrappers" in result
+    assert not stale_dir_exists
 
 
 def test_restart_recipe_unknown_environment_blocks_plan_until_reinspection():
@@ -3241,6 +3811,34 @@ def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypa
 
     assert operation_store.recipe_runner.dry_run is False
     assert operation_store.recipe_runner.execution_config == "enabled"
+
+
+def test_ops_privilege_executor_runs_unrestricted_command(monkeypatch):
+    import subprocess
+
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tools.executor import ToolExecutor
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr("klonet_agent.tools.shell.subprocess.run", fake_run)
+    executor = ToolExecutor(
+        session=AgentSession(mode="ops-privilege"),
+        allowed_tools={"run_privileged_command"},
+    )
+
+    result = executor.run("run_privileged_command", {"command": "sudo systemctl restart nginx"})
+
+    assert "privileged_command returncode=0" in result
+    assert calls
+    command, kwargs = calls[0]
+    assert command == "sudo systemctl restart nginx"
+    assert kwargs["shell"] is True
+    assert "capture_output" not in kwargs
 
 
 def _extract_plan_id(text: str) -> str:

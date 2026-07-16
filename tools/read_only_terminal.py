@@ -24,6 +24,10 @@ SAFE_PROGRAMS = {
     "ps",
     "ss",
     "systemctl",
+    "git",
+    "hostname",
+    "ip",
+    "dpkg",
 }
 
 
@@ -74,25 +78,36 @@ def _validated_command(raw) -> tuple[str, list[str]]:
     problem = _validate_program_args(basename, argv)
     if problem:
         return problem, []
-    executable = _resolve_program(program)
-    if not executable:
-        return f"program_not_allowlisted={program}", []
+    problem, executable = _resolve_program(program)
+    if problem:
+        return problem, []
     return "", [executable, *argv]
 
 
-def _resolve_program(program: str) -> str:
+def _resolve_program(program: str) -> tuple[str, str]:
     basename = Path(program).name
     allowed = basename in SAFE_PROGRAMS or _is_python(basename) or _is_pip(basename)
     if not allowed:
-        return ""
+        return f"program_not_allowlisted={program}", ""
     if os.path.isabs(program):
         path = Path(program)
-        return str(path) if path.is_file() and os.access(path, os.X_OK) else ""
+        if path.is_symlink() and not path.exists():
+            return f"program_path_broken_symlink={program}->{os.readlink(path)}", ""
+        if not path.exists():
+            return f"program_path_not_found={program}", ""
+        if not path.is_file():
+            return f"program_path_not_file={program}", ""
+        if not os.access(path, os.X_OK):
+            return f"program_path_not_executable={program}", ""
+        return "", str(path)
     if os.name == "nt" and basename == "which":
-        return shutil.which("where.exe") or shutil.which("where") or ""
+        resolved = shutil.which("where.exe") or shutil.which("where")
+        return ("", resolved) if resolved else (f"program_not_found={program}", "")
     if os.name == "nt" and basename == "grep":
-        return shutil.which("findstr.exe") or shutil.which("findstr") or ""
-    return shutil.which(program) or ""
+        resolved = shutil.which("findstr.exe") or shutil.which("findstr")
+        return ("", resolved) if resolved else (f"program_not_found={program}", "")
+    resolved = shutil.which(program)
+    return ("", resolved) if resolved else (f"program_not_found={program}", "")
 
 
 def _validate_program_args(program: str, argv: list[str]) -> str:
@@ -117,7 +132,64 @@ def _validate_program_args(program: str, argv: list[str]) -> str:
     if program == "systemctl":
         if not argv or argv[0] not in {"status", "is-active", "is-enabled", "show", "list-units"}:
             return "systemctl only allows read-only status operations"
+    if program == "git":
+        return _validate_git_args(argv)
+    if program == "hostname":
+        return "" if tuple(argv) in {(), ("-I",), ("--fqdn",)} else "hostname only allows no args, -I or --fqdn"
+    if program == "ip":
+        return _validate_ip_args(argv)
+    if program == "dpkg":
+        return _validate_dpkg_args(argv)
     return ""
+
+
+def _validate_git_args(argv: list[str]) -> str:
+    args = tuple(argv)
+    if args in {("status", "--short"), ("status", "-sb"), ("rev-parse", "--show-toplevel")}:
+        return ""
+    if argv[:1] == ["remote"] and tuple(argv[1:]) in {("-v",), ("get-url", "origin")}:
+        return ""
+    if argv[:2] == ["config", "--get"] and len(argv) == 3:
+        allowed_keys = {
+            "remote.origin.url",
+            "branch.main.remote",
+            "branch.master.remote",
+            "branch.main.merge",
+            "branch.master.merge",
+        }
+        return "" if argv[2] in allowed_keys else "git config key is not allowlisted"
+    return "git only allows status, rev-parse, remote read, or selected config --get"
+
+
+def _validate_ip_args(argv: list[str]) -> str:
+    if tuple(argv[:1]) in {("addr",), ("address",), ("route",), ("link",)}:
+        if len(argv) == 1:
+            return ""
+        if len(argv) == 2 and argv[1] in {"show", "list"}:
+            return ""
+    if tuple(argv[:2]) in {("-brief", "addr"), ("-br", "addr"), ("-brief", "link"), ("-br", "link")}:
+        return "" if len(argv) == 2 or (len(argv) == 3 and argv[2] == "show") else "ip brief form only allows show"
+    return "ip only allows addr/link/route show"
+
+
+def _validate_dpkg_args(argv: list[str]) -> str:
+    if not argv:
+        return "dpkg only allows -l or -s package checks"
+    if tuple(argv) in {("-l",), ("--list",)}:
+        return ""
+    if len(argv) == 2 and argv[0] in {"-s", "--status"} and _safe_package_name(argv[1]):
+        return ""
+    if len(argv) == 2 and argv[0] in {"-l", "--list"} and _safe_package_glob(argv[1]):
+        return ""
+    return "dpkg only allows -l or -s package checks"
+
+
+def _safe_package_name(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+_.:-]{0,127}", value or ""))
+
+
+def _safe_package_glob(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+_.:-]{0,127}\*?", value or ""))
 
 
 def _is_python(program: str) -> bool:

@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -24,10 +27,16 @@ MAX_READ_FILE_CHARS = 20000
 ALLOWED_COMPONENTS = {"master", "worker", "celery", "web_terminal"}
 START_COMPONENT_ORDER = ("master", "celery", "web_terminal", "worker")
 COMPONENT_COMMANDS = {
-    "master": "/usr/local/bin/gunicorn -c gun.py master_main:flask_app",
-    "worker": "/usr/local/bin/gunicorn -c worker_gun.py worker_main:flask_app",
-    "celery": "/usr/local/bin/celery -A celery_worker.celery worker --loglevel=info",
-    "web_terminal": "/usr/local/python3/bin/python3.8 web_terminal_main.py",
+    "master": "/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+    "worker": "/usr/bin/python3.8 -m gunicorn -c worker_gun.py worker_main:flask_app",
+    "celery": "/usr/bin/python3.8 -m celery -A celery_worker.celery worker --loglevel=info",
+    "web_terminal": "/usr/bin/python3.8 web_terminal_main.py",
+}
+STARTUP_PREFLIGHT_COMMANDS = {
+    "master": ["/usr/bin/python3.8", "-m", "gunicorn", "--check-config", "-c", "gun.py", "master_main:flask_app"],
+    "worker": ["/usr/bin/python3.8", "-m", "gunicorn", "--check-config", "-c", "worker_gun.py", "worker_main:flask_app"],
+    "celery": ["/usr/bin/python3.8", "-c", "from celery_worker import celery"],
+    "web_terminal": ["/usr/bin/python3.8", "-c", "import web_terminal_main"],
 }
 CONFIG_PORT_NAMES = (
     "master_port",
@@ -47,12 +56,14 @@ REQUIRED_PROJECT_ENTRY_FILES = (
 )
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+SAFE_RUNTIME_USER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 SAFE_ABSOLUTE_PATH = re.compile(r"^/[A-Za-z0-9_./:-]{1,300}$")
 SAFE_OPS_ARG = re.compile(r"^[A-Za-z0-9_.:+/@=-]{0,500}$")
 ALLOWED_INSTALL_SCRIPTS = {
     "base_requ_setup.sh": ("NORMAL",),
     "docker_service.sh": (),
 }
+ALLOWED_USER_GROUP_MEMBERSHIPS = {("klonet-agent", "docker")}
 
 
 def main(argv=None) -> int:
@@ -66,6 +77,14 @@ def main(argv=None) -> int:
     restart.add_argument("--component", required=True)
     restart.add_argument("--screen", required=True, dest="screen_session")
     restart.add_argument("--project-root", required=True)
+    start_component = subcommands.add_parser("start-screen-component")
+    start_component_mode = start_component.add_mutually_exclusive_group(required=True)
+    start_component_mode.add_argument("--dry-run", action="store_true")
+    start_component_mode.add_argument("--execute", action="store_true")
+    start_component.add_argument("--platform", required=True)
+    start_component.add_argument("--component", required=True)
+    start_component.add_argument("--screen", required=True, dest="screen_session")
+    start_component.add_argument("--project-root", required=True)
     stop = subcommands.add_parser("stop-screen-component")
     stop_mode = stop.add_mutually_exclusive_group(required=True)
     stop_mode.add_argument("--dry-run", action="store_true")
@@ -136,9 +155,17 @@ def main(argv=None) -> int:
     run_ops.add_argument("--program", required=True)
     run_ops.add_argument("--argv-json", required=True)
     run_ops.add_argument("--cwd", default="")
+    ensure_group = subcommands.add_parser("ensure-user-group")
+    ensure_group_mode = ensure_group.add_mutually_exclusive_group(required=True)
+    ensure_group_mode.add_argument("--dry-run", action="store_true")
+    ensure_group_mode.add_argument("--execute", action="store_true")
+    ensure_group.add_argument("--user", required=True)
+    ensure_group.add_argument("--group", required=True)
     args = parser.parse_args(argv)
     if args.action == "restart-screen-component":
         return _restart_screen_component(args)
+    if args.action == "start-screen-component":
+        return _start_screen_component(args)
     if args.action == "stop-screen-component":
         return _stop_screen_component(args)
     if args.action == "stop-platform-screens":
@@ -163,6 +190,8 @@ def main(argv=None) -> int:
         return _start_docker_container(args)
     if args.action == "run-ops-command":
         return _run_ops_command(args)
+    if args.action == "ensure-user-group":
+        return _ensure_user_group(args)
     _print_error(f"unsupported_action={args.action}")
     return 2
 
@@ -266,6 +295,7 @@ def _run_ops_command(args) -> int:
                 errors="replace",
                 check=False,
                 timeout=600,
+                env=_command_env(command),
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             _print_error(f"ops_command_failed={_one_line(str(exc))}")
@@ -281,6 +311,73 @@ def _run_ops_command(args) -> int:
         return completed.returncode
     print("environment_changed=false")
     return 0
+
+
+def _ensure_user_group(args) -> int:
+    user = str(args.user or "").strip()
+    group = str(args.group or "").strip()
+    problem = _validate_user_group(user, group)
+    if problem:
+        _print_error(problem)
+        return 2
+    already_member = user_in_group(user, group)
+    changed = False
+    if args.execute and not already_member:
+        try:
+            run_checked(["usermod", "-aG", group, user])
+        except (subprocess.CalledProcessError, OSError) as exc:
+            _print_command_failure(["usermod", "-aG", group, user], exc)
+            return 1
+        changed = True
+        already_member = user_in_group(user, group)
+        if not already_member:
+            _print_error(f"group_membership_not_applied user={user} group={group}")
+            return 1
+    print("klonet_agent_op")
+    print("action=ensure-user-group")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"user={user}")
+    print(f"group={group}")
+    print(f"already_member={str(already_member).lower()}")
+    print(f"environment_changed={str(changed).lower()}")
+    return 0
+
+
+def _validate_user_group(user: str, group: str) -> str:
+    if (user, group) not in ALLOWED_USER_GROUP_MEMBERSHIPS:
+        return f"user_group_membership_not_allowlisted user={user or 'missing'} group={group or 'missing'}"
+    if not SAFE_RUNTIME_USER.fullmatch(user) or not SAFE_RUNTIME_USER.fullmatch(group):
+        return f"invalid_user_group user={user or 'missing'} group={group or 'missing'}"
+    return ""
+
+
+def user_in_group(user: str, group: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["id", "-nG", user],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+    return group in set(completed.stdout.split())
+
+
+def _command_env(command: list) -> dict | None:
+    if not command or Path(str(command[0])).name != "git":
+        return None
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env.setdefault(
+        "GIT_SSH_COMMAND",
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15",
+    )
+    return env
 
 
 def _read_file(args) -> int:
@@ -403,6 +500,38 @@ def _restart_screen_component(args) -> int:
     return 0
 
 
+def _start_screen_component(args) -> int:
+    problem = _validate_restart_args(
+        args.platform,
+        args.component,
+        args.screen_session,
+        args.project_root,
+    )
+    if problem:
+        _print_error(problem)
+        return 2
+    if args.execute:
+        existing = existing_screen_sessions([args.screen_session])
+        if existing:
+            _print_error(f"screen_session_already_exists={args.screen_session}")
+            return 2
+        missing = project_entry_files_missing(args.project_root)
+        if missing:
+            _print_error(f"missing_project_entry_files={','.join(missing)}")
+            return 2
+        if not _run_commands(_start_component_commands(args.component, args.screen_session, args.project_root)):
+            return 1
+    print("klonet_agent_op")
+    print("action=start-screen-component")
+    print(f"dry_run={str(args.dry_run).lower()}")
+    print(f"platform={args.platform}")
+    print(f"component={args.component}")
+    print(f"screen_session={args.screen_session}")
+    print(f"project_root={args.project_root}")
+    print(f"environment_changed={str(args.execute).lower()}")
+    return 0
+
+
 def _stop_screen_component(args) -> int:
     problem = _validate_screen_component_args(
         args.platform,
@@ -473,8 +602,17 @@ def _start_platform_screens(args) -> int:
         if occupied_ports:
             _print_error(f"port_already_listening={','.join(str(port) for port in occupied_ports)}")
             return 2
+        problem = startup_preflight_problem(args.project_root)
+        if problem:
+            _print_error(problem)
+            return 2
     if args.execute:
         if not _run_commands(_start_platform_commands(args.platform, args.project_root)):
+            return 1
+        problem = wait_for_started_platform(args.platform, args.project_root)
+        if problem:
+            _print_error(problem)
+            print("environment_changed=unknown", file=sys.stderr)
             return 1
     print("klonet_agent_op")
     print("action=start-platform-screens")
@@ -679,7 +817,7 @@ def _validate_ops_command(program: str, argv_json: str, cwd: str) -> tuple[str, 
         if argv[:1] == ["install"]:
             options = {item for item in argv[1:] if item.startswith("-")}
             packages = [item for item in argv[1:] if not item.startswith("-")]
-            if packages and options <= {"-y", "--yes", "--no-install-recommends"}:
+            if packages and options <= {"-y", "--yes", "--no-install-recommends", "--reinstall"}:
                 return "", command, cwd
         return "apt_args_not_allowed", [], ""
     if program == "cp":
@@ -824,19 +962,21 @@ def _run_commands(commands: list) -> bool:
 def _restart_commands(component: str, screen_session: str, project_root: str) -> list:
     return [
         *_stop_commands(screen_session),
-        [
-            "screen",
-            "-dmS",
+        *_start_component_commands(component, screen_session, project_root),
+    ]
+
+
+def _start_component_commands(component: str, screen_session: str, project_root: str) -> list:
+    return [
+        _screen_command(
             screen_session,
-            "bash",
-            "-lc",
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
-        ],
+        )
     ]
 
 
 def _stop_commands(screen_session: str) -> list:
-    return [["screen", "-S", screen_session, "-X", "quit"]]
+    return [_as_runtime_user(["screen", "-S", screen_session, "-X", "quit"])]
 
 
 def _stop_platform_commands(platform: str) -> list:
@@ -863,7 +1003,7 @@ def _start_screen_sessions(platform: str) -> list:
 def existing_screen_sessions(screen_sessions: list) -> list:
     try:
         completed = subprocess.run(
-            ["screen", "-ls"],
+            _as_runtime_user(["screen", "-ls"]),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -890,15 +1030,41 @@ def project_entry_files_missing(project_root: str) -> list:
 
 
 def configured_ports(project_root: str) -> list:
+    content = active_config_content(project_root)
+    return _ports_from_content(content, CONFIG_PORT_NAMES)
+
+
+def runtime_required_ports(project_root: str) -> list:
+    content = active_config_content(project_root)
+    port_names = ("master_port", "worker_port", "web_terminal_port", "terminal_port")
+    return _ports_from_content(content, port_names)
+
+
+def active_config_content(project_root: str) -> str:
     config_path = Path(project_root) / "vemu_config" / "config.py"
     if not config_path.is_file():
-        return []
+        return ""
     try:
         content = config_path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
+        return ""
+    match = re.search(r"\bPROJ_CONFIG\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", content)
+    if not match:
+        return content
+    class_name = match.group(1)
+    class_match = re.search(rf"^class\s+{re.escape(class_name)}\b.*?:\s*$", content, flags=re.MULTILINE)
+    if not class_match:
+        return content
+    next_class = re.search(r"^class\s+[A-Za-z_][A-Za-z0-9_]*\b.*?:\s*$", content[class_match.end():], flags=re.MULTILINE)
+    end = class_match.end() + next_class.start() if next_class else len(content)
+    return content[class_match.start():end]
+
+
+def _ports_from_content(content: str, port_names: tuple[str, ...]) -> list:
+    if not content:
         return []
     pattern = re.compile(
-        rf"\b({'|'.join(re.escape(name) for name in CONFIG_PORT_NAMES)})\s*=\s*['\"]?(\d+)['\"]?"
+        rf"\b({'|'.join(re.escape(name) for name in port_names)})\s*=\s*['\"]?(\d+)['\"]?"
     )
     ports = []
     for match in pattern.finditer(content):
@@ -928,6 +1094,114 @@ def listening_ports(ports: list) -> list:
         if re.search(rf"(?<!\d):{port}\b", output):
             occupied.append(port)
     return occupied
+
+
+def wait_for_started_platform(platform: str, project_root: str, *, timeout_seconds: float = 5.0) -> str:
+    screen_sessions = _start_screen_sessions(platform)
+    required_ports = runtime_required_ports(project_root)
+    deadline = time.monotonic() + timeout_seconds
+    missing_screens = screen_sessions
+    missing_ports = required_ports
+    while time.monotonic() <= deadline:
+        existing = set(existing_screen_sessions(screen_sessions))
+        listening = set(listening_ports(required_ports))
+        missing_screens = [session for session in screen_sessions if session not in existing]
+        missing_ports = [port for port in required_ports if port not in listening]
+        if not missing_screens and not missing_ports:
+            return ""
+        time.sleep(0.5)
+    problems = []
+    if missing_screens:
+        problems.append("missing_started_screens=" + ",".join(missing_screens))
+    if missing_ports:
+        problems.append("missing_listening_ports=" + ",".join(str(port) for port in missing_ports))
+    return "start_postcondition_failed " + " ".join(problems)
+
+
+def startup_preflight_problem(project_root: str) -> str:
+    for component in START_COMPONENT_ORDER:
+        command = STARTUP_PREFLIGHT_COMMANDS[component]
+        try:
+            completed = run_startup_preflight_command(command, project_root, timeout=20)
+        except subprocess.TimeoutExpired as exc:
+            return (
+                f"startup_preflight_failed component={component} "
+                f"reason=timeout stdout={_one_line(exc.stdout or '', limit=1200)} "
+                f"stderr={_one_line(exc.stderr or '', limit=1200)}"
+            )
+        except OSError as exc:
+            return (
+                f"startup_preflight_failed component={component} "
+                f"reason={exc.__class__.__name__} message={_one_line(str(exc))}"
+            )
+        if completed.returncode != 0:
+            detail = startup_preflight_detail(completed.stderr or completed.stdout or "")
+            return (
+                f"startup_preflight_failed component={component} "
+                f"returncode={completed.returncode} detail={detail or 'empty_output'}"
+            )
+    return ""
+
+
+def run_startup_preflight_command(command: list, project_root: str, *, timeout: float) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        _as_runtime_user(command),
+        cwd=project_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_group(process)
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            exc.cmd,
+            exc.timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    return subprocess.CompletedProcess(
+        _as_runtime_user(command),
+        process.returncode,
+        stdout,
+        stderr,
+    )
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def startup_preflight_detail(output: str) -> str:
+    text = str(output or "").strip()
+    compact = _one_line(text, limit=1200)
+    last_error = last_python_error_line(text)
+    if not last_error:
+        return compact
+    return _one_line(f"last_error={last_error} detail={compact}", limit=1400)
+
+
+def last_python_error_line(text: str) -> str:
+    matches = re.findall(
+        r"(?m)^(?:[A-Za-z_][A-Za-z0-9_.]*Error|[A-Za-z_][A-Za-z0-9_.]*Exception):\s+.+$",
+        str(text or ""),
+    )
+    return " ".join(matches[-1].split()) if matches else ""
 
 
 def archive_members(archive: Path) -> list:
@@ -988,14 +1262,10 @@ def install_script_command(script_dir: str, script_name: str, script_args: list)
 def _start_platform_commands(platform: str, project_root: str) -> list:
     screen_sessions = dict(zip(START_COMPONENT_ORDER, _start_screen_sessions(platform)))
     return [
-        [
-            "screen",
-            "-dmS",
+        _screen_command(
             screen_sessions[component],
-            "bash",
-            "-lc",
             f"cd {shlex.quote(project_root)} && {COMPONENT_COMMANDS[component]}",
-        ]
+        )
         for component in START_COMPONENT_ORDER
     ]
 
@@ -1004,8 +1274,28 @@ def run_checked(command: list) -> None:
     subprocess.run(command, check=True)
 
 
-def _one_line(text: str) -> str:
-    return " ".join(str(text or "").split())[:500]
+def _screen_command(screen_session: str, shell_command: str) -> list:
+    return _as_runtime_user(["screen", "-dmS", screen_session, "bash", "-lc", shell_command])
+
+
+def _as_runtime_user(command: list) -> list:
+    user = runtime_user()
+    if not user:
+        return command
+    return ["runuser", "-u", user, "--", *command]
+
+
+def runtime_user() -> str:
+    if os.geteuid() != 0:
+        return ""
+    user = os.environ.get("SUDO_USER", "")
+    if not user or user == "root" or not SAFE_RUNTIME_USER.fullmatch(user):
+        return ""
+    return user
+
+
+def _one_line(text: str, *, limit: int = 500) -> str:
+    return " ".join(str(text or "").split())[:limit]
 
 
 if __name__ == "__main__":

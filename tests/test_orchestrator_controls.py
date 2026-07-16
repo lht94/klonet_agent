@@ -1102,7 +1102,8 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
     assert "目标：运行态盘点" in output
     assert "模式：只读诊断" in output
     assert "正在检索知识库：Klonet 启动" in output
-    assert "观察：unexpected tool result" in output
+    assert "我已经检索知识库：unexpected tool result" in output
+    assert "观察：" not in output
     assert "正在调用工具" not in output
     assert "工具完成" not in output
     assert "工具结果摘要" not in output
@@ -1240,19 +1241,19 @@ def test_ops_operation_plan_actions_are_named_explicitly():
             "target": "102",
             "secret": "hidden",
         },
-    ) == "Ops plan: create restart_platform for 102"
+    ) == "创建运维计划：restart_platform / 102"
     assert orchestrator._format_tool_action(
         "approve_ops_operation_plan",
         {"plan_id": "restart-abc", "scope": "plan", "token": "hidden"},
-    ) == "Ops plan: approve plan restart-abc"
+    ) == "确认运维计划：restart-abc"
     assert orchestrator._format_tool_action(
         "execute_ops_next_step",
         {"plan_id": "restart-abc", "password": "hidden"},
-    ) == "Ops plan: execute next step for restart-abc"
+    ) == "执行下一步：restart-abc"
     assert orchestrator._format_tool_action(
         "execute_ops_operation_step",
         {"plan_id": "restart-abc", "step_id": "restart-master"},
-    ) == "Ops plan: execute restart-master for restart-abc"
+    ) == "执行步骤：restart-master（restart-abc）"
 
 
 def test_ops_observation_shows_three_real_lines_and_omission():
@@ -1281,6 +1282,144 @@ def test_ops_observation_shows_three_real_lines_and_omission():
         "- ports: detected - 0.0.0.0:12000",
     ]
     assert omitted is True
+
+
+def test_ops_observation_prints_key_milestone_summary(capsys):
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    orchestrator._print_tool_loop_observation(
+        "inspect_klonet_runtime",
+        "\n".join(
+            [
+                "inspect_klonet_runtime",
+                "- redis: detected - active",
+                "- ports: detected - 0.0.0.0:12000",
+                "- screen: detected - 102_m",
+                "- logs: detected - recent traceback",
+            ]
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert "Klonet Agent：我已经检查 Klonet 运行状态" in output
+    assert "这一步的结论是" in output
+    assert "Redis 服务处于运行状态" in output
+    assert "其余内容已省略" in output
+    assert "观察：" not in output
+
+
+def test_ops_observation_naturalizes_machine_trace_for_users(capsys):
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+
+    assert orchestrator._format_ops_milestone_summary(
+        "run_readonly_command",
+        ["readonly_command; returncode=0; stdout:;"],
+        False,
+    ) == "我已经执行只读诊断：只读命令执行成功，但没有返回可用于判断的输出。"
+
+    orchestrator._print_tool_loop_observation(
+        "inspect_screen_session",
+        "\n".join(
+            [
+                "inspect_screen_session",
+                "- lht_m: detected - evidence_type=screen_scrollback current_state=false hardcopy snapshot; showing last 47 chars",
+                "- /home/klonet-agent/platforms/lht_project/logs/error.log: unchecked - file does not exist or is not a file",
+                "- program_not_allowlisted=ovs-vsctl",
+            ]
+        ),
+    )
+
+    output = capsys.readouterr().out
+    assert "找到 `lht_m` 的 screen 历史快照" in output
+    assert "没有找到日志文件 `/home/klonet-agent/platforms/lht_project/logs/error.log`" in output
+    assert "当前只读策略不允许执行 `ovs-vsctl`" in output
+    assert "evidence_type" not in output
+    assert "program_not_allowlisted" not in output
+    assert "returncode" not in output
+
+
+def test_ops_observation_prefers_llm_summary_for_real_client(capsys):
+    from types import SimpleNamespace
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.llm import LLMClient
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    class SummaryLLM(LLMClient):
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, messages, tools=None, stream=False):
+            self.calls.append({"messages": messages, "tools": tools, "stream": stream})
+            message = SimpleNamespace(
+                content="我已经确认 lht 平台目录存在，但这一步还不能判断是否存在 IP 冲突。",
+                tool_calls=None,
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)],
+                usage=SimpleNamespace(total_tokens=12),
+            )
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    orchestrator.llm = SummaryLLM()
+
+    orchestrator._print_tool_loop_observation(
+        "inspect_platform_instances",
+        "inspect_platform_instances\n- platform=lht; project_root=/srv/lht; project_root_status=detected",
+    )
+
+    output = capsys.readouterr().out
+    assert "我已经确认 lht 平台目录存在" in output
+    assert "project_root_status" not in output
+    assert orchestrator.llm.calls
+
+
+def test_ops_observation_falls_back_when_llm_summary_leaks_trace(capsys):
+    from types import SimpleNamespace
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.llm import LLMClient
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    class LeakySummaryLLM(LLMClient):
+        def __init__(self):
+            pass
+
+        def complete(self, messages, tools=None, stream=False):
+            message = SimpleNamespace(
+                content="readonly_command returncode=0 stdout 为空",
+                tool_calls=None,
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)],
+                usage=SimpleNamespace(total_tokens=12),
+            )
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    orchestrator.llm = LeakySummaryLLM()
+
+    orchestrator._print_tool_loop_observation(
+        "run_readonly_command",
+        "readonly_command\nreturncode=0\nstdout:",
+    )
+
+    output = capsys.readouterr().out
+    assert "只读命令执行成功" in output
+    assert "returncode" not in output
+    assert "stdout" not in output
 
 
 def test_ops_operation_observation_keeps_plan_and_execution_details_visible():
@@ -1324,24 +1463,49 @@ def test_ops_operation_observation_keeps_plan_and_execution_details_visible():
     )
 
     assert omitted is False
-    assert "计划 deploy-abc：deploy_platform / lht，状态 completed" in lines
-    assert "执行顺序：precheck -> prepare-files -> start-shared-services -> start-services" in lines
+    assert "计划 deploy-abc：部署/安装 / lht，已完成" in lines
+    assert "进度：已完成 4/4" in lines
     assert any(
-        "start-shared-services：启动共享基础服务；状态 completed；动作 ensure_shared_services；权限 plan_confirmed"
-        in line
+        "start-shared-services：启动共享基础服务；已完成" in line
         for line in lines
     )
-    assert any(
-        "start-shared-services：动作 ensure_shared_services；执行器 ensure_shared_services"
-        in line
-        for line in lines
+    assert "执行 start-shared-services（启动共享基础服务）：已完成" in lines
+    assert "结果：已完成。" in lines
+    assert all("执行绑定" not in line for line in lines)
+    assert all("recipe_args" not in line for line in lines)
+    assert all("权限 " not in line for line in lines)
+    assert all("动作 " not in line for line in lines)
+
+
+def test_ops_operation_observation_hides_raw_helper_failure_details():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    orchestrator.profile = get_profile("ops")
+    orchestrator.answer_style = "default"
+    lines, omitted = orchestrator._tool_observation_lines(
+        "execute_ops_next_step",
+        "\n".join(
+            [
+                "ops_operation_execution",
+                "plan_id=deploy-abc",
+                "execute_step=cp-plugin",
+                "step_title=cp q_theaterq.so",
+                "action_type=run_ops_command",
+                "permission=step_confirm_required",
+                "result_status=failed",
+                'execution_result=helper_failed returncode=1 stderr= stdout=klonet_agent_op action=run-ops-command dry_run=false program=cp argv_json=["tclib/q_theaterq.so","/usr/lib/x86_64-linux-gnu/tc/"] cwd=/tmp',
+            ]
+        ),
     )
-    assert "执行 start-shared-services（启动共享基础服务）：completed" in lines
-    assert any(
-        "结果：dry_run=false recipe_id=ensure_shared_services missing=mysql command_completed"
-        in line
-        for line in lines
-    )
+
+    assert omitted is False
+    assert "执行 cp-plugin（cp q_theaterq.so）：失败" in lines
+    assert "结果：命令执行失败，返回码 1。" in lines
+    assert "命令类型：cp" in lines
+    assert all("argv_json" not in line for line in lines)
+    assert all("klonet_agent_op" not in line for line in lines)
 
 
 def test_ops_knowledge_observation_prioritizes_source_and_evidence():

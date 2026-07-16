@@ -71,3 +71,15 @@ def test_ops_route_does_not_treat_plan_id_or_date_as_port():
     assert route.ports == []
     assert "5126" not in route.summary()
     assert "2026" not in route.summary()
+
+
+def test_ops_route_does_not_treat_conditional_failure_stop_as_stop_action():
+    from klonet_agent.ops.routing import route_ops_request
+
+    route = route_ops_request(
+        "确认计划并执行部署；如果任何步骤失败，先停止并报告原因，"
+        "不要自行改用 base_requ_setup.sh。"
+    )
+
+    assert route.action == "deploy"
+    assert "action=stop" not in route.summary()
