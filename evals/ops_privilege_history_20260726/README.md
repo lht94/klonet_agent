@@ -4,6 +4,8 @@
 Ops-Privilege 自适应 PEV 工作流的路由、风险分级、确认边界和真实 Planner
 表现。
 
+完整结果与问题分级见 `REPORT.md`，原始机器输出保存在 `results/`。
+
 ## 数据来源
 
 - `lzl@192.168.1.33:/home/lzl/klonet_agent/memory/sessions/**/history.jsonl`
