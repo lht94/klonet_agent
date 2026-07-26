@@ -8,13 +8,13 @@ import shutil
 import socket
 import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Dict, Optional
 
 from klonet_agent.ops.privileged.contracts import CheckResult, ExecutionEvidence
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 
 
-Checker = Callable[[dict[str, Any], ExecutionEvidence | None], CheckResult]
+Checker = Callable[[Dict[str, Any], Optional[ExecutionEvidence]], CheckResult]
 
 
 class DefaultCheckerRegistry:

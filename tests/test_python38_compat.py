@@ -27,6 +27,13 @@ RUNTIME_PATHS = (
 MODERN_ANNOTATION_PATTERN = re.compile(
     r"\b(?:list|dict|tuple|set)\s*\[|\w+\s*\|\s*None|None\s*\|\s*\w+"
 )
+EAGER_TYPE_ALIAS_PATTERN = re.compile(
+    r"^[A-Za-z_]\w*\s*=\s*Callable\[[^\n]*(?:"
+    r"\b(?:list|dict|tuple|set)\s*\[|"
+    r"\w+\s*\|\s*None|None\s*\|\s*\w+"
+    r")",
+    re.MULTILINE,
+)
 
 
 def test_runtime_modules_with_modern_annotations_use_future_annotations():
@@ -51,6 +58,18 @@ def test_runtime_modules_do_not_call_python39_path_is_relative_to():
     for path in _runtime_python_files():
         text = path.read_text(encoding="utf-8")
         if ".is_relative_to(" in text:
+            offenders.append(str(path.relative_to(PROJECT_ROOT)))
+
+    assert offenders == []
+
+
+def test_runtime_modules_do_not_eagerly_evaluate_modern_type_aliases():
+    """Future annotations do not defer module-level type alias assignments."""
+
+    offenders = []
+    for path in _runtime_python_files():
+        text = path.read_text(encoding="utf-8")
+        if EAGER_TYPE_ALIAS_PATTERN.search(text):
             offenders.append(str(path.relative_to(PROJECT_ROOT)))
 
     assert offenders == []
