@@ -25,15 +25,17 @@ def test_ops_profile_uses_read_only_environment_tools():
     assert "run_privileged_command" not in profile.allowed_tools
 
 
-def test_ops_privilege_profile_can_run_direct_sudo_commands():
+def test_ops_privilege_profile_uses_readonly_tools_and_supervisor_boundary():
     from klonet_agent.agents import get_profile
 
     profile = get_profile("ops-privilege")
 
     assert profile.name == "ops-privilege"
-    assert "run_privileged_command" in profile.allowed_tools
+    assert "run_privileged_command" not in profile.allowed_tools
     assert "run_readonly_command" in profile.allowed_tools
-    assert "create_ops_operation_plan" in profile.allowed_tools
+    assert "create_ops_operation_plan" not in profile.allowed_tools
+    assert "write_file" not in profile.allowed_tools
+    assert profile.requires_review is True
 
 
 def test_ops_tool_round_limit_is_higher_than_default():

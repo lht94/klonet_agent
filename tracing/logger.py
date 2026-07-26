@@ -70,6 +70,26 @@ class TraceLogger:
             }
         )
 
+    def record_privileged_event(
+        self,
+        user_id: str,
+        project_id: str,
+        mode: str,
+        event: str,
+        payload: dict | None = None,
+    ):
+        """记录高权限计划状态迁移，不把完整命令输出写入通用 trace。"""
+
+        row = {
+            "ts": datetime.now(_UTC8).isoformat(timespec="seconds"),
+            "event": event,
+            "user_id": user_id,
+            "project_id": project_id,
+            "mode": mode,
+        }
+        row.update(_json_safe(payload or {}))
+        self._append(row)
+
     def _append(self, row: dict):
         """追加一行 JSONL。"""
 

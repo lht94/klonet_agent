@@ -88,9 +88,18 @@ OPS_TOOLS = {
     "web_fetch",
 } | ENVIRONMENT_TOOLS | OPS_OPERATION_TOOLS
 
-OPS_PRIVILEGE_TOOLS = OPS_TOOLS | {
-    "run_privileged_command",
-}
+OPS_PRIVILEGE_TOOLS = {
+    "load_skill",
+    "search_knowledge",
+    "search_code",
+    "read_source_file",
+    "list_source_files",
+    "read_project_journal",
+    "list_files",
+    "read_file",
+    "append_episode",
+    "web_fetch",
+} | ENVIRONMENT_TOOLS
 
 CODING_TOOLS = MENTOR_TOOLS | {
     "update_todos",
@@ -134,9 +143,12 @@ def get_profile(name: str) -> AgentProfile:
             name="ops-privilege",
             mode_prompt=OPS_PRIVILEGE_PROMPT,
             allowed_tools=OPS_PRIVILEGE_TOOLS,
-            default_workflow="inspect if useful -> run shell/sudo command directly -> verify result",
+            default_workflow=(
+                "route -> inspect read-only evidence -> adaptive plan -> risk gate -> "
+                "deterministic execute -> evidence verify -> persist/recover"
+            ),
             requires_rag=True,
-            requires_review=False,
+            requires_review=True,
         )
     return AgentProfile(
         name="mentor",

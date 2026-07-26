@@ -1286,3 +1286,43 @@ python -m pytest tests/test_ops_command_policy.py::test_run_ops_command_sudo_pas
 ```
 
 结果：`10 passed`，`4 passed`。
+
+## 2026-07-26 第三十四轮：Ops-Privilege 自适应 PEV 与权限/验证边界
+
+### 变更目标
+
+原 `ops-privilege` 把任意 Shell 作为模型可见工具，只有模式级授权，缺少独立审批、
+执行后状态验证和崩溃恢复。本轮把它升级为 Supervisor 编排的自适应
+Plan–Execute–Verify 工作流。
+
+### 核心实现
+
+- 从 Agent Profile、工具 schema 和 ToolExecutor 删除 `run_privileged_command`。
+- 新增 `ops/privileged/`：
+  - `contracts.py`：计划、步骤、证据、检查和验证契约。
+  - `planner.py`：无工具 Planner，结构化输出失败只修复一次。
+  - `policy.py`：确定性风险下限、分级确认和硬拒绝规则。
+  - `executor.py`：非模型可见的单步 Executor，继承 stdin、流式输出、有界留证。
+  - `checkers.py`：Checker Registry 和命令族后置检查推断。
+  - `verifier.py`：无工具 Verifier 与不可被模型覆盖的结果门控。
+  - `store.py`：user/project 隔离、原子写入和中断恢复。
+  - `workflow.py`：确认、执行、验证、重规划、恢复、中止与审计状态机。
+- Orchestrator 在通用模型工具循环前处理修改型目标和高权限控制命令。
+- 授权绑定计划内容哈希；重规划或可执行内容改变后强制重新确认。
+- `resume-priv` 对 `execution_unknown` 只检查当前状态，绝不自动重放。
+
+### 用户命令
+
+```text
+list-priv
+show-priv <plan_id>
+confirm-priv <plan_id>
+confirm-priv-step <plan_id> <step_id>
+resume-priv <plan_id>
+abort-priv <plan_id>
+```
+
+### 边界说明
+
+该模式建立的是应用层权限与验证边界，不等同于容器、seccomp 或虚拟机级 OS 沙箱。
+普通 `ops` 的 OperationPlan/helper/Action Registry 不受本轮改动影响。

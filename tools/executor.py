@@ -47,7 +47,6 @@ from klonet_agent.tools.environment import (
 from klonet_agent.tools.shell import (
     run_command_linux,
     run_command_win,
-    run_privileged_command,
     run_tests,
 )
 from klonet_agent.tools.source_code import (
@@ -125,13 +124,6 @@ class ToolExecutor:
             else:
                 result = run_command_linux(tool_args["command"])
             print(f"Klonet Agent：命令执行完成，结果为：\n{result}")
-            return result
-
-        if tool_name == "run_privileged_command":
-            command = str(tool_args["command"])
-            print(f"Klonet Agent：正在执行高权限命令\n{command}")
-            result = run_privileged_command(command)
-            print(f"Klonet Agent：高权限命令执行完成：{result}")
             return result
 
         if tool_name == "load_skill":
@@ -366,7 +358,7 @@ class ToolExecutor:
         if tool_name == "record_acceptance_gap":
             return journal.record_acceptance_gap(tool_args["content"])
 
-        return f"Error:Unknown tool {tool_name}"
+        return f"Error: tool not registered: {tool_name}"
 
     def _approve_ops_operation_plan(self, tool_args: dict) -> str:
         store = self._operation_plan_store()

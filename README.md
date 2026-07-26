@@ -386,10 +386,29 @@ python -m klonet_agent.agent --mode ops --user-id lht --project-id test
 python -m klonet_agent.agent --mode ops-privilege --user-id lht --project-id test
 ```
 
-`ops-privilege` 是单独的高权限运维模式，会直接运行 shell/sudo 命令，不走
-OperationPlan、helper 或 allowlist。适合用户坐在当前终端前操作：如果 sudo 需要密码，
-就在终端提示里手动输入；不要把密码发到聊天里。普通 `ops` 模式仍然使用受控计划和
-helper/sudoers 链路。
+`ops-privilege` 是独立的自适应 PEV 高权限运维模式。主 Agent 只能读取环境证据，
+不能直接调用任意 Shell；修改型目标会交给独立 Planner 生成结构化计划，再经过
+确定性风险门控、必要的人类确认、非模型可见 Executor 和 Checker Registry 验收。
+单个可逆低/中风险修改使用 MicroPlan；多步骤计划使用 `confirm-priv <plan_id>`；
+高风险步骤还需 `confirm-priv-step <plan_id> <step_id>`。如果 sudo 需要密码，只能在
+当前终端提示中输入，不要把密码发到聊天里。普通 `ops` 模式仍使用
+OperationPlan/helper/sudoers 链路。
+
+高权限计划控制命令：
+
+```text
+list-priv
+show-priv <plan_id>
+confirm-priv <plan_id>
+confirm-priv-step <plan_id> <step_id>
+resume-priv <plan_id>
+abort-priv <plan_id>
+```
+
+计划、授权哈希、步骤状态、命令证据和检查结果保存在当前 user/project 的
+`memory/sessions/.../privileged_ops_plans/` 下。进程中断时，原来处于
+`running`/`verifying` 的步骤会变成 `execution_unknown`；`resume-priv` 只验证当前
+状态，绝不自动重放该步骤。
 
 部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
 `KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。

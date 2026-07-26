@@ -221,15 +221,16 @@ def test_ops_prompt_forbids_plaintext_secrets_in_plans():
     assert "敏感字段继承父类" in OPS_PROMPT
 
 
-def test_ops_privilege_prompt_allows_direct_terminal_sudo():
+def test_ops_privilege_prompt_describes_adaptive_pev_boundary():
     from klonet_agent.prompts import OPS_PRIVILEGE_PROMPT, SAFETY_PROMPT
 
     assert "当前模式：Klonet Ops-Privilege Agent" in OPS_PRIVILEGE_PROMPT
-    assert "run_privileged_command" in OPS_PRIVILEGE_PROMPT
-    assert "不需要 OperationPlan、helper、sudoers NOPASSWD 或 allowlist" in OPS_PRIVILEGE_PROMPT
-    assert "用户会在当前终端手动输入密码" in OPS_PRIVILEGE_PROMPT
+    assert "模型不可见、也不得请求任何任意 Shell 执行工具" in OPS_PRIVILEGE_PROMPT
+    assert "独立 Planner" in OPS_PRIVILEGE_PROMPT
+    assert "Checker Registry" in OPS_PRIVILEGE_PROMPT
+    assert "confirm-priv-step" in OPS_PRIVILEGE_PROMPT
     assert "不得要求用户在聊天里发送 sudo 密码" in OPS_PRIVILEGE_PROMPT
-    assert "当且仅当当前模式是 Ops-Privilege" in SAFETY_PROMPT
+    assert "Ops-Privilege 也不得让模型直接执行 shell/sudo" in SAFETY_PROMPT
 
 
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():
