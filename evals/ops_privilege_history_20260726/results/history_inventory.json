@@ -1,0 +1,40 @@
+{
+  "generated_at": "2026-07-26",
+  "privacy": "Only counts and relative session paths are retained. Raw conversation content is not copied.",
+  "totals": {
+    "jsonl_rows": 5901,
+    "user_turns": 611,
+    "derived_eval_cases": 60
+  },
+  "hosts": [
+    {
+      "account": "lzl",
+      "root": "/home/lzl/klonet_agent/memory/sessions",
+      "jsonl_rows": 433,
+      "user_turns": 50,
+      "excluded_generated_eval_sessions": true,
+      "sessions": [
+        {"path": "lht/TheaterQ/history.jsonl", "rows": 87, "user_turns": 5},
+        {"path": "lht/test/history.jsonl", "rows": 331, "user_turns": 43},
+        {"path": "xiaoyi/xiaoyi-Klonet/history.jsonl", "rows": 15, "user_turns": 2}
+      ]
+    },
+    {
+      "account": "klonet-agent",
+      "root": "/home/klonet-agent/klonet_agent/memory/sessions",
+      "jsonl_rows": 5468,
+      "user_turns": 561,
+      "sessions": [
+        {"path": "lht/102/history.jsonl", "rows": 248, "user_turns": 26},
+        {"path": "lht/TheaterQ/history.jsonl", "rows": 990, "user_turns": 107},
+        {"path": "lht/test/history.jsonl", "rows": 2738, "user_turns": 250},
+        {"path": "lht/test1/history.jsonl", "rows": 433, "user_turns": 30},
+        {"path": "lht/test2/history.jsonl", "rows": 161, "user_turns": 12},
+        {"path": "xiaoyi/xiaoyi-Klonet/history.jsonl", "rows": 640, "user_turns": 107},
+        {"path": "xiaoyi/xy-Klonet/history.jsonl", "rows": 30, "user_turns": 4},
+        {"path": "zk/zk1/history.jsonl", "rows": 175, "user_turns": 22},
+        {"path": "zk/zk_coding/history.jsonl", "rows": 53, "user_turns": 3}
+      ]
+    }
+  ]
+}
