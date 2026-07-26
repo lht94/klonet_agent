@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from typing import Any
 
 try:
@@ -74,13 +75,18 @@ class LLMClient:
             "messages": messages,
             # stream=False 表示等待模型完整回复后再返回，和旧版行为一致。
             "stream": stream,
-            # reasoning_effort 用来控制推理强度，默认值放在 config.py 中统一管理。
-            "reasoning_effort": reasoning_effort,
         }
+        create = self.client.chat.completions.create
+        parameters = inspect.signature(create).parameters
+        if "reasoning_effort" in parameters or any(
+            item.kind == inspect.Parameter.VAR_KEYWORD
+            for item in parameters.values()
+        ):
+            request["reasoning_effort"] = reasoning_effort
         # tools 是可选参数。没有工具时不传 tools 字段，避免某些模型接口对空列表兼容不好。
         if tools is not None:
             request["tools"] = tools
 
         # 真正发起 HTTP 请求的位置。上层模块只调用 complete()，
         # 不需要知道 OpenAI SDK 的具体调用链。
-        return self.client.chat.completions.create(**request)
+        return create(**request)
