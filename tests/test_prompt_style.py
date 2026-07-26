@@ -230,6 +230,23 @@ def test_ops_privilege_prompt_describes_adaptive_pev_boundary():
     assert "Checker Registry" in OPS_PRIVILEGE_PROMPT
     assert "confirm-priv-step" in OPS_PRIVILEGE_PROMPT
     assert "不得要求用户在聊天里发送 sudo 密码" in OPS_PRIVILEGE_PROMPT
+    assert "所有请求都先进入 Ops Supervisor" in OPS_PRIVILEGE_PROMPT
+    assert "Goal Safety Guard" in OPS_PRIVILEGE_PROMPT
+    assert "轻量模型 Intent Classifier" in OPS_PRIVILEGE_PROMPT
+    assert "普通问答、只读操作、变更操作或不确定" in OPS_PRIVILEGE_PROMPT
+    assert "不确定时必须澄清且不得执行" in OPS_PRIVILEGE_PROMPT
+
+
+def test_ops_privilege_profile_declares_supervisor_single_entry_workflow():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.prompts import SAFETY_PROMPT
+
+    workflow = get_profile("ops-privilege").default_workflow
+
+    assert workflow.startswith("supervisor -> exact plan control -> goal safety")
+    assert "model intent" in workflow
+    assert "readonly execute/check" in workflow
+    assert "mutation PEV" in workflow
     assert "Ops-Privilege 也不得让模型直接执行 shell/sudo" in SAFETY_PROMPT
 
 

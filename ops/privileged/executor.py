@@ -28,13 +28,31 @@ class PrivilegedCommandExecutor:
         self.on_output = on_output
 
     def execute(self, step: PrivilegedStep) -> ExecutionEvidence:
+        return self._execute(step, step.command, shell=True)
+
+    def execute_readonly(
+        self,
+        step: PrivilegedStep,
+        argv: list[str],
+    ) -> ExecutionEvidence:
+        """Execute prevalidated arguments without shell interpretation."""
+
+        return self._execute(step, list(argv), shell=False)
+
+    def _execute(
+        self,
+        step: PrivilegedStep,
+        command,
+        *,
+        shell: bool,
+    ) -> ExecutionEvidence:
         started_at = utc_now()
         if self.on_start:
             self.on_start(step.command)
         try:
             process = subprocess.Popen(
-                step.command,
-                shell=True,
+                command,
+                shell=shell,
                 cwd=step.cwd or None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

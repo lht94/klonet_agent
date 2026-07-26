@@ -7,13 +7,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from klonet_agent.ops.privileged.checkers import ensure_postconditions
 from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
 
 
 COMMAND_PATTERN = re.compile(
-    r"^(?:confirm-priv|confirm-priv-step|resume-priv|abort-priv|list-priv|show-priv)"
-    r"(?:\s+.*)?$"
+    r"^(?:list-priv|"
+    r"(?:show-priv|confirm-priv|resume-priv|abort-priv)\s+\S+|"
+    r"confirm-priv-step\s+\S+\s+\S+)$"
 )
 
 
@@ -55,7 +58,11 @@ class PrivilegedOpsWorkflow:
         plan = self.planner.plan(goal, environment_context=environment_context)
         self._event("privileged_plan_created", plan)
         if plan.risk == "readonly":
-            return self._execute_plan(plan, persist=False)
+            return self._execute_plan(
+                plan,
+                persist=False,
+                deterministic_verification=True,
+            )
         self.store.save(plan)
         if plan.is_authorized:
             self._event("privileged_plan_approved", plan)
@@ -65,6 +72,44 @@ class PrivilegedOpsWorkflow:
             render_plan(plan)
             + "\nConfirm once with: confirm-priv %s" % plan.plan_id,
             plan,
+        )
+
+    def submit_readonly(self, goal: str, command: str) -> WorkflowResult:
+        argv, reason = PrivilegedRiskPolicy().readonly_argv(command)
+        if argv is None:
+            return WorkflowResult(
+                "clarification",
+                "Read-only execution refused: command is not deterministically "
+                "read-only (%s). Nothing was executed." % reason,
+            )
+        execute_readonly = getattr(self.executor, "execute_readonly", None)
+        if execute_readonly is None:
+            return WorkflowResult(
+                "blocked",
+                "Read-only execution boundary is unavailable. Nothing was executed.",
+            )
+        postconditions, level = ensure_postconditions(command, [])
+        step = PrivilegedStep(
+            step_id="readonly-action",
+            title="read-only inspection",
+            command=command,
+            risk="readonly",
+            status="approved",
+            postconditions=postconditions,
+        )
+        plan = PrivilegedPlan(
+            plan_id="ephemeral-readonly",
+            goal=goal,
+            risk="readonly",
+            status="approved",
+            steps=[step],
+            verification_level=level,
+        )
+        return self._execute_plan(
+            plan,
+            persist=False,
+            deterministic_verification=True,
+            readonly_argv=argv,
         )
 
     def handle_command(self, text: str) -> WorkflowResult:
@@ -228,6 +273,8 @@ class PrivilegedOpsWorkflow:
         plan: PrivilegedPlan,
         *,
         persist: bool = True,
+        deterministic_verification: bool = False,
+        readonly_argv: list[str] | None = None,
     ) -> WorkflowResult:
         if plan.risk != "readonly" and not plan.is_authorized:
             plan.status = "blocked"
@@ -274,13 +321,40 @@ class PrivilegedOpsWorkflow:
                 )
                 return WorkflowResult("blocked", render_plan(plan), plan)
 
+            step_readonly_argv = readonly_argv
+            if plan.risk == "readonly" and step_readonly_argv is None:
+                step_readonly_argv, reason = PrivilegedRiskPolicy().readonly_argv(
+                    step.command
+                )
+                if step_readonly_argv is None:
+                    step.status = "blocked"
+                    step.observation = (
+                        "read-only validation failed before execution: %s" % reason
+                    )
+                    plan.status = "blocked"
+                    return WorkflowResult("blocked", render_plan(plan), plan)
+            if (
+                step_readonly_argv is not None
+                and not hasattr(self.executor, "execute_readonly")
+            ):
+                step.status = "blocked"
+                step.observation = "read-only execution boundary unavailable"
+                plan.status = "blocked"
+                return WorkflowResult("blocked", render_plan(plan), plan)
+
             plan.status = "executing"
             step.status = "running"
             if persist:
                 self.store.save(plan)
             self._event("privileged_step_started", plan, {"step_id": step.step_id})
 
-            step.evidence = self.executor.execute(step)
+            if step_readonly_argv is not None:
+                step.evidence = self.executor.execute_readonly(
+                    step,
+                    step_readonly_argv,
+                )
+            else:
+                step.evidence = self.executor.execute(step)
             step.status = "executed" if not step.evidence.timed_out else "execution_unknown"
             if persist:
                 self.store.save(plan)
@@ -299,7 +373,15 @@ class PrivilegedOpsWorkflow:
                 step.status = "verifying"
             if persist:
                 self.store.save(plan)
-            decision = self.verifier.verify_step(plan, step)
+            if deterministic_verification:
+                verify = getattr(
+                    self.verifier,
+                    "verify_deterministic_step",
+                    self.verifier.verify_step,
+                )
+                decision = verify(plan, step)
+            else:
+                decision = self.verifier.verify_step(plan, step)
             plan.verification = decision
             self._event(
                 "privileged_verification",

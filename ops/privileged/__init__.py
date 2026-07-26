@@ -7,6 +7,15 @@ from klonet_agent.ops.privileged.contracts import (
     PrivilegedStep,
     VerificationDecision,
 )
+from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
+from klonet_agent.ops.privileged.intent import (
+    PrivilegedIntentClassifier,
+    PrivilegedIntentDecision,
+)
+from klonet_agent.ops.privileged.supervisor import (
+    PrivilegedOpsSupervisor,
+    SupervisorResult,
+)
 
 __all__ = [
     "CheckResult",
@@ -14,4 +23,9 @@ __all__ = [
     "PrivilegedPlan",
     "PrivilegedStep",
     "VerificationDecision",
+    "GoalSafetyGuard",
+    "PrivilegedIntentClassifier",
+    "PrivilegedIntentDecision",
+    "PrivilegedOpsSupervisor",
+    "SupervisorResult",
 ]

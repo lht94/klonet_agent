@@ -47,8 +47,10 @@ from klonet_agent.memory import MemoryStore
 from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
 from klonet_agent.ops.routing import OpsRoute, route_ops_request
@@ -76,6 +78,7 @@ class AgentOrchestrator:
         intent_analyzer: IntentAnalyzer | None = None,
         journal_maintainer: ProjectJournalMaintainer | None = None,
         privileged_workflow: PrivilegedOpsWorkflow | None = None,
+        privileged_supervisor: PrivilegedOpsSupervisor | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
@@ -130,6 +133,12 @@ class AgentOrchestrator:
                     project_id=self.session.project_id,
                 ),
                 event_sink=self._record_privileged_event,
+            )
+        self.privileged_supervisor = privileged_supervisor
+        if self.profile.name == "ops-privilege" and self.privileged_supervisor is None:
+            self.privileged_supervisor = PrivilegedOpsSupervisor(
+                workflow=self.privileged_workflow,
+                classifier=PrivilegedIntentClassifier(self.llm),
             )
 
     def init_history(self) -> list[dict]:
@@ -459,8 +468,9 @@ class AgentOrchestrator:
         if hasattr(self.tool_executor, "set_user_authorization_context"):
             self.tool_executor.set_user_authorization_context(user_input)
 
-        privileged_reply = self._handle_privileged_request(user_input)
-        if privileged_reply is not None:
+        privileged_result = self._supervise_privileged_turn(user_input)
+        if privileged_result is not None and privileged_result.handled:
+            privileged_reply = privileged_result.message
             assistant_msg = {"role": "assistant", "content": privileged_reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
@@ -863,40 +873,14 @@ class AgentOrchestrator:
 
         return reply, history, token
 
-    def _handle_privileged_request(self, user_input: str) -> str | None:
-        """在通用模型工具循环之前接管高权限控制命令和修改型目标。"""
+    def _supervise_privileged_turn(self, user_input: str):
+        """Send every Ops-Privilege turn through the Supervisor control plane."""
 
-        workflow = self.privileged_workflow
-        if self.profile.name != "ops-privilege" or workflow is None:
+        if self.profile.name != "ops-privilege":
             return None
-        normalized = " ".join((user_input or "").split())
-        if workflow.is_control_command(normalized):
-            return workflow.handle_command(normalized).message
-        if not self._is_privileged_execution_request(normalized):
-            return None
-        return workflow.submit(normalized, environment_context="").message
-
-    @staticmethod
-    def _is_privileged_execution_request(user_input: str) -> bool:
-        """区分“执行一个修改”与“解释/查看”，避免把普通问答误送去执行。"""
-
-        text = (user_input or "").strip().lower()
-        if not text:
-            return False
-        mutation = re.search(
-            r"(重启|启动|停止|安装|卸载|删除|清理|修改|写入|覆盖|移动|部署|"
-            r"修复|升级|降级|reload|restart|start|stop|install|uninstall|"
-            r"remove|delete|modify|deploy|upgrade|execute|run\s+)",
-            text,
-        )
-        if mutation is None:
-            return False
-        question_only = re.search(
-            r"(怎么|如何|为什么|是什么|解释|介绍|教程|how\s+to|what\s+is|why\s+)",
-            text,
-        )
-        explicit_action = re.search(r"(请|帮我|立即|现在|执行|直接|please|go ahead)", text)
-        return question_only is None or explicit_action is not None
+        if self.privileged_supervisor is None:
+            raise RuntimeError("Ops-Privilege Supervisor is unavailable")
+        return self.privileged_supervisor.handle(user_input, environment_context="")
 
     def _record_privileged_event(self, event: str, payload: dict) -> None:
         self.trace_logger.record_privileged_event(

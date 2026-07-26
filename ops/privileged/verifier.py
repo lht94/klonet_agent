@@ -53,6 +53,23 @@ class PrivilegedVerifierAgent:
             reason="all deterministic checks passed",
         )
 
+    def verify_deterministic_step(
+        self,
+        plan: PrivilegedPlan,
+        step: PrivilegedStep,
+    ) -> VerificationDecision:
+        """Verify a read-only action from execution evidence and Checkers only."""
+
+        deterministic = self._deterministic_gate(step)
+        if deterministic is not None:
+            return deterministic
+        return VerificationDecision(
+            status="passed",
+            goal_achieved=True,
+            verification_level=plan.verification_level,
+            reason="all deterministic checks passed",
+        )
+
     def verify_recovered_step(
         self,
         plan: PrivilegedPlan,

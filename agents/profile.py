@@ -144,8 +144,8 @@ def get_profile(name: str) -> AgentProfile:
             mode_prompt=OPS_PRIVILEGE_PROMPT,
             allowed_tools=OPS_PRIVILEGE_TOOLS,
             default_workflow=(
-                "route -> inspect read-only evidence -> adaptive plan -> risk gate -> "
-                "deterministic execute -> evidence verify -> persist/recover"
+                "supervisor -> exact plan control -> goal safety -> model intent -> "
+                "answer | readonly execute/check | mutation PEV | clarify"
             ),
             requires_rag=True,
             requires_review=True,

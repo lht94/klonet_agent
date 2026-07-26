@@ -38,26 +38,15 @@ def test_tool_executor_cannot_be_used_as_raw_privileged_shell_escape():
     assert "not registered" in result
 
 
-class StubPrivilegedWorkflow:
+class StubPrivilegedSupervisor:
     def __init__(self):
-        self.submitted = []
-        self.commands = []
+        self.calls = []
 
-    @staticmethod
-    def is_control_command(text):
-        return text.startswith(("confirm-priv", "list-priv", "show-priv", "resume-priv", "abort-priv"))
+    def handle(self, text, environment_context=""):
+        from klonet_agent.ops.privileged.supervisor import SupervisorResult
 
-    def submit(self, goal, environment_context=""):
-        from klonet_agent.ops.privileged.workflow import WorkflowResult
-
-        self.submitted.append((goal, environment_context))
-        return WorkflowResult("completed", "privileged workflow completed")
-
-    def handle_command(self, text):
-        from klonet_agent.ops.privileged.workflow import WorkflowResult
-
-        self.commands.append(text)
-        return WorkflowResult("show", "privileged command handled")
+        self.calls.append((text, environment_context))
+        return SupervisorResult(True, "completed", "privileged supervisor completed")
 
 
 class NoCallLLM:
@@ -65,13 +54,43 @@ class NoCallLLM:
         raise AssertionError("main LLM loop must not receive privileged execution requests")
 
 
-def test_orchestrator_routes_mutating_privilege_request_before_main_tool_loop():
+class DelegatingSupervisor:
+    def __init__(self):
+        self.calls = []
+
+    def handle(self, text, environment_context=""):
+        from klonet_agent.ops.privileged.supervisor import SupervisorResult
+
+        self.calls.append((text, environment_context))
+        return SupervisorResult(False, "conversation")
+
+
+class AnswerLLM:
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, messages, tools=None, **kwargs):
+        self.calls.append({"messages": messages, "tools": tools, "kwargs": kwargs})
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="ordinary ops answer",
+                        tool_calls=None,
+                    )
+                )
+            ],
+            usage=SimpleNamespace(total_tokens=7),
+        )
+
+
+def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first():
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
     from klonet_agent.orchestrator import AgentOrchestrator
     from klonet_agent.session import AgentSession
 
-    workflow = StubPrivilegedWorkflow()
+    supervisor = StubPrivilegedSupervisor()
     with local_temp_dir() as temp_dir:
         session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
         memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
@@ -80,7 +99,7 @@ def test_orchestrator_routes_mutating_privilege_request_before_main_tool_loop():
             session=session,
             llm=NoCallLLM(),
             memory_store=memory,
-            privileged_workflow=workflow,
+            privileged_supervisor=supervisor,
         )
         reply, history, token = orchestrator.single_chat(
             "请重启 nginx 服务",
@@ -88,19 +107,19 @@ def test_orchestrator_routes_mutating_privilege_request_before_main_tool_loop():
             0,
         )
 
-    assert reply == "privileged workflow completed"
-    assert workflow.submitted == [("请重启 nginx 服务", "")]
+    assert reply == "privileged supervisor completed"
+    assert supervisor.calls == [("请重启 nginx 服务", "")]
     assert history[-1] == {"role": "assistant", "content": reply}
     assert token == 0
 
 
-def test_orchestrator_routes_exact_privileged_control_command_before_llm():
+def test_orchestrator_returns_handled_supervisor_result_before_main_llm():
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
     from klonet_agent.orchestrator import AgentOrchestrator
     from klonet_agent.session import AgentSession
 
-    workflow = StubPrivilegedWorkflow()
+    supervisor = StubPrivilegedSupervisor()
     with local_temp_dir() as temp_dir:
         session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
         memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
@@ -109,12 +128,42 @@ def test_orchestrator_routes_exact_privileged_control_command_before_llm():
             session=session,
             llm=NoCallLLM(),
             memory_store=memory,
-            privileged_workflow=workflow,
+            privileged_supervisor=supervisor,
         )
         reply, _, _ = orchestrator.single_chat("show-priv priv-123", [], 0)
 
-    assert reply == "privileged command handled"
-    assert workflow.commands == ["show-priv priv-123"]
+    assert reply == "privileged supervisor completed"
+    assert supervisor.calls == [("show-priv priv-123", "")]
+
+
+def test_orchestrator_continues_to_answerer_when_supervisor_delegates_conversation():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+
+    supervisor = DelegatingSupervisor()
+    llm = AnswerLLM()
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
+        memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops-privilege"),
+            session=session,
+            llm=llm,
+            memory_store=memory,
+            privileged_supervisor=supervisor,
+        )
+        reply, history, _ = orchestrator.single_chat(
+            "什么是 tc qdisc？",
+            [],
+            0,
+        )
+
+    assert supervisor.calls == [("什么是 tc qdisc？", "")]
+    assert reply == "ordinary ops answer"
+    assert history[-1] == {"role": "assistant", "content": reply}
+    assert llm.calls
 
 
 def test_trace_logger_records_privileged_lifecycle_event(tmp_path):

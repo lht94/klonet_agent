@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 
 def _step(step_id="step-1", command="echo ok", risk="low", approval_scope="plan"):
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
@@ -60,6 +62,10 @@ class StubExecutor:
             finished_at="finish",
             environment_changed=True,
         )
+
+    def execute_readonly(self, step, argv):
+        assert argv
+        return self.execute(step)
 
 
 class StubVerifier:
@@ -263,6 +269,102 @@ def test_readonly_plan_is_not_persisted_or_confirmed(tmp_path):
     assert executor.calls == ["step-1"]
 
 
+def test_planner_readonly_plan_cannot_bypass_argv_validation(tmp_path):
+    plan = _plan(
+        risk="readonly",
+        steps=[
+            _step(
+                command="ls\ntouch /tmp/ops-priv-bypass",
+                risk="readonly",
+            )
+        ],
+    )
+    executor = StubExecutor()
+    workflow = _workflow(tmp_path, plan, executor=executor)
+
+    result = workflow.submit("inspect safely")
+
+    assert result.kind == "blocked"
+    assert "read-only validation failed" in result.plan.steps[0].observation
+    assert executor.calls == []
+
+
+def test_submit_readonly_executes_ephemeral_command_with_deterministic_checker(tmp_path):
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    plan = _plan()
+    executor = StubExecutor()
+    workflow = _workflow(
+        tmp_path,
+        plan,
+        executor=executor,
+        verifier=PrivilegedVerifierAgent(None),
+    )
+
+    result = workflow.submit_readonly("show Python version", "python3 -V")
+
+    assert result.kind == "completed"
+    assert result.plan.status == "completed"
+    assert result.plan.risk == "readonly"
+    assert result.plan.steps[0].checks[0].status == "passed"
+    assert executor.calls == ["readonly-action"]
+    assert workflow.store.list() == []
+
+
+def test_submit_readonly_refuses_command_outside_readonly_policy(tmp_path):
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    plan = _plan()
+    executor = StubExecutor()
+    workflow = _workflow(
+        tmp_path,
+        plan,
+        executor=executor,
+        verifier=PrivilegedVerifierAgent(None),
+    )
+
+    result = workflow.submit_readonly(
+        "write a file",
+        "echo ready > /tmp/should-not-exist",
+    )
+
+    assert result.kind == "clarification"
+    assert "not deterministically read-only" in result.message
+    assert executor.calls == []
+    assert workflow.store.list() == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls $(touch /tmp/ops-priv-bypass)",
+        "cat `touch /tmp/ops-priv-bypass` /etc/hosts",
+        "find /tmp/scope -delete",
+        "find /tmp/scope -exec touch /tmp/ops-priv-bypass {} +",
+        "find /tmp/scope -fprint /tmp/ops-priv-bypass",
+        "ls\ntouch /tmp/ops-priv-bypass",
+        "find /tmp/scope -de''lete",
+        "find /tmp/scope -ex''ec touch /tmp/ops-priv-bypass {} +",
+        r"find /tmp/scope -de\lete",
+    ],
+)
+def test_submit_readonly_refuses_shell_and_find_side_effects(tmp_path, command):
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    executor = StubExecutor()
+    workflow = _workflow(
+        tmp_path,
+        _plan(),
+        executor=executor,
+        verifier=PrivilegedVerifierAgent(None),
+    )
+
+    result = workflow.submit_readonly("inspect safely", command)
+
+    assert result.kind == "clarification"
+    assert executor.calls == []
+
+
 def test_abort_list_show_commands_are_deterministic(tmp_path):
     plan = _plan(status="awaiting_confirmation")
     workflow = _workflow(tmp_path, plan)
@@ -275,6 +377,42 @@ def test_abort_list_show_commands_are_deterministic(tmp_path):
     assert "priv-test" in listing.message
     assert "echo ok" in showing.message
     assert aborted.plan.status == "aborted"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "list-priv",
+        "show-priv priv-123",
+        "confirm-priv priv-123",
+        "confirm-priv-step priv-123 step-1",
+        "resume-priv priv-123",
+        "abort-priv priv-123",
+    ],
+)
+def test_plan_control_recognizes_only_exact_command_grammar(command):
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    assert PrivilegedOpsWorkflow.is_control_command(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "list-priv extra",
+        "show-priv",
+        "show-priv priv-123 extra",
+        "confirm-priv",
+        "confirm-priv priv-123 extra",
+        "confirm-priv-step priv-123",
+        "resume-priv priv-123 extra",
+        "please confirm-priv priv-123",
+    ],
+)
+def test_plan_control_rejects_malformed_or_natural_language_commands(command):
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    assert PrivilegedOpsWorkflow.is_control_command(command) is False
 
 
 def test_workflow_emits_lifecycle_audit_events(tmp_path):
