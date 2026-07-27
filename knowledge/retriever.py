@@ -11,9 +11,11 @@ from typing import Any
 from rank_bm25 import BM25Okapi
 
 from klonet_agent.config import (
+    AUTO_BUILD_KNOWLEDGE_VECTORS,
     DEFAULT_RAG_TOP_K,
     KNOWLEDGE_INDEX_FILE,
     KNOWLEDGE_VECTOR_INDEX_FILE,
+    KNOWLEDGE_VECTOR_BUILD_BATCH_SIZE,
     PROJECT_ROOT,
 )
 from klonet_agent.llm.embeddings import build_default_embedding_provider
@@ -36,22 +38,26 @@ _TASK_LAYER_WEIGHTS = {
         "curated": 1.5,
         "experience": 1.1,
         "machine_index": 0.8,
+        "source_code": 0.7,
         "local": 1.0,
     },
     "troubleshooting": {
         "experience": 1.8,
         "curated": 1.1,
         "machine_index": 1.0,
+        "source_code": 1.2,
         "local": 0.9,
     },
     "code_lookup": {
         "machine_index": 2.0,
+        "source_code": 2.0,
         "curated": 1.0,
         "experience": 0.8,
         "local": 0.8,
     },
     "development": {
         "machine_index": 1.4,
+        "source_code": 1.6,
         "curated": 1.3,
         "experience": 1.0,
         "local": 0.9,
@@ -99,11 +105,17 @@ class KnowledgeRetriever:
         tokenizer: MixedTokenizer | None = None,
         vector_index_file: Path | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        auto_build_vectors: bool | None = None,
     ):
         self.index_file = index_file
         self.tokenizer = tokenizer or DEFAULT_TOKENIZER
         self.vector_index_file = vector_index_file or KNOWLEDGE_VECTOR_INDEX_FILE
         self.embedding_provider = embedding_provider
+        self.auto_build_vectors = (
+            AUTO_BUILD_KNOWLEDGE_VECTORS
+            if auto_build_vectors is None
+            else auto_build_vectors
+        )
         self._default_embedding_provider_loaded = embedding_provider is not None
         self._mtime_ns: int | None = None
         self._rows: list[dict[str, Any]] = []
@@ -111,6 +123,10 @@ class KnowledgeRetriever:
         self._bm25: BM25Okapi | None = None
         self._vector_mtime_ns: int | None = None
         self._vectors: dict[str, tuple[float, ...]] = {}
+        self._building_vectors = False
+        self._vector_build_attempt: tuple[int | None, int | None] | None = None
+        self.vector_status = "not_loaded"
+        self.vector_status_detail = ""
 
     def search(
         self,
@@ -146,7 +162,9 @@ class KnowledgeRetriever:
             or not self._rows
             or self._bm25 is None
         ):
-            return SearchOutcome(status="none", reason="empty_query_or_index")
+            return self._add_vector_status(
+                SearchOutcome(status="none", reason="empty_query_or_index")
+            )
 
         task_type = "concept" if request.task_type == "auto" else request.task_type
         bm25_scores = self._bm25.get_scores(query_tokens)
@@ -221,12 +239,18 @@ class KnowledgeRetriever:
 
         candidates.sort(key=lambda item: item.score, reverse=True)
         selected = _select_candidates(candidates, request)
-        return _classify_outcome(selected)
+        return self._add_vector_status(_classify_outcome(selected))
+
+    def _add_vector_status(self, outcome: SearchOutcome) -> SearchOutcome:
+        outcome.retrieval_mode = "hybrid" if self._vectors else "bm25"
+        outcome.vector_status = self.vector_status
+        outcome.vector_status_detail = self.vector_status_detail
+        return outcome
 
     def _ensure_loaded(self):
         """索引文件变化时重建内存 BM25，未变化时复用缓存。"""
 
-        if not self.index_file.exists():
+        if not self.index_file.exists() or self.index_file.stat().st_size == 0:
             KnowledgeIndexer(index_file=self.index_file).build()
         if not self.index_file.exists():
             return
@@ -239,6 +263,8 @@ class KnowledgeRetriever:
 
         mtime_ns = self.index_file.stat().st_mtime_ns
         if self._mtime_ns == mtime_ns:
+            self._load_vectors()
+            self._ensure_vector_index()
             return
 
         rows = _read_index_rows(self.index_file)
@@ -262,6 +288,7 @@ class KnowledgeRetriever:
         self._bm25 = BM25Okapi(corpus) if corpus else None
         self._mtime_ns = mtime_ns
         self._load_vectors()
+        self._ensure_vector_index()
 
     def _ensure_allowed_paths_indexed(self, request: SearchRequest):
         """Rebuild the default index if a routed collection references new curated docs."""
@@ -293,27 +320,36 @@ class KnowledgeRetriever:
     ) -> int:
         """Build the semantic vector sidecar for the loaded knowledge rows."""
 
-        self._ensure_loaded()
-        embedding_provider = self._embedding_provider()
-        if embedding_provider is None:
-            return 0
-        count = KnowledgeVectorIndex(
-            vector_file=self.vector_index_file,
-            embedding_provider=embedding_provider,
-        ).build(
-            self._rows,
-            append=append,
-            limit=limit,
-            include_paths=include_paths,
-        )
-        self._vector_mtime_ns = None
-        self._load_vectors()
-        return count
+        self._building_vectors = True
+        try:
+            self._ensure_loaded()
+            embedding_provider = self._embedding_provider()
+            if embedding_provider is None:
+                self.vector_status = "disabled"
+                self.vector_status_detail = "missing_embedding_credentials"
+                return 0
+            count = KnowledgeVectorIndex(
+                vector_file=self.vector_index_file,
+                embedding_provider=embedding_provider,
+            ).build(
+                self._rows,
+                append=append,
+                limit=limit,
+                include_paths=include_paths,
+                batch_size=KNOWLEDGE_VECTOR_BUILD_BATCH_SIZE,
+            )
+            self._vector_mtime_ns = None
+            self._load_vectors()
+            return count
+        finally:
+            self._building_vectors = False
 
     def _load_vectors(self):
         if not self.vector_index_file.exists():
             self._vectors = {}
             self._vector_mtime_ns = None
+            self.vector_status = "missing"
+            self.vector_status_detail = "vector_index_not_found"
             return
         mtime_ns = self.vector_index_file.stat().st_mtime_ns
         if self._vector_mtime_ns == mtime_ns:
@@ -322,6 +358,56 @@ class KnowledgeRetriever:
             vector_file=self.vector_index_file,
         ).load()
         self._vector_mtime_ns = mtime_ns
+        self.vector_status = "ready" if self._vectors else "empty"
+        self.vector_status_detail = f"loaded_vectors={len(self._vectors)}"
+
+    def _ensure_vector_index(self):
+        """Automatically build missing or stale vectors when credentials exist."""
+
+        if self._building_vectors or not self.auto_build_vectors or not self._rows:
+            return
+        embedding_provider = self._embedding_provider()
+        if embedding_provider is None:
+            self.vector_status = "disabled"
+            self.vector_status_detail = "missing_embedding_credentials"
+            return
+
+        vector_index = KnowledgeVectorIndex(
+            vector_file=self.vector_index_file,
+            embedding_provider=embedding_provider,
+        )
+        missing_count = vector_index.missing_count(self._rows)
+        if missing_count == 0:
+            self.vector_status = "ready"
+            self.vector_status_detail = f"loaded_vectors={len(self._vectors)}"
+            return
+
+        attempt = (self._mtime_ns, self._vector_mtime_ns)
+        if self._vector_build_attempt == attempt:
+            return
+        self._vector_build_attempt = attempt
+        self.vector_status = "building"
+        self.vector_status_detail = f"missing_vectors={missing_count}"
+        try:
+            built = vector_index.build(
+                self._rows,
+                append=True,
+                batch_size=KNOWLEDGE_VECTOR_BUILD_BATCH_SIZE,
+            )
+        except Exception as exc:
+            self.vector_status = "error"
+            self.vector_status_detail = (
+                f"auto_build_failed:{type(exc).__name__}"
+            )
+            return
+
+        self._vector_mtime_ns = None
+        self._load_vectors()
+        remaining = vector_index.missing_count(self._rows)
+        self.vector_status = "ready" if remaining == 0 else "partial"
+        self.vector_status_detail = (
+            f"built_vectors={built};remaining_vectors={remaining}"
+        )
 
     def _embed_query(self, query: str) -> tuple[float, ...] | None:
         if not self._vectors:

@@ -86,3 +86,6 @@ class SearchOutcome:
     results: list[RetrievedChunk] = field(default_factory=list)
     confidence: float = 0.0
     reason: str = ""
+    retrieval_mode: str = "bm25"
+    vector_status: str = "not_loaded"
+    vector_status_detail: str = ""

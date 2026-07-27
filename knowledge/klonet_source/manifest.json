@@ -1,0 +1,8 @@
+{
+  "file_count": 367,
+  "redacted_file_count": 12,
+  "snapshot_schema_version": 1,
+  "source_kind": "sanitized_retrieval_snapshot",
+  "upstream_commit": "af418698c3f26fa1e8e2ac469526bede30af5cbc",
+  "upstream_remote": "gitee:uestc-minenet/vemu_uestc.git"
+}

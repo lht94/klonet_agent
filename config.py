@@ -11,10 +11,26 @@ import os
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT
 
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    # Do not depend on the caller's current working directory.  The CLI and
+    # systemd service start from different directories in production.
+    load_dotenv(PACKAGE_ROOT / ".env")
+
 DEFAULT_MODEL = "deepseek-v4-pro"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-v4"
-DEFAULT_EMBEDDING_BASE_URL = "https://ws-o108vxrjw8kdvbrm.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+DEFAULT_EMBEDDING_MODEL = os.getenv(
+    "DEFAULT_EMBEDDING_MODEL",
+    "text-embedding-v4",
+)
+DEFAULT_EMBEDDING_BASE_URL = os.getenv(
+    "DEFAULT_EMBEDDING_BASE_URL",
+    "https://ws-o108vxrjw8kdvbrm.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+)
 DEFAULT_REASONING_EFFORT = "medium"
 MAX_TOKEN = 500000
 HISTORY_MAX_MESSAGES = 20
@@ -35,8 +51,29 @@ JOURNAL_DIR = PROJECT_ROOT / "journals"
 WORKSPACE_DIR = PROJECT_ROOT / "workspaces"
 KNOWLEDGE_INDEX_FILE = PROJECT_ROOT / "knowledge" / "index.jsonl"
 KNOWLEDGE_VECTOR_INDEX_FILE = PROJECT_ROOT / "knowledge" / "vectors.jsonl"
+CODE_INDEX_FILE = PROJECT_ROOT / "knowledge" / "code_index.jsonl"
+CODE_VECTOR_INDEX_FILE = PROJECT_ROOT / "knowledge" / "code_vectors.jsonl"
+AUTO_BUILD_KNOWLEDGE_VECTORS = os.getenv(
+    "KLONET_AGENT_AUTO_BUILD_VECTORS",
+    "1",
+).strip().lower() in {"1", "true", "yes", "on"}
+KNOWLEDGE_VECTOR_BUILD_BATCH_SIZE = max(
+    1,
+    int(os.getenv("KLONET_AGENT_VECTOR_BATCH_SIZE", "10")),
+)
 TRACE_FILE = PROJECT_ROOT / "tracing" / "trace.jsonl"
-KLONET_SOURCE_ROOT = PROJECT_ROOT / "klonet_knowledge" / "02_vemu_uestc_code"
+KLONET_UPSTREAM_SOURCE_ROOT = Path(
+    os.getenv(
+        "KLONET_UPSTREAM_SOURCE_ROOT",
+        str(PROJECT_ROOT.parent / "vemu_uestc"),
+    )
+).expanduser()
+KLONET_SOURCE_ROOT = Path(
+    os.getenv(
+        "KLONET_SOURCE_ROOT",
+        str(PROJECT_ROOT / "knowledge" / "klonet_source"),
+    )
+).expanduser()
 
 DEFAULT_USER_ID = "default"
 DEFAULT_PROJECT_ID = "default"

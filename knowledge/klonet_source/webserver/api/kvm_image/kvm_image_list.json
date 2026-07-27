@@ -1,0 +1,120 @@
+{
+    "routers": [
+        {
+            "image_name": "ne40e.qcow2",
+            "type": "router",
+            "subtype": "ne40e",
+            "service": "kvm",
+            "gateway": "",
+            "interfaces":[],
+            "intname":{},
+            "nic":[],
+            "portname": [
+              "nic_1",
+              "nic_2",
+              "nic_3",
+              "nic_4",
+              "nic_5",
+              "nic_6",
+              "nic_7",
+              "nic_8"
+            ],
+            "resource_limit": {
+              "cpu": "4",
+              "mem": "4096"
+            },
+            "config": {
+              "rip": {
+                  "networks": [],
+                  "neighbors": [],
+                  "version": 2,
+                  "enable": 0
+              },
+              "ospf": {
+                  "router_id": "",
+                  "networks": [],
+                  "areas": {},
+                  "enable": 0
+              },
+              "bgp": {
+                  "asn": "",
+                  "router_id": "",
+                  "networks": [],
+                  "neighbors": [],
+                  "enable": 0
+              }
+            },
+            "linestyle":"solid",
+            "vm_config": {
+              "kvm_image": {
+                  "image_path": "default_image",
+                  "qcow2_size": -1
+              },
+              "image_name": "ne40e.qcow2",
+              "type": "router",
+              "port_num": 8,
+              "kvm_config": {}
+            }
+        }
+    ],
+    "hosts": [
+        {
+            "image_name": "centos7.qcow2",
+            "type": "host",
+            "interfaces":[],
+            "intname":{},
+            "nic":[],
+            "service": "kvm",
+            "portname": [
+              "nic_1"
+            ],
+            "subtype": "centos7",
+            "resource_limit": {
+              "cpu": "1",
+              "mem": "1024"
+            },
+            "gateway": "",
+            "vm_config": {
+              "kvm_image": {
+                  "image_path": "default_image",
+                  "qcow2_size": -1
+              },
+              "image_name": "centos7.qcow2",
+              "type": "host",
+              "port_num": 1,
+              "kvm_config": {}
+            },
+            "linestyle":"solid",
+            "config":{}
+        },
+        {
+          "image_name": "ubuntu20.qcow2",
+          "type": "host",
+          "interfaces": [],
+          "intname": {},
+          "nic": [],
+          "service": "kvm",
+          "portname": [
+            "nic_1"
+          ],
+          "subtype": "ubuntu20",
+          "resource_limit": {
+            "cpu": "2",
+            "mem": "2048"
+          },
+          "gateway": "",
+          "vm_config": {
+            "kvm_image": {
+              "image_path": "default_image",
+              "qcow2_size": -1
+            },
+            "image_name": "ubuntu20.qcow2",
+            "type": "host",
+            "port_num": 1,
+            "kvm_config": {}
+          },
+          "linestyle": "solid",
+          "config": {}
+        }
+    ]
+}

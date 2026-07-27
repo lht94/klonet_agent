@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>test user management</title>
+</head>
+<body>
+<form name="myform">
+  <label>用户名：</label>
+  <input type="text" name="fname"/>
+  <br>
+  <label>密码：</label>
+  <input type="text" name="address"/>
+  <br>
+  <button type="button" onclick="login()">登录</button>
+  <button type="button" onclick="logout()">登出</button>
+  <button type="button" onclick="jump()">跳转</button>
+</form>
+<script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+
+<script>
+  function login() {
+    axios({
+      method: 'post',
+      url: 'http://127.0.0.1:5100/master/user_login/',
+      data: {
+        name: myform.fname.value,
+        password: myform.address.value
+      },
+      withCredentials: true,
+    }).then(function (response) {
+      console.log(response.data);
+    }).catch(function (error) {
+      console.log(error);
+    });
+  }
+  function logout() {
+    axios({
+      method: 'delete',
+      url: 'http://127.0.0.1:5100/master/user_logout/',
+      withCredentials: true,
+    }).then(function (response) {
+      console.log(response.data);
+    }).catch(function (error) {
+      console.log(error);
+    });
+  }
+  function jump() {
+    window.location.href = "test_socketio.html";
+  }
+</script>
+
+</body>
+</html>

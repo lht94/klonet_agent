@@ -39,3 +39,38 @@ def test_embedding_client_returns_vector_from_openai_compatible_response():
             "input": "用户问自己的笔记本要装什么工具",
         }
     ]
+
+
+def test_embedding_client_batches_multiple_texts_in_one_request():
+    from klonet_agent.llm.embeddings import EmbeddingClient
+
+    class FakeEmbeddings:
+        def __init__(self):
+            self.requests = []
+
+        def create(self, **request):
+            self.requests.append(request)
+            return SimpleNamespace(
+                data=[
+                    SimpleNamespace(index=0, embedding=[1.0, 0.0]),
+                    SimpleNamespace(index=1, embedding=[0.0, 1.0]),
+                ]
+            )
+
+    fake_embeddings = FakeEmbeddings()
+    client = EmbeddingClient(
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        model="test-embedding",
+        client=SimpleNamespace(embeddings=fake_embeddings),
+    )
+
+    vectors = client.embed_texts(("first", "second"))
+
+    assert vectors == ((1.0, 0.0), (0.0, 1.0))
+    assert fake_embeddings.requests == [
+        {
+            "model": "test-embedding",
+            "input": ["first", "second"],
+        }
+    ]

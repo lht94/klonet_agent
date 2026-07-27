@@ -1,8 +1,8 @@
-"""Klonet 源码只读检索工具。
+"""Klonet 源码快照只读检索工具。
 
-这些工具和 workspace 文件工具不同：它们固定面向规范源码树
-``klonet_knowledge/02_vemu_uestc_code``，供 Mentor 在源码解释、接口定位、
-配置说明和故障排查时读取真实源码证据。
+这些工具和 workspace 文件工具不同：它们固定面向配置指定的 Klonet 脱敏源码快照，
+供 Mentor 在源码解释、接口定位、
+配置说明和故障排查时读取指定上游 commit 的源码证据。
 """
 
 from __future__ import annotations
@@ -59,15 +59,82 @@ def search_code(
         max_results=max_results,
         case_sensitive=case_sensitive,
     )
-    if rg_result is not None:
+    if rg_result is not None and rg_result != "未在源码中找到匹配内容。":
         return rg_result
-    return _search_with_python(
+    python_result = _search_with_python(
         normalized_query,
         base=base,
         file_glob=file_glob,
         max_results=max_results,
         case_sensitive=case_sensitive,
     )
+    if python_result != "未在源码中找到匹配内容。":
+        return python_result
+    semantic_result = semantic_search_code(
+        normalized_query,
+        path=path,
+        top_k=min(8, max_results),
+    )
+    return semantic_result or python_result
+
+
+def semantic_search_code(
+    query: str,
+    *,
+    path: str = "",
+    top_k: int = 5,
+) -> str:
+    """Use the separate source-code vector index for conceptual code queries."""
+
+    from klonet_agent.config import CODE_INDEX_FILE, CODE_VECTOR_INDEX_FILE
+    from klonet_agent.knowledge.code_indexer import CodeIndexer
+    from klonet_agent.knowledge.models import SearchRequest
+    from klonet_agent.knowledge.retriever import KnowledgeRetriever
+
+    normalized_query = (query or "").strip()
+    if not normalized_query:
+        return ""
+    indexer = CodeIndexer(source_root=SOURCE_ROOT, index_file=CODE_INDEX_FILE)
+    if not SOURCE_ROOT.is_dir():
+        return ""
+    if indexer.is_stale():
+        indexer.build()
+
+    outcome = KnowledgeRetriever(
+        index_file=CODE_INDEX_FILE,
+        vector_index_file=CODE_VECTOR_INDEX_FILE,
+    ).search_request(
+        SearchRequest(
+            query=normalized_query,
+            task_type="code_lookup",
+            layers=("source_code",),
+            top_k=max(1, min(int(top_k), 20)),
+        )
+    )
+    normalized_path = (path or "").strip().replace("\\", "/").strip("/")
+    results = [
+        item
+        for item in outcome.results
+        if not normalized_path
+        or item.path == normalized_path
+        or item.path.startswith(normalized_path + "/")
+    ]
+    if not results:
+        return ""
+
+    lines = [
+        "未找到字面量命中，以下为源码语义检索候选；请继续用 read_source_file 核验：",
+        f"retrieval_mode={outcome.retrieval_mode}",
+        f"vector_status={outcome.vector_status}",
+    ]
+    for item in results:
+        lines.append(
+            f"\n{item.title}\n"
+            f"path={item.path}\n"
+            f"score={item.score}; semantic={item.semantic_score}\n"
+            f"{item.snippet}"
+        )
+    return "\n".join(lines)
 
 
 def read_source_file(
@@ -280,4 +347,3 @@ def _truncate(text: str, max_chars: int) -> str:
         return text
     suffix = "\n...（源码内容过长，已截断）"
     return text[: max_chars - len(suffix)].rstrip() + suffix
-

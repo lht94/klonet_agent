@@ -18,8 +18,9 @@ def test_knowledge_index_and_search():
 
     with local_temp_dir() as temp_dir:
         root = temp_dir / "repo"
-        root.mkdir()
-        (root / "README.md").write_text("# Klonet\n\n项目日志用于记录验收差异。", encoding="utf-8")
+        doc = root / "knowledge" / "klonet" / "project_journal.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_text("# 项目日志\n\n项目日志用于记录验收差异。", encoding="utf-8")
         index_file = temp_dir / "index.jsonl"
 
         count = KnowledgeIndexer(root=root, index_file=index_file).build()
@@ -38,8 +39,8 @@ def test_knowledge_index_staleness_detects_newer_source_files():
 
     with local_temp_dir() as temp_dir:
         root = temp_dir / "repo"
-        root.mkdir()
-        readme = root / "README.md"
+        readme = root / "knowledge" / "klonet" / "overview.md"
+        readme.parent.mkdir(parents=True)
         readme.write_text("# Klonet\n\n旧知识。", encoding="utf-8")
         index_file = temp_dir / "index.jsonl"
 
@@ -52,56 +53,115 @@ def test_knowledge_index_staleness_detects_newer_source_files():
         assert _index_is_older_than_sources(index_file, root)
 
 
-def test_knowledge_index_skips_runtime_memory_files():
-    """运行时记忆不应该进入 Klonet 知识库索引。"""
+def test_public_knowledge_index_excludes_runtime_and_agent_implementation():
+    """公共知识索引只能读取显式 allowlist 下的正式知识。"""
 
     from klonet_agent.knowledge.indexer import KnowledgeIndexer
 
     with local_temp_dir() as temp_dir:
         root = temp_dir / "repo"
+        curated = root / "knowledge" / "klonet"
         memory_dir = root / "memory"
+        curated.mkdir(parents=True)
         memory_dir.mkdir(parents=True)
-        (root / "README.md").write_text("# Klonet\n\n当前项目文档。", encoding="utf-8")
+        (curated / "overview.md").write_text(
+            "# Klonet\n\n当前正式知识。",
+            encoding="utf-8",
+        )
         (memory_dir / "MEMORY.md").write_text("小鸡毛 和 小白 的旧长期记忆", encoding="utf-8")
         (memory_dir / "USER.md").write_text("小白 的旧用户画像", encoding="utf-8")
         (memory_dir / "2026-05-19.md").write_text("小鸡毛 的旧情景记忆", encoding="utf-8")
         (memory_dir / "store.py").write_text('"""记忆源码模块。"""', encoding="utf-8")
+        journals = root / "journals" / "another-user"
+        journals.mkdir(parents=True)
+        (journals / "private.md").write_text("其他用户私有项目日志", encoding="utf-8")
+        (root / "prompts.py").write_text("内部提示词", encoding="utf-8")
         index_file = temp_dir / "index.jsonl"
 
         count = KnowledgeIndexer(root=root, index_file=index_file).build()
         text = index_file.read_text(encoding="utf-8")
 
     assert count > 0
-    assert "memory/store.py" in text
+    assert "knowledge/klonet/overview.md" in text
+    assert "memory/store.py" not in text
     assert "MEMORY.md" not in text
     assert "USER.md" not in text
     assert "2026-05-19.md" not in text
+    assert "其他用户私有项目日志" not in text
+    assert "内部提示词" not in text
     assert "小鸡毛" not in text
     assert "小白" not in text
 
 
-def test_task_templates_are_available_to_knowledge_index():
-    """常见任务模板应该能被知识库索引。"""
+def test_agent_task_templates_are_excluded_from_public_knowledge_index():
+    """Agent 工作流模板不是 Klonet 平台公共知识。"""
 
     from klonet_agent.knowledge.indexer import KnowledgeIndexer
-    from klonet_agent.knowledge.retriever import KnowledgeRetriever
 
     with local_temp_dir() as temp_dir:
         root = temp_dir / "repo"
         knowledge_dir = root / "knowledge"
         knowledge_dir.mkdir(parents=True)
-        (root / "README.md").write_text("# Klonet\n", encoding="utf-8")
         (knowledge_dir / "task_templates.md").write_text(
             "# 常见任务模板\n\n## 修复测试失败\n先读取失败信息，再最小修改。\n",
             encoding="utf-8",
         )
         index_file = temp_dir / "index.jsonl"
 
-        KnowledgeIndexer(root=root, index_file=index_file).build()
-        results = KnowledgeRetriever(index_file=index_file).search("修复测试失败", top_k=3)
+        count = KnowledgeIndexer(root=root, index_file=index_file).build()
+        index_text = index_file.read_text(encoding="utf-8")
 
-    assert results
-    assert results[0].path == "knowledge/task_templates.md"
+    assert count == 0
+    assert index_text == ""
+
+
+def test_public_knowledge_index_excludes_collection_readmes():
+    """集合 README 只描述路由和目录结构，不作为回答证据。"""
+
+    from klonet_agent.knowledge.indexer import KnowledgeIndexer
+
+    with local_temp_dir() as temp_dir:
+        root = temp_dir / "repo"
+        curated = root / "knowledge" / "klonet"
+        curated.mkdir(parents=True)
+        (curated / "README.md").write_text(
+            "# 集合导航\n\n这段内容不应进入回答证据。",
+            encoding="utf-8",
+        )
+        (curated / "overview.md").write_text(
+            "# 正式知识\n\n这段内容应进入回答证据。",
+            encoding="utf-8",
+        )
+        index_file = temp_dir / "index.jsonl"
+
+        count = KnowledgeIndexer(root=root, index_file=index_file).build()
+        index_text = index_file.read_text(encoding="utf-8")
+
+    assert count == 1
+    assert "这段内容应进入回答证据" in index_text
+    assert "这段内容不应进入回答证据" not in index_text
+
+
+def test_public_knowledge_index_rejects_symlink_escape():
+    """allowlist 内的符号链接不能读取知识目录之外的文件。"""
+
+    from klonet_agent.knowledge.indexer import KnowledgeIndexer
+
+    with local_temp_dir() as temp_dir:
+        root = temp_dir / "repo"
+        curated = root / "knowledge" / "klonet"
+        private = root / "memory" / "private.md"
+        curated.mkdir(parents=True)
+        private.parent.mkdir(parents=True)
+        private.write_text("不应通过符号链接进入公共知识库", encoding="utf-8")
+        (curated / "escaped.md").symlink_to(private)
+        index_file = temp_dir / "index.jsonl"
+
+        count = KnowledgeIndexer(root=root, index_file=index_file).build()
+        index_text = index_file.read_text(encoding="utf-8")
+
+    assert count == 0
+    assert index_text == ""
 
 
 def test_satellite_platform_overview_is_retrievable_from_curated_knowledge():

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!-- <link rel="stylesheet" href="{{ url_for('static', filename='xterm.css') }}" type="text/css"> -->
+    <!-- <link rel="stylesheet" href="{{ url_for('static', filename='addons/fullscreen/fullscreen.css')}}"> -->
+    <!-- <script src="{{ url_for('static', filename='xterm.js') }}"></script> -->
+    <!-- <script src="{{ url_for('static', filename='addons/attach/attach.js') }}"></script> -->
+    <!-- <script src="{{ url_for('static', filename='addons/fullscreen/fullscreen.js') }}"></script> -->
+    <!-- <script src="{{ url_for('static', filename='fetch.min.js') }}"></script> -->
+    <!-- <script src="{{ url_for('static', filename='addons/fit/fit.js') }}" ></script> -->
+    <link rel="stylesheet" href="../static/xterm/dist/xterm.css">
+    <link rel="stylesheet" href="../static/xterm/dist/addons/fullscreen/fullscreen.css">
+    <script src="../static/xterm/dist/xterm.js"></script>
+    <script src="../static/xterm/dist/addons/attach/attach.js"></script>
+    <script src="../static/xterm/dist/addons/fullscreen/fullscreen.js"></script>
+    <script src="../static/fetch.min.js"></script>
+    <script src="../static/xterm/dist/addons/fit/fit.js" ></script>
+    <meta charset="UTF-8">
+    <title>docker web terminal</title>
+</head>
+
+<body>
+<div>
+    User:<input type="text" id="user"><br>
+    Topo:<input type="text" id="topo"><br>
+    Net:<input type="text" id="net"><br>
+    Elem:<input type="text" id="elem"><br>
+    Command:<input type="text" id="command" value="/bin/bash"><br>
+    <button type="button" onclick="websocket()">connect</button>
+    <button type="button" onclick="closelink()">disconnect</button>
+</div>
+
+
+<div id="terminal" class="terminal"></div>
+<script type="text/javascript">
+    let wsPing = null;
+    function ping(ws) {
+        console.log('in ping func', ws.state);
+        if (ws.readyState == ws.CLOSED) {
+            clearInterval(wsPing)
+        } else {
+            ws.send('__ping__');
+            tm = setTimeout(function () {
+            }, 5000);
+        }
+    }
+
+    function pong() {
+        clearTimeout(tm);
+    }
+
+    function websocket() {
+        let user = document.getElementById("user").value
+        let topo = document.getElementById("topo").value
+        let ne = document.getElementById("net").value
+        elem = document.getElementById("elem").value
+        let cmd = document.getElementById("command").value
+        term = new Terminal({
+            cols: 120,
+            rows: 30,
+            cursorBlink: true,
+            scrollback: 800,
+            tabStopWidth: 8
+        });
+        term.open(document.getElementById('terminal'));
+        // term.fit();
+        // term.toggleFullscreen();        /// full screen
+        term.scrollToBottom();
+        term.writeln("Welcome to the virtual simulation experiment platform! You are at " +  ne + " terminal,  please continue the experiment.");
+        // term.writeln("Attach to " + elem + ", Input exit To Quit!");
+        get_url = '/container/?user='+ user + '&topo=' + topo + '&ne=' + ne
+        let socket = new WebSocket('ws://' + window.location.host + get_url);    /// container socket ///
+        term.attach(socket);
+
+        socket.onopen = function() {
+            wsPing = setInterval(()=>{ping(socket)}, 5000);
+        };
+        socket.onclose = function () {
+            term.writeln("closed. Thank you for use!");
+        };
+        }
+    function closelink() {
+        term.destroy()
+        alert(elem + " has been destoryed");
+    }
+    </script>
+</body>
+</html>

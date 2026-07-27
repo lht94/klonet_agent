@@ -1,0 +1,170 @@
+{"hosts": [
+    {
+        "interface": [
+            {
+                "config_name": "name",
+                "config_description": "接口",
+                "value_method": "disabled",
+                "default_value": null
+            },
+            {
+                "config_name": "ip",
+                "config_description": "IP",
+                "value_method": "input",
+                "default_value": null
+            },
+            {
+                "config_name": "netmask",
+                "config_description": "网络掩码",
+                "value_method": "input",
+                "default_value": null
+            }
+        ],
+        "gateway": {
+                "config_name": "gateway",
+                "config_description": "网关",
+                "value_method": "input",
+                "default_value": null
+            }
+    },
+    {
+        "interface": [
+            {
+                "config_name": "name",
+                "config_description": "接口",
+                "value_method": "disabled",
+                "default_value": null
+            },
+            {
+                "config_name": "ip",
+                "config_description": "IP",
+                "value_method": "input",
+                "default_value": null
+            },
+            {
+                "config_name": "netmask",
+                "config_description": "网络掩码",
+                "value_method": "input",
+                "default_value": null
+            }
+        ],
+        "gateway": {
+                "config_name": "gateway",
+                "config_description": "网关",
+                "value_method": "input",
+                "default_value": null
+            }
+    },
+    {
+        "interface": [
+            {
+                "config_name": "name",
+                "config_description": "接口",
+                "value_method": "disabled",
+                "default_value": null
+            },
+            {
+                "config_name": "ip",
+                "config_description": "IP",
+                "value_method": "input",
+                "default_value": null
+            },
+            {
+                "config_name": "netmask",
+                "config_description": "网络掩码",
+                "value_method": "input",
+                "default_value": null
+            }
+        ],
+        "gateway": {
+                "config_name": "gateway",
+                "config_description": "网关",
+                "value_method": "input",
+                "default_value": null
+            }
+    },
+    {
+        "interface": [
+            {
+                "config_name": "name",
+                "config_description": "接口",
+                "value_method": "disabled",
+                "default_value": null
+            },
+            {
+                "config_name": "ip",
+                "config_description": "IP",
+                "value_method": "input",
+                "default_value": null
+            },
+            {
+                "config_name": "netmask",
+                "config_description": "网络掩码",
+                "value_method": "input",
+                "default_value": null
+            }
+        ],
+        "gateway": {
+                "config_name": "gateway",
+                "config_description": "网关",
+                "value_method": "input",
+                "default_value": null
+            }
+    },
+    {
+        "interface": [
+            {
+                "config_name": "name",
+                "config_description": "接口",
+                "value_method": "disabled",
+                "default_value": null
+            },
+            {
+                "config_name": "ip",
+                "config_description": "IP",
+                "value_method": "input",
+                "default_value": null
+            },
+            {
+                "config_name": "netmask",
+                "config_description": "网络掩码",
+                "value_method": "input",
+                "default_value": null
+            }
+        ],
+        "gateway": {
+                "config_name": "gateway",
+                "config_description": "网关",
+                "value_method": "input",
+                "default_value": null
+            }
+    },
+    {
+        "interface": [
+            {
+                "config_name": "name",
+                "config_description": "接口",
+                "value_method": "disabled",
+                "default_value": null
+            },
+            {
+                "config_name": "ip",
+                "config_description": "IP",
+                "value_method": "input",
+                "default_value": null
+            },
+            {
+                "config_name": "netmask",
+                "config_description": "网络掩码",
+                "value_method": "input",
+                "default_value": null
+            }
+        ],
+        "gateway": {
+                "config_name": "gateway",
+                "config_description": "网关",
+                "value_method": "input",
+                "default_value": null
+            }
+    }
+]}

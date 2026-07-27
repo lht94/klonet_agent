@@ -1,0 +1,472 @@
+{
+	"controllers": [
+		{
+			"port": {
+				"config_name": "port",
+				"config_description": "控制器端口",
+				"value_method": "disabled",
+				"default_value": 6653
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+		},
+		{
+			"port": {
+				"config_name": "port",
+				"config_description": "控制器端口",
+				"value_method": "disabled",
+				"default_value": 6653
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+		}
+	],
+	"switches": [
+		{
+			"stp": {
+					"config_name": "stp",
+		            "config_description": "是否启用stp",
+		            "value_method": "boolean",
+		            "value_list": [true,false],
+		            "default_value": true
+				},
+			"controllers": {
+				"config_name": "controllers",
+				"config_description": "OVS控制器",
+				"value_method": "multi",
+				"default_value": []
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			],
+			"interface": [
+				{
+					"config_name": "name",
+					"config_description": "接口",
+					"value_method": "disabled",
+					"default_value": null
+				},
+				{
+					"config_name": "nic",
+					"config_description": "网卡",
+					"value_method": "disabled",
+					"default_value": null
+				}
+			]
+		}
+	],
+	"routers": [
+		{
+			"interface": [
+				{
+              		"config_name": "ip",
+              		"config_description": "IP",
+              		"value_method": "input",
+              		"default_value": null
+            	},
+            	{
+              		"config_name": "netmask",
+              		"config_description": "网络掩码",
+              		"value_method": "input",
+              		"default_value": null
+            	}
+			],
+			"rip": [
+				{
+	              	"config_name": "enable",
+	              	"config_description": "是否启用",
+	              	"value_method": "boolean",
+	              	"default_value": false,
+	              	"value_list": [true,false]
+	            },
+	            {
+	              	"config_name": "networks",
+	              	"config_description": "网络段配置",
+	              	"value_method": "multi",
+	              	"default_value": []
+	            },
+	            {
+	              	"config_name":  "neighbors",
+	            	"config_description":  "网络邻域配置",
+	            	"value_method":  "multi",
+	            	"default_value": []
+	            }
+			],
+			"ospf": [
+				{
+	              	"config_name": "enable",
+	              	"config_description": "是否启用",
+	              	"value_method": "boolean",
+	              	"default_value": false,
+	              	"value_list": [false,true]
+	            },
+	            {
+	              	"config_name": "router_id",
+	              	"config_description": "路由器ID",
+	              	"value_method": "input",
+	              	"default_value": null
+	            },
+	            {
+	              	"config_name": "networks",
+	              	"config_description": "网络段配置",
+	              	"value_method": "multi",
+	              	"default_value": []
+	            },
+	            {
+	              	"config_name": "areas",
+	              	"config_description": "区域信息配置",
+	              	"config_details": [
+	               		{
+	                  		"config_name": "<area_id>",
+	                  		"config_description": "区域信息ID",
+	                  		"value_method": "multi",
+	                  		"default_value": []
+	                	}
+	              	]
+	            }
+			],
+			"bgp": [
+				{
+	              	"config_name": "enable",
+	              	"config_description": "是否启用",
+	              	"value_method": "boolean",
+	              	"default_value": false,
+	              	"value_list":[false,true]
+	            },
+	            {
+	              	"config_name": "asn",
+	              	"config_description": "ASN编号",
+	              	"value_method": "input",
+	              	"default_value": null
+	            },
+	            {
+	              	"config_name": "router_id",
+	              	"config_description": "路由器id",
+	              	"value_method": "input",
+	              	"default_value": null
+	            },
+	            {
+	              	"config_name": "networks",
+	              	"config_description": "网络段配置",
+	              	"value_method": "multi",
+	              	"default_value": []
+	            },
+	            {
+	              	"config_name": "neighbors",
+	              	"config_description": "邻域配置",
+	              	"value_method": "multi",
+	              	"default_value": []
+	            }
+			],
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+		}
+	],
+	"hosts": [
+    	{
+	    	"interface": [
+	    		{
+	    			"config_name": "name",
+		            "config_description": "接口",
+		            "value_method": "disabled",
+		            "default_value": null
+	    		},
+				{
+					"config_name": "nic",
+					"config_description": "网卡",
+					"value_method": "disabled",
+					"default_value": null
+				},
+	    		{
+		            "config_name": "ip",
+		            "config_description": "IP",
+		            "value_method": "input",
+		            "default_value": null
+		        },
+		        {
+		            "config_name": "netmask",
+		            "config_description": "网络掩码",
+		            "value_method": "input",
+		            "default_value": null
+		        }
+	    	],
+	    	"gateway": {
+				"config_name": "gateway",
+				"config_description": "网关",
+				"value_method": "input",
+				"default_value": null
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+    	},
+		{
+	    	"interface": [
+	    		{
+	    			"config_name": "name",
+		            "config_description": "接口",
+		            "value_method": "disabled",
+		            "default_value": null
+	    		},
+				{
+					"config_name": "nic",
+					"config_description": "网卡",
+					"value_method": "disabled",
+					"default_value": null
+				},
+	    		{
+		            "config_name": "ip",
+		            "config_description": "IP",
+		            "value_method": "input",
+		            "default_value": null
+		        },
+		        {
+		            "config_name": "netmask",
+		            "config_description": "网络掩码",
+		            "value_method": "input",
+		            "default_value": null
+		        }
+	    	],
+	    	"gateway": {
+				"config_name": "gateway",
+				"config_description": "网关",
+				"value_method": "input",
+				"default_value": null
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+    	},
+		{
+	    	"interface": [
+	    		{
+	    			"config_name": "name",
+		            "config_description": "接口",
+		            "value_method": "disabled",
+		            "default_value": null
+	    		},
+				{
+					"config_name": "nic",
+					"config_description": "网卡",
+					"value_method": "disabled",
+					"default_value": null
+				},
+	    		{
+		            "config_name": "ip",
+		            "config_description": "IP",
+		            "value_method": "input",
+		            "default_value": null
+		        },
+		        {
+		            "config_name": "netmask",
+		            "config_description": "网络掩码",
+		            "value_method": "input",
+		            "default_value": null
+		        }
+	    	],
+	    	"gateway": {
+				"config_name": "gateway",
+				"config_description": "网关",
+				"value_method": "input",
+				"default_value": null
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+    	},
+		{
+	    	"interface": [
+	    		{
+	    			"config_name": "name",
+		            "config_description": "接口",
+		            "value_method": "disabled",
+		            "default_value": null
+	    		},
+				{
+					"config_name": "nic",
+					"config_description": "网卡",
+					"value_method": "disabled",
+					"default_value": null
+				},
+	    		{
+		            "config_name": "ip",
+		            "config_description": "IP",
+		            "value_method": "input",
+		            "default_value": null
+		        },
+		        {
+		            "config_name": "netmask",
+		            "config_description": "网络掩码",
+		            "value_method": "input",
+		            "default_value": null
+		        }
+	    	],
+	    	"gateway": {
+				"config_name": "gateway",
+				"config_description": "网关",
+				"value_method": "input",
+				"default_value": null
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+    	},
+		{
+	    	"interface": [
+	    		{
+	    			"config_name": "name",
+		            "config_description": "接口",
+		            "value_method": "disabled",
+		            "default_value": null
+	    		},
+				{
+					"config_name": "nic",
+					"config_description": "网卡",
+					"value_method": "disabled",
+					"default_value": null
+				},
+	    		{
+		            "config_name": "ip",
+		            "config_description": "IP",
+		            "value_method": "input",
+		            "default_value": null
+		        },
+		        {
+		            "config_name": "netmask",
+		            "config_description": "网络掩码",
+		            "value_method": "input",
+		            "default_value": null
+		        }
+	    	],
+	    	"gateway": {
+				"config_name": "gateway",
+				"config_description": "网关",
+				"value_method": "input",
+				"default_value": null
+			},
+			"resource_limit": [
+				{
+	    			"config_name": "cpu",
+		            "config_description": "cpu限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: %, 范围: 0 < cpu <= 1000"
+	    		},
+				{
+	    			"config_name": "mem",
+		            "config_description": "mem限制",
+		            "value_method": "input",
+		            "default_value": null,
+					"reminder_text": "单位: Mbytes, 范围: 10 < mem <= 1000"
+	    		}
+			]
+    	}
+	]
+}

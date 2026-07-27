@@ -113,7 +113,7 @@ def test_generator_prefers_runtime_package_over_duplicate_tree():
     assert counts["routes"] == 1
     assert routes[0]["implementation"] == "vemu_uestc/webserver/api/topo/master_topo.py"
 
-def test_main_index_uses_curated_experience_and_machine_layers_only():
+def test_main_index_uses_only_public_curated_and_experience_layers():
     from klonet_agent.knowledge.indexer import KnowledgeIndexer
 
     with local_temp_dir() as temp_dir:
@@ -126,6 +126,10 @@ def test_main_index_uses_curated_experience_and_machine_layers_only():
         (knowledge / "extracted_docs").mkdir(parents=True)
 
         (root / "README.md").write_text("# Test\n", encoding="utf-8")
+        (knowledge / "klonet" / "README.md").write_text(
+            "# Collection routing catalog\n",
+            encoding="utf-8",
+        )
         (knowledge / "klonet" / "guide.md").write_text("正式拓扑部署知识", encoding="utf-8")
         (knowledge / "klonet_experience" / "cases" / "case.md").write_text(
             "拓扑进度卡住案例", encoding="utf-8"
@@ -144,13 +148,15 @@ def test_main_index_uses_curated_experience_and_machine_layers_only():
 
     assert "正式拓扑部署知识" in text
     assert "拓扑进度卡住案例" in text
-    assert "/master/topo/" in text
+    assert "/master/topo/" not in text
+    assert "# Test" not in text
+    assert "Collection routing catalog" not in text
     assert "不应索引草稿" not in text
     assert "不应索引原始抽取" not in text
     sources = {row["path"]: row["source"] for row in rows}
     assert sources["knowledge/klonet/guide.md"] == "curated"
     assert sources["knowledge/klonet_experience/cases/case.md"] == "experience"
-    assert sources["knowledge/klonet_index/routes.jsonl"] == "machine_index"
+    assert "knowledge/klonet_index/routes.jsonl" not in sources
 
 
 def test_exact_route_query_prefers_machine_index():

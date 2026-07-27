@@ -155,11 +155,97 @@ CLI 会把非交互 stdin 的全部内容作为一个用户回合，并使用 UT
 如果生产端已经把中文替换成 `?`，程序会得到损坏文本，无法在接收后恢复。
 
 ### 这一版还没有做的事情
-- Klonet 真正源码仓库还没有接入 workspace
-- RAG 目前只是本地关键词检索，还不是向量数据库
+- Klonet 当前运行实例的现场源码仍不属于 Mentor workspace；Mentor 使用随主仓库发布的脱敏源码快照，现场差异需在 Ops 模式核验
+- RAG 使用 BM25、精确匹配、metadata 和可选本地向量 sidecar；当前不依赖向量数据库
 - ReviewAgent 目前只是 prompt 层面的轻量 review，还没有独立子 agent
 - Web/API 服务还没有做，当前目标仍然是本地 CLI 可用
 - token/速度优化目前已有 trace 和 eval runner 基础，后续需要接入真实 Klonet 任务做对比实验
+
+### 知识向量自动构建
+
+配置 `EMBEDDING_API_KEY` 后，Mentor 第一次加载知识索引时会自动创建
+`knowledge/vectors.jsonl`。已有文件缺少 chunk 或 chunk 内容发生变化时，只补齐
+缺失、过期的向量；接口支持批量输入时默认每批 10 条。构建中途失败会保留已经
+完成的批次，检索继续以 BM25 降级运行，并在 RAG 结果中输出
+`retrieval_mode`、`vector_status` 和 `vector_status_detail`。
+
+可用以下环境变量调整行为：
+
+```bash
+KLONET_AGENT_AUTO_BUILD_VECTORS=1
+KLONET_AGENT_VECTOR_BATCH_SIZE=10
+```
+
+也可以手工预构建：
+
+```bash
+cd /home/klonet-agent/klonet_agent
+PYTHONPATH=/home/klonet-agent python -m scripts.build_knowledge_vectors
+```
+
+`knowledge/vectors.jsonl` 是由指定 embedding 模型生成的部署产物，默认不进入普通
+Git 历史。需要在多台机器间分发时，推荐使用 Git LFS、Release artifact 或对象
+存储，并随文件记录 embedding 模型和知识索引版本。
+
+### 公共知识边界
+
+主 RAG 使用显式 allowlist，只索引以下正式知识：
+
+```text
+knowledge/klonet/**/*.md
+knowledge/klonet/**/*.txt
+knowledge/klonet_experience/**/*.md
+knowledge/klonet_experience/**/*.txt
+```
+
+上述目录中的 `README.md` 是集合导航和路由说明，也不会作为回答证据进入索引。
+`journals/`、`memory/`、`workspace/`、`workspaces/`、`tools/`、`doc/`、
+`docs/`、`prompts.py`、仓库 `README.md` 和 `knowledge/klonet_index/`
+不会进入公共索引或公共向量文件。项目日志通过当前用户和项目作用域内的
+`read_project_journal` 读取；源码事实通过 `search_code` 和
+`read_source_file` 按需核验；collection 的 `manifest.json` 只用于路由，
+不作为回答证据。
+
+### Klonet 源码检索层
+
+源码通过独立索引接入，不与公共文档 chunk 混在同一个向量文件中。主仓库跟踪
+一个位于 `knowledge/klonet_source/` 的精简、脱敏源码快照，因此新部署无需再
+单独拉取 `vemu_uestc`。也可通过 `KLONET_SOURCE_ROOT` 覆盖默认快照路径。
+快照会过滤 `.git`、`.history`、日志、测试、编译目录、`static_resources`、
+第三方前端依赖、二进制和压缩包等非业务源码。
+
+Python 源码按模块、类、方法和函数切分；JavaScript、TypeScript、C 和头文件
+优先按符号边界切分，其他允许的文本文件按带重叠的行窗口切分。每个 chunk
+保留相对路径、符号名和起止行号。密码、令牌、API Key 和带认证信息的 URL
+会在写入索引及调用 embedding 服务前脱敏。生成文件为：
+
+```text
+knowledge/code_index.jsonl
+knowledge/code_vectors.jsonl
+```
+
+两者均为本机部署产物，不进入普通 Git 历史。首次部署或需要手动重建时执行：
+
+```bash
+cd /home/klonet-agent/klonet_agent
+PYTHONPATH=/home/klonet-agent python -m scripts.build_code_vectors
+```
+
+`search_code` 仍优先执行精确字面量搜索；没有精确命中时才使用源码向量检索，
+返回候选路径和行号后应继续调用 `read_source_file` 核验真实代码。
+
+源码快照由上游仓库的已提交 Git tree 确定性生成，不会复制上游工作区的本地
+修改、未跟踪文件或备份文件。`knowledge/klonet_source/manifest.json` 记录
+上游 remote、commit、文件数和脱敏文件数。更新快照时执行：
+
+```bash
+cd /home/klonet-agent/klonet_agent
+PYTHONPATH=/home/klonet-agent python -m scripts.sync_klonet_source
+```
+
+同步源默认是主项目同级的 `/home/klonet-agent/vemu_uestc`，可通过
+`KLONET_UPSTREAM_SOURCE_ROOT` 覆盖。同步完成后需要审查并提交
+`knowledge/klonet_source/`；生成的源码索引和向量仍保持 Git ignore。
 
 ## 更新：项目架构
 把项目封装成了一个个类
