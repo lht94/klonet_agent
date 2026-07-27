@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-from klonet_agent.config import DEFAULT_RAG_TOP_K
+from klonet_agent.config import DEFAULT_RAG_TOP_K, RAG_PIPELINE_MODE
 from klonet_agent.knowledge.collection_router import collection_ids, collection_paths, route_collections
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
-from klonet_agent.knowledge.models import QueryRoute, QueryScope, SearchRequest
+from klonet_agent.knowledge.models import (
+    QueryRoute,
+    QueryScope,
+    RetrievalPlan,
+    SearchRequest,
+)
+from klonet_agent.knowledge.multi_stage import MultiStageRetriever
 from klonet_agent.knowledge.query_builder import QueryBuilder
 from klonet_agent.knowledge.retriever import KnowledgeRetriever
 from klonet_agent.knowledge.router import DEFAULT_QUERY_ROUTER
@@ -28,8 +34,21 @@ def classify_query_scope(query: str) -> QueryScope:
 class KnowledgeBase:
     """对外提供统一的 Klonet 知识检索入口。"""
 
-    def __init__(self, retriever: KnowledgeRetriever | None = None):
+    def __init__(
+        self,
+        retriever: KnowledgeRetriever | None = None,
+        *,
+        pipeline: MultiStageRetriever | None = None,
+    ):
+        explicit_retriever = retriever is not None
         self.retriever = retriever or KnowledgeRetriever()
+        self.pipeline = pipeline
+        if (
+            self.pipeline is None
+            and not explicit_retriever
+            and RAG_PIPELINE_MODE == "multi_stage"
+        ):
+            self.pipeline = MultiStageRetriever(public_retriever=self.retriever)
 
     def search_knowledge(
         self,
@@ -43,6 +62,7 @@ class KnowledgeBase:
         intent: QueryIntent | None = None,
         semantic_frame: SemanticFrame | None = None,
         conversation_state: ConversationState | None = None,
+        retrieval_plan: RetrievalPlan | None = None,
     ) -> str:
         """按软路由检索，并返回带来源和可靠度的证据。"""
 
@@ -88,7 +108,35 @@ class KnowledgeBase:
             allowed_paths=collection_paths(collections),
             top_k=plan.top_k,
         )
-        outcome = self.retriever.search_request(request)
+        if self.pipeline is not None:
+            context_hints = {
+                "task_type": request.task_type,
+                "operation": request.intent,
+                "domains": request.domains,
+                "excluded_intents": request.excluded_intents,
+            }
+            outcome = self.pipeline.search(
+                query,
+                top_k=plan.top_k,
+                task_type=request.task_type,
+                layers=request.layers,
+                # Planner queries already narrow semantics.  Only an explicit
+                # caller filter is hard; the legacy router's inferred domains
+                # are too lossy to use as a pre-filter here.
+                domains=domains,
+                min_priority=request.min_priority,
+                # RetrievalPlan.store is the routing source of truth in the
+                # multi-stage pipeline; legacy intent collections must not
+                # silently narrow a planner task.
+                collections=(),
+                allowed_paths=(),
+                excluded_intents=request.excluded_intents,
+                conversation_state=conversation_state,
+                context_hints=context_hints,
+                retrieval_plan=retrieval_plan,
+            )
+        else:
+            outcome = self.retriever.search_request(request)
         if outcome.status == "none":
             return (
                 "未检索到可靠 Klonet 证据。"
@@ -111,6 +159,21 @@ class KnowledgeBase:
             f"- task_type: {request.task_type}",
             f"- operation: {request.intent}",
         ]
+        if outcome.retrieval_plan is not None:
+            stores = ",".join(
+                task.store for task in outcome.retrieval_plan.retrieval_tasks
+            )
+            lines.extend(
+                [
+                    f"- planner_status: {outcome.planner_status}",
+                    f"- planner_detail: {outcome.retrieval_plan.detail}",
+                    f"- retrieval_stores: {stores}",
+                    f"- recall_counts: {outcome.recall_counts}",
+                    f"- fusion_status: {outcome.fusion_status}",
+                    f"- rerank_status: {outcome.rerank_status}",
+                    f"- stage_timings_ms: {outcome.stage_timings_ms}",
+                ]
+            )
         for index, item in enumerate(outcome.results, start=1):
             lines.append(
                 f"\n[{index}] {item.title}\n"
@@ -119,6 +182,10 @@ class KnowledgeBase:
                 f"- quality: {item.quality}\n"
                 f"- path: {item.path}\n"
                 f"- relevance: {item.relevance}\n"
+                f"- recall_channels: {','.join(item.recall_channels)}\n"
+                f"- rrf_score: {item.rrf_score}\n"
+                f"- rerank_score: {item.rerank_score}\n"
+                f"- final_score: {item.final_score}\n"
                 f"- snippet:\n{item.snippet}"
             )
         return "\n".join(lines)

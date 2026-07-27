@@ -3812,28 +3812,45 @@ ProjectJournal Store：写入 journals/{user_id}/{project_id}.md
 
 两类证据不应直接混成一个无法解释的总排行榜。公共文档适合回答“是什么、怎么做、标准流程和排障方法”；源码适合回答“哪个函数负责、接口在哪里、配置如何读取、当前调用链如何实现”。当二者冲突时，代码实现事实以当前真实源码为准，规范和操作建议则要结合文档状态、版本与源码共同判断。
 
-## 当前 Mentor 的RAG流程（query改写+意图识别路由+多库多路召回+rerank）
+## 当前 Mentor 的 RAG 流程（统一 Query Planner + 多库多路召回 + rerank）
 
 ```text
-用户问题
+用户问题 + 必要的会话状态
   ↓
-query改写 + 意图识别
+Mentor 前置 DeepSeek V4 Flash 单次生成意图理解 + RetrievalPlan
+  ├─ standalone_query：补全指代后的独立问题
+  └─ retrieval_tasks：按知识库组织的检索任务
   ↓
-知识库路由（选择检索范围）
+每个任务直接指定检索范围
   ├─ 公共文档库
   ├─ 源码库
   └─ 公共文档库 + 源码库
        ↓
 每个选中库内部多路召回
+  ├─ 原始问题（始终保留）
   ├─ BM25 关键词召回
   ├─ Dense 向量召回
   └─ 标识符/标题/路径/错误文本精确召回
        ↓
-RRF 跨通道融合、去重
-  ↓
-首次召回较差时，LLM 补充改写并再召回一次
+Weighted RRF 跨任务、跨通道融合去重
   ↓
 qwen3-rerank 统一重排
   ↓
 多样性过滤，输出最终证据
 ```
+
+Query 改写和检索路由不会分别调用两次 LLM。Planner 在同一次 JSON 输出中决定
+“用什么查询搜索”和“去哪个知识库搜索”，因此不再维护可能互相冲突的独立
+`intent` 与 `target_stores`。每个 `retrieval_task` 的 `store` 是实际执行范围，
+`purpose` 只用于解释和 trace。Mentor 后续调用 `search_knowledge` 时会注入并
+复用这份计划；只有绕过 Mentor 编排直接调用知识库时，检索层才自行补一次规划。
+
+Planner 不负责回答问题。程序会校验输出数量、知识库名称和精确标识符；模型
+虚构且无法在原问题或上下文中找到的函数名、路径和错误码会被丢弃。Planner
+超时、返回非法 JSON 或缺少凭据时，系统不做规则式口语改写，而是用原问题对
+公共文档和源码执行保守召回。
+
+所有召回通道保留独立排名，使用 weighted RRF 融合：BM25 和 dense 权重为
+1.0，精确源码/API 权重为 2.0。融合 Top 20 交给 `qwen3-rerank`；服务不可用
+时直接按 RRF 排序。最终限制同一公共文档最多两个 chunk、同一源码符号最多
+一个候选。代码实现结论仍应通过 `read_source_file` 核验。

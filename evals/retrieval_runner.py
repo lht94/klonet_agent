@@ -42,7 +42,11 @@ class RetrievalEvalRunner:
             "task_type_accuracy": _ratio(rows, "task_type_correct"),
             "recall_at_3": _ratio(retrieval_rows, "hit_at_3"),
             "recall_at_10": _ratio(retrieval_rows, "hit_at_10"),
+            "recall_at_20": _ratio(retrieval_rows, "hit_at_20"),
             "mrr": _average([row["reciprocal_rank"] for row in retrieval_rows]),
+            "mrr_at_5": _average(
+                [row["reciprocal_rank_at_5"] for row in retrieval_rows]
+            ),
             "abstention_accuracy": _ratio(abstention_rows, "abstention_correct"),
             "general_rag_false_positive_rate": _average(
                 [
@@ -92,7 +96,7 @@ class RetrievalEvalRunner:
                     query=case["query"],
                     task_type=route.task_type,
                     domains=route.domains or None,
-                    top_k=10,
+                    top_k=20,
                 )
             )
             results = outcome.results
@@ -122,7 +126,11 @@ class RetrievalEvalRunner:
             "task_type_correct": route.task_type == case["expected_task_type"],
             "hit_at_3": bool(first_rank and first_rank <= 3),
             "hit_at_10": bool(first_rank and first_rank <= 10),
+            "hit_at_20": bool(first_rank and first_rank <= 20),
             "reciprocal_rank": 1 / first_rank if first_rank else 0.0,
+            "reciprocal_rank_at_5": (
+                1 / first_rank if first_rank and first_rank <= 5 else 0.0
+            ),
             "abstention_correct": (not should_retrieve and not results),
             "latency_ms": round(latency_ms, 3),
         }
@@ -136,7 +144,9 @@ class RetrievalEvalRunner:
             f"- task_type_accuracy: {metrics['task_type_accuracy']:.3f}",
             f"- recall_at_3: {metrics['recall_at_3']:.3f}",
             f"- recall_at_10: {metrics['recall_at_10']:.3f}",
+            f"- recall_at_20: {metrics['recall_at_20']:.3f}",
             f"- mrr: {metrics['mrr']:.3f}",
+            f"- mrr_at_5: {metrics['mrr_at_5']:.3f}",
             f"- abstention_accuracy: {metrics['abstention_accuracy']:.3f}",
             (
                 "- general_rag_false_positive_rate: "

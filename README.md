@@ -156,7 +156,7 @@ CLI 会把非交互 stdin 的全部内容作为一个用户回合，并使用 UT
 
 ### 这一版还没有做的事情
 - Klonet 当前运行实例的现场源码仍不属于 Mentor workspace；Mentor 使用随主仓库发布的脱敏源码快照，现场差异需在 Ops 模式核验
-- RAG 使用 BM25、精确匹配、metadata 和可选本地向量 sidecar；当前不依赖向量数据库
+- RAG 已使用 LLM Query Planner、BM25、精确匹配、向量召回、RRF 和可选 rerank；仍不依赖向量数据库
 - ReviewAgent 目前只是 prompt 层面的轻量 review，还没有独立子 agent
 - Web/API 服务还没有做，当前目标仍然是本地 CLI 可用
 - token/速度优化目前已有 trace 和 eval runner 基础，后续需要接入真实 Klonet 任务做对比实验
@@ -186,6 +186,43 @@ PYTHONPATH=/home/klonet-agent python -m scripts.build_knowledge_vectors
 `knowledge/vectors.jsonl` 是由指定 embedding 模型生成的部署产物，默认不进入普通
 Git 历史。需要在多台机器间分发时，推荐使用 Git LFS、Release artifact 或对象
 存储，并随文件记录 embedding 模型和知识索引版本。
+
+### 多阶段 RAG
+
+Mentor 的 `search_knowledge` 默认使用 `multi_stage` 流程。每轮已有的前置
+理解调用改用 `deepseek-v4-flash`，并在同一次 JSON 响应中生成结构化
+`RetrievalPlan`，其中直接包含
+公共文档库和源码库的检索任务、BM25 查询、语义查询和精确词，不再先做一次
+意图分类再调用另一个模型改写 query。后续工具调用复用该计划，不进行第二次
+规划；直接调用 `KnowledgeBase` 且没有现成计划时才补一次 Planner。原始问题
+始终独立参与召回。
+
+每个任务在对应知识库内分别运行 BM25、dense vector 和精确匹配，候选使用
+weighted RRF 融合去重；融合 Top 20 可交给 DashScope `qwen3-rerank` 统一
+重排。Planner 失败时使用原问题同时搜索两个库，reranker 失败时退回 RRF，
+不会因为外部模型不可用而中断检索。
+
+同一轮的多个 dense query 会批量请求 embedding，并在公共文档索引和源码索引
+之间复用查询向量；chunk 向量从 JSONL 加载后使用内存 NumPy 矩阵计算余弦分数。
+向量完整性只在索引版本变化时检查一次，避免每个召回通道重复扫描向量文件。
+
+```bash
+RAG_PIPELINE_MODE=multi_stage
+RAG_QUERY_PLANNER_MODEL=deepseek-v4-flash
+RAG_QUERY_PLANNER_TIMEOUT_SECONDS=6
+RAG_RECALL_TOP_K=30
+RAG_FUSION_TOP_K=20
+RAG_RERANK_TOP_N=10
+RAG_RERANK_TIMEOUT_SECONDS=8
+RERANK_MODEL=qwen3-rerank
+RERANK_BASE_URL=https://WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/compatible-api/v1
+RERANK_API_KEY=...
+```
+
+`RERANK_API_KEY` 未设置时会依次尝试 `DASHSCOPE_API_KEY` 和
+`EMBEDDING_API_KEY`；默认会把 embedding URL 的 `compatible-mode/v1`
+转换为 rerank 使用的 `compatible-api/v1`。需要临时回退到旧检索流程时设置
+`RAG_PIPELINE_MODE=legacy`。
 
 ### 公共知识边界
 
@@ -231,8 +268,10 @@ cd /home/klonet-agent/klonet_agent
 PYTHONPATH=/home/klonet-agent python -m scripts.build_code_vectors
 ```
 
-`search_code` 仍优先执行精确字面量搜索；没有精确命中时才使用源码向量检索，
-返回候选路径和行号后应继续调用 `read_source_file` 核验真实代码。
+`search_knowledge` 的 Planner 可以把开发、API、调用链和排障问题自动路由到
+源码索引；`search_code` 仍保留为显式源码下钻工具，优先执行精确字面量搜索，
+没有精确命中时才使用源码 BM25 和向量检索。返回候选路径和行号后应继续调用
+`read_source_file` 核验真实代码。
 
 源码快照由上游仓库的已提交 Git tree 确定性生成，不会复制上游工作区的本地
 修改、未跟踪文件或备份文件。`knowledge/klonet_source/manifest.json` 记录

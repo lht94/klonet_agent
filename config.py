@@ -40,6 +40,30 @@ SHARED_OPS_MEMORY_RECENT_DAYS = 3
 SHARED_OPS_MEMORY_SEARCH_LIMIT = 5
 MAX_TODO_CONTINUATIONS = 1
 DEFAULT_RAG_TOP_K = 3
+RAG_PIPELINE_MODE = os.getenv("RAG_PIPELINE_MODE", "multi_stage").strip().lower()
+RAG_QUERY_PLANNER_MODEL = os.getenv(
+    "RAG_QUERY_PLANNER_MODEL",
+    "deepseek-v4-flash",
+).strip()
+RAG_QUERY_PLANNER_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("RAG_QUERY_PLANNER_TIMEOUT_SECONDS", "6")),
+)
+RAG_RECALL_TOP_K = max(1, int(os.getenv("RAG_RECALL_TOP_K", "30")))
+RAG_FUSION_TOP_K = max(1, int(os.getenv("RAG_FUSION_TOP_K", "20")))
+RAG_RERANK_TOP_N = max(1, int(os.getenv("RAG_RERANK_TOP_N", "10")))
+RAG_RERANK_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("RAG_RERANK_TIMEOUT_SECONDS", "8")),
+)
+RERANK_MODEL = os.getenv("RERANK_MODEL", "qwen3-rerank").strip()
+RERANK_BASE_URL = os.getenv(
+    "RERANK_BASE_URL",
+    DEFAULT_EMBEDDING_BASE_URL.replace(
+        "/compatible-mode/v1",
+        "/compatible-api/v1",
+    ),
+).strip()
 RAG_SEARCH_BUDGETS = {
     "general": 1,
     "klonet": 2,

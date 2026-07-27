@@ -13,6 +13,7 @@ from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_mode
 from klonet_agent.journal import ProjectJournal
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.intent import QueryIntent
+from klonet_agent.knowledge.query_planner import plan_from_mapping
 from klonet_agent.memory import MEMORY_STORE, MemoryStore
 from klonet_agent.ops.operations import (
     OperationPlanStore,
@@ -135,6 +136,11 @@ class ToolExecutor:
             conversation_state = ConversationState.from_mapping(
                 tool_args.get("conversation_state")
             )
+            retrieval_plan = plan_from_mapping(
+                tool_args["query"],
+                tool_args.get("retrieval_plan"),
+                support_text=tool_args["query"],
+            )
             return _knowledge_base().search_knowledge(
                 tool_args["query"],
                 tool_args.get("top_k", DEFAULT_RAG_TOP_K),
@@ -144,6 +150,7 @@ class ToolExecutor:
                 min_priority=tool_args.get("min_priority"),
                 intent=intent,
                 conversation_state=conversation_state,
+                retrieval_plan=retrieval_plan,
             )
 
         if tool_name == "inspect_system_environment":

@@ -91,6 +91,7 @@ _QUALITY_WEIGHTS = {
 }
 _DOMAIN_ALIASES = {
     "runtime": {"runtime", "operations", "deployment", "dependencies", "environment"},
+    "vm": {"vm", "kvm", "networking", "terminal", "images"},
 }
 _ROUTE_RE = re.compile(r"/[A-Za-z0-9_<>.-]+(?:/[A-Za-z0-9_<>.-]+)+/?")
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*(?:API|Manager|Worker|Config)\b")
@@ -123,8 +124,12 @@ class KnowledgeRetriever:
         self._bm25: BM25Okapi | None = None
         self._vector_mtime_ns: int | None = None
         self._vectors: dict[str, tuple[float, ...]] = {}
+        self._normalized_vector_matrix = None
+        self._vector_matrix_dimension = 0
         self._building_vectors = False
         self._vector_build_attempt: tuple[int | None, int | None] | None = None
+        self._vector_validation_state: tuple[int | None, int | None] | None = None
+        self._query_embedding_cache: dict[str, tuple[float, ...]] = {}
         self.vector_status = "not_loaded"
         self.vector_status_detail = ""
 
@@ -149,6 +154,120 @@ class KnowledgeRetriever:
             )
         ).results
 
+    def recall_channel(
+        self,
+        request: SearchRequest,
+        channel: str,
+        *,
+        top_k: int | None = None,
+    ) -> list[RetrievedChunk]:
+        """Return one independently ranked recall channel for RRF fusion."""
+
+        if channel not in {"bm25", "dense", "exact"}:
+            raise ValueError(f"unsupported recall channel: {channel}")
+        self._ensure_loaded()
+        self._ensure_allowed_paths_indexed(request)
+        if not self._rows:
+            return []
+
+        query = request.query.strip()
+        query_tokens = self.tokenizer.tokenize(query)
+        if not query and not query_tokens:
+            return []
+        query_embedding = self._embed_query(query) if channel == "dense" else None
+        if channel == "dense" and query_embedding is None:
+            return []
+        bm25_scores = (
+            self._bm25.get_scores(query_tokens)
+            if channel == "bm25" and self._bm25 is not None and query_tokens
+            else ()
+        )
+        semantic_scores = (
+            self._semantic_scores(query_embedding)
+            if channel == "dense"
+            else ()
+        )
+        task_type = "concept" if request.task_type == "auto" else request.task_type
+        ranked_rows: list[
+            tuple[
+                float,
+                int,
+                dict[str, Any],
+                dict[str, Any],
+                float,
+                float,
+                float,
+                float,
+            ]
+        ] = []
+
+        for index, row in enumerate(self._rows):
+            metadata = _row_metadata(row)
+            if not _allowed_by_request(metadata, request):
+                continue
+            if not _allowed_section_by_intent(row, request):
+                continue
+
+            bm25_score = (
+                max(0.0, float(bm25_scores[index])) if len(bm25_scores) else 0.0
+            )
+            semantic_score = semantic_scores[index] if semantic_scores else 0.0
+            exact_score = (
+                _literal_exact_score(query, query_tokens, row)
+                if channel == "exact"
+                else 0.0
+            )
+            if channel == "bm25":
+                channel_score = bm25_score
+            elif channel == "dense":
+                channel_score = max(0.0, semantic_score)
+            else:
+                channel_score = exact_score
+            if channel_score <= 0:
+                continue
+
+            metadata_score = _metadata_weight(metadata, task_type)
+            ranked_rows.append(
+                (
+                    channel_score * metadata_score,
+                    index,
+                    row,
+                    metadata,
+                    bm25_score,
+                    exact_score,
+                    semantic_score,
+                    metadata_score,
+                )
+            )
+
+        ranked_rows.sort(key=lambda item: item[0], reverse=True)
+        limit = max(1, top_k or request.top_k)
+        return [
+            _retrieved_chunk(
+                row,
+                index=index,
+                metadata=metadata,
+                query_tokens=query_tokens,
+                document_tokens=set(self._corpus_tokens[index]),
+                score=score,
+                bm25_score=bm25_score,
+                exact_score=exact_score,
+                semantic_score=semantic_score,
+                metadata_score=metadata_score,
+                channel=channel,
+            )
+            for (
+                score,
+                index,
+                row,
+                metadata,
+                bm25_score,
+                exact_score,
+                semantic_score,
+                metadata_score,
+            ) in ranked_rows[:limit]
+        ]
+
     def search_request(self, request: SearchRequest) -> SearchOutcome:
         """执行 BM25 召回、精确加权、metadata 过滤和置信度判断。"""
 
@@ -168,6 +287,7 @@ class KnowledgeRetriever:
 
         task_type = "concept" if request.task_type == "auto" else request.task_type
         bm25_scores = self._bm25.get_scores(query_tokens)
+        semantic_scores = self._semantic_scores(query_embedding)
         candidates: list[RetrievedChunk] = []
 
         for index, row in enumerate(self._rows):
@@ -183,7 +303,7 @@ class KnowledgeRetriever:
             )
             exact_score = _exact_score(request.query, query_tokens, row)
             bm25_score = max(0.0, float(bm25_scores[index]))
-            semantic_score = self._semantic_score(row, query_embedding)
+            semantic_score = semantic_scores[index] if semantic_scores else 0.0
             has_lexical_evidence = _has_enough_evidence(
                 query_tokens,
                 matched_terms,
@@ -344,9 +464,64 @@ class KnowledgeRetriever:
         finally:
             self._building_vectors = False
 
+    def prime_query_embeddings(
+        self,
+        queries: list[str],
+    ) -> dict[str, tuple[float, ...]]:
+        """Batch unique dense queries when the provider exposes ``embed_texts``."""
+
+        self._ensure_loaded()
+        if not self._vectors:
+            return {}
+        provider = self._embedding_provider()
+        if provider is None:
+            return {}
+        requested = [query.strip() for query in dict.fromkeys(queries) if query.strip()]
+        missing = [
+            query
+            for query in requested
+            if query not in self._query_embedding_cache
+        ]
+        if not missing:
+            return {
+                query: self._query_embedding_cache[query]
+                for query in requested
+                if query in self._query_embedding_cache
+            }
+        owner = getattr(provider, "__self__", None)
+        batch_method = getattr(owner, "embed_texts", None)
+        if not callable(batch_method):
+            return {}
+        try:
+            vectors = tuple(batch_method(missing))
+        except Exception:
+            return {}
+        if len(vectors) != len(missing):
+            return {}
+        if len(self._query_embedding_cache) > 128:
+            self._query_embedding_cache.clear()
+        for query, vector in zip(missing, vectors):
+            self._query_embedding_cache[query] = tuple(float(value) for value in vector)
+        return {
+            query: self._query_embedding_cache[query]
+            for query in requested
+            if query in self._query_embedding_cache
+        }
+
+    def seed_query_embeddings(
+        self,
+        embeddings: dict[str, tuple[float, ...]],
+    ) -> None:
+        """Reuse query vectors across public/source indexes using one model."""
+
+        self._query_embedding_cache.update(embeddings)
+
     def _load_vectors(self):
         if not self.vector_index_file.exists():
             self._vectors = {}
+            self._normalized_vector_matrix = None
+            self._vector_matrix_dimension = 0
+            self._vector_validation_state = None
             self._vector_mtime_ns = None
             self.vector_status = "missing"
             self.vector_status_detail = "vector_index_not_found"
@@ -357,6 +532,9 @@ class KnowledgeRetriever:
         self._vectors = KnowledgeVectorIndex(
             vector_file=self.vector_index_file,
         ).load()
+        self._normalized_vector_matrix = None
+        self._vector_matrix_dimension = 0
+        self._vector_validation_state = None
         self._vector_mtime_ns = mtime_ns
         self.vector_status = "ready" if self._vectors else "empty"
         self.vector_status_detail = f"loaded_vectors={len(self._vectors)}"
@@ -371,6 +549,12 @@ class KnowledgeRetriever:
             self.vector_status = "disabled"
             self.vector_status_detail = "missing_embedding_credentials"
             return
+        validation_state = (self._mtime_ns, self._vector_mtime_ns)
+        if self._vector_validation_state == validation_state:
+            return
+        # Validation is expensive for JSONL vectors.  Check once per index
+        # generation, including failed/partial build states.
+        self._vector_validation_state = validation_state
 
         vector_index = KnowledgeVectorIndex(
             vector_file=self.vector_index_file,
@@ -403,6 +587,7 @@ class KnowledgeRetriever:
 
         self._vector_mtime_ns = None
         self._load_vectors()
+        self._vector_validation_state = (self._mtime_ns, self._vector_mtime_ns)
         remaining = vector_index.missing_count(self._rows)
         self.vector_status = "ready" if remaining == 0 else "partial"
         self.vector_status_detail = (
@@ -412,6 +597,9 @@ class KnowledgeRetriever:
     def _embed_query(self, query: str) -> tuple[float, ...] | None:
         if not self._vectors:
             return None
+        normalized = query.strip()
+        if normalized in self._query_embedding_cache:
+            return self._query_embedding_cache[normalized]
         embedding_provider = self._embedding_provider()
         if embedding_provider is None:
             return None
@@ -419,7 +607,12 @@ class KnowledgeRetriever:
             values = embedding_provider(query)
         except Exception:
             return None
-        return tuple(float(value) for value in values)
+        result = tuple(float(value) for value in values)
+        if result:
+            if len(self._query_embedding_cache) > 128:
+                self._query_embedding_cache.clear()
+            self._query_embedding_cache[normalized] = result
+        return result
 
     def _embedding_provider(self) -> EmbeddingProvider | None:
         if not self._default_embedding_provider_loaded:
@@ -436,6 +629,47 @@ class KnowledgeRetriever:
             return 0.0
         chunk_id = str(row.get("chunk_id") or "")
         return cosine_similarity(query_embedding, self._vectors.get(chunk_id))
+
+    def _semantic_scores(
+        self,
+        query_embedding: tuple[float, ...] | None,
+    ) -> tuple[float, ...]:
+        """Compute cosine scores for every row with one matrix multiply."""
+
+        if query_embedding is None or not self._rows:
+            return ()
+        try:
+            import numpy as np
+        except ImportError:
+            return tuple(
+                self._semantic_score(row, query_embedding)
+                for row in self._rows
+            )
+
+        dimension = len(query_embedding)
+        if dimension <= 0:
+            return ()
+        if (
+            self._normalized_vector_matrix is None
+            or self._vector_matrix_dimension != dimension
+        ):
+            matrix = np.zeros((len(self._rows), dimension), dtype=np.float32)
+            for index, row in enumerate(self._rows):
+                vector = self._vectors.get(str(row.get("chunk_id") or ""))
+                if vector is None or len(vector) != dimension:
+                    continue
+                matrix[index] = vector
+            norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+            np.divide(matrix, norms, out=matrix, where=norms > 0)
+            self._normalized_vector_matrix = matrix
+            self._vector_matrix_dimension = dimension
+
+        query = np.asarray(query_embedding, dtype=np.float32)
+        query_norm = float(np.linalg.norm(query))
+        if query_norm <= 0:
+            return tuple(0.0 for _ in self._rows)
+        scores = self._normalized_vector_matrix @ (query / query_norm)
+        return tuple(float(value) for value in scores)
 
 
 def _read_index_rows(index_file: Path) -> list[dict[str, Any]]:
@@ -617,6 +851,82 @@ def _exact_score(query: str, query_tokens: list[str], row: dict[str, Any]) -> fl
         if "00_project_overview" in path:
             score += 10
     return score
+
+
+def _literal_exact_score(
+    query: str,
+    query_tokens: list[str],
+    row: dict[str, Any],
+) -> float:
+    """Score literal phrases/identifiers independently from BM25."""
+
+    score = _exact_score(query, query_tokens, row)
+    normalized = query.strip().casefold()
+    content = str(row.get("content") or "").casefold()
+    title = str(row.get("title") or "").casefold()
+    path = str(row.get("path") or "").casefold()
+    if len(normalized) >= 3:
+        if normalized in title:
+            score += 100
+        elif normalized in path:
+            score += 80
+        elif normalized in content:
+            score += 50
+    return score
+
+
+def _retrieved_chunk(
+    row: dict[str, Any],
+    *,
+    index: int,
+    metadata: dict[str, Any],
+    query_tokens: list[str],
+    document_tokens: set[str],
+    score: float,
+    bm25_score: float,
+    exact_score: float,
+    semantic_score: float,
+    metadata_score: float,
+    channel: str,
+) -> RetrievedChunk:
+    matched_terms = tuple(token for token in query_tokens if token in document_tokens)
+    return RetrievedChunk(
+        chunk_id=str(row.get("chunk_id") or f"legacy-{index}"),
+        layer=metadata["layer"],
+        source=str(row.get("source") or metadata["layer"]),
+        path=str(row.get("path") or ""),
+        title=str(row.get("title") or row.get("path") or ""),
+        snippet=_make_snippet(str(row.get("content") or ""), query_tokens),
+        domain=metadata["domain"],
+        priority=metadata["priority"],
+        status=metadata["status"],
+        quality=metadata["quality"],
+        sensitivity=metadata["sensitivity"],
+        last_verified=metadata["last_verified"],
+        score=round(score, 6),
+        intent_tags=metadata["intent_tags"],
+        bm25_score=round(bm25_score, 6),
+        exact_score=round(exact_score, 6),
+        semantic_score=round(semantic_score, 6),
+        metadata_score=round(metadata_score, 6),
+        matched_terms=matched_terms,
+        recall_channels=(channel,),
+        symbol=str(row.get("symbol") or ""),
+        line_start=_optional_int(row.get("line_start")),
+        line_end=_optional_int(row.get("line_end")),
+        rerank_text=_make_snippet(
+            str(row.get("content") or ""),
+            query_tokens,
+            width=3000,
+        ),
+    )
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_definition_query(query: str) -> bool:

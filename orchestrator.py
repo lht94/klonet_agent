@@ -20,6 +20,8 @@ from klonet_agent.config import (
     MAX_TOOL_ROUNDS,
     MEMORY_DIR,
     OPS_MAX_TOOL_ROUNDS,
+    RAG_QUERY_PLANNER_MODEL,
+    RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
     TRACE_FILE,
 )
@@ -33,6 +35,8 @@ from klonet_agent.knowledge.conversation_state import (
 )
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.intent_analyzer import IntentAnalyzer, route_from_intent
+from klonet_agent.knowledge.models import RetrievalPlan
+from klonet_agent.knowledge.query_planner import plan_as_dict
 from klonet_agent.knowledge.semantic_understanding import IntentDecision
 from klonet_agent.knowledge.turn_intent import (
     TurnDecision,
@@ -83,9 +87,21 @@ class AgentOrchestrator:
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
+        supplied_llm = llm
         self.llm = llm or LLMClient()
         self.answer_style = answer_style
-        self.intent_analyzer = intent_analyzer or IntentAnalyzer(self.llm)
+        if intent_analyzer is not None:
+            self.intent_analyzer = intent_analyzer
+        elif supplied_llm is not None:
+            # Test/custom callers commonly provide one deterministic client.
+            self.intent_analyzer = IntentAnalyzer(self.llm)
+        else:
+            self.intent_analyzer = IntentAnalyzer(
+                LLMClient(
+                    model=RAG_QUERY_PLANNER_MODEL,
+                    timeout=RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
+                )
+            )
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
             MEMORY_DIR,
@@ -100,6 +116,7 @@ class AgentOrchestrator:
         self._turn_intent_builder = TurnIntentBuilder()
         self._turn_decision_planner = TurnDecisionPlanner()
         self._conversation_state = ConversationState()
+        self._retrieval_plan: RetrievalPlan | None = None
         self._conversation_state_manager = ConversationStateManager()
         self._knowledge_search_count = 0
         self._paused_turn_state: dict | None = None
@@ -452,6 +469,7 @@ class AgentOrchestrator:
         reasoning_trace_printed = False
         self._query_intent = None
         self._intent_decision = None
+        self._retrieval_plan = None
         self._turn_intent = None
         self._turn_decision = None
         self._knowledge_search_count = 0
@@ -511,6 +529,7 @@ class AgentOrchestrator:
             self._intent_decision = state.get("decision")
             self._query_route = state.get("route") or route_query(effective_user_input)
             self._conversation_state = state.get("conversation_state") or ConversationState()
+            self._retrieval_plan = state.get("retrieval_plan")
             self._refresh_turn_plan(
                 user_input,
                 recent_history=recent_history_for_intent,
@@ -553,6 +572,7 @@ class AgentOrchestrator:
                 token += analysis.token_usage
                 self._query_intent = analysis.intent
                 self._intent_decision = analysis.decision
+                self._retrieval_plan = analysis.retrieval_plan
                 self._conversation_state = self._conversation_state_manager.from_turn(
                     user_input,
                     recent_history=recent_history_for_intent,
@@ -573,6 +593,7 @@ class AgentOrchestrator:
                 self._query_route = route_query(user_input)
                 self._query_intent = None
                 self._intent_decision = None
+                self._retrieval_plan = None
                 self._refresh_turn_plan(
                     user_input,
                     recent_history=recent_history_for_intent,
@@ -752,6 +773,12 @@ class AgentOrchestrator:
                             tool_args["intent"] = self._query_intent_tool_args()
                             tool_args["conversation_state"] = (
                                 self._conversation_state.to_tool_args()
+                            )
+                        if self._retrieval_plan is not None:
+                            # Reuse the front-loaded model call.  The retrieval
+                            # layer must not make a second planning call.
+                            tool_args["retrieval_plan"] = plan_as_dict(
+                                self._retrieval_plan
                             )
                     # 调用工具函数，开始执行命令或其他动作。
                     self._print_tool_loop_action(tool_name, tool_args)
@@ -1803,6 +1830,7 @@ class AgentOrchestrator:
             "turn_decision": self._turn_decision,
             "route": self._query_route,
             "conversation_state": self._conversation_state,
+            "retrieval_plan": self._retrieval_plan,
         }
 
     def _refresh_turn_plan(
