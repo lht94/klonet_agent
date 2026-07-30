@@ -65,6 +65,22 @@ class DelegatingSupervisor:
         return SupervisorResult(False, "conversation")
 
 
+class ContextCapturingSupervisor:
+    def __init__(self):
+        self.calls = []
+
+    def handle_with_context(
+        self,
+        text,
+        environment_context="",
+        conversation_context="",
+    ):
+        from klonet_agent.ops.privileged.supervisor import SupervisorResult
+
+        self.calls.append((text, environment_context, conversation_context))
+        return SupervisorResult(True, "clarification", "context captured")
+
+
 class AnswerLLM:
     def __init__(self):
         self.calls = []
@@ -136,6 +152,37 @@ def test_orchestrator_returns_handled_supervisor_result_before_main_llm():
     assert supervisor.calls == [("show-priv priv-123", "")]
 
 
+def test_orchestrator_passes_recent_dialogue_to_privileged_classifier():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+
+    supervisor = ContextCapturingSupervisor()
+    history = [
+        {"role": "system", "content": "internal"},
+        {"role": "user", "content": "检查 nginx"},
+        {"role": "assistant", "content": "nginx 当前未运行"},
+    ]
+    with local_temp_dir() as temp_dir:
+        session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
+        memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops-privilege"),
+            session=session,
+            llm=NoCallLLM(),
+            memory_store=memory,
+            privileged_supervisor=supervisor,
+        )
+        reply, _, _ = orchestrator.single_chat("重启它", history, 0)
+
+    assert reply == "context captured"
+    assert supervisor.calls[0][0] == "重启它"
+    assert supervisor.calls[0][1] == ""
+    assert "nginx 当前未运行" in supervisor.calls[0][2]
+    assert "internal" not in supervisor.calls[0][2]
+
+
 def test_orchestrator_continues_to_answerer_when_supervisor_delegates_conversation():
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
@@ -190,7 +237,6 @@ def test_trace_logger_records_privileged_lifecycle_event(tmp_path):
 
 def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
     import json
-    import sys
 
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
@@ -199,10 +245,6 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
     from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
 
     target = tmp_path / "result.txt"
-    command = (
-        '"%s" -c "from pathlib import Path; Path(r\'%s\').write_text(\'ready\')"'
-        % (sys.executable, target)
-    )
 
     class SequentialLLM:
         def __init__(self):
@@ -215,8 +257,11 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
                             {
                                 "step_id": "create-result",
                                 "title": "create result",
-                                "command": command,
-                                "risk": "low",
+                                "action": "write_ops_file",
+                                "args": {
+                                    "path": str(target),
+                                    "content": "ready",
+                                },
                                 "postconditions": [
                                     {
                                         "checker": "file_exists",
@@ -246,9 +291,20 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
 
     llm = SequentialLLM()
     store = PrivilegedPlanStore(tmp_path / "memory", user_id="u", project_id="p")
+
+    def action_runner(plan, step):
+        from klonet_agent.ops.operations import RecipeExecutionResult
+
+        del plan
+        target.write_text(step.args["content"], encoding="utf-8")
+        return RecipeExecutionResult(
+            "completed",
+            "environment_changed=true",
+        )
+
     workflow = PrivilegedOpsWorkflow(
         planner=PrivilegedPlannerAgent(llm),
-        executor=PrivilegedCommandExecutor(),
+        executor=PrivilegedCommandExecutor(action_runner=action_runner),
         verifier=PrivilegedVerifierAgent(llm),
         store=store,
     )

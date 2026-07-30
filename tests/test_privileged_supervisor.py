@@ -11,21 +11,30 @@ class FakeLLM:
         self.contents = list(contents)
         self.calls = []
 
-    def complete(self, messages, tools=None):
-        self.calls.append({"messages": messages, "tools": tools})
+    def complete(self, messages, tools=None, **kwargs):
+        self.calls.append(
+            {"messages": messages, "tools": tools, "kwargs": kwargs}
+        )
         content = self.contents.pop(0)
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
         )
 
 
+class FailingLLM:
+    def complete(self, *args, **kwargs):
+        raise RuntimeError("provider unavailable")
+
+
 def _intent_payload(intent, **overrides):
     payload = {
         "intent": intent,
+        "goal_clarity": "missing" if intent == "ambiguous" else "clear",
         "requires_execution": intent in {"readonly_action", "mutating_action"},
         "command": "",
         "confidence": 0.95,
         "reason": "classified from the user request",
+        "clarification_question": "",
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -45,23 +54,37 @@ def test_intent_classifier_returns_structured_toolless_decision(intent):
     assert decision.intent == intent
     assert decision.command == "python3 -V"
     assert llm.calls[0]["tools"] is None
+    assert llm.calls[0]["kwargs"]["extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
     assert "Intent Classifier" in llm.calls[0]["messages"][0]["content"]
 
 
-def test_intent_classifier_repairs_once_then_fails_safe_as_ambiguous():
+def test_intent_classifier_repairs_once_then_reports_internal_failure():
     from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 
     llm = FakeLLM(["not-json", "still-not-json"])
 
     decision = PrivilegedIntentClassifier(llm).classify("do something")
 
-    assert decision.intent == "ambiguous"
+    assert decision.intent == "classifier_error"
     assert decision.requires_execution is False
+    assert decision.classifier_status == "invalid_output"
     assert len(llm.calls) == 2
     assert "repair" in llm.calls[1]["messages"][-1]["content"].lower()
 
 
-def test_intent_classifier_fails_closed_on_low_confidence_execution_intent():
+def test_intent_classifier_reports_provider_failure_separately_from_ambiguity():
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    decision = PrivilegedIntentClassifier(FailingLLM()).classify("检查服务")
+
+    assert decision.intent == "classifier_error"
+    assert decision.classifier_status == "provider_error"
+    assert decision.should_clarify is False
+
+
+def test_intent_classifier_does_not_turn_low_confidence_into_user_ambiguity():
     from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 
     llm = FakeLLM(
@@ -76,9 +99,34 @@ def test_intent_classifier_fails_closed_on_low_confidence_execution_intent():
 
     decision = PrivilegedIntentClassifier(llm).classify("帮我看一下")
 
-    assert decision.intent == "ambiguous"
-    assert decision.requires_execution is False
-    assert "low confidence" in decision.reason
+    assert decision.intent == "readonly_action"
+    assert decision.requires_execution is True
+    assert decision.confidence == 0.2
+    assert decision.should_clarify is False
+
+
+def test_intent_classifier_receives_recent_conversation_for_reference_recovery():
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    llm = FakeLLM(
+        [
+            _intent_payload(
+                "mutating_action",
+                goal_clarity="discoverable",
+            )
+        ]
+    )
+
+    decision = PrivilegedIntentClassifier(llm).classify(
+        "重启它",
+        conversation_context="user: 检查 nginx\nassistant: nginx 未运行",
+    )
+
+    assert decision.intent == "mutating_action"
+    assert decision.goal_clarity == "discoverable"
+    prompt = llm.calls[0]["messages"][-1]["content"]
+    assert "nginx 未运行" in prompt
+    assert "重启它" in prompt
 
 
 @pytest.mark.parametrize(
@@ -104,8 +152,8 @@ class StubClassifier:
         self.decision = decision
         self.calls = []
 
-    def classify(self, text):
-        self.calls.append(text)
+    def classify(self, text, conversation_context=""):
+        self.calls.append((text, conversation_context))
         return self.decision
 
 
@@ -138,7 +186,13 @@ class StubWorkflow:
         return WorkflowResult("awaiting_confirmation", "confirm plan")
 
 
-def _decision(intent, command=""):
+def _decision(
+    intent,
+    command="",
+    *,
+    goal_clarity=None,
+    clarification_question="",
+):
     from klonet_agent.ops.privileged.intent import PrivilegedIntentDecision
 
     return PrivilegedIntentDecision(
@@ -147,13 +201,17 @@ def _decision(intent, command=""):
         command=command,
         confidence=0.9,
         reason="test",
+        goal_clarity=goal_clarity or (
+            "missing" if intent == "ambiguous" else "clear"
+        ),
+        clarification_question=clarification_question,
     )
 
 
-def _supervisor(intent="conversation", command=""):
+def _supervisor(intent="conversation", command="", **decision_kwargs):
     from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 
-    classifier = StubClassifier(_decision(intent, command))
+    classifier = StubClassifier(_decision(intent, command, **decision_kwargs))
     workflow = StubWorkflow()
     return (
         PrivilegedOpsSupervisor(workflow=workflow, classifier=classifier),
@@ -191,7 +249,22 @@ def test_supervisor_delegates_conversation_to_answerer():
 
     assert result.handled is False
     assert result.kind == "conversation"
-    assert classifier.calls == ["什么是 tc qdisc？"]
+    assert classifier.calls == [("什么是 tc qdisc？", "")]
+    assert workflow.readonly == []
+    assert workflow.mutations == []
+
+
+def test_supervisor_clarifies_when_conversation_goal_itself_is_missing():
+    supervisor, workflow, _ = _supervisor(
+        "conversation",
+        goal_clarity="missing",
+        clarification_question="请补充你想了解的具体对象。",
+    )
+
+    result = supervisor.handle("这个是什么")
+
+    assert result.kind == "clarification"
+    assert result.message == "请补充你想了解的具体对象。"
     assert workflow.readonly == []
     assert workflow.mutations == []
 
@@ -208,22 +281,107 @@ def test_supervisor_routes_readonly_action_to_readonly_flow():
 
 
 def test_supervisor_routes_mutating_action_to_existing_pev():
-    supervisor, workflow, _ = _supervisor("mutating_action")
+    supervisor, workflow, _ = _supervisor(
+        "mutating_action",
+        goal_clarity="discoverable",
+    )
 
     result = supervisor.handle("帮我部署平台")
 
     assert result.handled is True
     assert result.kind == "awaiting_confirmation"
-    assert workflow.mutations == [("帮我部署平台", "")]
+    assert workflow.mutations
+    assert workflow.mutations[0][0] == "帮我部署平台"
+    assert "read-only inspection" in workflow.mutations[0][1]
+
+
+def test_supervisor_reports_analysis_and_planning_progress_for_mutation():
+    from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
+
+    progress = []
+    classifier = StubClassifier(
+        _decision("mutating_action", goal_clarity="discoverable")
+    )
+    workflow = StubWorkflow()
+    supervisor = PrivilegedOpsSupervisor(
+        workflow=workflow,
+        classifier=classifier,
+        on_progress=progress.append,
+    )
+
+    result = supervisor.handle("帮我部署平台")
+
+    assert result.kind == "awaiting_confirmation"
+    assert progress == [
+        "正在分析请求并规划下一步…",
+        "正在检索 Klonet 知识并读取服务器环境，然后生成操作计划…",
+    ]
 
 
 def test_supervisor_clarifies_ambiguous_intent_without_execution():
-    supervisor, workflow, _ = _supervisor("ambiguous")
+    supervisor, workflow, _ = _supervisor(
+        "ambiguous",
+        clarification_question="请说明要处理哪个网络对象，以及期望达到什么状态。",
+    )
 
     result = supervisor.handle("帮我处理一下网络")
 
     assert result.handled is True
     assert result.kind == "clarification"
-    assert "clarify" in result.message.lower()
+    assert result.message == "请说明要处理哪个网络对象，以及期望达到什么状态。"
+    assert workflow.readonly == []
+    assert workflow.mutations == []
+
+
+def test_supervisor_never_exposes_english_model_clarification_to_chinese_user():
+    supervisor, _, _ = _supervisor(
+        "ambiguous",
+        clarification_question="Please clarify the target.",
+    )
+
+    result = supervisor.handle("处理一下")
+
+    assert result.kind == "clarification"
+    assert "Please" not in result.message
+    assert "补充具体目标" in result.message
+
+
+def test_supervisor_routes_readonly_goal_without_command_through_planner():
+    supervisor, workflow, _ = _supervisor(
+        "readonly_action",
+        goal_clarity="discoverable",
+    )
+
+    result = supervisor.handle("检查 Klonet 为什么没有启动")
+
+    assert result.handled is True
+    assert result.kind == "awaiting_confirmation"
+    assert workflow.readonly == []
+    assert workflow.mutations[0][0] == "检查 Klonet 为什么没有启动"
+    assert "read-only inspection" in workflow.mutations[0][1]
+
+
+def test_supervisor_clarifies_missing_target_even_if_action_type_is_known():
+    supervisor, workflow, _ = _supervisor(
+        "mutating_action",
+        goal_clarity="missing",
+        clarification_question="请说明要删除哪个对象。",
+    )
+
+    result = supervisor.handle("把它删掉")
+
+    assert result.kind == "clarification"
+    assert result.message == "请说明要删除哪个对象。"
+    assert workflow.mutations == []
+
+
+def test_supervisor_reports_classifier_failure_as_system_error_not_clarification():
+    supervisor, workflow, _ = _supervisor("classifier_error")
+
+    result = supervisor.handle("检查服务")
+
+    assert result.kind == "blocked"
+    assert "分类服务异常" in result.message
+    assert "不是你的表达问题" in result.message
     assert workflow.readonly == []
     assert workflow.mutations == []

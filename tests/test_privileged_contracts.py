@@ -32,7 +32,7 @@ def test_privileged_plan_round_trips_and_has_stable_content_hash():
 
     assert restored.to_dict() == plan.to_dict()
     assert restored.content_hash == plan.content_hash
-    assert restored.schema_version == 1
+    assert restored.schema_version == 2
 
 
 def test_plan_hash_changes_when_executable_content_changes_and_clears_authorization():
@@ -221,7 +221,7 @@ def test_store_marks_interrupted_running_steps_unknown_without_reexecuting(tmp_p
 
     recovered = store.recover("priv-123")
 
-    assert recovered.status == "blocked"
+    assert recovered.status == "paused"
     assert recovered.steps[0].status == "execution_unknown"
     assert "never auto-reexecute" in recovered.steps[0].observation
 
