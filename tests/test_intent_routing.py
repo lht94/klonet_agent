@@ -278,7 +278,7 @@ def test_old_index_rows_require_intent_metadata_migration():
         [{"path": "old-v2.md", "intent_tags": [], "index_schema_version": 2}]
     ) is True
     assert _needs_intent_metadata_migration(
-        [{"path": "new.md", "intent_tags": [], "index_schema_version": 3}]
+        [{"path": "new.md", "intent_tags": [], "index_schema_version": 5}]
     ) is False
 
 
@@ -323,6 +323,23 @@ screen -r worker
 
     assert [title for title, _ in sections] == ["正常停止", "正常停止 / 常见问题"]
     assert "# 按 Ctrl+C" in sections[0][1]
+
+
+def test_structural_windows_keep_normal_code_fence_together():
+    """超长章节按块打包时，不应从普通 fenced code 中间切断。"""
+
+    from klonet_agent.knowledge.indexer import _split_windows
+
+    command_block = "```bash\n" + "\n".join(
+        f"echo command-{index}" for index in range(20)
+    ) + "\n```"
+    text = ("背景说明。" * 80) + "\n\n" + command_block + "\n\n" + ("验收步骤。" * 80)
+
+    chunks = _split_windows(text, chunk_size=700, overlap=80)
+
+    containing = [chunk for chunk in chunks if "echo command-10" in chunk]
+    assert len(containing) == 1
+    assert command_block in containing[0]
 
 
 def test_platform_start_builds_component_complete_retrieval_plan():

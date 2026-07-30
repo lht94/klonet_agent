@@ -1,0 +1,203 @@
+{
+  "controllers": [
+    {
+      "image_name": "controller/floodlight",
+      "type": "controller",
+      "sub_type": "floodlight",
+      "image_icon": "image_icon/ctr.png",
+      "configurations": [
+        {
+          "config_name": "port",
+          "config_description": "控制器端口",
+          "value_method": "disabled",
+          "default_value": 6653
+        }
+      ]
+    }
+  ],
+  "switches": [
+    {
+      "image_name": "switch/ovs",
+      "type": "switch",
+      "sub_type": "ovs",
+      "image_icon": "image_icon/ovs.png",
+      "configurations": [
+        {
+          "config_name": "stp",
+          "config_description": "是否开启stp协议",
+          "value_method": "select",
+          "value_list": [true,false],
+          "default_value": true
+        },
+        {
+          "config_name": "controllers",
+          "config_description": "OVS的控制器",
+              "value_method": "multi",
+              "default_value": []
+        }
+      ]
+    }
+  ],
+  "routers": [
+    {
+      "image_name": "router/quagga",
+      "type": "router",
+      "sub_type": "quagga",
+      "image_icon": "image_icon/rip.png",
+      "configurations": [
+        {
+          "config_name": "interface",
+          "config_description": "路由器接口信息",
+          "config_details": [
+            {
+              "config_name": "ip",
+              "config_description": "接口IP信息",
+              "value_method": "input",
+              "default_value": null
+            },
+            {
+              "config_name": "netmask",
+              "config_description": "接口网络掩码的信息",
+              "value_method": "input",
+              "default_value": null
+            }
+          ]
+        },
+        {
+          "config_name": "rip",
+          "config_description": "rip路由协议的配置信息",
+          "config_details": [
+            {
+              "config_name": "enable",
+              "config_description": "是否启用rip协议",
+              "value_method": "select",
+              "default_value": false,
+              "value_list": [true, false]
+            },
+            {
+              "config_name": "networks",
+              "config_description": "网络段",
+              "value_method": "multi",
+              "default_value": []
+            },
+            {
+              "config_name":  "neighbors",
+              "config_description":  "网络邻域",
+              "value_method":  "multi",
+              "default_value": []
+            },
+            {
+              "config_name":  "version",
+              "config_description": "rip协议的版本",
+              "value_method": "select",
+              "default_value": 2,
+              "value_list": [1, 2]
+            }
+          ]
+        },
+        {
+          "config_name":  "ospf",
+          "config_description": "OSPF协议的配置信息",
+          "config_details": [
+            {
+              "config_name": "enable",
+              "config_description": "是否启用ospf协议",
+              "value_method": "select",
+              "default_value": false,
+              "value_list": [true, false]
+            },
+            {
+              "config_name": "router_id",
+              "config_description": "路由器ID",
+              "value_method": "input",
+              "default_value": null
+            },
+            {
+              "config_name": "networks",
+              "config_description": "网络配置信息",
+              "value_method": "multi",
+              "default_value": []
+            },
+            {
+              "config_name": "areas",
+              "config_description": "区域的配置信息",
+              "config_details": [
+               {
+                  "config_name": "<area_id>",
+                  "config_description": "区域信息的配置",
+                  "value_method": "multi",
+                  "default_value": []
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "config_name": "bgp",
+          "config_description": "bgp路由协议相关配置",
+          "config_details": [
+            {
+              "config_name": "asn",
+              "config_description": "自治系统编号",
+              "value_method": "input",
+              "default_value": null
+            },
+            {
+              "config_name": "router_id",
+              "config_description": "路由器id",
+              "value_method": "input",
+              "default_value": null
+            },
+            {
+              "config_name": "networks",
+              "config_description": "网络配置信息",
+              "value_method": "multi",
+              "default_value": []
+            },
+            {
+              "config_name": "neighbors",
+              "config_description": "邻域的配置信息",
+              "value_method": "multi",
+              "default_value": []
+            }
+          ]
+        }
+      ]
+    }
+
+  ],
+  "hosts": [
+    {
+      "image_name": "host/ubuntu",
+      "type": "host",
+      "sub_type": "ubuntu",
+      "image_icon": "image_icon/host.png",
+      "configurations": [
+        {
+          "config_name": "interface",
+          "config_description": "路由器接口信息",
+          "config_details": [
+            {
+              "config_name": "ip",
+              "config_description": "接口IP信息",
+              "value_method": "input",
+              "default_value": null
+            },
+            {
+              "config_name": "netmask",
+              "config_description": "接口网络掩码的信息",
+              "value_method": "input",
+              "default_value": null
+            }
+          ]
+        },
+        {
+          "config_name": "gateway",
+          "config_description": "网关信息",
+          "value_method": "input",
+          "default_value": null
+        }
+      ]
+    }
+  ]
+}

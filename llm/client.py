@@ -40,6 +40,8 @@ class LLMClient:
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         model: str = DEFAULT_MODEL,
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ):
         # api_key: str | None 表示 api_key 可以是字符串，也可以是 None。
         # 如果调用方没有显式传入 api_key，就从环境变量 DEEPSEEK_API_KEY 中读取。
@@ -53,7 +55,12 @@ class LLMClient:
         # 而是通过 LLMClient.complete() 发起模型请求。
         from openai import OpenAI
 
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        client_options = {"api_key": self.api_key, "base_url": self.base_url}
+        if timeout is not None:
+            client_options["timeout"] = timeout
+        if max_retries is not None:
+            client_options["max_retries"] = max(0, int(max_retries))
+        self.client = OpenAI(**client_options)
 
     def complete(
         self,
@@ -61,6 +68,10 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
         stream: bool = False,
+        *,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ):
         """发送一次 Chat Completions 请求并返回原始模型响应。
 
@@ -86,6 +97,12 @@ class LLMClient:
         # tools 是可选参数。没有工具时不传 tools 字段，避免某些模型接口对空列表兼容不好。
         if tools is not None:
             request["tools"] = tools
+        if temperature is not None:
+            request["temperature"] = temperature
+        if response_format is not None:
+            request["response_format"] = response_format
+        if extra_body is not None:
+            request["extra_body"] = extra_body
 
         # 真正发起 HTTP 请求的位置。上层模块只调用 complete()，
         # 不需要知道 OpenAI SDK 的具体调用链。

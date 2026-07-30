@@ -1,0 +1,56 @@
+{"hosts": [
+    {
+      "image_name": "pantheon",
+      "type": "host",
+      "subtype": "pantheon",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {}
+    },
+    {
+      "image_name": "host/ubuntu",
+      "type": "host",
+      "subtype": "base_station",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {}
+    },
+    {
+      "image_name": "host/ubuntu",
+      "type": "host",
+      "subtype": "router",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {}
+    },
+    {
+      "image_name": "host/ubuntu",
+      "type": "host",
+      "subtype": "phone",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"dashed",
+      "config": {}
+    },
+    {
+      "image_name": "host/ubuntu",
+      "type": "host",
+      "subtype": "cloud_server",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {}
+    },
+    {
+      "image_name": "host/ubuntu",
+      "type": "host",
+      "subtype": "data_center",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {}
+    }
+  ]}

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -32,6 +35,7 @@ class KnowledgeVectorIndex:
         append: bool = False,
         limit: int | None = None,
         include_paths: Sequence[str] | None = None,
+        batch_size: int = 10,
     ) -> int:
         """Embed rows and write chunk_id -> vector records."""
 
@@ -39,39 +43,94 @@ class KnowledgeVectorIndex:
             return 0
 
         self.vector_file.parent.mkdir(parents=True, exist_ok=True)
-        existing = self.load() if append else {}
+        records = self.load_records() if append else {}
+        if append:
+            current_chunk_ids = {
+                str(row.get("chunk_id") or f"legacy-{index}")
+                for index, row in enumerate(rows)
+            }
+            records = {
+                chunk_id: record
+                for chunk_id, record in records.items()
+                if chunk_id in current_chunk_ids
+            }
         selected_paths = {path for path in include_paths or () if path}
-        count = 0
-        vectors = dict(existing)
         if limit is not None and limit <= 0:
-            _write_vectors(self.vector_file, vectors)
+            _write_records(self.vector_file, records)
             return 0
 
+        pending: list[tuple[str, str, str]] = []
+        embedding_model = _embedding_model(self.embedding_provider)
         for index, row in enumerate(rows):
             chunk_id = str(row.get("chunk_id") or f"legacy-{index}")
-            if chunk_id in vectors:
-                continue
             if selected_paths and str(row.get("path") or "") not in selected_paths:
                 continue
             text = _row_text(row)
-            vector = _vector(self.embedding_provider(text))
-            if vector is None:
+            content_hash = _content_hash(text)
+            existing = records.get(chunk_id)
+            if (
+                existing is not None
+                and _vector(existing.get("embedding")) is not None
+                and existing.get("content_hash") in {None, "", content_hash}
+                and existing.get("embedding_model") in {
+                    None,
+                    "",
+                    embedding_model,
+                }
+            ):
                 continue
-            vectors[chunk_id] = vector
-            count += 1
-            if limit is not None and count >= limit:
+            pending.append((chunk_id, text, content_hash))
+            if limit is not None and len(pending) >= limit:
                 break
 
-        _write_vectors(self.vector_file, vectors)
+        count = 0
+        safe_batch_size = max(1, int(batch_size))
+        try:
+            for start in range(0, len(pending), safe_batch_size):
+                batch = pending[start:start + safe_batch_size]
+                vectors = _embed_batch(
+                    self.embedding_provider,
+                    [text for _, text, _ in batch],
+                )
+                if len(vectors) != len(batch):
+                    raise ValueError(
+                        "embedding provider returned a different number of vectors"
+                    )
+                for (chunk_id, _, content_hash), values in zip(batch, vectors):
+                    vector = _vector(values)
+                    if vector is None:
+                        continue
+                    records[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "embedding": vector,
+                        "content_hash": content_hash,
+                        "embedding_model": embedding_model,
+                    }
+                    count += 1
+        except Exception:
+            if count:
+                _write_records(self.vector_file, records)
+            raise
+        else:
+            _write_records(self.vector_file, records)
         return count
 
     def load(self) -> dict[str, tuple[float, ...]]:
         """Load all persisted vectors keyed by chunk id."""
 
+        return {
+            chunk_id: vector
+            for chunk_id, record in self.load_records().items()
+            if (vector := _vector(record.get("embedding"))) is not None
+        }
+
+    def load_records(self) -> dict[str, dict[str, Any]]:
+        """Load vector records, including fingerprints used for incremental rebuilds."""
+
         if not self.vector_file.exists():
             return {}
 
-        vectors: dict[str, tuple[float, ...]] = {}
+        records: dict[str, dict[str, Any]] = {}
         with self.vector_file.open("r", encoding="utf-8") as file:
             for line in file:
                 try:
@@ -81,8 +140,40 @@ class KnowledgeVectorIndex:
                 chunk_id = str(row.get("chunk_id") or "").strip()
                 vector = _vector(row.get("embedding"))
                 if chunk_id and vector is not None:
-                    vectors[chunk_id] = vector
-        return vectors
+                    records[chunk_id] = {
+                        "chunk_id": chunk_id,
+                        "embedding": vector,
+                        "content_hash": str(row.get("content_hash") or ""),
+                        "embedding_model": str(row.get("embedding_model") or ""),
+                    }
+        return records
+
+    def missing_count(self, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Return how many vector records are missing, stale, or out of scope."""
+
+        records = self.load_records()
+        embedding_model = _embedding_model(self.embedding_provider)
+        current_chunk_ids = {
+            str(row.get("chunk_id") or f"legacy-{index}")
+            for index, row in enumerate(rows)
+        }
+        missing = len(set(records) - current_chunk_ids)
+        for index, row in enumerate(rows):
+            chunk_id = str(row.get("chunk_id") or f"legacy-{index}")
+            text = _row_text(row)
+            content_hash = _content_hash(text)
+            record = records.get(chunk_id)
+            if record is None or _vector(record.get("embedding")) is None:
+                missing += 1
+                continue
+            stored_hash = str(record.get("content_hash") or "")
+            if stored_hash and stored_hash != content_hash:
+                missing += 1
+                continue
+            stored_model = str(record.get("embedding_model") or "")
+            if stored_model and stored_model != embedding_model:
+                missing += 1
+        return missing
 
 
 def cosine_similarity(
@@ -114,19 +205,59 @@ def _row_text(row: Mapping[str, Any]) -> str:
     return "\n".join(part for part in (title, content) if part)
 
 
-def _write_vectors(path: Path, vectors: Mapping[str, Sequence[float]]):
-    with path.open("w", encoding="utf-8") as file:
-        for chunk_id, vector in vectors.items():
-            file.write(
-                json.dumps(
-                    {
-                        "chunk_id": chunk_id,
-                        "embedding": tuple(float(value) for value in vector),
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
+def _embed_batch(
+    provider: EmbeddingProvider,
+    texts: Sequence[str],
+) -> tuple[Sequence[float], ...]:
+    owner = getattr(provider, "__self__", None)
+    batch_method = getattr(owner, "embed_texts", None)
+    if callable(batch_method):
+        return tuple(batch_method(texts))
+    return tuple(provider(text) for text in texts)
+
+
+def _content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _embedding_model(provider: EmbeddingProvider | None) -> str:
+    owner = getattr(provider, "__self__", None)
+    return str(getattr(owner, "model", "") or "")
+
+
+def _write_records(path: Path, records: Mapping[str, Mapping[str, Any]]):
+    temp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temp_name = file.name
+            for chunk_id, record in records.items():
+                vector = _vector(record.get("embedding"))
+                if vector is None:
+                    continue
+                payload = {
+                    "chunk_id": chunk_id,
+                    "embedding": vector,
+                }
+                content_hash = str(record.get("content_hash") or "")
+                if content_hash:
+                    payload["content_hash"] = content_hash
+                embedding_model = str(record.get("embedding_model") or "")
+                if embedding_model:
+                    payload["embedding_model"] = embedding_model
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if temp_name and os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
 def _vector(values: Sequence[float] | None) -> tuple[float, ...] | None:

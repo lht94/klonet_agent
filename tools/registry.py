@@ -673,7 +673,7 @@ TOOLS = [
     ),
     _tool(
         "search_code",
-        "在 Klonet 规范源码树中按字面量 grep 搜索源码。代码、接口、配置、启动脚本和报错类问题应优先用它定位真实源码证据。",
+        "在随主仓库发布的 Klonet 脱敏源码快照中检索。优先返回字面量 grep 命中；无字面量命中时自动使用独立的源码语义向量索引。结果代表 manifest 标记的上游 commit，不等同于某台运行机器的未提交现场源码。",
         {
             "query": {"type": "string", "description": "要搜索的函数名、路由、报错文本、配置项或关键词"},
             "path": {"type": "string", "description": "源码树内相对目录，默认搜索整个源码树"},
@@ -685,7 +685,7 @@ TOOLS = [
     ),
     _tool(
         "read_source_file",
-        "读取 Klonet 规范源码树中的真实源码文件。只能读取 klonet_knowledge/02_vemu_uestc_code 内文件，可指定行范围。",
+        "读取配置指定的 Klonet 脱敏源码快照文件，可指定行范围；路径始终限制在 KLONET_SOURCE_ROOT 内，并以快照 manifest 对应的 commit 为版本边界。",
         {
             "path": {"type": "string", "description": "源码树内相对文件路径，例如 mains/web_terminal_main.py"},
             "start_line": {"type": "integer", "description": "可选起始行号"},

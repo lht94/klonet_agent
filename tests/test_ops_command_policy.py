@@ -51,6 +51,39 @@ def test_command_policy_classifies_apt_install_as_step_confirmed_sudo():
     assert reinstall.requires_step_confirmation is True
 
 
+def test_command_policy_covers_bounded_git_update_and_recovery_forms(tmp_path):
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    repository = str(tmp_path)
+    allowed = [
+        (["pull", "--ff-only"], "git_pull"),
+        (["fetch", "--all", "--prune"], "git_fetch"),
+        (["reset", "--hard", "HEAD~1"], "git_reset"),
+        (["revert", "--no-edit", "abc123"], "git_revert"),
+        (["restore", "--", "config/app.py"], "git_restore"),
+        (["tag", "release-1", "HEAD"], "git_tag"),
+        (
+            ["push", "--force-with-lease", "origin", "feature/demo"],
+            "git_push",
+        ),
+    ]
+
+    for argv, category in allowed:
+        decision = decide_ops_command(
+            {"program": "git", "argv": argv, "cwd": repository}
+        )
+        assert decision.allowed, (argv, decision.reason)
+        assert decision.category == category
+    escaped = decide_ops_command(
+        {
+            "program": "git",
+            "argv": ["restore", "--", "../outside"],
+            "cwd": repository,
+        }
+    )
+    assert not escaped.allowed
+
+
 def test_command_policy_allows_controlled_python_package_install():
     from klonet_agent.ops.command_policy import decide_ops_command
 

@@ -14,7 +14,8 @@ from klonet_agent.knowledge.intent_cases import (
     build_intent_case_query,
 )
 from klonet_agent.knowledge.intent import QueryIntent
-from klonet_agent.knowledge.models import QueryRoute
+from klonet_agent.knowledge.models import QueryRoute, RetrievalPlan
+from klonet_agent.knowledge.query_planner import validate_plan
 from klonet_agent.knowledge.rag import route_query
 from klonet_agent.knowledge.semantic_understanding import (
     IntentDecision,
@@ -44,6 +45,21 @@ INTENT_ANALYSIS_PROMPT = """
 - clarification_question: 需要追问时的一句话问题
 - is_correction: 用户是否在纠正上一轮回答
 - confidence: 0 到 1
+
+同一个 JSON 还必须生成检索计划，不要再交给另一个模型改写：
+- standalone_query: 补全当前对话指代后的独立问题
+- retrieval_tasks: 1~2 个检索任务，每个任务包含：
+  - store: public_docs | source_code
+  - purpose: 该任务要寻找什么证据
+  - keyword_queries: 最多两条 BM25 查询
+  - semantic_queries: 最多两条向量查询
+  - exact_terms: 只能来自当前输入或上下文的函数、路径、配置项、错误文本
+- excluded_terms: 用户明确排除的检索词
+
+检索库职责：
+- public_docs：概念、使用、部署、规范和排障经验。
+- source_code：函数、API、配置、调用链和当前源码实现。
+- 开发、API、实现原理和排障问题通常需要同时检索两个库。
 
 判断原则：
 1. “部署 Klonet”如果无法判断是安装基础环境还是启动平台服务，clarification_required=true。
@@ -89,6 +105,7 @@ class IntentAnalysis:
     raw_content: str = ""
     semantic_frame: SemanticFrame | None = None
     decision: IntentDecision | None = None
+    retrieval_plan: RetrievalPlan | None = None
 
 
 class IntentAnalyzer:
@@ -108,23 +125,42 @@ class IntentAnalyzer:
     ) -> IntentAnalysis:
         history = recent_history or []
         user_message = _build_analysis_user_message(user_input, history)
+        plan_support_text = user_message
         intent_cases = self.intent_case_retriever.search_for_prompt(
             build_intent_case_query(user_input, history),
             top_k=4,
             min_score=0.1,
         )
         user_message = _append_intent_cases(user_message, intent_cases)
-        response = self.llm.complete(
-            messages=[
-                {"role": "system", "content": INTENT_ANALYSIS_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
-            tools=None,
-            stream=False,
-        )
+        messages = [
+            {"role": "system", "content": INTENT_ANALYSIS_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+        try:
+            response = self.llm.complete(
+                messages=messages,
+                tools=None,
+                stream=False,
+                temperature=0,
+                response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+        except TypeError:
+            # Compatibility for injected test/legacy clients with the older
+            # ``complete(messages, tools, stream)`` signature.
+            response = self.llm.complete(
+                messages=messages,
+                tools=None,
+                stream=False,
+            )
         content = response.choices[0].message.content or ""
         token_usage = getattr(getattr(response, "usage", None), "total_tokens", 0)
         raw = _parse_json_object(content)
+        retrieval_plan = validate_plan(
+            user_input,
+            raw,
+            support_text=plan_support_text,
+        )
         frame = _semantic_frame_from_mapping(raw)
         if frame is not None:
             decision = SemanticDecisionPlanner().plan(
@@ -139,12 +175,14 @@ class IntentAnalyzer:
                 raw_content=content,
                 semantic_frame=frame,
                 decision=decision,
+                retrieval_plan=retrieval_plan,
             )
         return IntentAnalysis(
             intent=QueryIntent.from_mapping(raw),
             token_usage=token_usage,
             used_model=True,
             raw_content=content,
+            retrieval_plan=retrieval_plan,
         )
 
 

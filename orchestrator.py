@@ -20,6 +20,14 @@ from klonet_agent.config import (
     MAX_TOOL_ROUNDS,
     MEMORY_DIR,
     OPS_MAX_TOOL_ROUNDS,
+    OPS_PRIVILEGE_CLASSIFIER_MODEL,
+    OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
+    OPS_PRIVILEGE_PLANNER_MODEL,
+    OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
+    OPS_PRIVILEGE_SUMMARIZER_MODEL,
+    OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
+    RAG_QUERY_PLANNER_MODEL,
+    RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
     TRACE_FILE,
 )
@@ -33,6 +41,8 @@ from klonet_agent.knowledge.conversation_state import (
 )
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.intent_analyzer import IntentAnalyzer, route_from_intent
+from klonet_agent.knowledge.models import RetrievalPlan
+from klonet_agent.knowledge.query_planner import plan_as_dict
 from klonet_agent.knowledge.semantic_understanding import IntentDecision
 from klonet_agent.knowledge.turn_intent import (
     TurnDecision,
@@ -47,8 +57,13 @@ from klonet_agent.memory import MemoryStore
 from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
+from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+from klonet_agent.ops.privileged.recovery import PrivilegedRecoveryAgent
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+from klonet_agent.ops.privileged.summarizer import PrivilegedEvidenceSummarizer
+from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
 from klonet_agent.ops.routing import OpsRoute, route_ops_request
@@ -76,13 +91,26 @@ class AgentOrchestrator:
         intent_analyzer: IntentAnalyzer | None = None,
         journal_maintainer: ProjectJournalMaintainer | None = None,
         privileged_workflow: PrivilegedOpsWorkflow | None = None,
+        privileged_supervisor: PrivilegedOpsSupervisor | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
+        supplied_llm = llm
         self.llm = llm or LLMClient()
         self.answer_style = answer_style
-        self.intent_analyzer = intent_analyzer or IntentAnalyzer(self.llm)
+        if intent_analyzer is not None:
+            self.intent_analyzer = intent_analyzer
+        elif supplied_llm is not None:
+            # Test/custom callers commonly provide one deterministic client.
+            self.intent_analyzer = IntentAnalyzer(self.llm)
+        else:
+            self.intent_analyzer = IntentAnalyzer(
+                LLMClient(
+                    model=RAG_QUERY_PLANNER_MODEL,
+                    timeout=RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
+                )
+            )
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
             MEMORY_DIR,
@@ -97,6 +125,7 @@ class AgentOrchestrator:
         self._turn_intent_builder = TurnIntentBuilder()
         self._turn_decision_planner = TurnDecisionPlanner()
         self._conversation_state = ConversationState()
+        self._retrieval_plan: RetrievalPlan | None = None
         self._conversation_state_manager = ConversationStateManager()
         self._knowledge_search_count = 0
         self._paused_turn_state: dict | None = None
@@ -104,7 +133,10 @@ class AgentOrchestrator:
         self._ops_route: OpsRoute | None = None
         self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
             ProjectJournal.from_session(self.session),
-            llm=self.llm,
+            # Test doubles and deterministic callers should not receive a
+            # surprise third model call. Production LLMClient instances still
+            # enable automatic journal maintenance.
+            llm=self.llm if isinstance(self.llm, LLMClient) else None,
         )
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
@@ -115,12 +147,24 @@ class AgentOrchestrator:
         )
         self.privileged_workflow = privileged_workflow
         if self.profile.name == "ops-privilege" and self.privileged_workflow is None:
+            planner_llm = self.llm
+            evidence_summarizer = None
+            if supplied_llm is None:
+                planner_llm = LLMClient(
+                    model=OPS_PRIVILEGE_PLANNER_MODEL,
+                    timeout=OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
+                    max_retries=0,
+                )
+                evidence_summarizer = PrivilegedEvidenceSummarizer(
+                    LLMClient(
+                        model=OPS_PRIVILEGE_SUMMARIZER_MODEL,
+                        timeout=OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
+                        max_retries=0,
+                    )
+                )
             self.privileged_workflow = PrivilegedOpsWorkflow(
-                planner=PrivilegedPlannerAgent(self.llm),
+                planner=PrivilegedPlannerAgent(planner_llm),
                 executor=PrivilegedCommandExecutor(
-                    on_start=lambda command: print(
-                        "Klonet Agent：正在执行已授权的高权限步骤\n%s" % command
-                    ),
                     on_output=lambda channel, chunk: print(chunk, end="", flush=True),
                 ),
                 verifier=PrivilegedVerifierAgent(self.llm),
@@ -130,6 +174,27 @@ class AgentOrchestrator:
                     project_id=self.session.project_id,
                 ),
                 event_sink=self._record_privileged_event,
+                context_builder=PrivilegedPlanContextBuilder(),
+                summarizer=evidence_summarizer,
+                recovery_agent=PrivilegedRecoveryAgent(planner_llm),
+                on_progress=lambda message: print("Klonet Agent：%s" % message),
+            )
+        self.privileged_supervisor = privileged_supervisor
+        if self.profile.name == "ops-privilege" and self.privileged_supervisor is None:
+            classifier_llm = self.llm
+            if supplied_llm is None:
+                classifier_llm = LLMClient(
+                    model=OPS_PRIVILEGE_CLASSIFIER_MODEL,
+                    timeout=OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
+                    max_retries=0,
+                )
+            self.privileged_supervisor = PrivilegedOpsSupervisor(
+                workflow=self.privileged_workflow,
+                classifier=PrivilegedIntentClassifier(classifier_llm),
+                on_progress=lambda message: print(
+                    "Klonet Agent：%s" % message,
+                    flush=True,
+                ),
             )
 
     def init_history(self) -> list[dict]:
@@ -443,6 +508,7 @@ class AgentOrchestrator:
         reasoning_trace_printed = False
         self._query_intent = None
         self._intent_decision = None
+        self._retrieval_plan = None
         self._turn_intent = None
         self._turn_decision = None
         self._knowledge_search_count = 0
@@ -459,8 +525,12 @@ class AgentOrchestrator:
         if hasattr(self.tool_executor, "set_user_authorization_context"):
             self.tool_executor.set_user_authorization_context(user_input)
 
-        privileged_reply = self._handle_privileged_request(user_input)
-        if privileged_reply is not None:
+        privileged_result = self._supervise_privileged_turn(
+            user_input,
+            recent_history=recent_history_for_intent,
+        )
+        if privileged_result is not None and privileged_result.handled:
+            privileged_reply = privileged_result.message
             assistant_msg = {"role": "assistant", "content": privileged_reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
@@ -501,6 +571,7 @@ class AgentOrchestrator:
             self._intent_decision = state.get("decision")
             self._query_route = state.get("route") or route_query(effective_user_input)
             self._conversation_state = state.get("conversation_state") or ConversationState()
+            self._retrieval_plan = state.get("retrieval_plan")
             self._refresh_turn_plan(
                 user_input,
                 recent_history=recent_history_for_intent,
@@ -543,6 +614,7 @@ class AgentOrchestrator:
                 token += analysis.token_usage
                 self._query_intent = analysis.intent
                 self._intent_decision = analysis.decision
+                self._retrieval_plan = analysis.retrieval_plan
                 self._conversation_state = self._conversation_state_manager.from_turn(
                     user_input,
                     recent_history=recent_history_for_intent,
@@ -563,6 +635,7 @@ class AgentOrchestrator:
                 self._query_route = route_query(user_input)
                 self._query_intent = None
                 self._intent_decision = None
+                self._retrieval_plan = None
                 self._refresh_turn_plan(
                     user_input,
                     recent_history=recent_history_for_intent,
@@ -743,6 +816,12 @@ class AgentOrchestrator:
                             tool_args["conversation_state"] = (
                                 self._conversation_state.to_tool_args()
                             )
+                        if self._retrieval_plan is not None:
+                            # Reuse the front-loaded model call.  The retrieval
+                            # layer must not make a second planning call.
+                            tool_args["retrieval_plan"] = plan_as_dict(
+                                self._retrieval_plan
+                            )
                     # 调用工具函数，开始执行命令或其他动作。
                     self._print_tool_loop_action(tool_name, tool_args)
                     result = self.use_tool(tool_name, tool_args)
@@ -863,40 +942,48 @@ class AgentOrchestrator:
 
         return reply, history, token
 
-    def _handle_privileged_request(self, user_input: str) -> str | None:
-        """在通用模型工具循环之前接管高权限控制命令和修改型目标。"""
+    def _supervise_privileged_turn(
+        self,
+        user_input: str,
+        *,
+        recent_history: list[dict] | None = None,
+    ):
+        """Send every Ops-Privilege turn through the Supervisor control plane."""
 
-        workflow = self.privileged_workflow
-        if self.profile.name != "ops-privilege" or workflow is None:
+        if self.profile.name != "ops-privilege":
             return None
-        normalized = " ".join((user_input or "").split())
-        if workflow.is_control_command(normalized):
-            return workflow.handle_command(normalized).message
-        if not self._is_privileged_execution_request(normalized):
-            return None
-        return workflow.submit(normalized, environment_context="").message
+        if self.privileged_supervisor is None:
+            raise RuntimeError("Ops-Privilege Supervisor is unavailable")
+        conversation_context = self._privileged_conversation_context(
+            recent_history or []
+        )
+        handle_with_context = getattr(
+            self.privileged_supervisor,
+            "handle_with_context",
+            None,
+        )
+        if handle_with_context is not None:
+            return handle_with_context(
+                user_input,
+                environment_context="",
+                conversation_context=conversation_context,
+            )
+        return self.privileged_supervisor.handle(user_input, environment_context="")
 
     @staticmethod
-    def _is_privileged_execution_request(user_input: str) -> bool:
-        """区分“执行一个修改”与“解释/查看”，避免把普通问答误送去执行。"""
+    def _privileged_conversation_context(history: list[dict]) -> str:
+        """Return a small dialogue-only context for pronoun and continuation recovery."""
 
-        text = (user_input or "").strip().lower()
-        if not text:
-            return False
-        mutation = re.search(
-            r"(重启|启动|停止|安装|卸载|删除|清理|修改|写入|覆盖|移动|部署|"
-            r"修复|升级|降级|reload|restart|start|stop|install|uninstall|"
-            r"remove|delete|modify|deploy|upgrade|execute|run\s+)",
-            text,
-        )
-        if mutation is None:
-            return False
-        question_only = re.search(
-            r"(怎么|如何|为什么|是什么|解释|介绍|教程|how\s+to|what\s+is|why\s+)",
-            text,
-        )
-        explicit_action = re.search(r"(请|帮我|立即|现在|执行|直接|please|go ahead)", text)
-        return question_only is None or explicit_action is not None
+        lines = []
+        for message in history[-8:]:
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = " ".join(str(message.get("content") or "").split())
+            if not content:
+                continue
+            lines.append("%s: %s" % (role, content[:600]))
+        return "\n".join(lines)[-3000:]
 
     def _record_privileged_event(self, event: str, payload: dict) -> None:
         self.trace_logger.record_privileged_event(
@@ -1073,7 +1160,10 @@ class AgentOrchestrator:
             return ""
         message = getattr(choices[0], "message", None)
         summary = self._compact_observation_text(getattr(message, "content", ""), 180)
-        summary = summary.removeprefix("Klonet Agent：").strip()
+        prefix = "Klonet Agent："
+        if summary.startswith(prefix):
+            summary = summary[len(prefix):]
+        summary = summary.strip()
         if self._ops_summary_leaks_machine_trace(summary):
             return ""
         return summary
@@ -1819,6 +1909,7 @@ class AgentOrchestrator:
             "turn_decision": self._turn_decision,
             "route": self._query_route,
             "conversation_state": self._conversation_state,
+            "retrieval_plan": self._retrieval_plan,
         }
 
     def _refresh_turn_plan(

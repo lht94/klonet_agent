@@ -81,4 +81,11 @@ def _runtime_python_files():
         if path.is_file():
             yield path
         elif path.is_dir():
-            yield from path.rglob("*.py")
+            for candidate in path.rglob("*.py"):
+                relative_candidate = candidate.relative_to(PROJECT_ROOT)
+                if relative_candidate.parts[:2] == (
+                    "knowledge",
+                    "klonet_source",
+                ):
+                    continue
+                yield candidate

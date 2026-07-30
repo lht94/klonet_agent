@@ -921,7 +921,14 @@ def _apply_action_bindings(plan: OperationPlan, action_bindings: dict) -> None:
                 step.args[normalized_key] = str(value)[:MAX_RECIPE_CONTENT_CHARS]
                 continue
             step.args[normalized_key] = _one_line(str(value), 300)
-        problem = _validate_plan_action_args(effective_action, step.args)
+        # Legacy/default bindings are still checked again by the action
+        # runner, which can redact dry-run previews and report a normal blocked
+        # result. Custom model-authored steps are rejected earlier.
+        problem = _validate_plan_action_args(
+            effective_action,
+            step.args,
+            reject_sensitive=False,
+        )
         if problem:
             raise ValueError(f"step {step.step_id} {problem}")
         step.recipe_args = dict(step.args)
@@ -948,14 +955,19 @@ def _clean_operation_args(args: dict) -> dict:
     }
 
 
-def _validate_plan_action_args(action: str, args: dict) -> str:
+def _validate_plan_action_args(
+    action: str,
+    args: dict,
+    *,
+    reject_sensitive: bool = True,
+) -> str:
     if action != "write_ops_file" or not isinstance(args, dict):
         return ""
     path = str(args.get("path") or "").strip()
     content = str(args.get("content") or "")
     if _is_direct_nginx_write_path(path):
         return "nginx_config_requires_install_nginx_config"
-    if SENSITIVE_ACTION_CONTENT.search(content):
+    if reject_sensitive and SENSITIVE_ACTION_CONTENT.search(content):
         return "sensitive_content_not_allowed"
     return ""
 

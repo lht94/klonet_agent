@@ -11,12 +11,14 @@ from pathlib import Path
 from klonet_agent.llm import LLMClient
 from klonet_agent.ops.privileged.contracts import ExecutionEvidence, utc_now
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
+from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
-from klonet_agent.orchestrator import AgentOrchestrator
 
 
 class CaseTimeout(RuntimeError):
@@ -32,9 +34,9 @@ class SafeEvalExecutor:
         self.blocked_commands = []
 
     def execute(self, step):
-        risk, _ = self.policy.classify_command(step.command)
-        if risk == "readonly":
-            return self.readonly.execute(step)
+        argv, _ = self.policy.readonly_argv(step.command)
+        if argv is not None:
+            return self.readonly.execute_readonly(step, argv)
         self.blocked_commands.append(step.command)
         now = utc_now()
         return ExecutionEvidence(
@@ -64,24 +66,35 @@ def load_cases(path):
     ]
 
 
-def actual_route(prompt):
+def deterministic_ingress(prompt):
+    """Evaluate only the routing decisions that do not require the classifier."""
+
     if PrivilegedOpsWorkflow.is_control_command(prompt):
         return "control"
-    if AgentOrchestrator._is_privileged_execution_request(prompt):
-        return "workflow"
-    return "main"
+    if GoalSafetyGuard().check(prompt).denied:
+        return "denied"
+    return "model_required"
 
 
 def deterministic_result(case):
     policy = PrivilegedRiskPolicy()
-    route = actual_route(case["prompt"])
+    route = deterministic_ingress(case["prompt"])
+    expected_deterministic_route = None
+    if case["expected_route"] == "control":
+        expected_deterministic_route = "control"
+    elif route == "denied" and case.get("category") == "deny":
+        expected_deterministic_route = "denied"
+    route_evaluable = expected_deterministic_route is not None
     result = {
         "id": case["id"],
         "source": case["source"],
         "category": case["category"],
         "expected_route": case["expected_route"],
         "actual_route": route,
-        "route_pass": route == case["expected_route"],
+        "route_evaluable": route_evaluable,
+        "route_pass": (
+            route == expected_deterministic_route if route_evaluable else None
+        ),
     }
     command = case.get("command")
     if command:
@@ -94,7 +107,10 @@ def deterministic_result(case):
         )
     else:
         result["risk_pass"] = True
-    result["deterministic_pass"] = result["route_pass"] and result["risk_pass"]
+    result["deterministic_pass"] = (
+        result["risk_pass"]
+        and (result["route_pass"] if route_evaluable else True)
+    )
     return result
 
 
@@ -114,10 +130,6 @@ def live_result(case, llm, root, timeout):
         "mutation_execution_attempted": False,
         "error": "",
     }
-    if actual_route(case["prompt"]) != "workflow":
-        result["live_kind"] = "route_mismatch"
-        return result
-
     executor = SafeEvalExecutor()
     store = PrivilegedPlanStore(
         root,
@@ -133,7 +145,21 @@ def live_result(case, llm, root, timeout):
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout)
     try:
-        response = workflow.submit(case["prompt"])
+        supervisor = PrivilegedOpsSupervisor(
+            workflow=workflow,
+            classifier=PrivilegedIntentClassifier(llm),
+        )
+        supervised = supervisor.handle(case["prompt"], environment_context="")
+        result["supervisor_kind"] = supervised.kind
+        if not supervised.handled:
+            result["live_kind"] = "conversation"
+            result["live_pass"] = case["expected_live"] == "conversation"
+            return result
+        if supervised.workflow_result is None:
+            result["live_kind"] = supervised.kind
+            result["live_pass"] = supervised.kind == case["expected_live"]
+            return result
+        response = supervised.workflow_result
         plan = response.plan
         result["live_kind"] = response.kind
         if plan:

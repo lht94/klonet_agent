@@ -6,6 +6,9 @@ import subprocess
 import threading
 from typing import Callable
 
+from klonet_agent.ops.privileged.action_runner import (
+    DirectPrivilegedActionRunner,
+)
 from klonet_agent.ops.privileged.contracts import (
     ExecutionEvidence,
     PrivilegedStep,
@@ -22,19 +25,108 @@ class PrivilegedCommandExecutor:
         max_output_chars: int = 12000,
         on_start: Callable[[str], None] | None = None,
         on_output: Callable[[str, str], None] | None = None,
+        action_runner: Callable | None = None,
+        direct_action_runner: Callable | None = None,
     ) -> None:
         self.max_output_chars = max(1, int(max_output_chars))
         self.on_start = on_start
         self.on_output = on_output
+        self._legacy_action_runner = action_runner
+        self.action_runner = (
+            direct_action_runner or DirectPrivilegedActionRunner()
+        )
 
     def execute(self, step: PrivilegedStep) -> ExecutionEvidence:
+        if step.action:
+            return self.execute_action(step)
+        return self._execute(step, step.command, shell=True)
+
+    def execute_action(self, step: PrivilegedStep) -> ExecutionEvidence:
+        """Dispatch one validated registered action without a shell boundary."""
+
+        started_at = utc_now()
+        if self.on_start:
+            self.on_start("正在执行已确认步骤：%s" % step.title)
+        try:
+            if self._legacy_action_runner is not None:
+                # Compatibility for injected test/integration runners created
+                # before Ops-Privilege gained its own direct backend. The
+                # production default never enters this branch.
+                from klonet_agent.ops.operations import OperationPlan, OperationStep
+
+                operation_step = OperationStep(
+                    step_id=step.step_id,
+                    title=step.title,
+                    purpose=step.title,
+                    action=step.action,
+                    args=dict(step.args),
+                    recipe_id=step.action,
+                    recipe_args=dict(step.args),
+                )
+                operation_plan = OperationPlan(
+                    plan_id="privileged-action",
+                    operation="deploy_platform",
+                    target=str(step.args.get("platform") or ""),
+                    objective=step.title,
+                    steps=[operation_step],
+                )
+                result = self._legacy_action_runner(
+                    operation_plan,
+                    operation_step,
+                )
+            else:
+                result = self.action_runner(step)
+        except Exception as exc:
+            return ExecutionEvidence(
+                return_code=1,
+                stderr=str(exc),
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        output = self._bounded(str(result.output or ""))
+        return_code = 0 if result.status == "completed" else (
+            2 if result.status == "blocked" else 1
+        )
+        changed = (
+            step.risk != "readonly"
+            and "environment unchanged" not in output.lower()
+            and "environment_changed=false" not in output.lower()
+            and "dry_run=true" not in output.lower()
+        )
+        return ExecutionEvidence(
+            return_code=return_code,
+            stdout=output if return_code == 0 else "",
+            stderr=output if return_code != 0 else "",
+            started_at=started_at,
+            finished_at=utc_now(),
+            timed_out=False,
+            environment_changed=changed,
+        )
+
+    def execute_readonly(
+        self,
+        step: PrivilegedStep,
+        argv: list[str],
+    ) -> ExecutionEvidence:
+        """Execute prevalidated arguments without shell interpretation."""
+
+        return self._execute(step, list(argv), shell=False)
+
+    def _execute(
+        self,
+        step: PrivilegedStep,
+        command,
+        *,
+        shell: bool,
+    ) -> ExecutionEvidence:
         started_at = utc_now()
         if self.on_start:
             self.on_start(step.command)
         try:
             process = subprocess.Popen(
-                step.command,
-                shell=True,
+                command,
+                shell=shell,
                 cwd=step.cwd or None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

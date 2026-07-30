@@ -21,12 +21,19 @@ MAX_ARG_LEN = 500
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.:+/@=-]{1,200}$")
 SAFE_GIT_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./@+-]{0,200}$")
 SAFE_GIT_REMOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}$")
-SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./@+:-]{0,200}$")
+SAFE_GIT_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_./@+:~^-]{0,200}$")
 SAFE_GIT_URL = re.compile(
     r"^(?:https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+|(?:git@)?[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+\.git)$"
 )
 SAFE_PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+_.:!<>=~,-]{0,120}$")
 SAFE_MODULE = re.compile(r"^[A-Za-z0-9_][-A-Za-z0-9_]{0,120}$")
+SAFE_SERVICE = re.compile(r"^[A-Za-z0-9_.@:-]{1,160}$")
+SAFE_CONTAINER = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+SAFE_IDENTITY = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+SAFE_MODE = re.compile(r"^0?[0-7]{3,4}$")
+SAFE_LOCAL_URL = re.compile(
+    r"^https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?(?:/[^\s]*)?$"
+)
 ALLOWED_COMMAND_ENV = {"PYTHONNOUSERSITE": {"1"}}
 SYSTEM_INSTALL_DIRS = (
     Path("/usr/lib"),
@@ -124,6 +131,22 @@ def decide_ops_command(args: Mapping | None) -> OpsCommandDecision:
     if program == "tc":
         decision = _decide_tc(program, argv, cwd)
         return _with_env(decision, env)
+    if program == "systemctl":
+        return _with_env(_decide_systemctl(program, argv, cwd), env)
+    if program == "docker":
+        return _with_env(_decide_docker(program, argv, cwd), env)
+    if program == "nginx":
+        return _with_env(_decide_nginx(program, argv, cwd), env)
+    if program == "redis-cli":
+        return _with_env(_decide_redis_cli(program, argv, cwd), env)
+    if program == "journalctl":
+        return _with_env(_decide_journalctl(program, argv, cwd), env)
+    if program == "curl":
+        return _with_env(_decide_curl(program, argv, cwd), env)
+    if program in {"tar", "unzip"}:
+        return _with_env(_decide_archive(program, argv, cwd), env)
+    if program in {"chmod", "chown"}:
+        return _with_env(_decide_permissions(program, argv, cwd), env)
     return _deny(f"program_not_allowlisted={program}")
 
 
@@ -142,6 +165,11 @@ def _decide_git(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
     pull = _git_pull_allowed(argv, cwd)
     push = _git_push_allowed(argv, cwd)
     checkout = _git_checkout_allowed(argv, cwd)
+    fetch = _git_fetch_allowed(argv, cwd)
+    reset = _git_reset_allowed(argv, cwd)
+    revert = _git_revert_allowed(argv, cwd)
+    restore = _git_restore_allowed(argv, cwd)
+    tag = _git_tag_allowed(argv, cwd)
     if readonly:
         return _allow(program, argv, cwd, risk="normal", category="git_readonly")
     if submodule_update:
@@ -154,6 +182,43 @@ def _decide_git(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDeci
         return _allow(program, argv, cwd, risk="controlled", category="git_pull")
     if checkout:
         return _allow(program, argv, cwd, risk="controlled", category="git_checkout")
+    if fetch:
+        return _allow(program, argv, cwd, risk="controlled", category="git_fetch")
+    if reset:
+        return _allow(
+            program,
+            argv,
+            cwd,
+            risk="dangerous",
+            step=True,
+            category="git_reset",
+        )
+    if revert:
+        return _allow(
+            program,
+            argv,
+            cwd,
+            risk="dangerous",
+            step=True,
+            category="git_revert",
+        )
+    if restore:
+        return _allow(
+            program,
+            argv,
+            cwd,
+            risk="dangerous",
+            step=True,
+            category="git_restore",
+        )
+    if tag:
+        return _allow(
+            program,
+            argv,
+            cwd,
+            risk="controlled",
+            category="git_tag",
+        )
     if push:
         return _allow(program, argv, cwd, risk="dangerous", step=True, category="git_push")
     if argv[:1] == ("clone",):
@@ -351,6 +416,253 @@ def _decide_tc(program: str, argv: tuple[str, ...], cwd: str) -> OpsCommandDecis
     return _deny("tc_args_not_allowed")
 
 
+def _decide_systemctl(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    if len(argv) == 2 and argv[0] in {
+        "status",
+        "is-active",
+        "is-enabled",
+        "show",
+    } and SAFE_SERVICE.fullmatch(argv[1]):
+        return _allow(
+            program, argv, cwd,
+            risk="normal",
+            category="service_readonly",
+        )
+    if len(argv) == 2 and argv[0] in {
+        "start",
+        "stop",
+        "restart",
+        "reload",
+        "enable",
+        "disable",
+    } and SAFE_SERVICE.fullmatch(argv[1]):
+        risk = "dangerous" if argv[0] in {"stop", "disable"} else "privileged"
+        return _allow(
+            program, argv, cwd,
+            risk=risk,
+            sudo=True,
+            step=argv[0] in {"stop", "disable", "restart"},
+            category="service_change",
+        )
+    if argv == ("daemon-reload",):
+        return _allow(
+            program, argv, cwd,
+            risk="privileged",
+            sudo=True,
+            category="service_manager_reload",
+        )
+    return _deny("systemctl_args_not_allowed")
+
+
+def _decide_docker(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    if argv[:1] in {("ps",), ("images",), ("info",), ("version",)}:
+        if all(_safe_arg(item) for item in argv[1:]):
+            return _allow(
+                program, argv, cwd,
+                risk="normal",
+                category="container_readonly",
+            )
+    if len(argv) >= 2 and argv[0] in {"inspect", "logs"}:
+        name = argv[-1]
+        options = argv[1:-1]
+        if SAFE_CONTAINER.fullmatch(name) and all(
+            item in {"--tail", "100", "200", "500", "--timestamps"}
+            for item in options
+        ):
+            return _allow(
+                program, argv, cwd,
+                risk="normal",
+                category="container_readonly",
+            )
+    if len(argv) == 2 and argv[0] in {"start", "stop", "restart"} and SAFE_CONTAINER.fullmatch(argv[1]):
+        return _allow(
+            program, argv, cwd,
+            risk="privileged",
+            sudo=True,
+            step=argv[0] == "stop",
+            category="container_change",
+        )
+    if len(argv) in {2, 3} and argv[0] == "rm":
+        rest = argv[1:]
+        force = rest[:1] == ("-f",)
+        name = rest[-1]
+        if SAFE_CONTAINER.fullmatch(name) and (len(rest) == 1 or force):
+            return _allow(
+                program, argv, cwd,
+                risk="dangerous",
+                sudo=True,
+                step=True,
+                category="container_remove",
+            )
+    return _deny("docker_args_not_allowed")
+
+
+def _decide_nginx(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    if argv == ("-t",):
+        return _allow(
+            program, argv, cwd,
+            risk="normal",
+            sudo=True,
+            category="nginx_syntax_check",
+        )
+    if argv == ("-s", "reload"):
+        return _allow(
+            program, argv, cwd,
+            risk="privileged",
+            sudo=True,
+            category="nginx_reload",
+        )
+    return _deny("nginx_args_not_allowed")
+
+
+def _decide_redis_cli(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    if argv == ("--version",):
+        return _allow(
+            program, argv, cwd,
+            risk="normal",
+            category="redis_readonly",
+        )
+    index = 0
+    while index < len(argv) and argv[index] in {"-h", "-p"}:
+        if index + 1 >= len(argv):
+            return _deny("redis_cli_option_value_missing")
+        key, value = argv[index], argv[index + 1]
+        if key == "-p" and not value.isdigit():
+            return _deny("redis_port_invalid")
+        if key == "-h" and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", value):
+            return _deny("redis_host_invalid")
+        index += 2
+    command = argv[index:]
+    if command[:1] in {("PING",), ("INFO",), ("DBSIZE",)} and len(command) <= 2:
+        return _allow(
+            program, argv, cwd,
+            risk="normal",
+            category="redis_readonly",
+        )
+    return _deny("redis_cli_args_not_allowed_or_auth_forbidden")
+
+
+def _decide_journalctl(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    allowed_flags = {"--no-pager", "-b", "-e", "-r"}
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in allowed_flags:
+            index += 1
+            continue
+        if item in {"-u", "-n"} and index + 1 < len(argv):
+            value = argv[index + 1]
+            if item == "-u" and not SAFE_SERVICE.fullmatch(value):
+                return _deny("journal_service_invalid")
+            if item == "-n" and (not value.isdigit() or int(value) > 2000):
+                return _deny("journal_line_count_invalid")
+            index += 2
+            continue
+        return _deny("journalctl_args_not_allowed")
+    return _allow(
+        program, argv, cwd,
+        risk="normal",
+        category="journal_readonly",
+    )
+
+
+def _decide_curl(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    urls = [item for item in argv if item.startswith(("http://", "https://"))]
+    if len(urls) != 1 or not SAFE_LOCAL_URL.fullmatch(urls[0]):
+        return _deny("curl_only_allows_local_health_urls")
+    allowed = {"-f", "-s", "-S", "-sS", "-fsS", "-I"}
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == urls[0] or item in allowed:
+            index += 1
+            continue
+        if item == "--max-time" and index + 1 < len(argv):
+            value = argv[index + 1]
+            if not value.isdigit() or int(value) > 60:
+                return _deny("curl_timeout_invalid")
+            index += 2
+            continue
+        return _deny("curl_args_not_allowed")
+    return _allow(
+        program, argv, cwd,
+        risk="normal",
+        category="http_health_readonly",
+    )
+
+
+def _decide_archive(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    if not cwd:
+        return _deny("archive_requires_cwd")
+    if program == "tar":
+        if len(argv) == 2 and argv[0] in {"-tf", "-tzf"} and _source_within_cwd(argv[1], cwd):
+            return _allow(program, argv, cwd, risk="normal", category="archive_readonly")
+        if len(argv) == 4 and argv[0] in {"-xf", "-xzf"} and argv[2] == "-C":
+            if _source_within_cwd(argv[1], cwd) and _workspace_destination_allowed(argv[3], cwd):
+                return _allow(program, argv, cwd, risk="controlled", category="archive_extract")
+    if program == "unzip":
+        if len(argv) == 2 and argv[0] == "-l" and _source_within_cwd(argv[1], cwd):
+            return _allow(program, argv, cwd, risk="normal", category="archive_readonly")
+        if len(argv) == 3 and argv[1] == "-d":
+            if _source_within_cwd(argv[0], cwd) and _workspace_destination_allowed(argv[2], cwd):
+                return _allow(program, argv, cwd, risk="controlled", category="archive_extract")
+    return _deny("archive_args_not_allowed")
+
+
+def _decide_permissions(
+    program: str,
+    argv: tuple[str, ...],
+    cwd: str,
+) -> OpsCommandDecision:
+    if not cwd:
+        return _deny("permission_change_requires_cwd")
+    recursive = argv[:1] == ("-R",)
+    rest = argv[1:] if recursive else argv
+    if len(rest) != 2 or not _workspace_destination_allowed(rest[1], cwd):
+        return _deny("permission_target_not_allowlisted")
+    if program == "chmod" and not SAFE_MODE.fullmatch(rest[0]):
+        return _deny("chmod_mode_invalid")
+    if program == "chown":
+        identity = rest[0].split(":", 1)
+        if any(value and not SAFE_IDENTITY.fullmatch(value) for value in identity):
+            return _deny("chown_identity_invalid")
+    return _allow(
+        program, argv, cwd,
+        risk="dangerous" if recursive else "privileged",
+        sudo=True,
+        step=recursive,
+        category="filesystem_permissions",
+    )
+
+
 def _allow(
     program: str,
     argv: tuple[str, ...],
@@ -471,8 +783,12 @@ def _git_pull_allowed(argv: tuple[str, ...], cwd: str) -> bool:
         return False
     if len(argv) == 1:
         return True
+    if argv == ("pull", "--ff-only"):
+        return True
     if len(argv) == 3:
         return bool(SAFE_GIT_REMOTE.fullmatch(argv[1]) and SAFE_GIT_REF.fullmatch(argv[2]))
+    if len(argv) == 4 and argv[1] == "--ff-only":
+        return bool(SAFE_GIT_REMOTE.fullmatch(argv[2]) and SAFE_GIT_REF.fullmatch(argv[3]))
     return False
 
 
@@ -485,6 +801,8 @@ def _git_push_allowed(argv: tuple[str, ...], cwd: str) -> bool:
         return bool(SAFE_GIT_REMOTE.fullmatch(argv[1]) and SAFE_GIT_REF.fullmatch(argv[2]))
     if len(argv) == 4 and argv[1] == "-u":
         return bool(SAFE_GIT_REMOTE.fullmatch(argv[2]) and SAFE_GIT_REF.fullmatch(argv[3]))
+    if len(argv) == 4 and argv[1] == "--force-with-lease":
+        return bool(SAFE_GIT_REMOTE.fullmatch(argv[2]) and SAFE_GIT_REF.fullmatch(argv[3]))
     return False
 
 
@@ -496,6 +814,60 @@ def _git_checkout_allowed(argv: tuple[str, ...], cwd: str) -> bool:
     if len(argv) == 3 and argv[1] in {"-b", "-c"}:
         return bool(SAFE_GIT_BRANCH.fullmatch(argv[2]))
     return False
+
+
+def _git_fetch_allowed(argv: tuple[str, ...], cwd: str) -> bool:
+    if not cwd or not argv or argv[0] != "fetch":
+        return False
+    if argv == ("fetch", "--all", "--prune"):
+        return True
+    if (
+        len(argv) == 3
+        and argv[1] == "--prune"
+        and SAFE_GIT_REMOTE.fullmatch(argv[2])
+    ):
+        return True
+    return (
+        len(argv) == 2
+        and bool(SAFE_GIT_REMOTE.fullmatch(argv[1]))
+    )
+
+
+def _git_reset_allowed(argv: tuple[str, ...], cwd: str) -> bool:
+    return bool(
+        cwd
+        and len(argv) == 3
+        and argv[:2] == ("reset", "--hard")
+        and SAFE_GIT_REF.fullmatch(argv[2])
+    )
+
+
+def _git_revert_allowed(argv: tuple[str, ...], cwd: str) -> bool:
+    return bool(
+        cwd
+        and len(argv) == 3
+        and argv[:2] == ("revert", "--no-edit")
+        and SAFE_GIT_REF.fullmatch(argv[2])
+    )
+
+
+def _git_restore_allowed(argv: tuple[str, ...], cwd: str) -> bool:
+    return bool(
+        cwd
+        and len(argv) == 3
+        and argv[:2] == ("restore", "--")
+        and _source_within_cwd(argv[2], cwd)
+    )
+
+
+def _git_tag_allowed(argv: tuple[str, ...], cwd: str) -> bool:
+    return bool(
+        cwd
+        and len(argv) in {2, 3}
+        and argv[0] == "tag"
+        and SAFE_GIT_REF.fullmatch(argv[1])
+        and (len(argv) == 2 or SAFE_GIT_REF.fullmatch(argv[2]))
+    )
 
 
 def _source_within_cwd(source: str, cwd: str) -> bool:

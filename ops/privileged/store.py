@@ -66,7 +66,7 @@ class PrivilegedPlanStore:
                 )
                 interrupted = True
         if interrupted or plan.status in {"executing", "verifying"}:
-            plan.status = "blocked"
+            plan.status = "paused"
         self.save(plan)
         return plan
 

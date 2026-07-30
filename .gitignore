@@ -30,6 +30,8 @@ workspaces/
 # Generated knowledge index
 knowledge/index.jsonl
 knowledge/vectors.jsonl
+knowledge/code_index.jsonl
+knowledge/code_vectors.jsonl
 evals/summary.md
 evals/retrieval_summary.md
 

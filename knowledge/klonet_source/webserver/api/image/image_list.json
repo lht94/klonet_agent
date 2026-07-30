@@ -1,0 +1,213 @@
+{
+  "controllers": [
+    {
+      "image_name": "controller/floodlight",
+      "type": "controller",
+      "service": "docker",
+      "portname": null,
+      "subtype": "floodlight",
+      "linestyle":"solid",
+      "config": {
+        "port": 6653
+      },
+      "resource_limit": {
+        "cpu": "10",
+        "mem": "1000"
+      }
+    },
+    {
+      "image_name": "controller/ryu",
+      "type": "controller",
+      "service": "docker",
+      "portname": null,
+      "subtype": "ryu",
+      "linestyle":"solid",
+      "config": {
+        "port": 6633
+      },
+      "resource_limit": {
+        "cpu": "10",
+        "mem": "1000"
+      }
+    }
+  ],
+  "switches": [
+    {
+      "type": "switch",
+      "service": "docker",
+      "portname": null,
+      "subtype": "ovs",
+      "image_name": "switch/ovs",
+      "linestyle":"solid",
+      "config": {
+        "stp": true,
+        "controllers": []
+      },
+      "resource_limit": {
+        "cpu": "100",
+        "mem": "1000"
+      }
+    }
+  ],
+  "dpdks": [
+    {
+      "image_name": "dpdk/l2fwd",
+      "type": "dpdk",
+      "service": "docker",
+      "portname": null,
+      "subtype": "l2fwd",
+      "linestyle":"solid",
+      "config":{},
+      "resource_limit": {
+        "cpu": "100", 
+        "mem": "1000" 
+      }
+    }
+  ],
+  "routers": [
+    {
+      "type": "router",
+      "subtype": "quagga",
+      "service": "docker",
+      "portname": null,
+      "image_name": "router/quagga",
+      "linestyle":"solid",
+      "gateway": "",
+      "interfaces": [],
+      "config": {
+          "rip": {
+              "networks": [],
+              "neighbors": [],
+              "version": 2,
+              "enable": 0
+          },
+          "ospf": {
+              "router_id": "",
+              "networks": [],
+              "areas": {},
+              "enable": 0
+          },
+          "bgp": {
+              "asn": "",
+              "router_id": "",
+              "networks": [],
+              "neighbors": [],
+              "enable": 0
+          }
+      },
+      "resource_limit": {
+        "cpu": "10",
+        "mem": "1000"
+      }
+    }
+  ],
+  "hosts": [
+    {
+      "image_name": "host/ubuntu",
+      "service": "docker",
+      "portname": null,
+      "type": "host",
+      "subtype": "ubuntu",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {},
+      "resource_limit": {
+        "cpu": "8",
+        "mem": "20"
+      }
+    },
+    {
+      "image_name": "host/snort",
+      "service": "docker",
+      "portname": null,
+      "type": "host",
+      "subtype": "snort",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {},
+      "resource_limit": {
+        "cpu": "99",
+        "mem": "999"
+      }
+    },
+    {
+      "image_name": "udt",
+      "service": "docker",
+      "portname": null,
+      "type": "host",
+      "subtype": "udt",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {},
+      "resource_limit": {
+        "cpu": "10",
+        "mem": "1000"      
+      }
+    },
+    {
+      "image_name": "pantheon",
+      "service":"docker",
+      "portname": null,
+      "type": "host",
+      "subtype": "pantheon",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {},
+      "resource_limit": {
+        "cpu": "10",
+        "mem": "100"
+      }
+    },
+    {
+      "image_name": "astra-sim",
+      "service":"docker",
+      "portname": null,
+      "type": "host",
+      "subtype": "CP",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {},
+      "resource_limit": {
+        "cpu": "10",
+        "mem": "1000"
+      }
+    },
+    {
+      "image_name": "host/bmv2",
+      "service":"docker",
+      "portname": null,
+      "type": "host",
+      "subtype": "bmv2",
+      "interfaces": [],
+      "gateway": "",
+      "linestyle":"solid",
+      "config": {},
+      "resource_limit": {
+        "cpu": "100",
+        "mem": "1000"
+      }
+    },
+    {
+      "image_name": "host/hardware",
+      "type": "host",
+      "service": "hardware",
+      "interfaces":[],
+      "portname": null,
+      "subtype": "host_hardware",
+      "resource_limit": {
+        "cpu": "0",
+        "mem": "0"
+      },
+      "gateway": "",
+      "linestyle":"solid",
+      "nic": [],
+      "intname": {},
+      "config": {}
+    }
+  ]
+}

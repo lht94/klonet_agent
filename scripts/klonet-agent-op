@@ -1041,7 +1041,15 @@ def runtime_required_ports(project_root: str) -> list:
 
 
 def active_config_content(project_root: str) -> str:
-    config_path = Path(project_root) / "vemu_config" / "config.py"
+    root = Path(project_root)
+    config_candidates = (
+        root / "vemu_uestc" / "vemu_config" / "config.py",
+        root / "vemu_config" / "config.py",
+    )
+    config_path = next(
+        (path for path in config_candidates if path.is_file()),
+        config_candidates[0],
+    )
     if not config_path.is_file():
         return ""
     try:

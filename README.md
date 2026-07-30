@@ -155,11 +155,136 @@ CLI 会把非交互 stdin 的全部内容作为一个用户回合，并使用 UT
 如果生产端已经把中文替换成 `?`，程序会得到损坏文本，无法在接收后恢复。
 
 ### 这一版还没有做的事情
-- Klonet 真正源码仓库还没有接入 workspace
-- RAG 目前只是本地关键词检索，还不是向量数据库
+- Klonet 当前运行实例的现场源码仍不属于 Mentor workspace；Mentor 使用随主仓库发布的脱敏源码快照，现场差异需在 Ops 模式核验
+- RAG 已使用 LLM Query Planner、BM25、精确匹配、向量召回、RRF 和可选 rerank；仍不依赖向量数据库
 - ReviewAgent 目前只是 prompt 层面的轻量 review，还没有独立子 agent
 - Web/API 服务还没有做，当前目标仍然是本地 CLI 可用
 - token/速度优化目前已有 trace 和 eval runner 基础，后续需要接入真实 Klonet 任务做对比实验
+
+### 知识向量自动构建
+
+配置 `EMBEDDING_API_KEY` 后，Mentor 第一次加载知识索引时会自动创建
+`knowledge/vectors.jsonl`。已有文件缺少 chunk 或 chunk 内容发生变化时，只补齐
+缺失、过期的向量；接口支持批量输入时默认每批 10 条。构建中途失败会保留已经
+完成的批次，检索继续以 BM25 降级运行，并在 RAG 结果中输出
+`retrieval_mode`、`vector_status` 和 `vector_status_detail`。
+
+可用以下环境变量调整行为：
+
+```bash
+KLONET_AGENT_AUTO_BUILD_VECTORS=1
+KLONET_AGENT_VECTOR_BATCH_SIZE=10
+```
+
+也可以手工预构建：
+
+```bash
+cd /home/klonet-agent/klonet_agent
+PYTHONPATH=/home/klonet-agent python -m scripts.build_knowledge_vectors
+```
+
+`knowledge/vectors.jsonl` 是由指定 embedding 模型生成的部署产物，默认不进入普通
+Git 历史。需要在多台机器间分发时，推荐使用 Git LFS、Release artifact 或对象
+存储，并随文件记录 embedding 模型和知识索引版本。
+
+### 多阶段 RAG
+
+Mentor 的 `search_knowledge` 默认使用 `multi_stage` 流程。每轮已有的前置
+理解调用改用 `deepseek-v4-flash`，并在同一次 JSON 响应中生成结构化
+`RetrievalPlan`，其中直接包含
+公共文档库和源码库的检索任务、BM25 查询、语义查询和精确词，不再先做一次
+意图分类再调用另一个模型改写 query。后续工具调用复用该计划，不进行第二次
+规划；直接调用 `KnowledgeBase` 且没有现成计划时才补一次 Planner。原始问题
+始终独立参与召回。
+
+每个任务在对应知识库内分别运行 BM25、dense vector 和精确匹配，候选使用
+weighted RRF 融合去重；融合 Top 20 可交给 DashScope `qwen3-rerank` 统一
+重排。Planner 失败时使用原问题同时搜索两个库，reranker 失败时退回 RRF，
+不会因为外部模型不可用而中断检索。
+
+同一轮的多个 dense query 会批量请求 embedding，并在公共文档索引和源码索引
+之间复用查询向量；chunk 向量从 JSONL 加载后使用内存 NumPy 矩阵计算余弦分数。
+向量完整性只在索引版本变化时检查一次，避免每个召回通道重复扫描向量文件。
+
+```bash
+RAG_PIPELINE_MODE=multi_stage
+RAG_QUERY_PLANNER_MODEL=deepseek-v4-flash
+RAG_QUERY_PLANNER_TIMEOUT_SECONDS=6
+RAG_RECALL_TOP_K=30
+RAG_FUSION_TOP_K=20
+RAG_RERANK_TOP_N=10
+RAG_RERANK_TIMEOUT_SECONDS=8
+RERANK_MODEL=qwen3-rerank
+RERANK_BASE_URL=https://WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/compatible-api/v1
+RERANK_API_KEY=...
+```
+
+`RERANK_API_KEY` 未设置时会依次尝试 `DASHSCOPE_API_KEY` 和
+`EMBEDDING_API_KEY`；默认会把 embedding URL 的 `compatible-mode/v1`
+转换为 rerank 使用的 `compatible-api/v1`。需要临时回退到旧检索流程时设置
+`RAG_PIPELINE_MODE=legacy`。
+
+### 公共知识边界
+
+主 RAG 使用显式 allowlist，只索引以下正式知识：
+
+```text
+knowledge/klonet/**/*.md
+knowledge/klonet/**/*.txt
+knowledge/klonet_experience/**/*.md
+knowledge/klonet_experience/**/*.txt
+```
+
+上述目录中的 `README.md` 是集合导航和路由说明，也不会作为回答证据进入索引。
+`journals/`、`memory/`、`workspace/`、`workspaces/`、`tools/`、`doc/`、
+`docs/`、`prompts.py`、仓库 `README.md` 和 `knowledge/klonet_index/`
+不会进入公共索引或公共向量文件。项目日志通过当前用户和项目作用域内的
+`read_project_journal` 读取；源码事实通过 `search_code` 和
+`read_source_file` 按需核验；collection 的 `manifest.json` 只用于路由，
+不作为回答证据。
+
+### Klonet 源码检索层
+
+源码通过独立索引接入，不与公共文档 chunk 混在同一个向量文件中。主仓库跟踪
+一个位于 `knowledge/klonet_source/` 的精简、脱敏源码快照，因此新部署无需再
+单独拉取 `vemu_uestc`。也可通过 `KLONET_SOURCE_ROOT` 覆盖默认快照路径。
+快照会过滤 `.git`、`.history`、日志、测试、编译目录、`static_resources`、
+第三方前端依赖、二进制和压缩包等非业务源码。
+
+Python 源码按模块、类、方法和函数切分；JavaScript、TypeScript、C 和头文件
+优先按符号边界切分，其他允许的文本文件按带重叠的行窗口切分。每个 chunk
+保留相对路径、符号名和起止行号。密码、令牌、API Key 和带认证信息的 URL
+会在写入索引及调用 embedding 服务前脱敏。生成文件为：
+
+```text
+knowledge/code_index.jsonl
+knowledge/code_vectors.jsonl
+```
+
+两者均为本机部署产物，不进入普通 Git 历史。首次部署或需要手动重建时执行：
+
+```bash
+cd /home/klonet-agent/klonet_agent
+PYTHONPATH=/home/klonet-agent python -m scripts.build_code_vectors
+```
+
+`search_knowledge` 的 Planner 可以把开发、API、调用链和排障问题自动路由到
+源码索引；`search_code` 仍保留为显式源码下钻工具，优先执行精确字面量搜索，
+没有精确命中时才使用源码 BM25 和向量检索。返回候选路径和行号后应继续调用
+`read_source_file` 核验真实代码。
+
+源码快照由上游仓库的已提交 Git tree 确定性生成，不会复制上游工作区的本地
+修改、未跟踪文件或备份文件。`knowledge/klonet_source/manifest.json` 记录
+上游 remote、commit、文件数和脱敏文件数。更新快照时执行：
+
+```bash
+cd /home/klonet-agent/klonet_agent
+PYTHONPATH=/home/klonet-agent python -m scripts.sync_klonet_source
+```
+
+同步源默认是主项目同级的 `/home/klonet-agent/vemu_uestc`，可通过
+`KLONET_UPSTREAM_SOURCE_ROOT` 覆盖。同步完成后需要审查并提交
+`knowledge/klonet_source/`；生成的源码索引和向量仍保持 Git ignore。
 
 ## 更新：项目架构
 把项目封装成了一个个类
@@ -389,10 +514,28 @@ python -m klonet_agent.agent --mode ops-privilege --user-id lht --project-id tes
 `ops-privilege` 是独立的自适应 PEV 高权限运维模式。主 Agent 只能读取环境证据，
 不能直接调用任意 Shell；修改型目标会交给独立 Planner 生成结构化计划，再经过
 确定性风险门控、必要的人类确认、非模型可见 Executor 和 Checker Registry 验收。
+执行器使用专属 `DirectPrivilegedActionRunner`，不调用普通 Ops 的
+`/usr/local/bin/klonet-agent-op`，也不依赖其 NOPASSWD sudoers 白名单；两种模式只
+共享 Action Schema、环境事实和计划语义。需要 sudo 时，密码提示只允许出现在当前
+终端，不进入对话、参数或审计证据。
 单个可逆低/中风险修改使用 MicroPlan；多步骤计划使用 `confirm-priv <plan_id>`；
 高风险步骤还需 `confirm-priv-step <plan_id> <step_id>`。如果 sudo 需要密码，只能在
 当前终端提示中输入，不要把密码发到聊天里。普通 `ops` 模式仍使用
 OperationPlan/helper/sudoers 链路。
+
+`ops-privilege` 的能力不是把所有 Ubuntu 命令逐条写成 recipe，而是分成四层注册表：
+
+- `DomainWorkflowRegistry`：部署、启停、重启、组件恢复、Nginx 配置、环境部署、
+  源码升级和回滚等任务的阶段、必需事实和验收证据。
+- `ReadOnlyProbeRegistry`：项目结构、Python 导入、进程树、PID/端口、systemd、
+  screen、Docker、Nginx、Redis/MySQL/RabbitMQ、网络、防火墙、磁盘、内存、
+  Git、日志、TCP/HTTP 和权限探测；探测结果统一脱敏。
+- `OpsActionRegistry`：文件复制/移动/创建/删除、服务/进程/容器管理、系统包与
+  Python 包、权限、Git、带备份的唯一文本匹配替换，以及 Klonet 专用平台动作。
+  动作声明前置条件、影响、后置条件、风险和可用执行后端。
+- `OpsCommandPolicy`：为标准工具提供受限 `program + argv + cwd` 兜底；不接受
+  shell 字符串、管道、重定向或命令替换。普通 Ops 会拒绝只属于
+  `ops-privilege` 的直连动作。
 
 高权限计划控制命令：
 
@@ -409,6 +552,11 @@ abort-priv <plan_id>
 `memory/sessions/.../privileged_ops_plans/` 下。进程中断时，原来处于
 `running`/`verifying` 的步骤会变成 `execution_unknown`；`resume-priv` 只验证当前
 状态，绝不自动重放该步骤。
+
+失败后的 `replan-priv` 会保存每次诊断快照和证据指纹。只有生成了实际替代步骤时，
+界面才会展示“新计划”并要求重新确认；如果 Planner 无法形成可靠步骤，则明确显示
+“没有生成新计划”，不会把原暂停计划重新包装成重规划结果。相同证据再次 replan
+不会重复调用 Planner，需先补充证据或改变服务器状态。
 
 部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
 `KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。

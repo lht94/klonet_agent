@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 import shutil
 import socket
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -24,13 +27,34 @@ class DefaultCheckerRegistry:
         self._checkers: dict[str, Checker] = {
             "exit_code_zero": self._exit_code_zero,
             "file_exists": self._file_exists,
+            "file_absent": self._file_absent,
             "file_contains": self._file_contains,
+            "json_file_valid": self._json_file_valid,
             "service_active": self._service_active,
+            "service_inactive": self._service_inactive,
             "process_running": self._process_running,
+            "process_not_running": self._process_not_running,
+            "process_pid_absent": self._process_pid_absent,
             "process_cwd_matches": self._process_cwd_matches,
             "port_listening": self._port_listening,
+            "port_not_listening": self._port_not_listening,
             "screen_session_exists": self._screen_session_exists,
+            "screen_session_absent": self._screen_session_absent,
             "container_running": self._container_running,
+            "container_absent": self._container_absent,
+            "container_restart_policy": self._container_restart_policy,
+            "docker_image_state": self._docker_image_state,
+            "docker_network_state": self._docker_network_state,
+            "docker_network_attachment": self._docker_network_attachment,
+            "network_link_state": self._network_link_state,
+            "libvirt_domain_state": self._libvirt_domain_state,
+            "ovs_resource_state": self._ovs_resource_state,
+            "http_status": self._http_status,
+            "git_revision": self._git_revision,
+            "user_in_group": self._user_in_group,
+            "file_mode": self._file_mode,
+            "system_package_installed": self._system_package_installed,
+            "python_package_state": self._python_package_state,
             "command_available": self._command_available,
             "python_import_succeeds": self._python_import_succeeds,
             "package_version": self._package_version,
@@ -93,6 +117,15 @@ class DefaultCheckerRegistry:
             expected="exists", observed=str(path),
         )
 
+    def _file_absent(self, args, evidence):
+        del evidence
+        path = Path(str(args["path"])).expanduser()
+        absent = not path.exists()
+        return CheckResult(
+            "file_absent", "passed" if absent else "failed",
+            expected="absent", observed=str(path),
+        )
+
     def _file_contains(self, args, evidence):
         del evidence
         path = Path(str(args["path"])).expanduser()
@@ -108,6 +141,23 @@ class DefaultCheckerRegistry:
             expected=needle, observed="content matched" if found else "content missing",
         )
 
+    def _json_file_valid(self, args, evidence):
+        del evidence
+        path = Path(str(args["path"])).expanduser()
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return CheckResult(
+                "json_file_valid",
+                "failed",
+                expected="valid JSON",
+                observed=exc.__class__.__name__,
+            )
+        return CheckResult(
+            "json_file_valid", "passed",
+            expected="valid JSON", observed=str(path),
+        )
+
     def _service_active(self, args, evidence):
         del evidence
         return self._command_check(
@@ -117,12 +167,43 @@ class DefaultCheckerRegistry:
             success=lambda item: item.returncode == 0 and item.stdout.strip() == "active",
         )
 
+    def _service_inactive(self, args, evidence):
+        del evidence
+        return self._command_check(
+            "service_inactive",
+            ["systemctl", "is-active", str(args["service"])],
+            expected="inactive",
+            success=lambda item: item.stdout.strip() in {
+                "inactive", "failed", "unknown",
+            },
+        )
+
     def _process_running(self, args, evidence):
         del evidence
         return self._command_check(
             "process_running",
             ["pgrep", "-f", str(args["pattern"])],
             expected="matching PID",
+        )
+
+    def _process_not_running(self, args, evidence):
+        del evidence
+        return self._command_check(
+            "process_not_running",
+            ["pgrep", "-f", str(args["pattern"])],
+            expected="no matching PID",
+            success=lambda item: item.returncode == 1,
+        )
+
+    def _process_pid_absent(self, args, evidence):
+        del evidence
+        pid = int(args["pid"])
+        absent = not Path("/proc/%s" % pid).exists()
+        return CheckResult(
+            "process_pid_absent",
+            "passed" if absent else "failed",
+            expected="PID %s absent" % pid,
+            observed="absent" if absent else "still present",
         )
 
     def _process_cwd_matches(self, args, evidence):
@@ -150,6 +231,18 @@ class DefaultCheckerRegistry:
             observed="reachable" if listening else "not reachable",
         )
 
+    def _port_not_listening(self, args, evidence):
+        result = self._port_listening(args, evidence)
+        return CheckResult(
+            "port_not_listening",
+            "passed" if result.status == "failed" else "failed",
+            expected="%s:%s not listening" % (
+                args.get("host") or "127.0.0.1",
+                args["port"],
+            ),
+            observed=result.observed,
+        )
+
     def _screen_session_exists(self, args, evidence):
         del evidence
         session = str(args["session"])
@@ -157,6 +250,16 @@ class DefaultCheckerRegistry:
             "screen_session_exists",
             ["screen", "-S", session, "-Q", "select", "."],
             expected=session,
+        )
+
+    def _screen_session_absent(self, args, evidence):
+        del evidence
+        session = str(args["session"])
+        return self._command_check(
+            "screen_session_absent",
+            ["screen", "-S", session, "-Q", "select", "."],
+            expected="session absent",
+            success=lambda item: item.returncode != 0,
         )
 
     def _container_running(self, args, evidence):
@@ -167,6 +270,269 @@ class DefaultCheckerRegistry:
             ["docker", "inspect", "-f", "{{.State.Running}}", name],
             expected="true",
             success=lambda item: item.returncode == 0 and item.stdout.strip() == "true",
+        )
+
+    def _container_absent(self, args, evidence):
+        del evidence
+        name = str(args["container"])
+        return self._command_check(
+            "container_absent",
+            ["docker", "inspect", name],
+            expected="container absent",
+            success=lambda item: item.returncode != 0,
+        )
+
+    def _container_restart_policy(self, args, evidence):
+        del evidence
+        name = str(args["container"])
+        expected = str(args["policy"])
+        return self._command_check(
+            "container_restart_policy",
+            ["docker", "inspect", "-f", "{{.HostConfig.RestartPolicy.Name}}", name],
+            expected=expected,
+            success=lambda item: (
+                item.returncode == 0 and item.stdout.strip() == expected
+            ),
+        )
+
+    def _docker_image_state(self, args, evidence):
+        del evidence
+        image = str(args["image"])
+        expected_present = _bool_arg(args.get("present"), default=True)
+        return self._command_check(
+            "docker_image_state",
+            ["docker", "image", "inspect", image],
+            expected="present" if expected_present else "absent",
+            success=(
+                (lambda item: item.returncode == 0)
+                if expected_present
+                else (lambda item: item.returncode != 0)
+            ),
+        )
+
+    def _docker_network_state(self, args, evidence):
+        del evidence
+        network = str(args["network"])
+        expected_present = _bool_arg(args.get("present"), default=True)
+        return self._command_check(
+            "docker_network_state",
+            ["docker", "network", "inspect", network],
+            expected="present" if expected_present else "absent",
+            success=(
+                (lambda item: item.returncode == 0)
+                if expected_present
+                else (lambda item: item.returncode != 0)
+            ),
+        )
+
+    def _docker_network_attachment(self, args, evidence):
+        del evidence
+        network = str(args["network"])
+        container = str(args["container"])
+        expected_attached = _bool_arg(args.get("attached"), default=True)
+        return self._command_check(
+            "docker_network_attachment",
+            [
+                "docker",
+                "network",
+                "inspect",
+                "-f",
+                "{{json .Containers}}",
+                network,
+            ],
+            expected=(
+                "%s attached" % container
+                if expected_attached
+                else "%s detached" % container
+            ),
+            success=lambda item: (
+                item.returncode == 0
+                and (
+                    (
+                        expected_attached
+                        and re.search(
+                            r'"Name"\s*:\s*"%s"' % re.escape(container),
+                            item.stdout,
+                        )
+                    )
+                    or (
+                        not expected_attached
+                        and not re.search(
+                            r'"Name"\s*:\s*"%s"' % re.escape(container),
+                            item.stdout,
+                        )
+                    )
+                )
+            ),
+        )
+
+    def _network_link_state(self, args, evidence):
+        del evidence
+        name = str(args["name"])
+        expected = str(args.get("state") or "present").lower()
+        if expected not in {"present", "absent", "up", "down"}:
+            raise ValueError("invalid expected network link state")
+        command = ["ip", "-o", "link", "show", "dev", name]
+        if expected == "absent":
+            return self._command_check(
+                "network_link_state",
+                command,
+                expected="absent",
+                success=lambda item: item.returncode != 0,
+            )
+        return self._command_check(
+            "network_link_state",
+            command,
+            expected=expected,
+            success=lambda item: (
+                item.returncode == 0
+                and (
+                    expected == "present"
+                    or (
+                        expected == "up"
+                        and re.search(r"<[^>]*\bUP\b", item.stdout)
+                    )
+                    or (
+                        expected == "down"
+                        and not re.search(r"<[^>]*\bUP\b", item.stdout)
+                    )
+                )
+            ),
+        )
+
+    def _libvirt_domain_state(self, args, evidence):
+        del evidence
+        domain = str(args["domain"])
+        expected = str(args["state"])
+        if expected == "absent":
+            return self._command_check(
+                "libvirt_domain_state",
+                ["virsh", "dominfo", domain],
+                expected="absent",
+                success=lambda item: item.returncode != 0,
+            )
+        return self._command_check(
+            "libvirt_domain_state",
+            ["virsh", "domstate", domain],
+            expected=expected,
+            success=lambda item: (
+                item.returncode == 0
+                and expected.lower() in item.stdout.strip().lower()
+            ),
+        )
+
+    def _ovs_resource_state(self, args, evidence):
+        del evidence
+        resource_type = str(args["resource_type"])
+        name = str(args["name"])
+        expected_present = _bool_arg(args.get("present"), default=True)
+        command = (
+            ["ovs-vsctl", "br-exists", name]
+            if resource_type == "bridge"
+            else ["ovs-vsctl", "port-to-br", name]
+        )
+        return self._command_check(
+            "ovs_resource_state",
+            command,
+            expected="present" if expected_present else "absent",
+            success=(
+                (lambda item: item.returncode == 0)
+                if expected_present
+                else (lambda item: item.returncode != 0)
+            ),
+        )
+
+    def _http_status(self, args, evidence):
+        del evidence
+        url = str(args["url"])
+        expected = int(args.get("status", 200))
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                observed = int(response.status)
+        except urllib.error.HTTPError as exc:
+            observed = int(exc.code)
+        except (urllib.error.URLError, OSError) as exc:
+            return CheckResult(
+                "http_status", "failed",
+                expected=str(expected), observed=exc.__class__.__name__,
+            )
+        return CheckResult(
+            "http_status",
+            "passed" if observed == expected else "failed",
+            expected=str(expected),
+            observed=str(observed),
+        )
+
+    def _git_revision(self, args, evidence):
+        del evidence
+        repository = str(args["repository"])
+        expected = str(args["revision"])
+        return self._command_check(
+            "git_revision",
+            ["git", "-C", repository, "rev-parse", "HEAD"],
+            expected=expected,
+            success=lambda item: (
+                item.returncode == 0
+                and item.stdout.strip().startswith(expected)
+            ),
+        )
+
+    def _user_in_group(self, args, evidence):
+        del evidence
+        user = str(args["user"])
+        group = str(args["group"])
+        return self._command_check(
+            "user_in_group",
+            ["id", "-nG", user],
+            expected=group,
+            success=lambda item: (
+                item.returncode == 0 and group in item.stdout.split()
+            ),
+        )
+
+    def _file_mode(self, args, evidence):
+        del evidence
+        path = Path(str(args["path"])).expanduser()
+        expected = str(args["mode"]).lstrip("0")
+        if not path.exists():
+            return CheckResult(
+                "file_mode", "failed", expected=expected, observed="missing"
+            )
+        observed = oct(path.stat().st_mode & 0o7777)[2:]
+        return CheckResult(
+            "file_mode",
+            "passed" if observed == expected else "failed",
+            expected=expected,
+            observed=observed,
+        )
+
+    def _system_package_installed(self, args, evidence):
+        del evidence
+        package = str(args["package"])
+        return self._command_check(
+            "system_package_installed",
+            ["dpkg-query", "-W", "-f=${Status}", package],
+            expected="install ok installed",
+            success=lambda item: (
+                item.returncode == 0
+                and item.stdout.strip() == "install ok installed"
+            ),
+        )
+
+    def _python_package_state(self, args, evidence):
+        del evidence
+        python = str(args["python_executable"])
+        package = str(args["package"])
+        expected_present = _bool_arg(args.get("present"), default=True)
+        return self._command_check(
+            "python_package_state",
+            [python, "-m", "pip", "show", package],
+            expected="installed" if expected_present else "absent",
+            success=(
+                (lambda item: item.returncode == 0)
+                if expected_present
+                else (lambda item: item.returncode != 0)
+            ),
         )
 
     def _command_available(self, args, evidence):
@@ -328,3 +694,16 @@ def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key)
             output.append(item)
     return output
+
+
+def _bool_arg(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError("invalid boolean value")

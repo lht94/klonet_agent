@@ -96,6 +96,40 @@ def test_executor_turns_process_launch_error_into_failed_evidence(monkeypatch):
     assert evidence.timed_out is False
 
 
+def test_readonly_executor_uses_validated_argv_without_shell(monkeypatch):
+    from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+
+    seen = {}
+
+    class FakeProcess:
+        stdout = None
+        stderr = None
+
+        def communicate(self, timeout):
+            return "ok", ""
+
+        @property
+        def returncode(self):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        seen["command"] = command
+        seen.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("klonet_agent.ops.privileged.executor.subprocess.Popen", fake_popen)
+    step = _step("find /tmp/scope -maxdepth 1", risk="readonly")
+
+    evidence = PrivilegedCommandExecutor().execute_readonly(
+        step,
+        ["find", "/tmp/scope", "-maxdepth", "1"],
+    )
+
+    assert evidence.return_code == 0
+    assert seen["command"] == ["find", "/tmp/scope", "-maxdepth", "1"]
+    assert seen["shell"] is False
+
+
 def test_checker_registry_verifies_files_without_shell(tmp_path):
     from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
 

@@ -517,8 +517,10 @@ def generate_indexes(source_root: Path, output_root: Path) -> dict[str, int]:
 
 
 def main() -> int:
+    from klonet_agent.config import KLONET_SOURCE_ROOT
+
     parser = argparse.ArgumentParser(description="Generate Klonet source machine indexes.")
-    parser.add_argument("--source", default="klonet_knowledge/02_vemu_uestc_code")
+    parser.add_argument("--source", default=str(KLONET_SOURCE_ROOT))
     parser.add_argument("--output", default="knowledge/klonet_index")
     args = parser.parse_args()
 

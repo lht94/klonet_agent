@@ -13,7 +13,7 @@ def test_pytest_ignores_runtime_directories():
     text = config.read_text(encoding="utf-8")
 
     assert "norecursedirs" in text
-    assert "--basetemp=C:/tmp/klonet_agent_pytest_tmp" in text
+    assert "--basetemp=/tmp/klonet_agent_pytest_tmp" in text
     assert "workspaces" in text
     assert "journals" in text
     assert "memory" in text

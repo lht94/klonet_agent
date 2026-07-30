@@ -1,0 +1,29 @@
+<!DOCTYPE HTML>
+<html>
+
+<head>
+    <title>网络实验监控进度提示系统</title>
+    <!-- 请将下面的script更换为本地文件 -->
+    <script src="https://cdn.bootcdn.net/ajax/libs/jquery/3.4.1/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/2.3.0/socket.io.dev.js"></script>
+    <script type="text/javascript" charset="utf-8">
+        $(document).ready(function () {
+            var url = 'http://192.168.1.44'; // 请结合配置修改为master的ip
+            var port = '5003';
+            var socket = io.connect(url + ':' + port);
+            socket.on('connect', function () {
+                socket.emit('connected_event', { data: 'connected!!' });
+            })
+            socket.on('push_event', function (msg) {
+                $('#log').append('<br>' + $('<div/>').text('Received #' + ': ' + msg.data).html());
+            });
+        });
+    </script>
+</head>
+
+<body>
+    <h2>网络实验监控进度提示系统</h2>
+    <div id='log'></div>
+</body>
+
+</html>

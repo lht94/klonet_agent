@@ -5,6 +5,8 @@
 
 from klonet_agent.knowledge.models import (
     QueryRoute,
+    RetrievalPlan,
+    RetrievalTask,
     RetrievedChunk,
     SearchOutcome,
     SearchRequest,
@@ -24,6 +26,8 @@ __all__ = [
     "KNOWLEDGE_BASE",
     "KnowledgeBase",
     "QueryRoute",
+    "RetrievalPlan",
+    "RetrievalTask",
     "SearchRequest",
     "SearchOutcome",
     "RetrievedChunk",

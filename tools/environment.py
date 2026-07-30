@@ -150,7 +150,10 @@ _SECRET_PATTERNS = (
         r"(?i)\b([A-Za-z0-9_-]*(?:password|passwd|pwd|api[_-]?key|secret|token)[A-Za-z0-9_-]*)\s*[:=]\s*([^\s]+)"
     ),
     re.compile(
-        r"(?i)(--(?:password|passwd|pwd|api-key|api_key|secret|token)(?:=|\s+))([^\s]+)"
+        r"(?i)(--(?:password|passwd|pwd|api-key|api_key|secret|token|requirepass)(?:=|\s+))([^\s]+)"
+    ),
+    re.compile(
+        r"(?i)((?:redis|rediss|mysql|amqp)://[^:\s/@]+:)([^@\s/]+)(@)"
     ),
     re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+([^\s]+)"),
     re.compile(r"(?i)\b(cookie\s*:\s*)(.+)$", re.MULTILINE),
@@ -766,7 +769,10 @@ def read_ops_file(args: Optional[dict] = None) -> str:
             "read_ops_file",
             [ProbeResult(str(path), STATUS_UNCHECKED, str(exc))],
         )
-    snippet = text[-max_chars:]
+    view = str(args.get("view") or "tail").strip().lower()
+    if view not in {"head", "tail"}:
+        return "Error: view must be head or tail"
+    snippet = text[:max_chars] if view == "head" else text[-max_chars:]
     return "\n".join(
         [
             "read_ops_file",
@@ -777,7 +783,7 @@ def read_ops_file(args: Optional[dict] = None) -> str:
                     f"resolved_path={resolved_path} "
                     f"mtime={_format_mtime(stat.st_mtime)} "
                     f"size_bytes={stat.st_size} "
-                    f"showing last {len(snippet)} chars"
+                    f"showing {view} {len(snippet)} chars"
                 ),
             ).render(),
             redact_sensitive_text(snippet),

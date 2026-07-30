@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 
 from klonet_agent.ops.privileged.contracts import PrivilegedStep, RISK_LEVELS
@@ -48,9 +49,24 @@ class PrivilegedRiskPolicy:
         r"^\s*(?:sudo\s+)?(?:ls|pwd|cat|head|tail|grep|rg|find|stat|ps|ss|which|"
         r"systemctl\s+(?:status|is-active)|docker\s+(?:ps|inspect)|python\d*\s+-V)\b"
     )
+    _unsafe_readonly_shell = re.compile(r"[>|;&`$]")
+    _mutating_find_action = re.compile(
+        r"(?:^|\s)-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b"
+    )
 
     def classify_command(self, command: str) -> tuple[str, str]:
-        normalized = " ".join((command or "").split())
+        raw = command or ""
+        raw_normalized = " ".join(raw.split())
+        for pattern in self._hard_denied:
+            if pattern.search(raw_normalized):
+                return "destructive", "hard-denied catastrophic command"
+        if "\n" in raw or "\r" in raw:
+            return "low", "multiline command is not allowed in read-only execution"
+        try:
+            argv = shlex.split(raw, posix=True)
+        except ValueError:
+            return "low", "command has invalid shell quoting"
+        normalized = " ".join(argv)
         for pattern in self._hard_denied:
             if pattern.search(normalized):
                 return "destructive", "hard-denied catastrophic command"
@@ -60,9 +76,28 @@ class PrivilegedRiskPolicy:
         for pattern in self._medium:
             if pattern.search(normalized):
                 return "medium", "deterministic mutating command pattern"
-        if self._readonly.search(normalized) and not re.search(r"[>|;&]", normalized):
+        if self._readonly.search(normalized):
+            if self._unsafe_readonly_shell.search(normalized):
+                return "low", "shell evaluation is not allowed in read-only execution"
+            if (
+                re.match(r"^\s*(?:sudo\s+)?find\b", normalized)
+                and self._mutating_find_action.search(normalized)
+            ):
+                return "low", "mutating find action is not read-only"
             return "readonly", "deterministic read-only command"
         return "low", "unrecognized command treated as mutating"
+
+    def readonly_argv(self, command: str) -> tuple[list[str] | None, str]:
+        risk, reason = self.classify_command(command)
+        if risk != "readonly":
+            return None, reason
+        try:
+            argv = shlex.split(command, posix=True)
+        except ValueError:
+            return None, "command has invalid shell quoting"
+        if not argv:
+            return None, "empty command is not read-only"
+        return argv, reason
 
     def evaluate(self, goal: str, steps: list[PrivilegedStep]) -> RiskDecision:
         del goal

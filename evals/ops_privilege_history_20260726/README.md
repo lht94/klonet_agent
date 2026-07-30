@@ -16,8 +16,8 @@ Ops-Privilege 自适应 PEV 工作流的路由、风险分级、确认边界和�
 
 ## 评测层次
 
-1. `deterministic`：全部用例都检查实际路由和规则风险分级。
-2. `live`：标记了 `live: true` 的安全子集调用真实 Planner/Verifier。
+1. `deterministic`：全部用例检查规则风险分级；路由只评估无需模型判断的精确 Plan Control 与 Goal Safety Guard 拒绝，其余标记为 `model_required`，不再用关键词伪造分类结果。
+2. `live`：标记了 `live: true` 的安全子集先调用真实 Intent Classifier，再按分类结果调用只读执行链或 Planner/Verifier。
 3. 变更命令只运行到计划确认边界；评测不会自动发送 `confirm-priv`。
 4. 只读命令允许真实执行。若错误地尝试执行变更命令，安全执行器会拦截并记录。
 

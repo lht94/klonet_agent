@@ -14,11 +14,14 @@ import yaml
 from klonet_agent.config import KNOWLEDGE_INDEX_FILE, PROJECT_ROOT
 
 
-TEXT_SUFFIXES = {".md", ".txt", ".py", ".json", ".jsonl", ".yaml", ".yml", ".toml"}
+PUBLIC_KNOWLEDGE_ROOTS = (
+    "knowledge/klonet",
+    "knowledge/klonet_experience",
+)
+PUBLIC_KNOWLEDGE_SUFFIXES = {".md", ".txt"}
+PUBLIC_KNOWLEDGE_EXCLUDED_NAMES = {"README.md"}
 SKIP_PARTS = {"__pycache__", ".git", ".DS_Store"}
-RUNTIME_MEMORY_FILES = {"MEMORY.md", "USER.md", "history.jsonl", "tokens.jsonl"}
-SKIP_KNOWLEDGE_DIRS = {"extracted_docs", "extracted_images", "staging"}
-INDEX_SCHEMA_VERSION = 3
+INDEX_SCHEMA_VERSION = 5
 
 _LAYER_DEFAULTS = {
     "curated": {
@@ -75,9 +78,11 @@ class KnowledgeIndexer:
         self,
         root: Path = PROJECT_ROOT,
         index_file: Path = KNOWLEDGE_INDEX_FILE,
+        source_roots: tuple[str, ...] = PUBLIC_KNOWLEDGE_ROOTS,
     ):
         self.root = root
         self.index_file = index_file
+        self.source_roots = source_roots
 
     def build(self) -> int:
         """重建索引，敏感 chunk 不进入公共索引。"""
@@ -98,43 +103,30 @@ class KnowledgeIndexer:
     def _iter_source_files(self):
         """遍历可进入知识库的文本文件。"""
 
-        roots = [
-            self.root / "README.md",
-            self.root / "prompts.py",
-            self.root / "knowledge",
-            self.root / "journal",
-            self.root / "workspace",
-            self.root / "tools",
-            self.root / "memory",
-            self.root / "doc",
-            self.root / "journals",
-        ]
+        project_root = self.root.resolve()
+        roots = [self.root / relative for relative in self.source_roots]
         seen: set[Path] = set()
-        knowledge_root = self.root / "knowledge"
         for source_root in roots:
             if not source_root.exists():
                 continue
+            resolved_source_root = source_root.resolve()
+            if not _path_is_relative_to(resolved_source_root, project_root):
+                continue
             candidates = [source_root] if source_root.is_file() else source_root.rglob("*")
             for path in candidates:
-                if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
+                if (
+                    not path.is_file()
+                    or path.suffix.lower() not in PUBLIC_KNOWLEDGE_SUFFIXES
+                    or path.name in PUBLIC_KNOWLEDGE_EXCLUDED_NAMES
+                ):
                     continue
                 if any(part in SKIP_PARTS for part in path.parts):
                     continue
-                if _is_runtime_memory_file(path, self.root):
-                    continue
                 if path.resolve() == self.index_file.resolve():
                     continue
-                if _path_is_relative_to(path, knowledge_root):
-                    relative = path.relative_to(knowledge_root)
-                    if relative.parts and relative.parts[0] in SKIP_KNOWLEDGE_DIRS:
-                        continue
-                    if path.suffix == ".jsonl" and (
-                        not relative.parts or relative.parts[0] != "klonet_index"
-                    ):
-                        continue
-                elif path.suffix == ".jsonl":
-                    continue
                 resolved = path.resolve()
+                if not _path_is_relative_to(resolved, resolved_source_root):
+                    continue
                 if resolved in seen:
                     continue
                 seen.add(resolved)
@@ -152,9 +144,6 @@ class KnowledgeIndexer:
         relative_text = relative.as_posix()
         layer = _knowledge_layer(relative_text)
         defaults = dict(_LAYER_DEFAULTS[layer])
-
-        if path.suffix.lower() == ".jsonl":
-            return _chunk_jsonl(text, relative_text, layer, defaults)
 
         metadata: dict[str, Any] = {}
         if path.suffix.lower() == ".md":
@@ -314,66 +303,120 @@ def _mask_markdown_fences(text: str) -> str:
 
 
 def _split_windows(text: str, chunk_size: int = 1200, overlap: int = 120) -> list[str]:
-    """超长章节再按固定窗口切分，并保留少量重叠。"""
+    """按段落、列表和 fenced code 组合窗口，并保留结构化重叠。"""
 
     cleaned = text.strip()
     if not cleaned:
         return []
-    result = []
-    start = 0
-    while start < len(cleaned):
-        end = min(len(cleaned), start + chunk_size)
-        result.append(cleaned[start:end])
-        if end == len(cleaned):
-            break
-        start = max(end - overlap, start + 1)
+    if len(cleaned) <= chunk_size:
+        return [cleaned]
+
+    blocks = _structural_blocks(cleaned)
+    result: list[str] = []
+    current: list[str] = []
+    for block in blocks:
+        if len(block) > chunk_size:
+            if current:
+                result.append("\n\n".join(current))
+                current = []
+            result.extend(_split_oversized_block(block, chunk_size, overlap))
+            continue
+        candidate = "\n\n".join([*current, block])
+        if current and len(candidate) > chunk_size:
+            result.append("\n\n".join(current))
+            current = _overlap_blocks(current, overlap)
+            while current and len("\n\n".join([*current, block])) > chunk_size:
+                current.pop(0)
+        current.append(block)
+    if current:
+        result.append("\n\n".join(current))
     return result
 
 
-def _chunk_jsonl(
-    text: str,
-    path: str,
-    layer: str,
-    defaults: dict[str, str],
-) -> list[KnowledgeChunk]:
-    """机器索引按记录切分并继承原记录 metadata。"""
+def _structural_blocks(text: str) -> list[str]:
+    """Split text without separating a normal fenced-code block."""
 
-    chunks = []
-    for index, line in enumerate(text.splitlines(), start=1):
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
+    lines = text.splitlines()
+    blocks: list[str] = []
+    current: list[str] = []
+    fence: str | None = None
+    for line in lines:
+        stripped = line.lstrip()
+        marker = re.match(r"(`{3,}|~{3,})", stripped)
+        if fence is not None:
+            current.append(line)
+            if stripped.startswith(fence):
+                blocks.append("\n".join(current).strip())
+                current = []
+                fence = None
             continue
-        if not isinstance(row, dict):
+        if marker:
+            if current:
+                blocks.append("\n".join(current).strip())
+                current = []
+            fence = marker.group(1)
+            current.append(line)
             continue
+        if not line.strip():
+            if current:
+                blocks.append("\n".join(current).strip())
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current).strip())
+    return [block for block in blocks if block]
 
-        identifier = (
-            row.get("route")
-            or row.get("symbol")
-            or row.get("name")
-            or row.get("path")
-            or row.get("domain")
-            or str(index)
-        )
-        metadata = dict(row)
-        if row.get("sensitive") is True and row.get("default") != "<redacted>":
-            metadata["sensitivity"] = "restricted"
-        normalized = _normalize_metadata(
-            metadata,
-            defaults,
-            domain=str(row.get("domain") or _infer_domain(str(row.get("path") or path))),
-        )
-        chunks.append(
-            _make_chunk(
-                path=path,
-                layer=layer,
-                title=f"{path}#{identifier}",
-                content=json.dumps(row, ensure_ascii=False, sort_keys=True),
-                index=str(index),
-                metadata=normalized,
-            )
-        )
-    return chunks
+
+def _split_oversized_block(
+    block: str,
+    chunk_size: int,
+    overlap: int,
+) -> list[str]:
+    """Fallback for a single huge paragraph/code block, preferring line boundaries."""
+
+    lines = block.splitlines()
+    result: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        candidate = "\n".join([*current, line])
+        if current and len(candidate) > chunk_size:
+            result.append("\n".join(current))
+            carried: list[str] = []
+            carried_size = 0
+            for previous in reversed(current):
+                if carried and carried_size + len(previous) + 1 > overlap:
+                    break
+                carried.insert(0, previous)
+                carried_size += len(previous) + 1
+            current = carried
+        if len(line) > chunk_size:
+            if current:
+                result.append("\n".join(current))
+                current = []
+            start = 0
+            while start < len(line):
+                end = min(len(line), start + chunk_size)
+                result.append(line[start:end])
+                if end == len(line):
+                    break
+                start = max(start + 1, end - overlap)
+        else:
+            current.append(line)
+    if current:
+        result.append("\n".join(current))
+    return result
+
+
+def _overlap_blocks(blocks: list[str], overlap: int) -> list[str]:
+    carried: list[str] = []
+    size = 0
+    for block in reversed(blocks):
+        if carried and size + len(block) + 2 > overlap:
+            break
+        carried.insert(0, block)
+        size += len(block) + 2
+    return carried
 
 
 def _make_chunk(
@@ -424,23 +467,6 @@ def _infer_domain(path: str) -> str:
         if any(term in lowered for term in terms):
             return domain
     return "general"
-
-
-def _is_runtime_memory_file(path: Path, root: Path) -> bool:
-    """运行时记忆不进入 Klonet 公共知识索引。"""
-
-    try:
-        relative = path.relative_to(root)
-    except ValueError:
-        return False
-    parts = relative.parts
-    if len(parts) < 2 or parts[0] != "memory":
-        return False
-    if path.name in RUNTIME_MEMORY_FILES:
-        return True
-    if "sessions" in parts or "users" in parts:
-        return True
-    return path.suffix == ".md" and path.stem[:4].isdigit()
 
 
 # 兼容已有测试和调用。

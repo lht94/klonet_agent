@@ -3,21 +3,12 @@
 from __future__ import annotations
 
 import os
-from typing import Any
-
-try:
-    from dotenv import load_dotenv
-except ModuleNotFoundError:
-    def load_dotenv():
-        return None
+from typing import Any, Sequence
 
 from klonet_agent.config import (
     DEFAULT_EMBEDDING_BASE_URL,
     DEFAULT_EMBEDDING_MODEL,
 )
-
-
-load_dotenv()
 
 
 def get_embedding_api_key() -> str | None:
@@ -69,3 +60,24 @@ class EmbeddingClient:
             return ()
         embedding = getattr(response.data[0], "embedding", None) or ()
         return tuple(float(value) for value in embedding)
+
+    def embed_texts(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        """Return embeddings in one request when the provider supports batching."""
+
+        inputs = tuple(str(text) for text in texts)
+        if not inputs:
+            return ()
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=list(inputs),
+        )
+        if not getattr(response, "data", None):
+            return ()
+        ordered = sorted(
+            response.data,
+            key=lambda item: int(getattr(item, "index", 0)),
+        )
+        return tuple(
+            tuple(float(value) for value in (getattr(item, "embedding", None) or ()))
+            for item in ordered
+        )

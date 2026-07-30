@@ -21,6 +21,31 @@ TaskType = Literal[
     "general",
 ]
 RelevanceStatus = Literal["reliable", "weak", "none"]
+KnowledgeStore = Literal["public_docs", "source_code"]
+
+
+@dataclass(frozen=True)
+class RetrievalTask:
+    """Planner 生成的一个知识库检索任务。"""
+
+    store: KnowledgeStore
+    purpose: str
+    keyword_queries: tuple[str, ...] = ()
+    semantic_queries: tuple[str, ...] = ()
+    exact_terms: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RetrievalPlan:
+    """一次 LLM 调用生成的完整检索计划。"""
+
+    original_query: str
+    standalone_query: str
+    retrieval_tasks: tuple[RetrievalTask, ...]
+    excluded_terms: tuple[str, ...] = ()
+    confidence: float = 0.0
+    status: str = "planned"
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +101,15 @@ class RetrievedChunk:
     metadata_score: float = 1.0
     matched_terms: tuple[str, ...] = ()
     relevance: str = "weak"
+    recall_channels: tuple[str, ...] = ()
+    task_purposes: tuple[str, ...] = ()
+    rrf_score: float = 0.0
+    rerank_score: float | None = None
+    final_score: float = 0.0
+    symbol: str = ""
+    line_start: int | None = None
+    line_end: int | None = None
+    rerank_text: str = ""
 
 
 @dataclass
@@ -86,3 +120,12 @@ class SearchOutcome:
     results: list[RetrievedChunk] = field(default_factory=list)
     confidence: float = 0.0
     reason: str = ""
+    retrieval_mode: str = "bm25"
+    vector_status: str = "not_loaded"
+    vector_status_detail: str = ""
+    retrieval_plan: RetrievalPlan | None = None
+    planner_status: str = "not_used"
+    recall_counts: dict[str, int] = field(default_factory=dict)
+    fusion_status: str = "not_used"
+    rerank_status: str = "not_used"
+    stage_timings_ms: dict[str, float] = field(default_factory=dict)
