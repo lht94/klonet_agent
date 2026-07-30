@@ -1036,6 +1036,56 @@ Replan：
 6c. 重启 Web Terminal
 ```
 
+### Ops-Privilege 澄清边界
+
+Ops-Privilege 入口把“请求类型”和“目标明确性”分开判断：
+
+```text
+用户目标是否明确？
+  ├─ 否：是否能通过最近对话或安全只读检查补全？
+  │    ├─ 能：进入 Planner，并先安排最小只读发现步骤
+  │    └─ 不能：提出一个具体的中文澄清问题
+  └─ 是：是否要求真实操作？
+       ├─ 否：交给正常 Answerer
+       ├─ 只读：进入确定性只读执行；没有安全命令时进入只读规划
+       └─ 变更：进入 PEV 计划并等待确认
+```
+
+以下情况不得伪装成“用户没有说清”：
+
+- 分类模型置信度较低：保留合法的结构化分类，仅作为可观测信息。
+- 分类服务异常或连续返回非法 JSON：报告内部分类故障，禁止执行。
+- 只读目标明确但分类器没有生成命令：交给 Planner 生成受策略校验的检查步骤。
+- 部署、安装、诊断等目标明确，但路径、服务名或当前状态可通过只读检查发现：
+  标记为 `discoverable` 并进入 Planner。
+
+只有目标或操作对象既不能从最近对话恢复，也不能通过安全只读发现确定时，才标记为
+`missing` 并向用户澄清。
+
+Ops-Privilege 的交互输出与延迟也遵循以下边界：
+
+- 分类器与 Planner 默认都使用 `deepseek-v4-pro`，显式关闭 thinking；强模型负责理解
+  和规划，但不消耗不必要的隐藏推理 Token。
+- 默认不设置业务层硬超时，避免正常的模型延迟波动被误报为失败；仍关闭 SDK 自动
+  重试，网络或服务错误不会暗中重复请求。
+- 分类前立即显示“正在分析请求并规划下一步…”，进入 Planner 后显示“正在生成高权限
+  操作计划…”，等待期间不再保持空白。
+- Planner 通常生成 3–6 步、最多 8 步；相关只读探测必须合并，标准超时和校验器由
+  确定性代码补齐，不要求模型重复输出内部表格。
+- 默认只展示中文目标、风险、状态和步骤标题，不展示命令、哈希、Schema、校验器等
+  内部字段；用户显式运行 `show-priv <plan_id>` 时才查看完整审计数据。
+- Planner 超时或输出无效时返回简短的安全失败提示，任何命令都不会执行。
+
+步骤验证与总体目标验证必须分层：
+
+- 执行中间步骤时，Verifier 只接收当前步骤标题、命令证据和 Checker 结果，不接收
+  `plan.goal`，避免用“平台是否已经部署完成”否定前置环境检查。
+- 非零退出码、超时、失败或不可用的必要 Checker 仍然立即阻断，LLM 无权覆盖。
+- 文件存在、服务状态、配置有效性等强确定性 Checker 全部通过时，当前步骤直接完成；
+  只有缺少强状态证据的变更步骤才交给模型进行步骤级判断。
+- `goal_achieved` 在步骤 Verifier 中只表示“当前步骤目标完成”，不表示整个计划完成；
+  整体计划只有在全部步骤验证通过后才能进入 `completed`。
+
 ### 总结
 
 后续 Ops Agent 的关键优化方向是把三件事拆开：
@@ -1047,3 +1097,93 @@ Replan：
 ```
 
 当前 `OperationPlan + recipe + helper/sudoers` 是为了快速跑通安全执行底座；下一阶段应把 `recipe_id` 从计划层下沉到 Action Router / Executor 内部，让用户和模型主要面对任务级计划。
+# 2026-07-28：高权限 Planner 接入知识与环境 grounding
+
+- 高权限计划生成前，先检索 Klonet 公共文档与源码知识，再执行有界、只读的服务器环境探测。
+- Planner 输出由任意 `command` 改为 Action Registry 中的 `action + args`；`command`、`shell`、`script` 等模型字段会在审批前被拒绝。
+- 动作参数必须完整且路径必须通过 Action Registry 校验。缺少 `project_root` 等关键事实时不能猜测命令或路径。
+- 审批后的执行使用 Ops-Privilege 专属 `DirectPrivilegedActionRunner`。它与普通
+  Ops 的 `ControlledActionRunner`、`/usr/local/bin/klonet-agent-op` 和 sudoers
+  白名单完全分离；模型仍不直接接触 shell 执行边界。
+- 执行能力采用混合分层：Klonet 专用工作流、通用参数化动作，以及
+  `run_ops_command`（别名 `run_controlled_argv`）受控 argv 兜底。兜底只接受
+  `program + argv + cwd`，由确定性命令策略逐项校验，禁止 shell 解释器、
+  管道、重定向、命令替换和 `shell=True`。
+- Action Registry、环境事实模型和计划契约可在两种 Ops 模式间共享，但执行后端不共享：
+  普通 Ops 把动作交给 helper；Ops-Privilege 把已确认动作编译成固定 argv 或受策略
+  校验的通用 argv 直接执行。未实现的直连动作会明确报告能力缺口并进入 replan，不会
+  静默回退 helper。
+- Ops-Privilege 的统一环境事实模型明确区分源码仓库、后端 Python 包、平台运行根目录、
+  入口文件来源和运行 cwd，并记录 Nginx 路径、Redis 端口/认证元数据及 Python
+  解释器。Redis 等密码只保存“是否配置、来源路径”，不进入 Planner Prompt。
+- 标准 Klonet 部署增加确定性 Grounded Resolver：当 RAG 可用且服务器只读
+  证据只确认一个完整源码根目录时，即使 Planner 连续返回无效或空步骤，也能
+  生成 `validate_project_files → prepare_project_files（按需）→
+  start_platform_screens` 标准动作链；非标准目标仍然失败关闭，不猜测。
+- 修复混合风险计划中的验证路由：只读注册动作按当前步骤使用确定性 Verifier，
+  不再因为整个计划包含后续变更动作而交给 LLM 二次判断。对“执行成功、检查通过，
+  但 LLM 返回 inconclusive”的既有只读步骤，`resume-priv` 会从持久化证据恢复为
+  completed，并继续后续已授权步骤，不会重复执行该只读步骤。
+- 执行继续权改为用户控制：LLM Verifier 不再参与步骤成败或是否继续的裁决。
+  已配置的确定性检查通过后，按用户已确认的计划自动继续；失败、检查器不可用或
+  执行结果未知时进入 `paused`，展示事实并等待用户选择
+  `continue-priv`、`retry-priv`、`replan-priv` 或 `abort-priv`。
+- `blocked` 仅保留给未授权、旧版命令计划、非注册动作和只读边界绕过等硬安全拒绝。
+  Planner 可以提高 Action Registry 给出的风险等级，但不能降低确定性风险下限。
+- 内置的 `knowledge/klonet_source` 只作为源码知识快照，不会被自动当成部署目录；部署候选源码根目录来自服务器只读证据和显式配置。
+- 高权限动作的默认输出改为用户可读摘要：开始时说明正在做什么，完成步骤说明验证了什么，
+  暂停步骤直接给出具体失败组件和根因。摘要由独立小模型
+  `OPS_PRIVILEGE_SUMMARIZER_MODEL`（默认 `deepseek-v4-flash`）根据确定性状态和经过
+  脱敏、截断的执行证据生成，不再为每个 Action 维护一套文案规则。小模型不可用或输出
+  机器日志时回退到通用确定性状态提示。recipe 字段、完整 stdout/stderr 与 traceback
+  继续保存在步骤证据中，只在 `show-priv <plan_id>` 的完整审计数据里展示。
+- 每个已确认步骤在真正执行前，也由同一个小模型根据步骤标题、脱敏参数、风险和预期变化
+  生成一到两句操作说明，明确步骤序号、操作对象、将检查或修改什么以及是否影响服务器
+  环境；说明只描述即将发生的操作，不能提前声称成功。执行器自身不再维护 Action 专用
+  开始文案，模型不可用时按只读/变更风险输出通用说明。
+- “验证能力仅限退出码”只保留为计划内部的 `verification_level`，不再混入步骤结果；
+  暂停提示明确指向上方失败原因，并继续由用户决定跳过、重试、重新规划或终止。
+- 已授权步骤失败后立即停止剩余变更操作，并自动运行有界只读环境探测、重新检索 Klonet
+  知识，再把失败证据一并交给 Planner 生成修复草案。原执行步骤和完整证据进入
+  `recovery_history`；新步骤替换计划后旧授权立即清空，必须再次执行
+  `confirm-priv <plan_id>` 才能实施修复。自动诊断或修复规划不可用时保持 `paused`，
+  不会退化为自动重试或越权执行。
+- Replan 不再是把同一份错误日志直接再交给 Planner 一次。通用恢复分析器先输出故障
+  假设、需要的只读探针和修复能力要求；系统只执行允许的
+  `system_environment`、`platform_health`、`process_detail`、`ops_file`、`logs`、
+  `screen_session` 等探针，随后根据新增证据收敛根因，再规划修复。独立的恢复审查会拒绝
+  只重复失败动作或未覆盖根因的草案。若 Action Registry 缺少实施能力，用户看到的是
+  已确认根因和具体能力缺口，而不是内部校验表达式。手动 `replan-priv` 对带失败证据的
+  旧计划也进入同一恢复流水线。
+- `show-priv <plan_id>` 改为详细自然语言计划，说明目标、风险、每步对象、行为、环境影响、
+  当前结果和回退方式；持久化 JSON、完整 stdout/stderr、Checker 与恢复历史改由
+  `audit-priv <plan_id>` 单独查看，避免把审计结构当作用户界面。
+- Ops-Privilege 能力补齐为四层注册结构：`DomainWorkflowRegistry` 保存平台部署、
+  启停、重启、组件恢复、配置、Nginx、环境部署、源码升级和回滚等领域工作流合同；
+  `ReadOnlyProbeRegistry` 保存项目/Python/进程/端口/服务/screen/Docker/Nginx/
+  中间件/网络/资源/Git/日志/TCP/HTTP/权限等只读证据能力；`OpsActionRegistry`
+  保存结构化变更动作及其前置条件、影响、后置条件、风险和执行后端；
+  `OpsCommandPolicy` 保存标准 Ubuntu 工具的受限 argv 兜底策略。
+- 新增通用直连变更动作：文件复制、移动、目录创建、明确路径删除、systemd 服务管理、
+  带 PID 身份核验的进程信号、Docker 容器管理、apt 包安装、指定 Python 解释器的
+  pip 包变更、文件权限/属主管理和结构化 Git 操作。普通 Ops 后端会拒绝这些
+  `ops-privilege` 专属动作，避免错误回落到 helper。
+- 命令策略新增 `systemctl`、`docker`、`nginx`、无密码参数的只读 `redis-cli`、
+  `journalctl`、仅本机健康地址的 `curl`、工作目录内的 `tar/unzip`、受限
+  `chmod/chown`，以及 Git fetch/reset。删除、停止、递归权限修改和 Git hard reset
+  等高风险形式仍要求步骤级确认。
+- 只读探针统一经注册表分发并脱敏，Git 探针输出明确的仓库、revision、状态和 remote；
+  Python 导入探针使用明确解释器与 cwd，并报告模块文件来源，供通用 Replan 根据真实
+  环境证据选择修复能力。
+- 修复 `replan-priv` 失败后重复展示旧暂停计划的问题：每次恢复尝试无论成功失败都写入
+  `recovery_history`，保存诊断证据、结论、失败原因、结果和证据指纹。没有形成替代步骤
+  时明确提示“没有生成新计划”，不再调用 `render_plan` 冒充新计划；相同证据再次请求
+  时不会重复调用 Planner。
+- 恢复阶段新增确定性基础探针补全：根据失败形状自动补项目结构、实际配置文件、
+  监听端口、Docker/Redis、Python 导入、路径权限或磁盘证据，再与模型建议的探针去重
+  合并。执行证据的 traceback 上限提高，避免真实目标端口和根因被截断。
+- 新增 `replace_text_in_file` 受控动作：仅允许安全文本类型、旧文本必须唯一匹配、
+  新旧内容不得包含敏感字段，修改前自动保留同目录备份。它为端口、路径等配置类修复
+  提供通用能力，而不是为单个 Redis 故障硬编码 recipe。
+- `read_ops_file` 支持明确的 `head`/`tail` 视图，恢复探测可以读取配置文件前部而非
+  固定读取尾部；Docker 命令行中的 `--requirepass` 和常见服务 URI 密码也会被统一脱敏。

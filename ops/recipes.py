@@ -156,6 +156,11 @@ class ControlledActionRunner:
                 "blocked",
                 f"action_not_allowlisted={action or 'missing'}; environment unchanged",
             )
+        if "ops" not in spec.backends:
+            return RecipeExecutionResult(
+                "blocked",
+                f"action_backend_not_supported=ops:{spec.name}; environment unchanged",
+            )
         if spec.requires_confirmation and self.execution_config != "enabled":
             return RecipeExecutionResult(
                 "blocked",
@@ -391,7 +396,13 @@ class ControlledActionRunner:
                 f"recipe_id={PREPARE_PROJECT_FILES} invalid_project_root={project_root or 'missing'}; environment unchanged",
             )
         root = Path(project_root)
-        mains = root / "mains"
+        source_root = str(args.get("source_root") or "").strip()
+        mains = Path(source_root).expanduser() if source_root else root / "mains"
+        if _looks_unsafe_path(str(mains)):
+            return RecipeExecutionResult(
+                "blocked",
+                f"recipe_id={PREPARE_PROJECT_FILES} invalid_source_root={_one_line(str(mains))}; environment unchanged",
+            )
         missing_sources = [
             filename
             for filename in REQUIRED_PROJECT_ENTRY_FILES
@@ -407,7 +418,16 @@ class ControlledActionRunner:
                     "environment unchanged"
                 ),
             )
-        previews = [f"mains/{filename}->{filename}" for filename in REQUIRED_PROJECT_ENTRY_FILES]
+        if source_root:
+            previews = [
+                f"{mains / filename}->{root / filename}"
+                for filename in REQUIRED_PROJECT_ENTRY_FILES
+            ]
+        else:
+            previews = [
+                f"mains/{filename}->{filename}"
+                for filename in REQUIRED_PROJECT_ENTRY_FILES
+            ]
         if self.dry_run:
             return RecipeExecutionResult(
                 "completed",
@@ -1146,6 +1166,8 @@ def _project_entry_file_sources(root: Path) -> dict:
             found[filename] = filename
         elif (root / "mains" / filename).is_file():
             found[filename] = f"mains/{filename}"
+        elif (root / "vemu_uestc" / "mains" / filename).is_file():
+            found[filename] = f"vemu_uestc/mains/{filename}"
     return found
 
 

@@ -41,6 +41,7 @@ class LLMClient:
         base_url: str = DEFAULT_BASE_URL,
         model: str = DEFAULT_MODEL,
         timeout: float | None = None,
+        max_retries: int | None = None,
     ):
         # api_key: str | None 表示 api_key 可以是字符串，也可以是 None。
         # 如果调用方没有显式传入 api_key，就从环境变量 DEEPSEEK_API_KEY 中读取。
@@ -57,6 +58,8 @@ class LLMClient:
         client_options = {"api_key": self.api_key, "base_url": self.base_url}
         if timeout is not None:
             client_options["timeout"] = timeout
+        if max_retries is not None:
+            client_options["max_retries"] = max(0, int(max_retries))
         self.client = OpenAI(**client_options)
 
     def complete(

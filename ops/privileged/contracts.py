@@ -17,6 +17,7 @@ PLAN_STATUSES = {
     "verifying",
     "completed",
     "partially_completed",
+    "paused",
     "blocked",
     "failed",
     "aborted",
@@ -29,6 +30,7 @@ STEP_STATUSES = {
     "executed",
     "verifying",
     "completed",
+    "paused",
     "blocked",
     "failed",
     "execution_unknown",
@@ -113,7 +115,9 @@ class VerificationDecision:
 class PrivilegedStep:
     step_id: str
     title: str
-    command: str
+    command: str = ""
+    action: str = ""
+    args: dict[str, Any] = field(default_factory=dict)
     cwd: str = ""
     risk: str = "medium"
     approval_scope: str = "plan"
@@ -139,6 +143,8 @@ class PrivilegedStep:
             "step_id": self.step_id,
             "title": self.title,
             "command": self.command,
+            "action": self.action,
+            "args": self.args,
             "cwd": self.cwd,
             "risk": self.risk,
             "approval_scope": self.approval_scope,
@@ -169,13 +175,15 @@ class PrivilegedPlan:
     goal: str
     risk: str
     steps: list[PrivilegedStep]
-    schema_version: int = 1
+    schema_version: int = 2
     status: str = "draft"
     verification_level: str = "none"
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     authorized_hash: str = ""
     verification: VerificationDecision | None = None
+    grounding: dict[str, Any] = field(default_factory=dict)
+    recovery_history: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.risk not in RISK_LEVELS:
@@ -225,6 +233,8 @@ class PrivilegedPlan:
             "content_hash": self.content_hash,
             "steps": [step.to_dict() for step in self.steps],
             "verification": self.verification.to_dict() if self.verification else None,
+            "grounding": self.grounding,
+            "recovery_history": self.recovery_history,
         }
 
     @classmethod

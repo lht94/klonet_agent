@@ -514,10 +514,28 @@ python -m klonet_agent.agent --mode ops-privilege --user-id lht --project-id tes
 `ops-privilege` 是独立的自适应 PEV 高权限运维模式。主 Agent 只能读取环境证据，
 不能直接调用任意 Shell；修改型目标会交给独立 Planner 生成结构化计划，再经过
 确定性风险门控、必要的人类确认、非模型可见 Executor 和 Checker Registry 验收。
+执行器使用专属 `DirectPrivilegedActionRunner`，不调用普通 Ops 的
+`/usr/local/bin/klonet-agent-op`，也不依赖其 NOPASSWD sudoers 白名单；两种模式只
+共享 Action Schema、环境事实和计划语义。需要 sudo 时，密码提示只允许出现在当前
+终端，不进入对话、参数或审计证据。
 单个可逆低/中风险修改使用 MicroPlan；多步骤计划使用 `confirm-priv <plan_id>`；
 高风险步骤还需 `confirm-priv-step <plan_id> <step_id>`。如果 sudo 需要密码，只能在
 当前终端提示中输入，不要把密码发到聊天里。普通 `ops` 模式仍使用
 OperationPlan/helper/sudoers 链路。
+
+`ops-privilege` 的能力不是把所有 Ubuntu 命令逐条写成 recipe，而是分成四层注册表：
+
+- `DomainWorkflowRegistry`：部署、启停、重启、组件恢复、Nginx 配置、环境部署、
+  源码升级和回滚等任务的阶段、必需事实和验收证据。
+- `ReadOnlyProbeRegistry`：项目结构、Python 导入、进程树、PID/端口、systemd、
+  screen、Docker、Nginx、Redis/MySQL/RabbitMQ、网络、防火墙、磁盘、内存、
+  Git、日志、TCP/HTTP 和权限探测；探测结果统一脱敏。
+- `OpsActionRegistry`：文件复制/移动/创建/删除、服务/进程/容器管理、系统包与
+  Python 包、权限、Git、带备份的唯一文本匹配替换，以及 Klonet 专用平台动作。
+  动作声明前置条件、影响、后置条件、风险和可用执行后端。
+- `OpsCommandPolicy`：为标准工具提供受限 `program + argv + cwd` 兜底；不接受
+  shell 字符串、管道、重定向或命令替换。普通 Ops 会拒绝只属于
+  `ops-privilege` 的直连动作。
 
 高权限计划控制命令：
 
@@ -534,6 +552,11 @@ abort-priv <plan_id>
 `memory/sessions/.../privileged_ops_plans/` 下。进程中断时，原来处于
 `running`/`verifying` 的步骤会变成 `execution_unknown`；`resume-priv` 只验证当前
 状态，绝不自动重放该步骤。
+
+失败后的 `replan-priv` 会保存每次诊断快照和证据指纹。只有生成了实际替代步骤时，
+界面才会展示“新计划”并要求重新确认；如果 Planner 无法形成可靠步骤，则明确显示
+“没有生成新计划”，不会把原暂停计划重新包装成重规划结果。相同证据再次 replan
+不会重复调用 Planner，需先补充证据或改变服务器状态。
 
 部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
 `KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。

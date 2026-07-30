@@ -36,7 +36,7 @@ SAFETY_PROMPT = """
 MODE_CAPABILITY_PROMPT = """
 【可用 Agent 模式】
 1. Mentor 模式：默认教学与咨询模式，负责 Klonet 概念解释、知识库问答、源码/报错解释、部署与运维思路指导；不直接读取本机环境，不修改代码。
-2. Ops 模式：受控运维诊断与操作模式，负责读取 Agent 所在机器的端口、服务、screen、Docker、Nginx、日志等环境证据，并通过 OperationPlan/helper 做受控修改。
+2. Ops 模式：受控运维诊断与操作模式，提供只读环境感知，负责读取 Agent 所在机器的端口、服务、screen、Docker、Nginx、日志等环境证据，并通过 OperationPlan/helper 做受控修改。
 3. Ops-Privilege 模式：自适应 PEV 高权限运维模式，由 Supervisor 编排独立 Planner/Verifier、风险分级审批、确定性 Executor 和执行后 Checker；sudo 密码由用户在终端提示中手动输入，不进入对话。
 4. Coding 模式：代码修改与测试模式，负责在 workspace 内改代码、跑测试、看 diff 和记录项目日志。
 

@@ -20,6 +20,12 @@ from klonet_agent.config import (
     MAX_TOOL_ROUNDS,
     MEMORY_DIR,
     OPS_MAX_TOOL_ROUNDS,
+    OPS_PRIVILEGE_CLASSIFIER_MODEL,
+    OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
+    OPS_PRIVILEGE_PLANNER_MODEL,
+    OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
+    OPS_PRIVILEGE_SUMMARIZER_MODEL,
+    OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
     RAG_QUERY_PLANNER_MODEL,
     RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
@@ -51,9 +57,12 @@ from klonet_agent.memory import MemoryStore
 from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
 from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+from klonet_agent.ops.privileged.recovery import PrivilegedRecoveryAgent
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+from klonet_agent.ops.privileged.summarizer import PrivilegedEvidenceSummarizer
 from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
@@ -124,7 +133,10 @@ class AgentOrchestrator:
         self._ops_route: OpsRoute | None = None
         self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
             ProjectJournal.from_session(self.session),
-            llm=self.llm,
+            # Test doubles and deterministic callers should not receive a
+            # surprise third model call. Production LLMClient instances still
+            # enable automatic journal maintenance.
+            llm=self.llm if isinstance(self.llm, LLMClient) else None,
         )
         self.tool_executor = tool_executor or ToolExecutor(
             session=self.session,
@@ -135,12 +147,24 @@ class AgentOrchestrator:
         )
         self.privileged_workflow = privileged_workflow
         if self.profile.name == "ops-privilege" and self.privileged_workflow is None:
+            planner_llm = self.llm
+            evidence_summarizer = None
+            if supplied_llm is None:
+                planner_llm = LLMClient(
+                    model=OPS_PRIVILEGE_PLANNER_MODEL,
+                    timeout=OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
+                    max_retries=0,
+                )
+                evidence_summarizer = PrivilegedEvidenceSummarizer(
+                    LLMClient(
+                        model=OPS_PRIVILEGE_SUMMARIZER_MODEL,
+                        timeout=OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
+                        max_retries=0,
+                    )
+                )
             self.privileged_workflow = PrivilegedOpsWorkflow(
-                planner=PrivilegedPlannerAgent(self.llm),
+                planner=PrivilegedPlannerAgent(planner_llm),
                 executor=PrivilegedCommandExecutor(
-                    on_start=lambda command: print(
-                        "Klonet Agent：正在执行已授权的高权限步骤\n%s" % command
-                    ),
                     on_output=lambda channel, chunk: print(chunk, end="", flush=True),
                 ),
                 verifier=PrivilegedVerifierAgent(self.llm),
@@ -150,12 +174,27 @@ class AgentOrchestrator:
                     project_id=self.session.project_id,
                 ),
                 event_sink=self._record_privileged_event,
+                context_builder=PrivilegedPlanContextBuilder(),
+                summarizer=evidence_summarizer,
+                recovery_agent=PrivilegedRecoveryAgent(planner_llm),
+                on_progress=lambda message: print("Klonet Agent：%s" % message),
             )
         self.privileged_supervisor = privileged_supervisor
         if self.profile.name == "ops-privilege" and self.privileged_supervisor is None:
+            classifier_llm = self.llm
+            if supplied_llm is None:
+                classifier_llm = LLMClient(
+                    model=OPS_PRIVILEGE_CLASSIFIER_MODEL,
+                    timeout=OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
+                    max_retries=0,
+                )
             self.privileged_supervisor = PrivilegedOpsSupervisor(
                 workflow=self.privileged_workflow,
-                classifier=PrivilegedIntentClassifier(self.llm),
+                classifier=PrivilegedIntentClassifier(classifier_llm),
+                on_progress=lambda message: print(
+                    "Klonet Agent：%s" % message,
+                    flush=True,
+                ),
             )
 
     def init_history(self) -> list[dict]:
@@ -486,7 +525,10 @@ class AgentOrchestrator:
         if hasattr(self.tool_executor, "set_user_authorization_context"):
             self.tool_executor.set_user_authorization_context(user_input)
 
-        privileged_result = self._supervise_privileged_turn(user_input)
+        privileged_result = self._supervise_privileged_turn(
+            user_input,
+            recent_history=recent_history_for_intent,
+        )
         if privileged_result is not None and privileged_result.handled:
             privileged_reply = privileged_result.message
             assistant_msg = {"role": "assistant", "content": privileged_reply}
@@ -900,14 +942,48 @@ class AgentOrchestrator:
 
         return reply, history, token
 
-    def _supervise_privileged_turn(self, user_input: str):
+    def _supervise_privileged_turn(
+        self,
+        user_input: str,
+        *,
+        recent_history: list[dict] | None = None,
+    ):
         """Send every Ops-Privilege turn through the Supervisor control plane."""
 
         if self.profile.name != "ops-privilege":
             return None
         if self.privileged_supervisor is None:
             raise RuntimeError("Ops-Privilege Supervisor is unavailable")
+        conversation_context = self._privileged_conversation_context(
+            recent_history or []
+        )
+        handle_with_context = getattr(
+            self.privileged_supervisor,
+            "handle_with_context",
+            None,
+        )
+        if handle_with_context is not None:
+            return handle_with_context(
+                user_input,
+                environment_context="",
+                conversation_context=conversation_context,
+            )
         return self.privileged_supervisor.handle(user_input, environment_context="")
+
+    @staticmethod
+    def _privileged_conversation_context(history: list[dict]) -> str:
+        """Return a small dialogue-only context for pronoun and continuation recovery."""
+
+        lines = []
+        for message in history[-8:]:
+            role = str(message.get("role") or "")
+            if role not in {"user", "assistant"}:
+                continue
+            content = " ".join(str(message.get("content") or "").split())
+            if not content:
+                continue
+            lines.append("%s: %s" % (role, content[:600]))
+        return "\n".join(lines)[-3000:]
 
     def _record_privileged_event(self, event: str, payload: dict) -> None:
         self.trace_logger.record_privileged_event(
@@ -1084,7 +1160,10 @@ class AgentOrchestrator:
             return ""
         message = getattr(choices[0], "message", None)
         summary = self._compact_observation_text(getattr(message, "content", ""), 180)
-        summary = summary.removeprefix("Klonet Agent：").strip()
+        prefix = "Klonet Agent："
+        if summary.startswith(prefix):
+            summary = summary[len(prefix):]
+        summary = summary.strip()
         if self._ops_summary_leaks_machine_trace(summary):
             return ""
         return summary

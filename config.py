@@ -49,6 +49,34 @@ RAG_QUERY_PLANNER_TIMEOUT_SECONDS = max(
     1.0,
     float(os.getenv("RAG_QUERY_PLANNER_TIMEOUT_SECONDS", "6")),
 )
+OPS_PRIVILEGE_CLASSIFIER_MODEL = os.getenv(
+    "OPS_PRIVILEGE_CLASSIFIER_MODEL",
+    "deepseek-v4-pro",
+).strip()
+_ops_classifier_timeout = float(
+    os.getenv("OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS", "0")
+)
+OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS = (
+    _ops_classifier_timeout if _ops_classifier_timeout > 0 else None
+)
+OPS_PRIVILEGE_PLANNER_MODEL = os.getenv(
+    "OPS_PRIVILEGE_PLANNER_MODEL",
+    "deepseek-v4-pro",
+).strip()
+_ops_planner_timeout = float(
+    os.getenv("OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS", "0")
+)
+OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS = (
+    _ops_planner_timeout if _ops_planner_timeout > 0 else None
+)
+OPS_PRIVILEGE_SUMMARIZER_MODEL = os.getenv(
+    "OPS_PRIVILEGE_SUMMARIZER_MODEL",
+    "deepseek-v4-flash",
+).strip()
+OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.getenv("OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS", "8")),
+)
 RAG_RECALL_TOP_K = max(1, int(os.getenv("RAG_RECALL_TOP_K", "30")))
 RAG_FUSION_TOP_K = max(1, int(os.getenv("RAG_FUSION_TOP_K", "20")))
 RAG_RERANK_TOP_N = max(1, int(os.getenv("RAG_RERANK_TOP_N", "10")))
