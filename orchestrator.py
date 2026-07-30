@@ -57,10 +57,12 @@ from klonet_agent.memory import MemoryStore
 from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+from klonet_agent.ops.privileged.execution_agent import (
+    PrivilegedExecutionAgent,
+)
 from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
 from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
-from klonet_agent.ops.privileged.recovery import PrivilegedRecoveryAgent
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
 from klonet_agent.ops.privileged.summarizer import PrivilegedEvidenceSummarizer
 from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
@@ -162,21 +164,37 @@ class AgentOrchestrator:
                         max_retries=0,
                     )
                 )
+            privileged_context_builder = PrivilegedPlanContextBuilder()
+            privileged_probe_runner = (
+                privileged_context_builder.run_recovery_diagnostics
+            )
             self.privileged_workflow = PrivilegedOpsWorkflow(
-                planner=PrivilegedPlannerAgent(planner_llm),
+                planner=PrivilegedPlannerAgent(
+                    planner_llm,
+                    probe_runner=privileged_probe_runner,
+                ),
+                execution_agent=PrivilegedExecutionAgent(
+                    planner_llm,
+                    probe_runner=privileged_probe_runner,
+                ),
                 executor=PrivilegedCommandExecutor(
                     on_output=lambda channel, chunk: print(chunk, end="", flush=True),
+                    environment_fingerprint_provider=(
+                        privileged_context_builder.current_environment_fingerprint
+                    ),
                 ),
-                verifier=PrivilegedVerifierAgent(self.llm),
+                verifier=PrivilegedVerifierAgent(
+                    self.llm,
+                    probe_runner=privileged_probe_runner,
+                ),
                 store=PrivilegedPlanStore(
                     MEMORY_DIR,
                     user_id=self.session.user_id,
                     project_id=self.session.project_id,
                 ),
                 event_sink=self._record_privileged_event,
-                context_builder=PrivilegedPlanContextBuilder(),
+                context_builder=privileged_context_builder,
                 summarizer=evidence_summarizer,
-                recovery_agent=PrivilegedRecoveryAgent(planner_llm),
                 on_progress=lambda message: print("Klonet Agent：%s" % message),
             )
         self.privileged_supervisor = privileged_supervisor

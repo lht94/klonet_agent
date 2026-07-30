@@ -37,6 +37,16 @@ class PrivilegedEvidenceSummarizer:
             return _fallback_summary(step, status)
         raw = evidence.stderr or evidence.stdout
         safe_evidence = redact_sensitive_text(raw)[: self.max_evidence_chars]
+        binding = step.execution_binding
+        action_name = (
+            binding.action
+            if binding is not None and binding.kind == "registered_action"
+            else (
+                "一次性 Shell 脚本"
+                if binding is not None and binding.kind == "shell_artifact"
+                else step.action or "受控操作"
+            )
+        )
         prompt = (
             "步骤：%s\n"
             "动作：%s\n"
@@ -48,7 +58,7 @@ class PrivilegedEvidenceSummarizer:
             "已脱敏执行证据：\n%s"
             % (
                 step.title,
-                step.action or "受控命令",
+                action_name,
                 status,
                 evidence.return_code,
                 evidence.timed_out,
@@ -88,8 +98,22 @@ class PrivilegedEvidenceSummarizer:
     ) -> str:
         """Explain an approved step before execution without predicting its result."""
 
+        binding = step.execution_binding
+        action_name = step.action or "受控操作"
+        args = step.args
+        if binding is not None:
+            if binding.kind == "registered_action":
+                action_name = binding.action
+                args = binding.args
+            elif binding.kind == "shell_artifact":
+                action_name = "一次性 Shell 脚本（需单步确认）"
+                args = {
+                    "cwd": binding.shell_artifact.cwd,
+                    "run_as": binding.shell_artifact.run_as,
+                    "declared_changes": binding.shell_artifact.declared_changes,
+                }
         safe_args = redact_sensitive_text(
-            json.dumps(step.args, ensure_ascii=False)
+            json.dumps(args, ensure_ascii=False)
         )[:3000]
         prompt = (
             "请用一到两句简洁中文说明即将执行的运维步骤，让普通用户知道操作对象、"
@@ -105,7 +129,7 @@ class PrivilegedEvidenceSummarizer:
                 index,
                 total,
                 step.title,
-                step.action or "受控命令",
+                action_name,
                 step.risk,
                 "；".join(step.expected_changes) or "未声明环境变化",
                 safe_args or "{}",
@@ -152,8 +176,10 @@ class PrivilegedEvidenceSummarizer:
                 {
                     "index": index,
                     "title": step.title,
-                    "action": step.action,
-                    "args": step.args,
+                    "objective": step.objective or step.title,
+                    "reason": step.reason,
+                    "success_criteria": step.success_criteria,
+                    "implementation": _safe_implementation(step),
                     "risk": step.risk,
                     "status": step.status,
                     "expected_changes": step.expected_changes,
@@ -235,6 +261,31 @@ def _fallback_execution_description(
         step.title,
         impact,
     )
+
+
+def _safe_implementation(step: PrivilegedStep) -> dict[str, Any]:
+    binding = step.execution_binding
+    if binding is None:
+        return {
+            "kind": "legacy",
+            "action": step.action,
+            "args": step.args,
+        }
+    if binding.kind == "registered_action":
+        return {
+            "kind": "registered_action",
+            "action": binding.action,
+            "args": binding.args,
+            "binding_reason": binding.binding_reason,
+        }
+    artifact = binding.shell_artifact
+    return {
+        "kind": binding.kind,
+        "cwd": artifact.cwd if artifact else "",
+        "run_as": artifact.run_as if artifact else "",
+        "declared_changes": artifact.declared_changes if artifact else [],
+        "binding_reason": binding.binding_reason,
+    }
 
 
 def _one_line(value: Any, limit: int) -> str:

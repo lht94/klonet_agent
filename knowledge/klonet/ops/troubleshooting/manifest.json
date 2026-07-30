@@ -4,7 +4,8 @@
   "paths": [
     "knowledge/klonet/ops/common_troubleshooting.md",
     "knowledge/klonet/ops/startup_shutdown.md",
-    "knowledge/klonet/ops/environment_setup.md"
+    "knowledge/klonet/ops/environment_setup.md",
+    "knowledge/klonet/ops/agentic_operations_runbook.md"
   ],
   "task_types": ["troubleshooting"],
   "operations": [],
@@ -31,4 +32,3 @@
   ],
   "excluded_operations": []
 }
-

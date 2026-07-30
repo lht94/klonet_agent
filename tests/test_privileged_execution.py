@@ -1,30 +1,50 @@
 from __future__ import annotations
 
-import os
-import sys
-
-
 def _step(command, **overrides):
-    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.shell_artifact import create_shell_artifact
 
     values = {
         "step_id": "step-1",
         "title": "run command",
         "command": command,
+        "objective": "execute reviewed test script",
+        "reason": "exercise the frozen shell boundary",
+        "success_criteria": ["exit code is zero"],
         "risk": "low",
         "timeout": 5,
     }
     values.update(overrides)
+    artifact = create_shell_artifact(
+        artifact_id="shell-test",
+        script=command,
+        cwd="/tmp",
+        run_as="",
+        timeout=values["timeout"],
+        environment_fingerprint="",
+        declared_changes=["test fixture"],
+        rollback="remove test fixture",
+        nonce="nonce",
+    )
+    artifact.status = "approved"
+    artifact.approved_contract_hash = artifact.contract_hash
+    values["execution_binding"] = ExecutionBinding(
+        kind="shell_artifact",
+        risk=max(values["risk"], "high", key=("readonly", "low", "medium", "high", "destructive").index),
+        approval_scope="step",
+        shell_artifact=artifact,
+        postconditions=[{"checker": "exit_code_zero", "args": {}}],
+    )
     return PrivilegedStep(**values)
 
 
 def test_executor_captures_bounded_stdout_stderr_and_return_code():
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 
-    command = (
-        '"%s" -c "import sys; print(\'hello\'); '
-        'print(\'problem\', file=sys.stderr)"' % sys.executable
-    )
+    command = "printf 'hello\\n'; printf 'problem\\n' >&2"
     executor = PrivilegedCommandExecutor(max_output_chars=100)
 
     evidence = executor.execute(_step(command))
@@ -43,7 +63,7 @@ def test_executor_timeout_is_execution_unknown_evidence_and_never_retries():
 
     calls = []
     executor = PrivilegedCommandExecutor(on_start=lambda command: calls.append(command))
-    command = '"%s" -c "import time; time.sleep(2)"' % sys.executable
+    command = "sleep 2"
 
     evidence = executor.execute(_step(command, timeout=1))
 
@@ -52,7 +72,7 @@ def test_executor_timeout_is_execution_unknown_evidence_and_never_retries():
     assert calls == [command]
 
 
-def test_executor_inherits_stdin_for_interactive_sudo_contract(monkeypatch):
+def test_shell_artifact_executes_fixed_argv_without_shell_interpretation(monkeypatch):
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 
     seen = {}
@@ -72,13 +92,21 @@ def test_executor_inherits_stdin_for_interactive_sudo_contract(monkeypatch):
         seen.update(kwargs)
         return FakeProcess()
 
+    class AllowPolicy:
+        @staticmethod
+        def validate(artifact):
+            del artifact
+            return ""
+
     monkeypatch.setattr("klonet_agent.ops.privileged.executor.subprocess.Popen", fake_popen)
 
-    evidence = PrivilegedCommandExecutor().execute(_step("sudo whoami"))
+    evidence = PrivilegedCommandExecutor(shell_policy=AllowPolicy()).execute(
+        _step("sudo whoami")
+    )
 
     assert evidence.return_code == 0
     assert "stdin" not in seen
-    assert seen["shell"] is True
+    assert seen["shell"] is False
 
 
 def test_executor_turns_process_launch_error_into_failed_evidence(monkeypatch):
@@ -87,9 +115,17 @@ def test_executor_turns_process_launch_error_into_failed_evidence(monkeypatch):
     def fail_popen(*args, **kwargs):
         raise OSError("working directory missing")
 
+    class AllowPolicy:
+        @staticmethod
+        def validate(artifact):
+            del artifact
+            return ""
+
     monkeypatch.setattr("klonet_agent.ops.privileged.executor.subprocess.Popen", fail_popen)
 
-    evidence = PrivilegedCommandExecutor().execute(_step("echo ok"))
+    evidence = PrivilegedCommandExecutor(shell_policy=AllowPolicy()).execute(
+        _step("echo ok")
+    )
 
     assert evidence.return_code == 127
     assert "working directory missing" in evidence.stderr

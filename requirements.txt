@@ -25,5 +25,8 @@ jieba>=0.42.1
 rank-bm25>=0.2.2
 numpy>=1.24,<2.0
 
+# Parser-backed review for one-time privileged shell artifacts
+bashlex>=0.18
+
 # Tests
 pytest>=8.0.0

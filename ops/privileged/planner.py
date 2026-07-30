@@ -1,4 +1,4 @@
-"""独立、无工具权限的高权限任务 Planner。"""
+"""Agentic semantic Planner for Ops-Privilege."""
 
 from __future__ import annotations
 
@@ -8,21 +8,13 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from klonet_agent.ops.actions import (
-    OpsActionRegistry,
-    configured_ops_action_registry,
-)
-from klonet_agent.ops.command_policy import command_exists, decide_ops_command
 from klonet_agent.ops.privileged.context import GroundedPlanContext
-from klonet_agent.ops.privileged.action_runner import (
-    DIRECT_PRIVILEGED_ACTIONS,
-)
-from klonet_agent.ops.privileged.planner_schema import REQUIRED_ACTION_ARGS
 from klonet_agent.ops.privileged.contracts import (
     PrivilegedPlan,
     PrivilegedStep,
     RISK_LEVELS,
 )
+from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 
 
 PLANNER_SYSTEM_PROMPT = """
@@ -30,24 +22,45 @@ You are the Klonet Ops-Privilege Planner.
 You plan operations for the Klonet project. An unqualified "平台" means the
 Klonet platform unless the user or conversation explicitly names another
 product. Never replace an unknown target with a generic Nginx/demo web stack.
-Return one JSON object only. Decompose the requested operational goal into the
-smallest auditable registered actions. Each step uses step_id, title, action and
-args. Never return command, shell, script, or executable text. Include timeout,
-expected_changes, preconditions, postconditions or rollback guidance only when
-a non-default value is materially useful;
-rollback must be descriptive and must never contain a command. Deterministic code
-will add standard checks and defaults.
-Use concise Chinese step titles. Normally return 3-6 steps and never more than
-8. Merge related read-only probes into one auditable step instead of creating
-one step per inventory command. If details can be discovered, start with the
-smallest read-only discovery step and do not perform a broad machine inventory.
-Never include passwords. Mark destructive operations honestly. Prefer explicit
-postconditions that prove the requested state, not merely a zero exit code.
-Use only action names present in the supplied Allowed action registry. Arguments
-must be grounded in the supplied evidence; never invent paths, platform names,
-services, hosts or ports. If required facts are absent, return only a safe
-registered inspection/validation action when possible; otherwise return an
-invalid plan rather than guessing. You have no tools and cannot execute actions.
+You own the operational route. Runbooks are experience, not mandatory workflows.
+Do not select registered Action names and do not emit commands or scripts.
+
+Return one JSON object with status exactly "need_evidence", "ready", or
+"blocked".
+
+When facts are missing but discoverable, return:
+{"status":"need_evidence","probe_requests":[
+ {"probe":"registered probe name","args":{},"purpose":"why this fact matters"}
+]}
+Use at most 4 probes in one round. Probe arguments must come from existing
+evidence. Never request mutation.
+
+When ready, return:
+{
+ "status":"ready",
+ "goal":"the actual user goal",
+ "assumptions":[],
+ "steps":[{
+   "step_id":"stable id",
+   "title":"concise Chinese title",
+   "objective":"state this step must achieve",
+   "reason":"why this route follows from evidence",
+   "evidence_refs":[],
+   "depends_on":[],
+   "expected_effects":[],
+   "success_criteria":[],
+   "risk_suggestion":"readonly|low|medium|high|destructive"
+ }]
+}
+Normally return 2-6 steps and never more than 8. Every step needs an objective,
+reason, and at least one observable success criterion. Dependencies may reference
+only earlier steps. Do not invent paths, platform names, services, hosts or
+ports. If a material choice belongs to the user and cannot be discovered, use
+status="blocked" with a concise reason and missing_decisions array.
+
+Never include passwords. You have no mutation tools. An independent Execution
+Agent will map semantic steps to registered Actions or frozen one-time shell
+artifacts after planning.
 Treat Structured environment facts as the authoritative resource model. Never
 use source_repo_root as project_root when the model gives a different
 platform_root. runtime_cwd is the only valid start project_root. Secret facts
@@ -55,6 +68,11 @@ contain metadata only and must never be expanded, requested, copied, or echoed.
 """.strip()
 
 MAX_PRIVILEGED_PLAN_STEPS = 8
+MAX_PLANNING_PROBE_ROUNDS = 3
+
+
+class PlanningBlocked(Exception):
+    """The Planner needs a material user decision that probes cannot resolve."""
 
 
 class PrivilegedPlannerAgent:
@@ -62,13 +80,14 @@ class PrivilegedPlannerAgent:
         self,
         llm: Any,
         policy: Any | None = None,
-        action_registry: OpsActionRegistry | None = None,
+        action_registry: Any | None = None,
+        probe_runner: Any | None = None,
     ) -> None:
         self.llm = llm
-        # policy is retained as a compatibility argument. Action metadata, not
-        # model-authored command text, is now the deterministic risk source.
-        self.policy = policy
-        self.action_registry = action_registry or configured_ops_action_registry()
+        # Retained only as constructor compatibility. The semantic Planner
+        # deliberately cannot inspect execution implementation names.
+        del policy, action_registry
+        self.probe_runner = probe_runner
 
     def plan(
         self,
@@ -81,8 +100,11 @@ class PrivilegedPlannerAgent:
             grounded_context.render()
             if grounded_context is not None
             else (
-                "## Read-only server evidence\n%s\n\n## Allowed action registry\n%s"
-                % (environment_context or "(none)", self._action_catalog())
+                "## Read-only server evidence\n%s\n\n## Registered probes\n%s"
+                % (
+                    environment_context or "(none)",
+                    DEFAULT_READONLY_PROBES.render(),
+                )
             )
         )
         messages = [
@@ -97,59 +119,90 @@ class PrivilegedPlannerAgent:
         ]
         data = None
         last_error = ""
-        planner_source = "llm"
-        for attempt in range(2):
+        probe_history: list[dict[str, Any]] = []
+        probe_rounds = 0
+        invalid_repairs = 0
+        while True:
             response = self._complete(messages)
             content = response.choices[0].message.content or ""
             try:
                 data = _parse_json_object(content)
-                steps = self._build_steps(
-                    data,
-                    enforce_host_facts=grounded_context is not None,
-                )
-                if grounded_context is not None:
-                    _validate_environment_model(steps, grounded_context)
-                _validate_goal_action_compatibility(goal, steps)
-                break
-            except (KeyError, TypeError, ValueError) as exc:
-                last_error = str(exc)
-                if attempt == 0:
+                status = str(data.get("status") or "").strip().lower()
+                if status == "need_evidence":
+                    if probe_rounds >= MAX_PLANNING_PROBE_ROUNDS:
+                        raise ValueError(
+                            "planning probe round limit reached without a plan"
+                        )
+                    requests = self._validate_probe_requests(
+                        data.get("probe_requests")
+                    )
+                    if self.probe_runner is None:
+                        raise ValueError(
+                            "planner requested evidence but probe runner is unavailable"
+                        )
+                    evidence = self.probe_runner(requests)
+                    probe_history.append(
+                        {
+                            "round": probe_rounds + 1,
+                            "requests": requests,
+                            "evidence": str(evidence)[:18000],
+                        }
+                    )
+                    probe_rounds += 1
                     messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "Repair the invalid response. Return one valid JSON object "
-                                "matching the required schema. Error: %s" % last_error
+                                "Read-only probe evidence for round %s:\n%s\n\n"
+                                "Continue planning. Request more evidence only if"
+                                " materially necessary."
+                                % (probe_rounds, str(evidence)[:18000])
                             ),
                         }
                     )
-        else:
-            steps = _deterministic_grounded_steps(goal, grounded_context)
-            if not steps:
-                raise ValueError(
-                    "Planner did not return a valid privileged plan: %s"
-                    % last_error
+                    continue
+                if status == "blocked":
+                    reason = str(data.get("reason") or "缺少必要决策").strip()
+                    missing = _string_list(data.get("missing_decisions"))
+                    raise PlanningBlocked(
+                        "%s%s"
+                        % (
+                            reason,
+                            "；需要确认：" + "；".join(missing)
+                            if missing
+                            else "",
+                        )
+                    )
+                if status != "ready":
+                    raise ValueError("planner status must be need_evidence, ready, or blocked")
+                steps = self._build_semantic_steps(data)
+                break
+            except (KeyError, TypeError, ValueError) as exc:
+                last_error = str(exc)
+                if invalid_repairs >= 1:
+                    raise ValueError(
+                        "Planner did not return a valid semantic plan: %s"
+                        % last_error
+                    )
+                invalid_repairs += 1
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair only the invalid JSON/schema response. Do not"
+                            " switch to a canned workflow. Error: %s" % last_error
+                        ),
+                    }
                 )
-            data = {"goal": goal}
-            planner_source = "deterministic_grounded_resolver"
-            if grounded_context is not None:
-                _validate_environment_model(steps, grounded_context)
+            except PlanningBlocked:
+                raise
 
-        partial_verification = False
-        for step in steps:
-            if not step.postconditions:
-                step.postconditions = _default_action_postconditions(
-                    step.action,
-                    step.args,
-                )
-            if not step.postconditions:
-                step.postconditions = [{"checker": "exit_code_zero", "args": {}}]
-            if step.risk != "readonly" and all(
-                item.get("checker") == "exit_code_zero"
-                for item in step.postconditions
-            ):
-                partial_verification = True
+        if data is None:
+            raise ValueError(
+                "Planner did not return a semantic plan: %s" % last_error
+            )
 
         risk = _effective_declared_risk(
             _highest_risk(steps),
@@ -160,36 +213,20 @@ class PrivilegedPlannerAgent:
             goal=str(data.get("goal") or goal).strip(),
             risk=risk,
             steps=steps,
-            verification_level=(
-                "partial" if partial_verification else "full"
+            verification_level="semantic",
+            status="draft",
+            grounding=_grounding_summary(
+                grounded_context,
+                "llm_agentic_v3",
             ),
-            status="awaiting_confirmation",
-            grounding=_grounding_summary(grounded_context, planner_source),
+            assumptions=_string_list(data.get("assumptions")),
+            probe_history=probe_history,
         )
-        if risk == "readonly":
-            plan.authorize()
-            for step in plan.steps:
-                step.status = "approved"
         return plan
 
-    def _complete(self, messages: list[dict[str, str]]) -> Any:
-        try:
-            return self.llm.complete(
-                messages=messages,
-                tools=None,
-                reasoning_effort="low",
-                temperature=0,
-                response_format={"type": "json_object"},
-                extra_body={"thinking": {"type": "disabled"}},
-            )
-        except TypeError:
-            return self.llm.complete(messages=messages, tools=None)
-
-    def _build_steps(
+    def _build_semantic_steps(
         self,
         data: dict[str, Any],
-        *,
-        enforce_host_facts: bool = False,
     ) -> list[PrivilegedStep]:
         raw_steps = data.get("steps")
         if not isinstance(raw_steps, list) or not raw_steps:
@@ -198,145 +235,101 @@ class PrivilegedPlannerAgent:
             raise ValueError(
                 "steps exceeds maximum of %s" % MAX_PRIVILEGED_PLAN_STEPS
             )
-        steps = []
-        seen = set()
-        seen_actions = set()
+        steps: list[PrivilegedStep] = []
+        seen: set[str] = set()
         for index, item in enumerate(raw_steps, start=1):
             if not isinstance(item, dict):
-                raise ValueError("step must be an object")
-            step_id = str(item.get("step_id") or "step-%s" % index).strip()
-            if any(key in item for key in ("command", "shell", "script", "executable")):
-                raise ValueError("step must use action + args, not command or shell")
-            rollback = str(item.get("rollback") or "").strip()
-            if _looks_like_command(rollback):
-                raise ValueError("rollback must be descriptive, not executable text")
-            requested_action = str(item.get("action") or "").strip()
-            spec = self.action_registry.get(requested_action)
-            if (
-                spec is None
-                or spec.name not in DIRECT_PRIVILEGED_ACTIONS
-            ):
-                raise ValueError("action_not_allowlisted=%s" % (requested_action or "missing"))
-            args = item.get("args") or {}
-            if not isinstance(args, dict):
-                raise ValueError("step args must be an object")
-            missing = [
-                key
-                for key in REQUIRED_ACTION_ARGS.get(spec.name, ())
-                if not args.get(key)
-            ]
-            if missing:
-                raise ValueError(
-                    "action=%s missing_required_args=%s"
-                    % (spec.name, ",".join(missing))
+                raise ValueError("semantic step must be an object")
+            if any(
+                key in item
+                for key in (
+                    "action", "args", "command", "shell", "script",
+                    "executable",
                 )
-            problem = self.action_registry.validate_args(spec, args)
-            if problem:
-                raise ValueError(problem)
-            problem = _validate_action_semantics(spec.name, args)
-            if problem:
-                raise ValueError(problem)
-            if enforce_host_facts:
-                problem = _validate_host_facts(spec.name, args)
-                if problem:
-                    raise ValueError(problem)
-            command_decision = (
-                decide_ops_command(args)
-                if spec.name == "run_ops_command"
-                else None
-            )
-            if command_decision is not None:
-                if not command_decision.allowed:
-                    raise ValueError(
-                        "controlled_argv_not_allowed=%s"
-                        % command_decision.reason
-                    )
-                if enforce_host_facts and not command_exists(
-                    command_decision.program
-                ):
-                    raise ValueError(
-                        "controlled_argv_program_not_found=%s"
-                        % command_decision.program
-                    )
-            action_identity = (
-                spec.name,
-                json.dumps(args, ensure_ascii=False, sort_keys=True),
-            )
-            if action_identity in seen_actions:
-                raise ValueError("duplicate action with identical args: %s" % spec.name)
-            seen_actions.add(action_identity)
-            if step_id in seen:
-                raise ValueError("duplicate step_id: %s" % step_id)
+            ):
+                raise ValueError(
+                    "semantic Planner must not choose execution implementation"
+                )
+            step_id = str(
+                item.get("step_id") or "step-%s" % index
+            ).strip()
+            if not step_id or step_id in seen:
+                raise ValueError("duplicate or empty semantic step_id")
+            objective = str(item.get("objective") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            criteria = _string_list(item.get("success_criteria"))
+            if not objective or not reason or not criteria:
+                raise ValueError(
+                    "semantic step requires objective, reason, and success_criteria"
+                )
+            dependencies = _string_list(item.get("depends_on"))
+            unknown = [item for item in dependencies if item not in seen]
+            if unknown:
+                raise ValueError(
+                    "semantic dependency must reference an earlier step: %s"
+                    % ",".join(unknown)
+                )
+            risk = str(
+                item.get("risk_suggestion") or "medium"
+            ).strip().lower()
+            if risk not in RISK_LEVELS:
+                raise ValueError("invalid semantic risk suggestion: %s" % risk)
             seen.add(step_id)
             steps.append(
                 PrivilegedStep(
                     step_id=step_id,
-                    title=str(item.get("title") or step_id).strip(),
-                    action=spec.name,
-                    args=_clean_args(args),
-                    risk=_effective_declared_risk(
-                        _action_risk(
-                            command_decision.risk
-                            if command_decision is not None
-                            else spec.risk
-                        ),
-                        item.get("risk"),
+                    title=str(item.get("title") or objective).strip(),
+                    objective=objective,
+                    reason=reason,
+                    evidence_refs=_string_list(item.get("evidence_refs")),
+                    depends_on=dependencies,
+                    success_criteria=criteria,
+                    risk=risk,
+                    expected_changes=_string_list(
+                        item.get("expected_effects")
                     ),
-                    approval_scope=(
-                        "step"
-                        if (
-                            spec.confirmation_scope == "step"
-                            or (
-                                command_decision is not None
-                                and command_decision.requires_step_confirmation
-                            )
-                        )
-                        else "plan"
-                    ),
-                    timeout=int(item.get("timeout") or 120),
-                    expected_changes=_string_list(item.get("expected_changes")),
-                    preconditions=_check_list(item.get("preconditions")),
-                    postconditions=_check_list(item.get("postconditions")),
-                    rollback=rollback,
-                    status=(
-                        "awaiting_confirmation"
-                        if (
-                            spec.confirmation_scope == "step"
-                            or (
-                                command_decision is not None
-                                and command_decision.requires_step_confirmation
-                            )
-                        )
-                        else "pending"
-                    ),
+                    status="pending",
                 )
             )
         return steps
 
-    def _action_catalog(self) -> str:
-        lines = []
-        for spec in self.action_registry.describe():
-            if spec.name not in DIRECT_PRIVILEGED_ACTIONS:
-                continue
-            lines.append(
-                "- action=%s category=%s risk=%s description=%s "
-                "required_args=%s path_args=%s preconditions=%s effects=%s "
-                "postconditions=%s backends=%s"
-                % (
-                    spec.name,
-                    spec.category,
-                    spec.risk,
-                    spec.description or spec.name,
-                    ",".join(REQUIRED_ACTION_ARGS.get(spec.name, ())) or "none",
-                    ",".join(spec.path_args) or "none",
-                    ",".join(spec.preconditions) or "none",
-                    ",".join(spec.effects) or "none",
-                    ",".join(spec.postconditions) or "none",
-                    ",".join(spec.backends),
-                )
+    @staticmethod
+    def _validate_probe_requests(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list) or not value:
+            raise ValueError("need_evidence requires probe_requests")
+        known = {
+            spec.name for spec in DEFAULT_READONLY_PROBES.describe()
+        }
+        result = []
+        for item in value[:4]:
+            if not isinstance(item, dict):
+                raise ValueError("probe request must be an object")
+            name = str(item.get("probe") or "").strip()
+            if name not in known:
+                raise ValueError("planning probe is not registered: %s" % name)
+            args = item.get("args")
+            if not isinstance(args, dict):
+                args = {}
+            result.append(
+                {
+                    "probe": name,
+                    "args": args,
+                    "purpose": str(item.get("purpose") or "").strip()[:500],
+                }
             )
-        return "\n".join(lines)
+        return result
 
+    def _complete(self, messages: list[dict[str, str]]) -> Any:
+        try:
+            return self.llm.complete(
+                messages=messages,
+                tools=None,
+                reasoning_effort="high",
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+        except TypeError:
+            return self.llm.complete(messages=messages, tools=None)
 
 def _default_action_postconditions(
     action: str,
@@ -676,30 +669,6 @@ def _string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _check_list(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    return [dict(item) for item in value if isinstance(item, dict) and item.get("checker")]
-
-
-def _clean_args(value: dict[str, Any]) -> dict[str, Any]:
-    result = {}
-    for key, item in list(value.items())[:40]:
-        normalized = str(key or "").strip()[:80]
-        if not normalized or item is None:
-            continue
-        if isinstance(item, list):
-            result[normalized] = [str(part)[:300] for part in item[:40]]
-        elif isinstance(item, dict):
-            result[normalized] = {
-                str(part_key)[:80]: str(part_value)[:300]
-                for part_key, part_value in list(item.items())[:40]
-            }
-        else:
-            result[normalized] = str(item)[:20000 if normalized == "content" else 300]
-    return result
-
-
 def _action_risk(value: str) -> str:
     return {
         "normal": "readonly",
@@ -730,28 +699,6 @@ def _effective_declared_risk(
         (deterministic_floor, normalized),
         key=RISK_LEVELS.index,
     )
-
-
-def _looks_like_command(value: str) -> bool:
-    if not value:
-        return False
-    lowered = value.lower()
-    command_markers = (
-        "sudo ",
-        "systemctl ",
-        "docker ",
-        "rm ",
-        "cp ",
-        "mv ",
-        "bash ",
-        "sh ",
-        "&&",
-        "||",
-        "|",
-        ";",
-        "\n",
-    )
-    return any(marker in lowered for marker in command_markers)
 
 
 def _validate_host_facts(action: str, args: dict[str, Any]) -> str:
@@ -965,113 +912,6 @@ def _validate_environment_model(
             prepared_roots.add(root)
 
 
-def _validate_goal_action_compatibility(
-    goal: str,
-    steps: list[PrivilegedStep],
-) -> None:
-    """Reject action families that contradict the user's requested direction."""
-
-    lowered = str(goal or "").lower()
-    deploy_goal = "部署" in lowered or "deploy" in lowered or "安装平台" in lowered
-    if not deploy_goal:
-        return
-    forbidden = {
-        "stop_screen_component",
-        "stop_platform_screens",
-        "remove_python_package_entries",
-    }
-    conflicting = [step.action for step in steps if step.action in forbidden]
-    if conflicting:
-        raise ValueError(
-            "deployment plan contains contradictory destructive actions: %s"
-            % ",".join(conflicting)
-        )
-
-
-def _deterministic_grounded_steps(
-    goal: str,
-    context: GroundedPlanContext | None,
-) -> list[PrivilegedStep]:
-    """Resolve the common Klonet deployment path without trusting model output."""
-
-    if context is None:
-        return []
-    lowered = str(goal or "").lower()
-    if "先处理已诊断的失败原因" in lowered or "修复能力要求" in lowered:
-        # This resolver only knows the normal deployment happy path. Using it
-        # during recovery would silently recreate the plan that just failed.
-        return []
-    if not ("部署" in lowered or "deploy" in lowered or "安装平台" in lowered):
-        return []
-    model = context.facts.get("environment_model")
-    projects = (
-        model.get("projects", [])
-        if isinstance(model, dict)
-        else []
-    )
-    usable = [
-        item for item in projects
-        if isinstance(item, dict)
-        and item.get("readiness") in {"preparable", "runnable"}
-    ]
-    if len(usable) == 1:
-        layout = usable[0]
-        root = Path(str(layout["platform_root"])).expanduser()
-        entry_source = str(layout.get("entry_source_root") or "")
-        platform = Path(
-            str(layout.get("source_repo_root") or root)
-        ).name
-    else:
-        roots = list(context.facts.get("candidate_project_roots") or [])
-        if len(roots) != 1:
-            return []
-        root = Path(str(roots[0])).expanduser()
-        entry_source = str(root / "mains")
-        platform = root.name
-    if _validate_host_facts("validate_project_files", {"project_root": str(root)}):
-        return []
-    steps = [
-        PrivilegedStep(
-            step_id="validate-project",
-            title="校验 Klonet 项目文件",
-            action="validate_project_files",
-            args={"project_root": str(root)},
-            risk="readonly",
-        )
-    ]
-    required = (
-        "gun.py",
-        "master_main.py",
-        "celery_worker.py",
-        "web_terminal_main.py",
-        "worker_gun.py",
-        "worker_main.py",
-    )
-    if any(not (root / name).is_file() for name in required):
-        steps.append(
-            PrivilegedStep(
-                step_id="prepare-project",
-                title="准备 Klonet 项目入口文件",
-                action="prepare_project_files",
-                args={
-                    "project_root": str(root),
-                    "source_root": entry_source,
-                },
-                risk="medium",
-            )
-        )
-    steps.append(
-        PrivilegedStep(
-            step_id="start-platform",
-            title="启动 Klonet 平台组件",
-            action="start_platform_screens",
-            args={"platform": platform, "project_root": str(root)},
-            risk="medium",
-        )
-    )
-    return steps
-
-
 def _grounding_summary(
     context: GroundedPlanContext | None,
     planner_source: str,
@@ -1079,7 +919,7 @@ def _grounding_summary(
     summary = (
         context.audit_summary()
         if context is not None
-        else {"context_policy": "caller_environment+action_registry"}
+        else {"context_policy": "caller_environment+registered_probes"}
     )
     summary["planner_source"] = planner_source
     return summary

@@ -2,28 +2,32 @@
 
 ## 目的
 
-Ops-Privilege 不把知识库中的命令原样交给模型执行，而是把高频运维需求映射为四类可审计能力：
+Ops-Privilege V3 把规划、实现绑定、执行和验证分开：
 
-1. `workflow`：说明一个领域任务应按什么阶段完成。
+1. RAG Runbook：提供领域经验，不规定固定路径。
 2. `probe`：执行有边界的只读事实采集。
-3. `action`：执行用户已经确认的结构化变更。
-4. `checker`：独立检查变更后的真实状态。
+3. `action`：优先实现已确认的语义步骤。
+4. Shell Artifact：注册 Action 不覆盖时的固定、单次、逐步确认实现。
+5. `checker` 与 Verifier：独立检查真实状态并形成反思证据。
 
 失败重规划使用同一套能力目录：
 
 ```text
 步骤失败
   → 停止后续变更
-  → 确定性探测 + 模型选择的补充只读探测
-  → 结合失败证据、统一环境事实和 Klonet RAG 确认根因
-  → 只允许用已注册 action 生成修复步骤
-  → 拒绝“没有修复便原样重试”的候选计划
+  → Verifier 按需选择补充只读探测并形成反思
+  → 组成包含执行绑定、证据和环境变化的 Failure Packet
+  → 同一个语义 Planner 结合统一环境事实和 Klonet RAG 自主重新规划
+  → Execution Agent 重新选择注册 Action 或一次性 Shell
+  → 拒绝没有实质差异的候选计划并限制循环次数
   → 展示新的自然语言修复计划
   → 用户重新确认后执行
   → checker 验收
 ```
 
-当前注册规模为 23 个领域工作流、43 个只读探测器、39 个直接执行动作和 35 个结果检查器。注册表一致性由测试保证：工作流引用的动作必须真实存在，直接动作必须有实现，常见知识领域必须同时具备探测和验证能力。
+原 `DomainWorkflowRegistry` 已删除，其经验迁移到
+`knowledge/klonet/ops/agentic_operations_runbook.md` 并由 RAG 检索。注册表一致性
+测试仍保证直接动作有实现、常见领域具备探测和验证能力。
 
 ## 知识库归纳出的高频能力
 
@@ -54,24 +58,40 @@ Planner 在生成计划前会获得结构化、脱敏的环境模型：
 
 密码、token、私钥不会进入模型；环境事实只记录“是否已配置”和配置来源。环境模型带指纹，便于判断重新规划时环境是否真的发生变化。
 
+## Planner 与执行边界
+
+- Planner 只输出目标、依据、依赖、预期影响和成功标准；它看不到 Action 名称，
+  不能输出命令，也没有确定性 happy-path fallback。
+- Execution Agent 独占完整 Action Catalog，先尝试参数有界的注册 Action；Action
+  的确定性风险是下限，模型不能降低。
+- 注册 Action 在整体计划确认后自动执行；Shell Artifact 额外逐步确认。
+
 ## 安全边界
 
-- 不注册“任意 Ubuntu shell”。模型只能选择结构化动作，`run_ops_command` 也只能使用确定性策略允许的 `program + argv`。
+- 不向 Planner 注册“任意 Ubuntu shell”。Execution Agent 无法映射 Action 时才可
+  生成 Shell Artifact，并固定脚本、cwd、run_as、环境、超时、哈希、nonce、环境
+  指纹和有效期。
+- Shell Artifact 使用 `bashlex` AST 与 `bash -n` 双重校验，禁止动态命令替换、
+  嵌套解释器、后台执行、网络外传、凭据读取/内嵌、修改 Agent 安全边界和无边界删除；
+  执行使用 `shell=False`，且只能使用一次。
 - 删除容器网络、镜像、libvirt domain、OVS 或宿主链路时必须携带归属确认。
 - Git 更新默认使用 fast-forward；hard reset、revert、restore、push 等高影响操作需要逐步确认。
 - 归档解压拒绝路径穿越、链接和设备文件。
 - 本地维护脚本必须固定路径、参数和 SHA-256。
 - JSON 修改会先备份、深度合并并重新解析；敏感字段不能由计划写入。
-- 不允许只凭退出码把关键状态判定为成功；Planner 未声明后置条件时会为已知动作自动补充确定性 checker。
+- 不允许只凭退出码把关键状态判定为成功；Execution Agent 为已知动作补充确定性
+  checker，证据不足时 Verifier 可自动执行最多两轮注册只读探测。
 
 ## 能力扩展规则
 
-未来知识库出现新的高频运维方式时，不应只在提示词里增加一条命令。完整扩展至少包含：
+未来出现新的高频运维方式时，优先补 Runbook 和通用事实能力，不要求每条路线都
+注册成固定动作。完整扩展可以包含：
 
-1. 在工作流中描述使用阶段与所需事实。
+1. 在 RAG Runbook 中描述经验、适用证据与验收方法。
 2. 增加或复用只读 probe。
-3. 增加参数有界的 action，并定义风险、前置条件、影响和确认范围。
+3. 对高频、稳定、可复用变更增加参数有界的 action；长尾能力由 Shell Artifact
+   人工在环承接。
 4. 增加能证明目标状态的 checker。
-5. 增加正常、拒绝、失败恢复和安全边界测试。
+5. 增加 Action 绑定、Shell 拒绝、失败回传、重规划和迁移测试。
 
 这样新增知识才会从“模型知道”变成“系统能够安全地做并确认做对”。

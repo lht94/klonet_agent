@@ -239,6 +239,9 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
     import json
 
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
     from klonet_agent.ops.privileged.store import PrivilegedPlanStore
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
@@ -250,36 +253,39 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
         def __init__(self):
             self.responses = [
                 json.dumps(
-                    {
-                        "goal": "create result",
-                        "risk": "low",
-                        "steps": [
-                            {
-                                "step_id": "create-result",
-                                "title": "create result",
-                                "action": "write_ops_file",
-                                "args": {
-                                    "path": str(target),
-                                    "content": "ready",
-                                },
-                                "postconditions": [
-                                    {
-                                        "checker": "file_exists",
-                                        "args": {"path": str(target)},
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ),
+                        {
+                            "status": "ready",
+                            "goal": "create result",
+                            "risk": "low",
+                            "steps": [
+                                {
+                                    "step_id": "create-result",
+                                    "title": "create result",
+                                    "objective": "create the requested result file",
+                                    "reason": "the user requested a durable result",
+                                    "success_criteria": ["the result file exists"],
+                                    "risk_suggestion": "low",
+                                }
+                            ],
+                        }
+                    ),
                 json.dumps(
-                    {
-                        "status": "passed",
-                        "goal_achieved": True,
-                        "reason": "file exists",
-                        "next_action": "",
-                    }
-                ),
+                        {
+                            "status": "registered_action",
+                            "action": "write_ops_file",
+                            "args": {
+                                "path": str(target),
+                                "content": "ready",
+                            },
+                            "binding_reason": "registered file writer covers the objective",
+                            "postconditions": [
+                                {
+                                    "checker": "file_exists",
+                                    "args": {"path": str(target)},
+                                }
+                            ],
+                        }
+                    ),
             ]
 
         def complete(self, messages, tools=None):
@@ -304,6 +310,7 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
 
     workflow = PrivilegedOpsWorkflow(
         planner=PrivilegedPlannerAgent(llm),
+        execution_agent=PrivilegedExecutionAgent(llm),
         executor=PrivilegedCommandExecutor(action_runner=action_runner),
         verifier=PrivilegedVerifierAgent(llm),
         store=store,

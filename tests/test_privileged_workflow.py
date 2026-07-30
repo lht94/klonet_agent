@@ -10,14 +10,33 @@ def _step(
     approval_scope="plan",
     action="manual_checkpoint",
 ):
-    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedStep,
+    )
 
+    binding = (
+        ExecutionBinding(
+            kind="registered_action",
+            action=action,
+            args={"reason": "workflow test"},
+            risk=risk,
+            approval_scope=approval_scope,
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        )
+        if action
+        else None
+    )
     return PrivilegedStep(
         step_id=step_id,
         title=step_id,
+        objective="complete %s" % step_id,
+        reason="workflow test route",
+        success_criteria=["exit code is zero"],
         command=command,
         action=action,
         args={"reason": "workflow test"},
+        execution_binding=binding,
         risk=risk,
         approval_scope=approval_scope,
         postconditions=[{"checker": "exit_code_zero", "args": {}}],
@@ -97,6 +116,13 @@ class StubVerifier:
         )
 
 
+class PreboundExecutionAgent:
+    @staticmethod
+    def prepare_plan(current_plan, *, grounded_context):
+        del grounded_context
+        return current_plan
+
+
 def _workflow(tmp_path, plan, executor=None, verifier=None, events=None):
     from klonet_agent.ops.privileged.store import PrivilegedPlanStore
     from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
@@ -105,6 +131,7 @@ def _workflow(tmp_path, plan, executor=None, verifier=None, events=None):
         planner=StubPlanner(plan),
         executor=executor or StubExecutor(),
         verifier=verifier or StubVerifier(),
+        execution_agent=PreboundExecutionAgent(),
         store=PrivilegedPlanStore(tmp_path, user_id="alice", project_id="p1"),
         event_sink=(lambda name, payload: events.append((name, payload)))
         if events is not None
@@ -176,11 +203,33 @@ def test_readonly_step_in_mutating_plan_uses_deterministic_verifier(tmp_path):
 
 
 def test_high_risk_plan_requires_plan_and_exact_step_confirmation(tmp_path):
+    import hashlib
+
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ShellArtifact,
+    )
+
     step = _step(
         "delete-old",
         command="sudo rm -r /var/log/myapp-old",
         risk="high",
         approval_scope="step",
+    )
+    script = "set -euo pipefail\nprintf 'reviewed\\n'\n"
+    step.execution_binding = ExecutionBinding(
+        kind="shell_artifact",
+        risk="high",
+        approval_scope="step",
+        shell_artifact=ShellArtifact(
+            artifact_id="shell-test",
+            script=script,
+            sha256=hashlib.sha256(script.encode()).hexdigest(),
+            cwd=str(tmp_path),
+            single_use_nonce="nonce",
+            expires_at="2999-01-01T00:00:00+00:00",
+        ),
+        postconditions=[{"checker": "exit_code_zero", "args": {}}],
     )
     step.status = "awaiting_confirmation"
     plan = _plan(status="awaiting_confirmation", steps=[step], risk="high")
@@ -202,7 +251,7 @@ def test_wrong_or_stale_authorization_never_executes(tmp_path):
     workflow = _workflow(tmp_path, plan, executor=executor)
     workflow.submit("test goal")
     stored = workflow.store.load("priv-test")
-    stored.steps[0].command = "echo changed"
+    stored.steps[0].execution_binding.args["reason"] = "changed"
     stored.authorized_hash = "stale"
     stored.status = "approved"
     workflow.store.save(stored)
@@ -518,7 +567,7 @@ def test_abort_list_show_commands_are_deterministic(tmp_path):
     assert "执行内容：" in showing.message
     assert "schema_version" not in showing.message
     assert "echo ok" not in showing.message
-    assert '"schema_version": 2' in audit.message
+    assert '"schema_version": 3' in audit.message
     assert "echo ok" in audit.message
     assert aborted.plan.status == "aborted"
 
@@ -568,7 +617,8 @@ def test_planner_timeout_returns_short_safe_message_instead_of_crashing(tmp_path
     result = workflow.submit("部署平台")
 
     assert result.kind == "blocked"
-    assert result.message == "安全计划生成失败或超时，当前没有执行任何操作。请稍后重试。"
+    assert "planner timed out" in result.message
+    assert "当前没有执行任何操作" in result.message
 
 
 @pytest.mark.parametrize(
@@ -646,6 +696,7 @@ def test_replan_required_replaces_steps_and_invalidates_old_authorization(tmp_pa
         planner=planner,
         executor=executor,
         verifier=verifier,
+        execution_agent=PreboundExecutionAgent(),
         store=PrivilegedPlanStore(tmp_path, user_id="alice", project_id="p1"),
     )
     planner.result = original
@@ -711,13 +762,17 @@ def test_failure_automatically_diagnoses_and_drafts_unapproved_recovery(tmp_path
     class ContextBuilder:
         def build(self, goal, **kwargs):
             events.append("readonly_diagnosis")
-            assert "失败摘要" in goal
+            assert "Failure Packet" in goal
             assert "supplemental_environment_context" in kwargs
             return GroundedPlanContext(
                 knowledge_evidence="Klonet import recovery knowledge",
                 environment_evidence="read-only host diagnosis",
                 action_catalog="registered actions",
             )
+
+        @staticmethod
+        def current_environment_fingerprint():
+            return "env-1"
 
     class Summarizer:
         def summarize(self, step, **kwargs):
@@ -729,6 +784,7 @@ def test_failure_automatically_diagnoses_and_drafts_unapproved_recovery(tmp_path
         planner=planner,
         executor=Executor(),
         verifier=StubVerifier(status="failed"),
+        execution_agent=PreboundExecutionAgent(),
         store=PrivilegedPlanStore(
             tmp_path,
             user_id="alice",
@@ -747,9 +803,9 @@ def test_failure_automatically_diagnoses_and_drafts_unapproved_recovery(tmp_path
     assert result.plan.is_authorized is False
     assert result.plan.status == "awaiting_confirmation"
     assert result.plan.steps[0].step_id == "repair"
-    assert result.plan.recovery_history[0]["failed_step"]["evidence"]["return_code"] == 1
-    assert "修复尚未执行" in result.message
-    assert "确认执行新计划：confirm-priv priv-test" in result.message
+    assert result.plan.failure_packets[0].execution_evidence["return_code"] == 1
+    assert "Planner 已根据真实证据" in result.message
+    assert "确认新计划：confirm-priv priv-test" in result.message
 
 
 def test_each_step_is_explained_before_execution(tmp_path):
@@ -776,6 +832,7 @@ def test_each_step_is_explained_before_execution(tmp_path):
         planner=StubPlanner(plan),
         executor=StubExecutor(),
         verifier=StubVerifier(),
+        execution_agent=PreboundExecutionAgent(),
         store=PrivilegedPlanStore(
             tmp_path,
             user_id="alice",
@@ -793,6 +850,7 @@ def test_each_step_is_explained_before_execution(tmp_path):
     ]
 
 
+@pytest.mark.skip(reason="replaced by same-Planner Failure Packet recovery in V3")
 def test_generic_recovery_pipeline_probes_then_reviews_repair_plan(tmp_path):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence
@@ -924,6 +982,7 @@ def test_generic_recovery_pipeline_probes_then_reviews_repair_plan(tmp_path):
     ] == "端口冲突"
 
 
+@pytest.mark.skip(reason="legacy RecoveryAgent was removed in Agentic V3")
 def test_recovery_capability_gap_is_explained_without_internal_guard_text(tmp_path):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence
@@ -1008,6 +1067,7 @@ def test_recovery_capability_gap_is_explained_without_internal_guard_text(tmp_pa
     assert "修复草案没有在重试" not in result.message
 
 
+@pytest.mark.skip(reason="covered by V3 failure-fingerprint loop guard")
 def test_replan_with_unchanged_evidence_does_not_repeat_old_plan(tmp_path):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence

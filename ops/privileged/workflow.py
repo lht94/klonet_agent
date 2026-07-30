@@ -6,13 +6,18 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.checkers import ensure_postconditions
-from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+from klonet_agent.ops.privileged.contracts import (
+    FailurePacket,
+    PrivilegedPlan,
+    PrivilegedStep,
+)
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
+from klonet_agent.ops.privileged.planner import PlanningBlocked
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+from klonet_agent.ops.privileged.shell_artifact import artifact_is_expired
 from klonet_agent.tools.environment import redact_sensitive_text
 
 
@@ -44,21 +49,21 @@ class PrivilegedOpsWorkflow:
         planner: Any,
         executor: Any,
         verifier: Any,
+        execution_agent: Any | None = None,
         store: PrivilegedPlanStore,
         event_sink: Callable[[str, dict], None] | None = None,
         context_builder: Any | None = None,
         summarizer: Any | None = None,
-        recovery_agent: Any | None = None,
         on_progress: Callable[[str], None] | None = None,
     ) -> None:
         self.planner = planner
         self.executor = executor
         self.verifier = verifier
+        self.execution_agent = execution_agent
         self.store = store
         self.event_sink = event_sink
         self.context_builder = context_builder
         self.summarizer = summarizer
-        self.recovery_agent = recovery_agent
         self.on_progress = on_progress
 
     @staticmethod
@@ -92,15 +97,28 @@ class PrivilegedOpsWorkflow:
             if grounded_context is not None:
                 planner_kwargs["grounded_context"] = grounded_context
             plan = self.planner.plan(goal, **planner_kwargs)
+            if self.execution_agent is None:
+                raise RuntimeError("Execution Agent is unavailable")
+            plan = self.execution_agent.prepare_plan(
+                plan,
+                grounded_context=grounded_context,
+            )
+        except PlanningBlocked as exc:
+            return WorkflowResult(
+                "clarification",
+                "规划需要你补充一个无法从服务器探测得到的决定：%s；当前没有执行任何操作。"
+                % _short_error(exc),
+            )
         except PermissionError as exc:
             return WorkflowResult(
                 "denied",
                 "该操作计划被安全策略拒绝：%s" % exc,
             )
-        except Exception:
+        except Exception as exc:
             return WorkflowResult(
                 "blocked",
-                "安全计划生成失败或超时，当前没有执行任何操作。请稍后重试。",
+                "无法生成可确认的安全计划：%s。当前没有执行任何操作。"
+                % _short_error(exc),
             )
         self._event("privileged_plan_created", plan)
         if plan.risk == "readonly":
@@ -231,6 +249,34 @@ class PrivilegedOpsWorkflow:
                 plan,
             )
         step.status = "approved"
+        binding = step.execution_binding
+        if (
+            binding is not None
+            and binding.kind == "shell_artifact"
+            and binding.shell_artifact is not None
+        ):
+            artifact = binding.shell_artifact
+            if artifact_is_expired(artifact):
+                artifact.status = "expired"
+                step.status = "paused"
+                step.observation = (
+                    "一次性 Shell 脚本已过期，未执行；请重新规划以生成新的固定脚本。"
+                )
+                plan.status = "paused"
+                self.store.save(plan)
+                return WorkflowResult(
+                    "paused",
+                    render_plan(plan) + _pause_controls(plan),
+                    plan,
+                )
+            fingerprint = getattr(
+                self.executor,
+                "current_environment_fingerprint",
+                lambda: artifact.environment_fingerprint,
+            )()
+            artifact.environment_fingerprint = str(fingerprint or "")
+            artifact.approved_contract_hash = artifact.contract_hash
+            artifact.status = "approved"
         plan.status = "approved"
         self.store.save(plan)
         return self._execute_plan(plan)
@@ -446,6 +492,12 @@ class PrivilegedOpsWorkflow:
                 )
             planner_kwargs["grounded_context"] = grounded_context
         replacement = self.planner.plan(plan.goal, **planner_kwargs)
+        if self.execution_agent is None:
+            raise RuntimeError("Execution Agent is unavailable")
+        replacement = self.execution_agent.prepare_plan(
+            replacement,
+            grounded_context=planner_kwargs.get("grounded_context"),
+        )
         plan.risk = replacement.risk
         plan.verification_level = replacement.verification_level
         plan.verification = None
@@ -476,26 +528,44 @@ class PrivilegedOpsWorkflow:
         readonly_argv: list[str] | None = None,
     ) -> WorkflowResult:
         if plan.risk != "readonly":
-            if plan.schema_version < 2:
+            if plan.schema_version < 3:
                 plan.status = "blocked"
                 if persist:
                     self.store.save(plan)
                 return WorkflowResult(
                     "blocked",
-                    "这是旧版命令型计划，已失效且不会执行。请重新提交目标以生成基于注册动作的新计划。",
+                    "这是旧版计划，已失效且不会执行。请重新提交目标以生成 Agentic V3 计划。",
                     plan,
                 )
-            missing_actions = [
-                step.step_id for step in plan.steps if not step.action
+            missing_bindings = [
+                step.step_id
+                for step in plan.steps
+                if step.execution_binding is None
             ]
-            if missing_actions:
+            if missing_bindings:
                 plan.status = "blocked"
                 if persist:
                     self.store.save(plan)
                 return WorkflowResult(
                     "blocked",
-                    "计划包含未注册的命令型步骤，执行已拒绝：%s"
-                    % ", ".join(missing_actions),
+                    "计划包含尚未完成执行绑定的语义步骤：%s"
+                    % ", ".join(missing_bindings),
+                    plan,
+                )
+            legacy_bindings = [
+                step.step_id
+                for step in plan.steps
+                if step.execution_binding is not None
+                and step.execution_binding.kind == "legacy_command"
+            ]
+            if legacy_bindings:
+                plan.status = "blocked"
+                if persist:
+                    self.store.save(plan)
+                return WorkflowResult(
+                    "blocked",
+                    "旧版原始命令只保留用于审计，不能执行：%s。请重新提交目标。"
+                    % ", ".join(legacy_bindings),
                     plan,
                 )
         if plan.risk != "readonly" and not plan.is_authorized:
@@ -513,6 +583,25 @@ class PrivilegedOpsWorkflow:
             if step.status in {"completed", "skipped"}:
                 continue
             if step.status == "execution_unknown":
+                plan.status = "paused"
+                if persist:
+                    self.store.save(plan)
+                return WorkflowResult(
+                    "paused",
+                    render_plan(plan) + _pause_controls(plan),
+                    plan,
+                )
+            incomplete_dependencies = [
+                dependency
+                for dependency in step.depends_on
+                if _find_step(plan, dependency).status != "completed"
+            ]
+            if incomplete_dependencies:
+                step.status = "paused"
+                step.observation = (
+                    "依赖步骤尚未完成：%s"
+                    % "、".join(incomplete_dependencies)
+                )
                 plan.status = "paused"
                 if persist:
                     self.store.save(plan)
@@ -554,7 +643,7 @@ class PrivilegedOpsWorkflow:
             step_readonly_argv = readonly_argv
             if (
                 plan.risk == "readonly"
-                and not step.action
+                and step.execution_binding is None
                 and step_readonly_argv is None
             ):
                 step_readonly_argv, reason = PrivilegedRiskPolicy().readonly_argv(
@@ -700,7 +789,12 @@ class PrivilegedOpsWorkflow:
     def _render_detailed_plan(self, plan: PrivilegedPlan) -> str:
         if self.summarizer is not None:
             try:
-                return self.summarizer.describe_plan(plan)
+                description = self.summarizer.describe_plan(plan)
+                shell_review = _render_shell_review(plan)
+                return (
+                    description
+                    + ("\n\n" + shell_review if shell_review else "")
+                )
             except Exception:
                 pass
         return render_plan_details(plan)
@@ -740,233 +834,177 @@ class PrivilegedOpsWorkflow:
         *,
         persist: bool,
     ) -> WorkflowResult | None:
-        """Run bounded read-only diagnosis and draft, but never authorize, a repair."""
+        """Return a structured failure packet to the same semantic Planner."""
 
-        if not persist or self.context_builder is None:
+        if (
+            not persist
+            or self.context_builder is None
+            or self.execution_agent is None
+        ):
             return None
-        if self.on_progress is not None:
-            self.on_progress("步骤失败，正在进行安全的只读诊断并生成修复计划…")
         failure_summary = failed_step.observation or _fallback_step_summary(
             failed_step,
             "failed",
         )
-        recovery_snapshot = {
-            "failed_step": failed_step.to_dict(),
-            "failure_summary": failure_summary,
-            "previous_verification": (
-                plan.verification.to_dict() if plan.verification else None
-            ),
-        }
+        if self.on_progress is not None:
+            self.on_progress(
+                "步骤未达到成功标准，正在把执行证据和反思返回 Planner…"
+            )
         try:
-            conclusion = None
-            diagnostic_evidence = ""
-            if self.recovery_agent is not None:
-                catalog = getattr(
-                    self.context_builder,
-                    "recovery_probe_catalog",
-                    lambda: "",
-                )()
-                analysis = self.recovery_agent.analyze(
-                    plan,
-                    failed_step,
-                    probe_catalog=catalog,
-                )
-                analysis.probes = _merge_recovery_probes(
-                    _deterministic_recovery_probes(failed_step),
-                    analysis.probes,
-                )
-                run_diagnostics = getattr(
-                    self.context_builder,
-                    "run_recovery_diagnostics",
-                    None,
-                )
-                if run_diagnostics is not None:
-                    diagnostic_evidence = run_diagnostics(analysis.probes)
-                conclusion = self.recovery_agent.conclude(
-                    plan,
-                    failed_step,
-                    analysis,
-                    diagnostic_evidence,
-                )
-                if conclusion.summary:
-                    failure_summary = conclusion.summary
-                recovery_snapshot["recovery_analysis"] = analysis.__dict__
-                recovery_snapshot["diagnostic_evidence"] = diagnostic_evidence
-                recovery_snapshot["recovery_conclusion"] = conclusion.__dict__
-
-            recovery_fingerprint = _recovery_fingerprint(
+            fingerprint = self.context_builder.current_environment_fingerprint()
+        except Exception:
+            fingerprint = ""
+        packet = _build_failure_packet(
+            plan,
+            failed_step,
+            environment_fingerprint=fingerprint,
+        )
+        if plan.replan_attempts >= 3:
+            return self._pause_agentic_replan(
+                plan,
                 failed_step,
-                diagnostic_evidence,
-                conclusion.__dict__ if conclusion is not None else {},
+                packet,
+                failure_summary,
+                "已经连续重新规划 3 次，系统停止自动循环并等待用户决定。",
             )
-            recovery_snapshot["recovery_fingerprint"] = recovery_fingerprint
-            previous_attempt = (
-                plan.recovery_history[-1]
-                if plan.recovery_history
-                and isinstance(plan.recovery_history[-1], dict)
-                else {}
+        if (
+            plan.failure_packets
+            and plan.failure_packets[-1].failure_fingerprint
+            == packet.failure_fingerprint
+        ):
+            return self._pause_agentic_replan(
+                plan,
+                failed_step,
+                packet,
+                failure_summary,
+                "环境和失败证据与上次相同，没有新证据支持再次执行。",
             )
-            if (
-                previous_attempt.get("outcome") == "unavailable"
-                and previous_attempt.get("recovery_fingerprint")
-                == recovery_fingerprint
-            ):
-                raise RecoveryPlanUnavailable(
-                    "本次只读诊断与上一次相比没有发现新证据，因此没有再次调用"
-                    " Planner 或重复生成同一失败计划。请先改变相关环境状态、"
-                    "补充证据，或查看审计记录后再重新规划。"
-                )
 
-            planner_evidence = redact_sensitive_text(
-                json.dumps(recovery_snapshot, ensure_ascii=False)
-            )[:22000]
-            guidance = (
-                "\n已确认根因：%s\n修复能力要求：%s\n规划约束：%s"
-                % (
-                    conclusion.confirmed_cause or "尚未完全确认",
-                    conclusion.required_capability or "根据诊断证据确定",
-                    conclusion.planning_guidance or "不得原样重试失败动作",
-                )
-                if conclusion is not None
-                else ""
-            )
-            recovery_goal = (
-                "原目标：%s\n"
-                "先处理已诊断的失败原因，再安全地继续完成原目标。\n"
-                "失败摘要：%s%s"
-                % (plan.goal, failure_summary, guidance)
-            )
+        previous_signature = _semantic_plan_signature(
+            [
+                step
+                for step in plan.steps
+                if step.status not in {"completed", "skipped"}
+            ]
+        )
+        plan.failure_packets.append(packet)
+        plan.replan_attempts += 1
+        planner_evidence = redact_sensitive_text(
+            json.dumps(packet.to_dict(), ensure_ascii=False)
+        )[:24000]
+        recovery_goal = (
+            "原始目标：%s\n"
+            "上一执行步骤失败。请根据 Failure Packet 自主反思并重新规划"
+            "剩余路线；保留已完成步骤作为不可更改事实，不得原样重复失败方案。"
+            % plan.goal
+        )
+        try:
             grounded_context = self.context_builder.build(
                 recovery_goal,
                 supplemental_environment_context=planner_evidence,
             )
             blocker = grounded_context.planning_blocker()
             if blocker:
-                raise ValueError(blocker)
-            try:
-                replacement = self.planner.plan(
-                    recovery_goal,
-                    environment_context=planner_evidence,
-                    grounded_context=grounded_context,
-                )
-            except Exception as exc:
-                if conclusion is not None:
-                    required = (
-                        conclusion.required_capability
-                        or "根据诊断结论实施修复"
-                    )
-                    raise RecoveryPlanUnavailable(
-                        "只读诊断已经完成，但 Planner 无法用当前注册动作构造"
-                        "经过证据支持的修复步骤。可靠修复需要具备“%s”的"
-                        "受控执行能力；系统没有原样重试失败操作。" % required
-                    ) from exc
-                raise
-            if _repeats_failed_action_without_repair(
-                replacement.steps,
-                failed_step,
-            ):
-                required = (
-                    conclusion.required_capability
-                    if conclusion is not None
-                    else ""
-                )
+                raise RecoveryPlanUnavailable(blocker)
+            replacement = self.planner.plan(
+                recovery_goal,
+                environment_context=planner_evidence,
+                grounded_context=grounded_context,
+            )
+            replacement = self.execution_agent.prepare_plan(
+                replacement,
+                grounded_context=grounded_context,
+            )
+            if _semantic_plan_signature(replacement.steps) == previous_signature:
                 raise RecoveryPlanUnavailable(
-                    "诊断已经完成，但候选计划只是重复失败操作，没有处理根因。"
-                    + (
-                        "可靠修复需要具备“%s”的受控执行能力；当前动作目录中没有"
-                        "得到证据支持的实施步骤。" % required
-                        if required
-                        else "当前动作目录中没有得到证据支持的修复步骤。"
-                    )
+                    "新计划与失败计划没有实质差异，已拒绝再次执行。"
                 )
-            if self.recovery_agent is not None and conclusion is not None:
-                review = self.recovery_agent.review_plan(
-                    failed_step,
-                    conclusion,
-                    replacement,
-                )
-                recovery_snapshot["repair_plan_review"] = review.__dict__
-                if not review.covers_cause:
-                    detail = review.explanation or "候选步骤未覆盖已诊断根因"
-                    if review.missing_capability:
-                        detail += "；缺少的受控能力：%s" % review.missing_capability
-                    raise RecoveryPlanUnavailable(detail)
         except Exception as exc:
-            plan.status = "paused"
-            if isinstance(exc, RecoveryPlanUnavailable):
-                user_reason = str(exc)
-            else:
-                user_reason = (
-                    "自动恢复分析未能完整结束，因此没有生成可能误操作的修复计划。"
-                    "你可以稍后重新规划，原计划不会自动重试。"
-                )
-            failed_step.observation = _append_observation(
+            return self._pause_agentic_replan(
+                plan,
+                failed_step,
+                packet,
                 failure_summary,
-                user_reason,
-            )
-            recovery_snapshot["outcome"] = "unavailable"
-            recovery_snapshot["failure_reason"] = _short_error(exc)
-            recovery_snapshot["user_reason"] = user_reason
-            if "recovery_fingerprint" not in recovery_snapshot:
-                recovery_snapshot["recovery_fingerprint"] = (
-                    _recovery_fingerprint(
-                        failed_step,
-                        recovery_snapshot.get("diagnostic_evidence", ""),
-                        recovery_snapshot.get("recovery_conclusion", {}),
-                    )
-                )
-            plan.recovery_history.append(recovery_snapshot)
-            self.store.save(plan)
-            self._event(
-                "privileged_recovery_plan_failed",
-                plan,
-                {
-                    "step_id": failed_step.step_id,
-                    "reason": _short_error(exc),
-                    "user_reason": user_reason,
-                },
-            )
-            return WorkflowResult(
-                "paused",
-                _render_recovery_unavailable(
-                    plan,
-                    failure_summary=failure_summary,
-                    reason=user_reason,
-                ),
-                plan,
+                "Planner 未能形成有实质差异的可靠新路线：%s"
+                % _short_error(exc),
+                append_packet=False,
             )
 
-        recovery_snapshot["outcome"] = "planned"
-        plan.recovery_history.append(recovery_snapshot)
+        old_goal = plan.goal
         plan.risk = replacement.risk
         plan.verification_level = replacement.verification_level
         plan.verification = None
         plan.grounding = replacement.grounding
+        plan.assumptions = replacement.assumptions
+        plan.probe_history.extend(replacement.probe_history)
         plan.replace_steps(replacement.steps)
-        for step in plan.steps:
-            if step.status == "approved":
-                step.status = "pending"
+        plan.goal = old_goal
         self.store.save(plan)
         self._event(
-            "privileged_plan_created",
+            "agentic_replan_created",
             plan,
             {
-                "replan": True,
-                "automatic_recovery": True,
                 "failed_step_id": failed_step.step_id,
+                "failure_fingerprint": packet.failure_fingerprint,
+                "replan_attempt": plan.replan_attempts,
             },
         )
         return WorkflowResult(
             "awaiting_confirmation",
-            "原计划已停止，未继续执行后续变更。\n"
-            "失败原因：%s\n"
-            "已完成安全的只读诊断，并生成以下修复计划；修复尚未执行：\n\n%s"
-            "\n\n确认执行新计划：confirm-priv %s"
-            "\n查看详细修复计划：show-priv %s"
-            "\n查看原始诊断与审计证据：audit-priv %s"
+            "原计划已停止，后续步骤未执行。\n"
+            "失败与反思：%s\n"
+            "Planner 已根据真实证据生成一条有实质差异的新路线：\n\n%s"
+            "\n\n确认新计划：confirm-priv %s"
+            "\n查看详细计划：show-priv %s"
+            "\n查看 Failure Packet：audit-priv %s"
             % (
                 failure_summary,
                 render_plan(plan),
+                plan.plan_id,
+                plan.plan_id,
+                plan.plan_id,
+            ),
+            plan,
+        )
+
+    def _pause_agentic_replan(
+        self,
+        plan: PrivilegedPlan,
+        failed_step: PrivilegedStep,
+        packet: FailurePacket,
+        failure_summary: str,
+        reason: str,
+        *,
+        append_packet: bool = True,
+    ) -> WorkflowResult:
+        if append_packet:
+            plan.failure_packets.append(packet)
+        failed_step.observation = _append_observation(
+            failure_summary,
+            reason,
+        )
+        plan.status = "paused"
+        self.store.save(plan)
+        self._event(
+            "agentic_replan_paused",
+            plan,
+            {
+                "step_id": failed_step.step_id,
+                "reason": reason,
+                "failure_fingerprint": packet.failure_fingerprint,
+            },
+        )
+        return WorkflowResult(
+            "paused",
+            "当前步骤失败，后续操作已停止。\n"
+            "失败与反思：%s\n"
+            "未继续自动规划：%s\n\n"
+            "查看证据：audit-priv %s\n"
+            "重新要求规划：replan-priv %s\n"
+            "终止计划：abort-priv %s"
+            % (
+                failure_summary,
+                reason,
                 plan.plan_id,
                 plan.plan_id,
                 plan.plan_id,
@@ -1125,6 +1163,18 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
             lines.append(
                 "   当前结果：%s" % _visible_observation(step.observation)
             )
+        binding = step.execution_binding
+        if binding is not None:
+            lines.append(
+                "   执行方式：%s"
+                % (
+                    "已注册受控动作，随计划确认后自动执行。"
+                    if binding.kind == "registered_action"
+                    else "固定的一次性 Shell 脚本，执行前还需单步确认。"
+                )
+            )
+            if binding.binding_reason:
+                lines.append("   绑定依据：%s" % binding.binding_reason)
     lines.append("")
     if plan.status in {"awaiting_confirmation", "draft"}:
         lines.append("确认当前计划：confirm-priv %s" % plan.plan_id)
@@ -1139,6 +1189,9 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
     elif plan.status == "completed":
         lines.append("该计划已经完成，无需再次确认。")
     lines.append("查看原始审计数据：audit-priv %s" % plan.plan_id)
+    shell_review = _render_shell_review(plan)
+    if shell_review:
+        lines.extend(("", shell_review))
     return "\n".join(lines)
 
 
@@ -1154,6 +1207,40 @@ def render_plan_list(plans: list[PrivilegedPlan]) -> str:
         % (plan.plan_id, plan.status, plan.risk, plan.goal)
         for plan in plans
     )
+
+
+def _render_shell_review(plan: PrivilegedPlan) -> str:
+    sections = []
+    for index, step in enumerate(plan.steps, start=1):
+        binding = step.execution_binding
+        artifact = (
+            binding.shell_artifact
+            if binding is not None and binding.kind == "shell_artifact"
+            else None
+        )
+        if artifact is None:
+            continue
+        sections.append(
+            "\n".join(
+                (
+                    "一次性 Shell 审核（第 %s 步：%s）" % (index, step.title),
+                    "工作目录：%s" % artifact.cwd,
+                    "执行用户：%s" % (artifact.run_as or "当前用户"),
+                    "最长执行：%s 秒；到期时间：%s"
+                    % (artifact.timeout, artifact.expires_at),
+                    "预期改动：%s"
+                    % ("；".join(artifact.declared_changes) or "未声明"),
+                    "脚本 SHA-256：%s" % artifact.sha256,
+                    "固定脚本如下：",
+                    "```bash",
+                    artifact.script.rstrip(),
+                    "```",
+                    "确认该脚本：confirm-priv-step %s %s"
+                    % (plan.plan_id, step.step_id),
+                )
+            )
+        )
+    return "\n\n".join(sections)
 
 
 def _first_step_with_status(
@@ -1189,8 +1276,19 @@ def _fallback_step_summary(step: PrivilegedStep, status: str) -> str:
 
 
 def _natural_step_scope(step: PrivilegedStep) -> str:
+    if step.objective:
+        scope = "目标是%s" % step.objective.rstrip("。")
+        if step.reason:
+            scope += "；依据是%s" % step.reason.rstrip("。")
+        return scope + "。"
+    binding = step.execution_binding
+    args = (
+        binding.args
+        if binding is not None and binding.kind == "registered_action"
+        else step.args
+    )
     values = []
-    for key, value in step.args.items():
+    for key, value in args.items():
         lowered_key = str(key).lower()
         if lowered_key in {"content", "anchor", "argv", "env"} or any(
             marker in lowered_key
@@ -1219,213 +1317,149 @@ def _visible_observation(observation: str) -> str:
     return text
 
 
-def _repeats_failed_action_without_repair(
-    steps: list[PrivilegedStep],
+def _build_failure_packet(
+    plan: PrivilegedPlan,
     failed_step: PrivilegedStep,
-) -> bool:
-    """Reject a draft whose first material action merely repeats the failure."""
-
-    for step in steps:
-        if step.risk == "readonly":
-            continue
-        return step.action == failed_step.action and step.args == failed_step.args
-    return False
-
-
-def _deterministic_recovery_probes(
-    failed_step: PrivilegedStep,
-) -> list[dict[str, Any]]:
-    """Add evidence probes implied by common failure shapes.
-
-    The model may request additional probes, but it cannot omit the basic
-    evidence needed to distinguish configuration, dependency, port, process,
-    permission and resource failures.
-    """
-
-    evidence = failed_step.evidence
-    execution_raw = " ".join(
-        (
-            evidence.stdout if evidence else "",
-            evidence.stderr if evidence else "",
-        )
+    *,
+    environment_fingerprint: str,
+) -> FailurePacket:
+    binding = (
+        failed_step.execution_binding.to_dict()
+        if failed_step.execution_binding is not None
+        else {}
     )
-    raw = " ".join((execution_raw, failed_step.observation))
-    lowered = raw.lower()
-    root_text = str(failed_step.args.get("project_root") or "").strip()
-    root = Path(root_text).expanduser() if root_text else None
-    probes: list[dict[str, Any]] = []
-
-    if root is not None and root.is_absolute():
-        probes.append(
-            {
-                "probe": "project_layout",
-                "args": {"project_roots": [str(root)]},
-                "purpose": "确认失败组件使用的源码包、配置文件和运行目录",
-            }
-        )
-        probes.append(
-            {
-                "probe": "klonet_config_consistency",
-                "args": {"project_root": str(root)},
-                "purpose": "核对活动配置类及 Master、Worker、终端和依赖端口",
-            }
-        )
-        for candidate in (
-            root / "vemu_uestc" / "vemu_config" / "config.py",
-            root / "vemu_config" / "config.py",
-            root / "config.py",
-        ):
-            if candidate.is_file():
-                probes.append(
-                    {
-                        "probe": "ops_file",
-                        "args": {
-                            "path": str(candidate),
-                            "max_chars": 8000,
-                            "view": "head",
-                        },
-                        "purpose": "读取并脱敏核对当前项目的实际连接配置",
-                    }
-                )
-                break
-
-    ports = []
-    for value in re.findall(
-        r"(?i)(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::\])[:](\d{2,5})",
-        execution_raw,
+    evidence = (
+        failed_step.evidence.to_dict()
+        if failed_step.evidence is not None
+        else {}
+    )
+    verification = (
+        plan.verification.to_dict()
+        if plan.verification is not None
+        else {}
+    )
+    changes = []
+    if (
+        failed_step.evidence is not None
+        and failed_step.evidence.environment_changed
     ):
-        number = int(value)
-        if 1 <= number <= 65535 and number not in ports:
-            ports.append(number)
-    if ports or "connection refused" in lowered or "address already in use" in lowered:
-        probes.append(
-            {
-                "probe": "ports",
-                "args": {"ports": ports},
-                "purpose": "确认目标端口是否监听以及端口所有者",
-            }
+        changes = list(failed_step.expected_changes)
+        artifact = (
+            failed_step.execution_binding.shell_artifact
+            if failed_step.execution_binding is not None
+            else None
         )
-    if "redis" in lowered:
-        probes.extend(
-            (
-                {
-                    "probe": "docker",
-                    "args": {},
-                    "purpose": "核对 Redis 容器状态和宿主机端口映射",
-                },
-                {
-                    "probe": "redis",
-                    "args": {},
-                    "purpose": "核对 Redis 服务状态",
-                },
+        if artifact is not None:
+            changes = list(artifact.declared_changes)
+    fingerprint_payload = {
+        "step_objective": failed_step.objective or failed_step.title,
+        "binding": binding,
+        "evidence": evidence,
+        "verification": verification,
+        "environment_fingerprint": environment_fingerprint,
+    }
+    fingerprint = hashlib.sha256(
+        redact_sensitive_text(
+            json.dumps(
+                fingerprint_payload,
+                ensure_ascii=False,
+                sort_keys=True,
             )
-        )
-    if "no module named" in lowered and root is not None:
-        module_match = re.search(r"No module named ['\"]([^'\"]+)", raw)
-        if module_match:
-            probes.append(
-                {
-                    "probe": "python_import",
-                    "args": {
-                        "python_executable": "/usr/bin/python3",
-                        "cwd": str(root),
-                        "modules": [module_match.group(1)],
-                    },
-                    "purpose": "使用明确 cwd 复现并定位 Python 导入失败",
-                }
-            )
-    if "permission denied" in lowered:
-        paths = re.findall(r"(/[A-Za-z0-9_./-]{2,500})", raw)[:8]
-        probes.append(
+        ).encode("utf-8")
+    ).hexdigest()
+    return FailurePacket(
+        original_goal=plan.goal,
+        failed_step={
+            "step_id": failed_step.step_id,
+            "title": failed_step.title,
+            "objective": failed_step.objective or failed_step.title,
+            "reason": failed_step.reason,
+            "success_criteria": failed_step.success_criteria,
+            "expected_effects": failed_step.expected_changes,
+            "status": failed_step.status,
+        },
+        execution_binding=binding,
+        execution_evidence=evidence,
+        verification=verification,
+        environment_changes=changes,
+        completed_steps=[
             {
-                "probe": "path_permissions",
-                "args": {"paths": paths},
-                "purpose": "核对失败路径的存在性、权限和属主",
+                "step_id": item.step_id,
+                "objective": item.objective or item.title,
+                "result": item.observation,
             }
-        )
-    if "no space left" in lowered or "disk full" in lowered:
-        probes.append(
+            for item in plan.steps
+            if item.status == "completed"
+        ],
+        remaining_steps=[
             {
-                "probe": "disk",
-                "args": {},
-                "purpose": "核对磁盘容量和文件系统状态",
+                "step_id": item.step_id,
+                "objective": item.objective or item.title,
+                "depends_on": item.depends_on,
             }
-        )
-    return probes
+            for item in plan.steps
+            if item.step_id != failed_step.step_id
+            and item.status not in {"completed", "skipped"}
+        ],
+        reflection=(
+            plan.verification.reflection
+            if plan.verification is not None
+            else ""
+        ),
+        environment_fingerprint=environment_fingerprint,
+        failure_fingerprint=fingerprint,
+    )
 
 
-def _merge_recovery_probes(
-    deterministic: list[dict[str, Any]],
-    adaptive: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    result = []
-    seen = set()
-    for request in [*deterministic, *adaptive]:
-        if not isinstance(request, dict):
-            continue
-        key = json.dumps(
-            {
-                "probe": request.get("probe"),
-                "args": request.get("args") or {},
-            },
+def _semantic_plan_signature(steps: list[PrivilegedStep]) -> str:
+    payload = [
+        {
+            "objective": " ".join(
+                (step.objective or step.title).lower().split()
+            ),
+            "depends_on": sorted(step.depends_on),
+            "success_criteria": sorted(
+                " ".join(item.lower().split())
+                for item in step.success_criteria
+            ),
+            "binding_kind": (
+                step.execution_binding.kind
+                if step.execution_binding is not None
+                else ""
+            ),
+            "binding_action": (
+                step.execution_binding.action
+                if step.execution_binding is not None
+                else ""
+            ),
+            "binding_args": (
+                step.execution_binding.args
+                if step.execution_binding is not None
+                and step.execution_binding.kind == "registered_action"
+                else {}
+            ),
+            "shell_sha256": (
+                step.execution_binding.shell_artifact.sha256
+                if step.execution_binding is not None
+                and step.execution_binding.shell_artifact is not None
+                else ""
+            ),
+        }
+        for step in steps
+    ]
+    return hashlib.sha256(
+        json.dumps(
+            payload,
             ensure_ascii=False,
             sort_keys=True,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(request)
-        if len(result) >= 8:
-            break
-    return result
-
-
-def _recovery_fingerprint(
-    failed_step: PrivilegedStep,
-    diagnostic_evidence: str,
-    _conclusion: dict[str, Any],
-) -> str:
-    evidence = failed_step.evidence
-    payload = {
-        "action": failed_step.action,
-        "args": failed_step.args,
-        "return_code": evidence.return_code if evidence else None,
-        "stdout": evidence.stdout if evidence else "",
-        "stderr": evidence.stderr if evidence else "",
-        "diagnostic_evidence": diagnostic_evidence,
-    }
-    serialized = redact_sensitive_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True)
-    )
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-
-def _render_recovery_unavailable(
-    plan: PrivilegedPlan,
-    *,
-    failure_summary: str,
-    reason: str,
-) -> str:
-    return (
-        "本次没有生成新的修复计划，原计划仍保持暂停，失败步骤不会自动重试。\n"
-        "诊断结论：%s\n"
-        "未生成新计划的原因：%s\n\n"
-        "这不是一份新的待执行计划。你可以：\n"
-        "- 查看完整诊断证据：audit-priv %s\n"
-        "- 在补充证据或服务器状态发生变化后重新规划：replan-priv %s\n"
-        "- 终止原计划：abort-priv %s"
-        % (
-            failure_summary,
-            reason,
-            plan.plan_id,
-            plan.plan_id,
-            plan.plan_id,
-        )
-    )
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _short_error(exc: Exception) -> str:
-    message = " ".join(str(exc or exc.__class__.__name__).split())
+    message = redact_sensitive_text(
+        " ".join(str(exc or exc.__class__.__name__).split())
+    )
     return message[:180] or exc.__class__.__name__
 
 

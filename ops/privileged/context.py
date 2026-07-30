@@ -15,7 +15,6 @@ from klonet_agent.ops.actions import (
     OpsActionRegistry,
     configured_ops_action_registry,
 )
-from klonet_agent.ops.privileged.planner_schema import REQUIRED_ACTION_ARGS
 from klonet_agent.ops.privileged.action_runner import (
     DIRECT_PRIVILEGED_ACTIONS,
 )
@@ -23,7 +22,6 @@ from klonet_agent.ops.privileged.environment_facts import (
     EnvironmentFactCollector,
     UnifiedEnvironmentFacts,
 )
-from klonet_agent.ops.privileged.workflows import DEFAULT_DOMAIN_WORKFLOWS
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 from klonet_agent.tools.environment import (
     inspect_install_scripts,
@@ -68,13 +66,13 @@ class GroundedPlanContext:
             "## Klonet knowledge evidence\n"
             f"{self.knowledge_evidence}\n\n"
             f"{model_section}"
-            "## Registered domain workflows\n"
-            f"{DEFAULT_DOMAIN_WORKFLOWS.render()}\n\n"
             "## Registered read-only probes\n"
             f"{DEFAULT_READONLY_PROBES.render()}\n\n"
             "## Read-only server evidence\n"
             f"{self.environment_evidence}\n\n"
-            "## Allowed action registry\n"
+            "## Available execution capability summary\n"
+            "This summary describes feasibility only. The semantic Planner must"
+            " not select implementation names.\n"
             f"{self.action_catalog}"
         )
 
@@ -82,7 +80,9 @@ class GroundedPlanContext:
         summary = {
             "knowledge_status": self.knowledge_status,
             "environment_status": self.environment_status,
-            "context_policy": "knowledge+readonly_environment+action_registry",
+            "context_policy": (
+                "knowledge+readonly_environment+execution_capability_summary"
+            ),
         }
         fingerprint = self.facts.get("environment_fingerprint")
         if fingerprint:
@@ -129,11 +129,17 @@ class PrivilegedPlanContextBuilder:
     ) -> GroundedPlanContext:
         knowledge_status = "available"
         environment_status = "available"
+        knowledge_query = str(goal or "").strip()
+        if supplemental_environment_context:
+            knowledge_query += (
+                "\n\nCurrent read-only/failure evidence:\n"
+                + _bounded(supplemental_environment_context, 6000)
+            )
         try:
             knowledge = self.knowledge_search(
-                goal,
+                knowledge_query,
                 top_k=6,
-                task_type="deployment",
+                task_type=_knowledge_task_type(goal),
             )
         except Exception as exc:
             knowledge_status = "unavailable"
@@ -175,9 +181,8 @@ class PrivilegedPlanContextBuilder:
 
     def _action_catalog(self) -> str:
         lines = [
-            "The planner may select only the actions below. Shell commands are forbidden. "
-            "run_ops_command is a controlled argv fallback: it accepts program + argv, "
-            "never a shell command string, and is checked by deterministic policy."
+            "An independent Execution Agent may use registered capabilities or"
+            " propose a separately confirmed one-time shell artifact."
         ]
         for spec in self.action_registry.describe():
             if (
@@ -186,30 +191,26 @@ class PrivilegedPlanContextBuilder:
             ):
                 continue
             parts = [
-                f"- action={spec.name}",
-                f"category={spec.category}",
+                f"- category={spec.category}",
                 f"risk={spec.risk}",
-                f"confirmation={spec.confirmation_scope if spec.requires_confirmation else 'none'}",
-                f"description={spec.description or spec.name}",
+                f"description={spec.description or spec.category}",
             ]
-            if spec.path_args:
-                parts.append("path_args=" + ",".join(spec.path_args))
-            required = REQUIRED_ACTION_ARGS.get(spec.name, ())
-            if required:
-                parts.append("required_args=" + ",".join(required))
             if spec.preconditions:
                 parts.append("preconditions=" + ",".join(spec.preconditions))
-            if spec.effects:
-                parts.append("effects=" + ",".join(spec.effects))
             if spec.postconditions:
                 parts.append("postconditions=" + ",".join(spec.postconditions))
-            parts.append("backends=" + ",".join(spec.backends))
             lines.append(" ".join(parts))
-        return "\n".join(lines)
+        return "\n".join(dict.fromkeys(lines))
 
     @staticmethod
     def recovery_probe_catalog() -> str:
         return DEFAULT_READONLY_PROBES.render()
+
+    def current_environment_fingerprint(self) -> str:
+        facts = self.fact_collector.collect(
+            self._candidate_project_roots()
+        )
+        return facts.fingerprint
 
     def run_recovery_diagnostics(
         self,
@@ -297,6 +298,31 @@ class PrivilegedPlanContextBuilder:
                 + "\n".join("- %s" % root for root in roots)
             )
         return "\n\n".join(sections)
+
+
+def _knowledge_task_type(goal: str) -> str:
+    lowered = str(goal or "").lower()
+    recovery_markers = (
+        "failure packet",
+        "失败",
+        "故障",
+        "异常",
+        "报错",
+        "修复",
+        "恢复",
+        "诊断",
+        "排查",
+        "failed",
+        "error",
+        "recover",
+        "diagnose",
+        "troubleshoot",
+    )
+    return (
+        "troubleshooting"
+        if any(marker in lowered for marker in recovery_markers)
+        else "deployment"
+    )
 
 
 def _bounded(value: Any, limit: int) -> str:

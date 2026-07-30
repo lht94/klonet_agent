@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import hashlib
+import os
+import tempfile
+from pathlib import Path
 from typing import Callable
 
 from klonet_agent.ops.privileged.action_runner import (
@@ -13,6 +17,11 @@ from klonet_agent.ops.privileged.contracts import (
     ExecutionEvidence,
     PrivilegedStep,
     utc_now,
+)
+from klonet_agent.ops.privileged.shell_artifact import (
+    ShellArtifactPolicy,
+    artifact_is_expired,
+    build_shell_environment,
 )
 
 
@@ -27,6 +36,8 @@ class PrivilegedCommandExecutor:
         on_output: Callable[[str, str], None] | None = None,
         action_runner: Callable | None = None,
         direct_action_runner: Callable | None = None,
+        shell_policy: ShellArtifactPolicy | None = None,
+        environment_fingerprint_provider: Callable[[], str] | None = None,
     ) -> None:
         self.max_output_chars = max(1, int(max_output_chars))
         self.on_start = on_start
@@ -35,11 +46,160 @@ class PrivilegedCommandExecutor:
         self.action_runner = (
             direct_action_runner or DirectPrivilegedActionRunner()
         )
+        self.shell_policy = shell_policy or ShellArtifactPolicy()
+        self.environment_fingerprint_provider = (
+            environment_fingerprint_provider or (lambda: "")
+        )
 
     def execute(self, step: PrivilegedStep) -> ExecutionEvidence:
-        if step.action:
-            return self.execute_action(step)
-        return self._execute(step, step.command, shell=True)
+        binding = step.execution_binding
+        if binding is None:
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="execution_binding_missing",
+                started_at=utc_now(),
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        if binding.kind == "registered_action":
+            bound_step = PrivilegedStep.from_dict(step.to_dict())
+            bound_step.action = binding.action
+            bound_step.args = dict(binding.args)
+            bound_step.preconditions = list(binding.preconditions)
+            bound_step.postconditions = list(binding.postconditions)
+            return self.execute_action(bound_step)
+        if binding.kind == "shell_artifact":
+            return self.execute_shell_artifact(step)
+        return ExecutionEvidence(
+            return_code=2,
+            stderr="legacy_or_unknown_execution_binding_refused",
+            started_at=utc_now(),
+            finished_at=utc_now(),
+            environment_changed=False,
+        )
+
+    def execute_shell_artifact(
+        self,
+        step: PrivilegedStep,
+    ) -> ExecutionEvidence:
+        binding = step.execution_binding
+        artifact = binding.shell_artifact if binding is not None else None
+        started_at = utc_now()
+        if artifact is None:
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="shell_artifact_missing",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        if artifact.status != "approved":
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="shell_artifact_not_exactly_approved",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        if (
+            not artifact.approved_contract_hash
+            or artifact.approved_contract_hash != artifact.contract_hash
+        ):
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="shell_artifact_contract_not_exactly_approved",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        if artifact_is_expired(artifact):
+            artifact.status = "expired"
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="shell_artifact_expired",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        problem = self.shell_policy.validate(artifact)
+        if problem:
+            return ExecutionEvidence(
+                return_code=2,
+                stderr=problem,
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        current_fingerprint = self.environment_fingerprint_provider()
+        if (
+            artifact.environment_fingerprint
+            and current_fingerprint != artifact.environment_fingerprint
+        ):
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="shell_artifact_environment_fingerprint_changed",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        if hashlib.sha256(
+            artifact.script.encode("utf-8")
+        ).hexdigest() != artifact.sha256:
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="shell_artifact_changed_after_confirmation",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="klonet-shell-artifact-"
+        ) as temp_dir:
+            script_path = Path(temp_dir) / (
+                artifact.artifact_id + ".sh"
+            )
+            script_path.write_text(artifact.script, encoding="utf-8")
+            script_path.chmod(0o700)
+            argv = [
+                artifact.interpreter,
+                "--noprofile",
+                "--norc",
+                str(script_path),
+            ]
+            current_user = ""
+            try:
+                import pwd
+
+                current_user = pwd.getpwuid(os.geteuid()).pw_name
+            except (ImportError, KeyError, OSError):
+                current_user = ""
+            if artifact.run_as and artifact.run_as != current_user:
+                # A different, explicitly reviewed execution identity needs to
+                # traverse and read this short-lived artifact. Scripts cannot
+                # contain secrets by policy and the directory disappears
+                # immediately after execution.
+                Path(temp_dir).chmod(0o711)
+                script_path.chmod(0o555)
+                argv = ["sudo", "-n", "-u", artifact.run_as, *argv]
+            evidence = self._execute(
+                step,
+                argv,
+                shell=False,
+                cwd=artifact.cwd,
+                env=build_shell_environment(artifact),
+                timeout=artifact.timeout,
+            )
+        artifact.status = (
+            "executed"
+            if evidence.return_code == 0 and not evidence.timed_out
+            else "failed"
+        )
+        artifact.executed_at = utc_now()
+        evidence.environment_changed = True
+        return evidence
+
+    def current_environment_fingerprint(self) -> str:
+        return str(self.environment_fingerprint_provider() or "")
 
     def execute_action(self, step: PrivilegedStep) -> ExecutionEvidence:
         """Dispatch one validated registered action without a shell boundary."""
@@ -119,6 +279,9 @@ class PrivilegedCommandExecutor:
         command,
         *,
         shell: bool,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> ExecutionEvidence:
         started_at = utc_now()
         if self.on_start:
@@ -127,7 +290,8 @@ class PrivilegedCommandExecutor:
             process = subprocess.Popen(
                 command,
                 shell=shell,
-                cwd=step.cwd or None,
+                cwd=cwd or step.cwd or None,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -166,7 +330,7 @@ class PrivilegedCommandExecutor:
             for thread in threads:
                 thread.start()
             try:
-                process.wait(timeout=step.timeout)
+                process.wait(timeout=timeout or step.timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
                 process.kill()

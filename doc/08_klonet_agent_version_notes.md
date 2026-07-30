@@ -1187,3 +1187,26 @@ Ops-Privilege 的交互输出与延迟也遵循以下边界：
   提供通用能力，而不是为单个 Redis 故障硬编码 recipe。
 - `read_ops_file` 支持明确的 `head`/`tail` 视图，恢复探测可以读取配置文件前部而非
   固定读取尾部；Docker 命令行中的 `--requirepass` 和常见服务 URI 密码也会被统一脱敏。
+
+# 2026-07-30：Ops-Privilege Agentic V3
+
+- 计划契约升级到 Schema V3。Planner 只输出语义目标、依据、依赖、预期影响和可观察
+  成功标准，不再看到或选择 Action，不输出 Shell，也没有固定部署流程兜底。
+- 新增独立 Execution Agent。它独占完整 Action Catalog，把语义步骤映射为注册 Action；
+  没有合适 Action 时生成固定的一次性 Shell Artifact。
+- Shell Artifact 固定脚本、cwd、run_as、环境白名单、超时、SHA-256、nonce、环境
+  指纹和有效期。注册 Action 随整体计划确认自动执行；Shell 还需
+  `confirm-priv-step` 精确确认，且只能执行一次。
+- Shell 安全边界新增 `bashlex` AST、`bash -n`、大小/行数上限和硬拒绝规则，禁止命令
+  替换、嵌套解释器、后台执行、网络外传、凭据读取或内嵌、修改 Agent 安全目录以及
+  动态/无边界删除。执行使用固定 argv 和 `shell=False`。
+- Verifier 在确定性 Checker 不足时可执行最多两轮注册只读探测；探测请求和证据写入
+  VerificationDecision。确定性失败是不可被 LLM 覆盖的下限。
+- 步骤失败后生成 Failure Packet，包含原目标、失败语义步骤、真实执行绑定、执行与
+  验证证据、已发生变化、已完成/剩余步骤、反思及环境/失败指纹，并交回同一个 Planner
+  自主重新规划。自动重规划最多三次，且拒绝没有实质差异或证据完全相同的循环。
+- 删除独立 RecoveryAgent 和 DomainWorkflowRegistry。原工作流经验迁移到
+  `knowledge/klonet/ops/agentic_operations_runbook.md`，作为 RAG 经验而非强制路径。
+  Workflow 只保留通用状态机、授权、执行顺序、失败停止、持久化与恢复职责。
+- V1/V2 计划加载时迁移为 V3 审计记录并清除未完成计划的授权；旧注册 Action 需要重新
+  确认，旧原始命令标记为 `legacy_command` 且永不执行。

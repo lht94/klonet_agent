@@ -121,10 +121,8 @@ def test_planner_replaces_source_repo_runtime_with_grounded_parent_plan(tmp_path
         EnvironmentFactCollector,
     )
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
-    from klonet_agent.tests.test_privileged_grounded_planning import (
-        FakeLLM,
-        _action_payload,
-    )
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.tests.test_privileged_agents import FakeLLM
 
     backend = _backend_repo(tmp_path)
     facts = EnvironmentFactCollector().collect([str(backend)])
@@ -134,30 +132,74 @@ def test_planner_replaces_source_repo_runtime_with_grounded_parent_plan(tmp_path
         action_catalog="actions",
         facts={"environment_model": facts.to_dict()},
     )
-    payload = _action_payload(
-        action="start_platform_screens",
-        args={"platform": "demo", "project_root": str(backend)},
+    semantic = json.dumps(
+        {
+            "status": "ready",
+            "goal": "部署平台",
+            "steps": [
+                {
+                    "step_id": "prepare",
+                    "title": "准备运行入口",
+                    "objective": "make all platform entry files available in the runtime directory",
+                    "reason": "the environment model marks the runtime layout as preparable",
+                    "success_criteria": ["all entry files exist in runtime cwd"],
+                    "risk_suggestion": "medium",
+                },
+                {
+                    "step_id": "start",
+                    "title": "启动平台",
+                    "objective": "start all Klonet platform components",
+                    "reason": "runtime entries will be prepared by the preceding step",
+                    "depends_on": ["prepare"],
+                    "success_criteria": ["platform components are running"],
+                    "risk_suggestion": "medium",
+                },
+            ],
+        }
     )
-
-    plan = PrivilegedPlannerAgent(FakeLLM([payload, payload])).plan(
+    plan = PrivilegedPlannerAgent(FakeLLM([semantic])).plan(
         "部署平台",
         grounded_context=context,
     )
-
-    assert plan.grounding["planner_source"] == "deterministic_grounded_resolver"
-    assert all(
-        step.args.get("project_root") != str(backend)
-        for step in plan.steps
-        if step.action in {
-            "validate_project_files",
-            "prepare_project_files",
-            "start_platform_screens",
-        }
+    assert all(step.execution_binding is None for step in plan.steps)
+    binder = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "prepare_project_files",
+                    "args": {
+                        "project_root": str(backend.parent),
+                        "source_root": str(backend / "mains"),
+                    },
+                    "binding_reason": "grounded runtime layout",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "start_platform_screens",
+                    "args": {
+                        "platform": "demo",
+                        "project_root": str(backend.parent),
+                    },
+                    "binding_reason": "grounded runtime cwd",
+                }
+            ),
+        ]
     )
-    assert plan.steps[-1].args["project_root"] == str(backend.parent)
+    bound = PrivilegedExecutionAgent(binder).prepare_plan(
+        plan,
+        grounded_context=context,
+    )
+    assert bound.grounding["planner_source"] == "llm_agentic_v3"
+    assert [
+        step.execution_binding.args["project_root"]
+        for step in bound.steps
+    ] == [str(backend.parent), str(backend.parent)]
 
 
-def test_deterministic_plan_prepares_parent_runtime_from_nested_mains(tmp_path):
+def test_invalid_planner_output_has_no_deterministic_workflow_fallback(tmp_path):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.environment_facts import (
         EnvironmentFactCollector,
@@ -176,22 +218,14 @@ def test_deterministic_plan_prepares_parent_runtime_from_nested_mains(tmp_path):
             "environment_model": facts.to_dict(),
         },
     )
-    invalid = json.dumps({"steps": []})
-    plan = PrivilegedPlannerAgent(FakeLLM([invalid, invalid])).plan(
-        "部署平台",
-        grounded_context=context,
-    )
+    invalid = json.dumps({"status": "ready", "steps": []})
+    import pytest
 
-    assert [step.action for step in plan.steps] == [
-        "validate_project_files",
-        "prepare_project_files",
-        "start_platform_screens",
-    ]
-    assert plan.steps[1].args == {
-        "project_root": str(backend.parent),
-        "source_root": str(backend / "mains"),
-    }
-    assert plan.steps[2].args["project_root"] == str(backend.parent)
+    with pytest.raises(ValueError, match="valid semantic plan"):
+        PrivilegedPlannerAgent(FakeLLM([invalid, invalid])).plan(
+            "部署平台",
+            grounded_context=context,
+        )
 
 
 def test_validate_and_prepare_actions_support_nested_backend_layout(tmp_path):

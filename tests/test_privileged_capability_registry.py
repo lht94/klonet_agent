@@ -1,42 +1,17 @@
 from __future__ import annotations
 
 
-def test_domain_workflow_registry_covers_platform_lifecycle():
-    from klonet_agent.ops.privileged.workflows import DEFAULT_DOMAIN_WORKFLOWS
+def test_operational_experience_is_a_rag_runbook_not_a_workflow_registry():
+    from pathlib import Path
 
-    expected = {
-        "deploy_platform",
-        "start_platform",
-        "stop_platform",
-        "restart_platform",
-        "restart_component",
-        "configure_platform",
-        "configure_nginx",
-        "verify_platform",
-        "diagnose_platform",
-        "deploy_environment",
-        "upgrade_platform_source",
-        "rollback_platform",
-        "acquire_platform_source",
-        "install_base_environment",
-        "recover_shared_services",
-        "configure_docker_runtime",
-        "recover_runtime_redis",
-        "diagnose_worker_registration",
-        "diagnose_topology_progress",
-        "diagnose_kvm_network",
-        "manage_kvm_runtime",
-        "diagnose_onos",
-        "cleanup_orphan_resources",
-    }
+    root = Path(__file__).resolve().parents[1]
+    runbook = root / "knowledge" / "klonet" / "ops" / "agentic_operations_runbook.md"
+    text = runbook.read_text(encoding="utf-8")
 
-    assert expected <= {spec.name for spec in DEFAULT_DOMAIN_WORKFLOWS.describe()}
-    for name in expected:
-        spec = DEFAULT_DOMAIN_WORKFLOWS.get(name)
-        assert spec is not None
-        assert spec.phases
-        assert spec.required_facts
-        assert spec.success_evidence
+    assert "不定义必须执行的工作流" in text
+    assert "Failure Packet" in text
+    assert "一次性 Shell" in text
+    assert not (root / "ops" / "privileged" / "workflows.py").exists()
 
 
 def test_direct_action_specs_publish_machine_readable_contracts():
@@ -101,21 +76,18 @@ def test_every_direct_privileged_action_has_spec_handler_and_schema():
         assert name in REQUIRED_ACTION_ARGS or not spec.path_args, name
 
 
-def test_every_workflow_preferred_action_is_directly_executable():
-    from klonet_agent.ops.actions import DEFAULT_OPS_ACTION_REGISTRY
-    from klonet_agent.ops.privileged.action_runner import DIRECT_PRIVILEGED_ACTIONS
-    from klonet_agent.ops.privileged.workflows import DEFAULT_DOMAIN_WORKFLOWS
+def test_semantic_planner_does_not_import_action_or_workflow_registry():
+    from pathlib import Path
 
-    for workflow in DEFAULT_DOMAIN_WORKFLOWS.describe():
-        for action in workflow.preferred_actions:
-            assert DEFAULT_OPS_ACTION_REGISTRY.get(action) is not None, (
-                workflow.name,
-                action,
-            )
-            assert action in DIRECT_PRIVILEGED_ACTIONS, (
-                workflow.name,
-                action,
-            )
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "ops"
+        / "privileged"
+        / "planner.py"
+    ).read_text(encoding="utf-8")
+
+    assert "DEFAULT_DOMAIN_WORKFLOWS" not in source
+    assert "configured_ops_action_registry" not in source
 
 
 def test_common_knowledge_domains_have_probe_action_and_checker_coverage():
@@ -184,7 +156,7 @@ def test_ordinary_ops_runner_refuses_privilege_only_actions():
     assert "backend" in result.output
 
 
-def test_grounded_context_exposes_workflows_probes_and_action_contracts(tmp_path):
+def test_grounded_context_exposes_runbook_evidence_probes_and_capability_summary(tmp_path):
     from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
 
     context = PrivilegedPlanContextBuilder(
@@ -195,7 +167,9 @@ def test_grounded_context_exposes_workflows_probes_and_action_contracts(tmp_path
     )
     rendered = context.render()
 
-    assert "workflow=deploy_platform" in rendered
+    assert "可靠 Klonet 部署知识" in rendered
     assert "python_import:" in rendered
-    assert "action=manage_service" in rendered
+    assert "Available execution capability summary" in rendered
+    assert "action=manage_service" not in rendered
+    assert "category=" in rendered
     assert "postconditions=" in rendered

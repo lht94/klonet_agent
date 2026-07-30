@@ -427,6 +427,7 @@ def test_intent_routes_to_document_collection_before_bm25():
         "knowledge/klonet/ops/source_acquisition_git.md",
         "knowledge/klonet/ops/multi_platform_startup.md",
         "knowledge/klonet/ops/startup_shutdown.md",
+        "knowledge/klonet/ops/agentic_operations_runbook.md",
     )
 
     environment_intent = QueryIntent.from_mapping(

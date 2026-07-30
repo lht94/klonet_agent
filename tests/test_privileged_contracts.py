@@ -32,7 +32,7 @@ def test_privileged_plan_round_trips_and_has_stable_content_hash():
 
     assert restored.to_dict() == plan.to_dict()
     assert restored.content_hash == plan.content_hash
-    assert restored.schema_version == 2
+    assert restored.schema_version == 3
 
 
 def test_plan_hash_changes_when_executable_content_changes_and_clears_authorization():

@@ -20,22 +20,24 @@ class FakeLLM:
 
 def _planner_payload(**overrides):
     payload = {
+        "status": "ready",
         "goal": "restart nginx",
         "risk": "low",
+        "assumptions": [],
         "steps": [
             {
                 "step_id": "reload-nginx",
                 "title": "reload nginx",
-                "action": "reload_nginx",
-                "args": {},
-                "timeout": 30,
-                "expected_changes": ["nginx restarts"],
-                "preconditions": [],
-                "postconditions": [
-                    {"checker": "nginx_config_valid", "args": {}},
-                    {"checker": "service_active", "args": {"service": "nginx"}},
+                "objective": "reload nginx with the reviewed configuration",
+                "reason": "the configuration must become active",
+                "evidence_refs": ["systemd available"],
+                "depends_on": [],
+                "expected_effects": ["nginx reloads"],
+                "success_criteria": [
+                    "nginx configuration syntax is valid",
+                    "nginx service is active",
                 ],
-                "rollback": "restore the previous reviewed configuration",
+                "risk_suggestion": "medium",
             }
         ],
     }
@@ -43,7 +45,7 @@ def _planner_payload(**overrides):
     return json.dumps(payload)
 
 
-def test_planner_uses_toolless_isolated_prompt_and_applies_deterministic_risk():
+def test_planner_uses_toolless_prompt_and_emits_semantic_plan_only():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
     llm = FakeLLM([_planner_payload()])
@@ -55,20 +57,19 @@ def test_planner_uses_toolless_isolated_prompt_and_applies_deterministic_risk():
 
     assert len(llm.calls) == 1
     assert llm.calls[0]["tools"] is None
-    assert llm.calls[0]["kwargs"]["extra_body"] == {
-        "thinking": {"type": "disabled"}
-    }
-    assert llm.calls[0]["kwargs"]["reasoning_effort"] == "low"
+    assert llm.calls[0]["kwargs"]["reasoning_effort"] == "high"
     prompt = llm.calls[0]["messages"]
     assert prompt[0]["role"] == "system"
     assert "Planner" in prompt[0]["content"]
     assert "Verifier" not in prompt[0]["content"]
     assert plan.risk == "medium"
-    assert plan.status == "awaiting_confirmation"
+    assert plan.status == "draft"
     assert plan.is_authorized is False
-    assert plan.steps[0].postconditions == [
-        {"checker": "nginx_config_valid", "args": {}},
-        {"checker": "service_active", "args": {"service": "nginx"}},
+    assert plan.steps[0].action == ""
+    assert plan.steps[0].execution_binding is None
+    assert plan.steps[0].success_criteria == [
+        "nginx configuration syntax is valid",
+        "nginx service is active",
     ]
 
 
@@ -80,7 +81,7 @@ def test_planner_allows_model_to_raise_but_not_lower_registry_risk():
     plan = PrivilegedPlannerAgent(llm).plan("restart nginx")
 
     assert plan.risk == "high"
-    assert plan.status == "awaiting_confirmation"
+    assert plan.status == "draft"
     assert plan.steps[0].risk == "medium"
     assert plan.steps[0].approval_scope == "plan"
 
@@ -105,21 +106,24 @@ def test_planner_fails_safe_after_invalid_repair():
     try:
         PrivilegedPlannerAgent(llm).plan("restart nginx")
     except ValueError as exc:
-        assert "valid privileged plan" in str(exc)
+        assert "valid semantic plan" in str(exc)
     else:
         raise AssertionError("planner must fail safe")
 
 
 def test_planner_rejects_oversized_internal_plan_and_requests_compaction():
     oversized = {
+        "status": "ready",
         "goal": "deploy platform",
         "risk": "medium",
         "steps": [
             {
                 "step_id": "step-%s" % index,
                 "title": "检查 %s" % index,
-                "command": "echo %s" % index,
-                "risk": "readonly",
+                "objective": "inspect item %s" % index,
+                "reason": "collect required evidence",
+                "success_criteria": ["item is observed"],
+                "risk_suggestion": "readonly",
             }
             for index in range(9)
         ],
@@ -155,23 +159,22 @@ def test_planner_rejects_hard_denied_command_even_if_model_calls_it_low_risk():
     try:
         PrivilegedPlannerAgent(llm).plan("wipe host")
     except ValueError as exc:
-        assert "action + args" in str(exc)
+        assert "must not choose execution implementation" in str(exc)
     else:
         raise AssertionError("catastrophic command must be denied")
 
 
-def test_complex_nginx_plan_waits_for_confirmation_and_gets_config_health_checks():
+def test_semantic_nginx_plan_keeps_observable_success_criteria():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
     llm = FakeLLM([_planner_payload(goal="deploy nginx config")])
 
     plan = PrivilegedPlannerAgent(llm).plan("deploy nginx config")
 
-    assert plan.status == "awaiting_confirmation"
+    assert plan.status == "draft"
     assert plan.authorized_hash == ""
-    reload_checks = plan.steps[0].postconditions
-    assert {"checker": "nginx_config_valid", "args": {}} in reload_checks
-    assert {"checker": "service_active", "args": {"service": "nginx"}} in reload_checks
+    assert "nginx configuration syntax is valid" in plan.steps[0].success_criteria
+    assert "nginx service is active" in plan.steps[0].success_criteria
 
 
 def _verified_step(return_code=0, timed_out=False, postconditions=None):
@@ -206,7 +209,7 @@ def _plan_with_step(step):
     )
 
 
-def test_verifier_accepts_deterministic_success_without_calling_llm():
+def test_verifier_uses_agent_when_exit_code_is_the_only_evidence():
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
     llm = FakeLLM(
@@ -214,9 +217,12 @@ def test_verifier_accepts_deterministic_success_without_calling_llm():
             json.dumps(
                 {
                     "status": "passed",
-                    "goal_achieved": True,
-                    "reason": "evidence proves service is healthy",
-                    "next_action": "",
+                    "summary": "evidence proves service is healthy",
+                    "confirmed_facts": ["exit code is zero"],
+                    "failed_criteria": [],
+                    "missing_evidence": [],
+                    "reflection": "",
+                    "recommended_next_focus": "",
                 }
             )
         ]
@@ -227,10 +233,10 @@ def test_verifier_accepts_deterministic_success_without_calling_llm():
 
     assert decision.status == "passed"
     assert decision.goal_achieved is True
-    assert llm.calls == []
+    assert len(llm.calls) == 1
 
 
-def test_verifier_does_not_send_intermediate_or_final_goal_to_llm():
+def test_verifier_receives_goal_and_semantic_step_context():
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence, PrivilegedPlan
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
@@ -239,9 +245,12 @@ def test_verifier_does_not_send_intermediate_or_final_goal_to_llm():
             json.dumps(
                 {
                     "status": "passed",
-                    "goal_achieved": True,
-                    "reason": "current user and home directory were identified",
-                    "next_action": "",
+                    "summary": "current user and home directory were identified",
+                    "confirmed_facts": ["current user observed"],
+                    "failed_criteria": [],
+                    "missing_evidence": [],
+                    "reflection": "",
+                    "recommended_next_focus": "",
                 }
             )
         ]
@@ -264,7 +273,8 @@ def test_verifier_does_not_send_intermediate_or_final_goal_to_llm():
     decision = PrivilegedVerifierAgent(llm).verify_step(plan, step)
 
     assert decision.status == "passed"
-    assert llm.calls == []
+    assert len(llm.calls) == 1
+    assert "部署 Klonet 平台" in llm.calls[0]["messages"][1]["content"]
 
 
 def test_verifier_trusts_passed_state_checker_without_calling_llm(tmp_path):
@@ -290,7 +300,7 @@ def test_verifier_trusts_passed_state_checker_without_calling_llm(tmp_path):
     assert llm.calls == []
 
 
-def test_verifier_does_not_allow_llm_to_veto_configured_success():
+def test_verifier_can_mark_exit_code_only_evidence_inconclusive():
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
     llm = FakeLLM(
@@ -298,9 +308,12 @@ def test_verifier_does_not_allow_llm_to_veto_configured_success():
             json.dumps(
                 {
                     "status": "inconclusive",
-                    "goal_achieved": False,
-                    "reason": "exit code alone does not prove the service restarted",
-                    "next_action": "check service state",
+                    "summary": "exit code alone does not prove the service restarted",
+                    "confirmed_facts": ["exit code is zero"],
+                    "failed_criteria": [],
+                    "missing_evidence": ["service state"],
+                    "reflection": "execution success is not state success",
+                    "recommended_next_focus": "check service state",
                 }
             )
         ]
@@ -312,9 +325,9 @@ def test_verifier_does_not_allow_llm_to_veto_configured_success():
         step,
     )
 
-    assert decision.status == "passed"
-    assert decision.goal_achieved is True
-    assert llm.calls == []
+    assert decision.status == "inconclusive"
+    assert decision.goal_achieved is False
+    assert len(llm.calls) == 1
 
 
 def test_verifier_never_allows_llm_passed_to_override_nonzero_exit():

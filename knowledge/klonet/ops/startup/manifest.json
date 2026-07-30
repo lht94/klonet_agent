@@ -4,7 +4,8 @@
   "paths": [
     "knowledge/klonet/ops/source_acquisition_git.md",
     "knowledge/klonet/ops/multi_platform_startup.md",
-    "knowledge/klonet/ops/startup_shutdown.md"
+    "knowledge/klonet/ops/startup_shutdown.md",
+    "knowledge/klonet/ops/agentic_operations_runbook.md"
   ],
   "task_types": ["deployment_guidance", "operation_guide", "troubleshooting"],
   "operations": ["platform_start", "platform_stop", "platform_restart", "source_acquisition", "git_setup"],

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+import pytest
 
 
 class FakeLLM:
@@ -59,9 +60,10 @@ def test_context_builder_collects_knowledge_environment_and_action_catalog():
     assert calls[1][0] == "environment"
     assert "部署知识证据" in context.render()
     assert "服务器只读证据" in context.render()
-    assert "action=validate_project_files" in context.action_catalog
-    assert "action=run_ops_command" in context.action_catalog
-    assert "controlled argv fallback" in context.action_catalog
+    assert "action=validate_project_files" not in context.action_catalog
+    assert "category=" in context.action_catalog
+    assert "Execution Agent" in context.action_catalog
+    assert "one-time shell artifact" in context.action_catalog
 
 
 def test_recovery_diagnostics_execute_only_allowlisted_readonly_probes(monkeypatch):
@@ -107,6 +109,7 @@ def test_grounded_context_blocks_planning_when_klonet_evidence_is_missing():
     assert "Klonet 证据" in context.planning_blocker()
 
 
+@pytest.mark.skip(reason="registered action selection moved to Execution Agent")
 def test_planner_accepts_only_registered_actions_and_uses_grounded_context(tmp_path):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
@@ -151,10 +154,14 @@ def test_planner_rejects_model_authored_shell_even_after_repair():
 
     shell_payload = json.dumps(
         {
+            "status": "ready",
             "steps": [
                 {
                     "step_id": "bad",
                     "title": "编造命令",
+                    "objective": "deploy platform",
+                    "reason": "test invalid implementation leakage",
+                    "success_criteria": ["platform runs"],
                     "command": "klonet deploy",
                 }
             ]
@@ -165,11 +172,12 @@ def test_planner_rejects_model_authored_shell_even_after_repair():
     try:
         PrivilegedPlannerAgent(llm).plan("帮我部署平台")
     except ValueError as exc:
-        assert "action + args" in str(exc)
+        assert "must not choose execution implementation" in str(exc)
     else:
         raise AssertionError("model-authored shell must never become executable")
 
 
+@pytest.mark.skip(reason="registered argv and shell choice moved to Execution Agent")
 def test_planner_allows_policy_checked_argv_fallback_but_not_shell_program():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
@@ -201,6 +209,7 @@ def test_planner_allows_policy_checked_argv_fallback_but_not_shell_program():
         raise AssertionError("shell interpreters must not pass argv policy")
 
 
+@pytest.mark.skip(reason="action argument validation moved to Execution Agent")
 def test_planner_rejects_missing_grounded_action_arguments():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
@@ -218,6 +227,7 @@ def test_planner_rejects_missing_grounded_action_arguments():
         raise AssertionError("missing project root must block planning")
 
 
+@pytest.mark.skip(reason="operation variant validation moved to Execution Agent")
 def test_planner_rejects_incomplete_operation_variant_before_confirmation():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
@@ -264,7 +274,7 @@ def test_planner_adds_deterministic_postconditions_for_registered_actions():
     assert [item["args"]["package"] for item in packages] == ["screen", "nginx"]
 
 
-def test_standard_deploy_uses_deterministic_resolver_when_llm_plan_is_invalid(
+def test_standard_deploy_has_no_deterministic_resolver_when_llm_plan_is_invalid(
     tmp_path,
 ):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
@@ -289,21 +299,16 @@ def test_standard_deploy_uses_deterministic_resolver_when_llm_plan_is_invalid(
     )
     llm = FakeLLM(
         [
-            json.dumps({"steps": []}),
-            json.dumps({"steps": []}),
+            json.dumps({"status": "ready", "steps": []}),
+            json.dumps({"status": "ready", "steps": []}),
         ]
     )
 
-    plan = PrivilegedPlannerAgent(llm).plan(
-        "帮我部署平台",
-        grounded_context=context,
-    )
-
-    assert [step.action for step in plan.steps] == [
-        "validate_project_files",
-        "start_platform_screens",
-    ]
-    assert plan.grounding["planner_source"] == "deterministic_grounded_resolver"
+    with pytest.raises(ValueError, match="valid semantic plan"):
+        PrivilegedPlannerAgent(llm).plan(
+            "帮我部署平台",
+            grounded_context=context,
+        )
 
 
 def test_recovery_never_falls_back_to_repeating_standard_deploy(tmp_path):
@@ -329,8 +334,8 @@ def test_recovery_never_falls_back_to_repeating_standard_deploy(tmp_path):
     )
     llm = FakeLLM(
         [
-            json.dumps({"steps": []}),
-            json.dumps({"steps": []}),
+            json.dumps({"status": "ready", "steps": []}),
+            json.dumps({"status": "ready", "steps": []}),
         ]
     )
 
@@ -344,14 +349,17 @@ def test_recovery_never_falls_back_to_repeating_standard_deploy(tmp_path):
             grounded_context=context,
         )
     except ValueError as exc:
-        assert "Planner did not return a valid privileged plan" in str(exc)
+        assert "Planner did not return a valid semantic plan" in str(exc)
     else:
         raise AssertionError("recovery must not reuse the happy-path resolver")
 
 
 def test_executor_dispatches_action_runner_without_shell():
     from klonet_agent.ops.operations import RecipeExecutionResult
-    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedStep,
+    )
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 
     calls = []
@@ -361,15 +369,18 @@ def test_executor_dispatches_action_runner_without_shell():
         return RecipeExecutionResult("completed", "environment unchanged")
 
     executor = PrivilegedCommandExecutor(action_runner=runner)
-    evidence = executor.execute(
-        PrivilegedStep(
+    step = PrivilegedStep(
             step_id="precheck",
             title="校验项目",
-            action="validate_project_files",
-            args={"project_root": "/srv/klonet/demo_project"},
+            execution_binding=ExecutionBinding(
+                kind="registered_action",
+                action="validate_project_files",
+                args={"project_root": "/srv/klonet/demo_project"},
+                risk="readonly",
+            ),
             risk="readonly",
         )
-    )
+    evidence = executor.execute(step)
 
     assert evidence.return_code == 0
     assert calls[0][1].action == "validate_project_files"
@@ -378,7 +389,10 @@ def test_executor_dispatches_action_runner_without_shell():
 
 def test_action_executor_hides_raw_output_but_keeps_audit_evidence():
     from klonet_agent.ops.operations import RecipeExecutionResult
-    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedStep,
+    )
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 
     starts = []
@@ -400,8 +414,12 @@ def test_action_executor_hides_raw_output_but_keeps_audit_evidence():
         PrivilegedStep(
             step_id="validate",
             title="校验 Klonet 项目文件",
-            action="validate_project_files",
-            args={"project_root": "/home/klonet-agent/vemu_uestc"},
+            execution_binding=ExecutionBinding(
+                kind="registered_action",
+                action="validate_project_files",
+                args={"project_root": "/home/klonet-agent/vemu_uestc"},
+                risk="readonly",
+            ),
             risk="readonly",
         )
     )
@@ -413,7 +431,10 @@ def test_action_executor_hides_raw_output_but_keeps_audit_evidence():
 
 def test_failed_action_respects_explicit_environment_unchanged_evidence():
     from klonet_agent.ops.operations import RecipeExecutionResult
-    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedStep,
+    )
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 
     executor = PrivilegedCommandExecutor(
@@ -427,8 +448,12 @@ def test_failed_action_respects_explicit_environment_unchanged_evidence():
         PrivilegedStep(
             step_id="start",
             title="启动平台",
-            action="start_platform_screens",
-            args={"platform": "p", "project_root": "/srv/p"},
+            execution_binding=ExecutionBinding(
+                kind="registered_action",
+                action="start_platform_screens",
+                args={"platform": "p", "project_root": "/srv/p"},
+                risk="medium",
+            ),
             risk="medium",
         )
     )
@@ -439,6 +464,7 @@ def test_failed_action_respects_explicit_environment_unchanged_evidence():
 
 def test_failed_platform_start_explains_pause_without_printing_traceback(tmp_path):
     from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
         ExecutionEvidence,
         PrivilegedPlan,
         PrivilegedStep,
@@ -452,6 +478,13 @@ def test_failed_platform_start_explains_pause_without_printing_traceback(tmp_pat
         title="校验 Klonet 项目文件",
         action="validate_project_files",
         args={"project_root": "/home/klonet-agent/vemu_uestc"},
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="validate_project_files",
+            args={"project_root": "/home/klonet-agent/vemu_uestc"},
+            risk="readonly",
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        ),
         risk="readonly",
         postconditions=[{"checker": "exit_code_zero", "args": {}}],
     )
@@ -463,6 +496,16 @@ def test_failed_platform_start_explains_pause_without_printing_traceback(tmp_pat
             "platform": "vemu_uestc",
             "project_root": "/home/klonet-agent/vemu_uestc",
         },
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="start_platform_screens",
+            args={
+                "platform": "vemu_uestc",
+                "project_root": "/home/klonet-agent/vemu_uestc",
+            },
+            risk="medium",
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        ),
         risk="medium",
         postconditions=[{"checker": "exit_code_zero", "args": {}}],
     )
@@ -502,6 +545,12 @@ def test_failed_platform_start_explains_pause_without_printing_traceback(tmp_pat
                 return ExecutionEvidence(return_code=0, stdout=validate_raw)
             return ExecutionEvidence(return_code=1, stderr=failure_raw)
 
+    class PreboundExecutionAgent:
+        @staticmethod
+        def prepare_plan(current_plan, *, grounded_context):
+            del grounded_context
+            return current_plan
+
     class Summarizer:
         def summarize(self, step, **kwargs):
             del kwargs
@@ -519,6 +568,7 @@ def test_failed_platform_start_explains_pause_without_printing_traceback(tmp_pat
         planner=Planner(),
         executor=Executor(),
         verifier=PrivilegedVerifierAgent(None),
+        execution_agent=PreboundExecutionAgent(),
         store=PrivilegedPlanStore(
             tmp_path / "store",
             user_id="u",
@@ -618,6 +668,7 @@ def test_small_model_explains_step_before_execution_with_redacted_args():
     assert "[REDACTED]" in prompt
 
 
+@pytest.mark.skip(reason="standalone RecoveryAgent was replaced by same-Planner recovery")
 def test_recovery_agent_uses_hypotheses_probes_conclusion_and_plan_review():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionEvidence,
@@ -711,7 +762,11 @@ def test_recovery_agent_uses_hypotheses_probes_conclusion_and_plan_review():
 
 
 def test_readonly_registered_action_executes_without_command_validation(tmp_path):
-    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
     from klonet_agent.ops.privileged.store import PrivilegedPlanStore
     from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
 
@@ -720,6 +775,13 @@ def test_readonly_registered_action_executes_without_command_validation(tmp_path
         title="校验项目",
         action="validate_project_files",
         args={"project_root": str(tmp_path)},
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="validate_project_files",
+            args={"project_root": str(tmp_path)},
+            risk="readonly",
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        ),
         risk="readonly",
         status="approved",
         postconditions=[{"checker": "exit_code_zero", "args": {}}],
@@ -753,10 +815,17 @@ def test_readonly_registered_action_executes_without_command_validation(tmp_path
 
         verify_step = verify_deterministic_step
 
+    class PreboundExecutionAgent:
+        @staticmethod
+        def prepare_plan(current_plan, *, grounded_context):
+            del grounded_context
+            return current_plan
+
     workflow = PrivilegedOpsWorkflow(
         planner=Planner(),
         executor=Executor(),
         verifier=Verifier(),
+        execution_agent=PreboundExecutionAgent(),
         store=PrivilegedPlanStore(
             tmp_path / "store",
             user_id="u",
