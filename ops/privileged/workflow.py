@@ -14,6 +14,7 @@ from klonet_agent.ops.privileged.contracts import (
     PrivilegedPlan,
     PrivilegedStep,
 )
+from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 from klonet_agent.ops.privileged.planner import PlanningBlocked
 from klonet_agent.ops.privileged.store import PrivilegedPlanStore
@@ -27,6 +28,7 @@ COMMAND_PATTERN = re.compile(
     r"retry-priv|replan-priv)\s+\S+|"
     r"confirm-priv-step\s+\S+\s+\S+)$"
 )
+MAX_INITIAL_BINDING_REPLAN_ATTEMPTS = 2
 
 
 @dataclass
@@ -75,12 +77,42 @@ class PrivilegedOpsWorkflow:
         goal: str,
         *,
         environment_context: str = "",
+        conversation_context: str = "",
+    ) -> WorkflowResult:
+        begin = getattr(self.context_builder, "begin_probe_session", None)
+        end = getattr(self.context_builder, "end_probe_session", None)
+        if begin is not None:
+            begin()
+        try:
+            return self._submit_with_evidence_session(
+                goal,
+                environment_context=environment_context,
+                conversation_context=conversation_context,
+            )
+        finally:
+            if end is not None:
+                end()
+
+    def _submit_with_evidence_session(
+        self,
+        goal: str,
+        *,
+        environment_context: str = "",
+        conversation_context: str = "",
     ) -> WorkflowResult:
         try:
+            context_supplement = environment_context
+            if conversation_context:
+                context_supplement = (
+                    (context_supplement + "\n\n") if context_supplement else ""
+                ) + (
+                    "Recent dialogue for resolving the current request:\n"
+                    + conversation_context
+                )
             grounded_context = (
                 self.context_builder.build(
                     goal,
-                    supplemental_environment_context=environment_context,
+                    supplemental_environment_context=context_supplement,
                 )
                 if self.context_builder is not None
                 else None
@@ -96,12 +128,16 @@ class PrivilegedOpsWorkflow:
             planner_kwargs = {"environment_context": environment_context}
             if grounded_context is not None:
                 planner_kwargs["grounded_context"] = grounded_context
+            if conversation_context:
+                planner_kwargs["conversation_context"] = conversation_context
             plan = self.planner.plan(goal, **planner_kwargs)
             if self.execution_agent is None:
                 raise RuntimeError("Execution Agent is unavailable")
-            plan = self.execution_agent.prepare_plan(
+            plan = self._bind_with_replanning(
+                goal,
                 plan,
                 grounded_context=grounded_context,
+                planner_kwargs=planner_kwargs,
             )
         except PlanningBlocked as exc:
             return WorkflowResult(
@@ -138,6 +174,103 @@ class PrivilegedOpsWorkflow:
             + "\n查看完整计划：show-priv %s" % plan.plan_id,
             plan,
         )
+
+    def _bind_with_replanning(
+        self,
+        goal: str,
+        plan: PrivilegedPlan,
+        *,
+        grounded_context: Any | None,
+        planner_kwargs: dict[str, Any],
+    ) -> PrivilegedPlan:
+        """Return binding failures to the semantic Planner before giving up."""
+
+        failures: list[str] = []
+        for attempt in range(MAX_INITIAL_BINDING_REPLAN_ATTEMPTS + 1):
+            try:
+                return self.execution_agent.prepare_plan(
+                    plan,
+                    grounded_context=grounded_context,
+                )
+            except ExecutionBindingError as exc:
+                failure = redact_sensitive_text(_short_error(exc))
+                failures.append(failure)
+                if not getattr(exc, "replan_recommended", True):
+                    if self.on_progress is not None:
+                        self.on_progress(
+                            "Execute 内部实现合同修复已耗尽；语义目标没有变化，"
+                            "因此不消耗 Planner 重规划次数。"
+                        )
+                    raise ExecutionBindingError(
+                        "Execute 无法形成有效实现合同，未触发无意义的 Planner "
+                        "重规划：%s" % failure,
+                        replan_recommended=False,
+                        category=getattr(
+                            exc,
+                            "category",
+                            "implementation_contract_invalid",
+                        ),
+                    ) from exc
+                if attempt >= MAX_INITIAL_BINDING_REPLAN_ATTEMPTS:
+                    raise ExecutionBindingError(
+                        "执行绑定在 %s 次重新规划后仍失败：%s"
+                        % (
+                            MAX_INITIAL_BINDING_REPLAN_ATTEMPTS,
+                            "；".join(failures),
+                        )
+                    ) from exc
+                if self.on_progress is not None:
+                    self.on_progress(
+                        "执行实现无法安全绑定（第 %s/%s 次）：%s；"
+                        "正在把原因返回 Planner 重新规划…"
+                        % (
+                            attempt + 1,
+                            MAX_INITIAL_BINDING_REPLAN_ATTEMPTS,
+                            failure,
+                        )
+                    )
+                previous_probe_history = list(plan.probe_history)
+                feedback = redact_sensitive_text(
+                    json.dumps(
+                        {
+                            "phase": "execution_binding",
+                            "attempt": attempt + 1,
+                            "binding_error": failure,
+                            "evidence_already_collected": (
+                                _probe_evidence_for_replan(
+                                    previous_probe_history
+                                )
+                            ),
+                            "previous_semantic_steps": [
+                                {
+                                    "step_id": item.step_id,
+                                    "objective": item.objective,
+                                    "reason": item.reason,
+                                    "success_criteria": item.success_criteria,
+                                }
+                                for item in plan.steps
+                            ],
+                            "instruction": (
+                                "Replan the semantic route using the same user goal"
+                                " and evidence. Split or revise steps when that makes"
+                                " them implementable. Treat evidence_already_collected"
+                                " as authoritative and do not request duplicate probes."
+                                " Do not emit actions, commands, or scripts."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                )[:12000]
+                retry_kwargs = dict(planner_kwargs)
+                retry_kwargs["planning_feedback"] = feedback
+                retry_kwargs["prior_probe_history"] = previous_probe_history
+                replacement = self.planner.plan(goal, **retry_kwargs)
+                replacement.probe_history = (
+                    previous_probe_history
+                    + list(replacement.probe_history)
+                )
+                plan = replacement
+        raise AssertionError("unreachable binding replan loop")
 
     def submit_readonly(self, goal: str, command: str) -> WorkflowResult:
         argv, reason = PrivilegedRiskPolicy().readonly_argv(command)
@@ -494,9 +627,11 @@ class PrivilegedOpsWorkflow:
         replacement = self.planner.plan(plan.goal, **planner_kwargs)
         if self.execution_agent is None:
             raise RuntimeError("Execution Agent is unavailable")
-        replacement = self.execution_agent.prepare_plan(
+        replacement = self._bind_with_replanning(
+            plan.goal,
             replacement,
             grounded_context=planner_kwargs.get("grounded_context"),
+            planner_kwargs=planner_kwargs,
         )
         plan.risk = replacement.risk
         plan.verification_level = replacement.verification_level
@@ -611,6 +746,7 @@ class PrivilegedOpsWorkflow:
                     plan,
                 )
             if step.approval_scope == "step" and step.status != "approved":
+                step.status = "awaiting_confirmation"
                 plan.status = "awaiting_confirmation"
                 if persist:
                     self.store.save(plan)
@@ -906,14 +1042,19 @@ class PrivilegedOpsWorkflow:
             blocker = grounded_context.planning_blocker()
             if blocker:
                 raise RecoveryPlanUnavailable(blocker)
+            recovery_planner_kwargs = {
+                "environment_context": planner_evidence,
+                "grounded_context": grounded_context,
+            }
             replacement = self.planner.plan(
                 recovery_goal,
-                environment_context=planner_evidence,
-                grounded_context=grounded_context,
+                **recovery_planner_kwargs,
             )
-            replacement = self.execution_agent.prepare_plan(
+            replacement = self._bind_with_replanning(
+                recovery_goal,
                 replacement,
                 grounded_context=grounded_context,
+                planner_kwargs=recovery_planner_kwargs,
             )
             if _semantic_plan_signature(replacement.steps) == previous_signature:
                 raise RecoveryPlanUnavailable(
@@ -1461,6 +1602,30 @@ def _short_error(exc: Exception) -> str:
         " ".join(str(exc or exc.__class__.__name__).split())
     )
     return message[:180] or exc.__class__.__name__
+
+
+def _probe_evidence_for_replan(
+    history: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep a bounded, redacted ledger so replans do not rediscover facts."""
+
+    ledger = []
+    for item in history[-8:]:
+        if not isinstance(item, dict):
+            continue
+        requests = item.get("requests")
+        ledger.append(
+            {
+                "phase": str(item.get("phase") or "semantic_planning"),
+                "round": item.get("round"),
+                "step_id": str(item.get("step_id") or ""),
+                "requests": requests if isinstance(requests, list) else [],
+                "evidence": redact_sensitive_text(
+                    str(item.get("evidence") or "")
+                )[:1000],
+            }
+        )
+    return ledger
 
 
 def _append_observation(current: str, message: str) -> str:

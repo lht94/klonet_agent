@@ -23,6 +23,7 @@ from klonet_agent.ops.privileged.environment_facts import (
     UnifiedEnvironmentFacts,
 )
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+from klonet_agent.ops.privileged.planner_schema import normalize_semantic_risk
 from klonet_agent.tools.environment import (
     inspect_install_scripts,
     inspect_klonet_runtime,
@@ -113,6 +114,7 @@ class PrivilegedPlanContextBuilder:
         environment_inspector: Callable[[dict], str] | None = None,
         fact_collector: EnvironmentFactCollector | None = None,
         action_registry: OpsActionRegistry | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> None:
         self.knowledge_search = knowledge_search or KNOWLEDGE_BASE.search_knowledge
         self.environment_inspector = (
@@ -120,6 +122,16 @@ class PrivilegedPlanContextBuilder:
         )
         self.fact_collector = fact_collector or EnvironmentFactCollector()
         self.action_registry = action_registry or configured_ops_action_registry()
+        self.on_progress = on_progress
+        self._probe_cache: dict[str, str] | None = None
+
+    def begin_probe_session(self) -> None:
+        """Cache identical read-only probes only within one planning submission."""
+
+        self._probe_cache = {}
+
+    def end_probe_session(self) -> None:
+        self._probe_cache = None
 
     def build(
         self,
@@ -135,16 +147,20 @@ class PrivilegedPlanContextBuilder:
                 "\n\nCurrent read-only/failure evidence:\n"
                 + _bounded(supplemental_environment_context, 6000)
             )
+        self._progress("证据节点 1/3：正在检索 Klonet 知识库…")
         try:
             knowledge = self.knowledge_search(
                 knowledge_query,
                 top_k=6,
                 task_type=_knowledge_task_type(goal),
             )
+            self._progress("关键证据：Klonet 知识检索完成。")
         except Exception as exc:
             knowledge_status = "unavailable"
             knowledge = "Klonet knowledge retrieval unavailable: %s" % _one_line(exc)
+            self._progress("关键证据：Klonet 知识检索不可用。")
 
+        self._progress("证据节点 2/3：正在识别工程布局和服务配置…")
         project_roots = self._candidate_project_roots()
         environment_facts: UnifiedEnvironmentFacts
         try:
@@ -153,13 +169,17 @@ class PrivilegedPlanContextBuilder:
             environment_facts = UnifiedEnvironmentFacts(
                 warnings=("structured_environment_collection_unavailable",)
             )
+        self._progress(_environment_fact_progress(environment_facts))
+        self._progress("证据节点 3/3：正在执行服务器只读状态检查…")
         try:
             environment = self.environment_inspector(
                 {"project_roots": project_roots}
             )
+            self._progress("关键证据：服务器只读状态检查完成。")
         except Exception as exc:
             environment_status = "unavailable"
             environment = "Read-only environment inspection unavailable: %s" % _one_line(exc)
+            self._progress("关键证据：服务器只读状态检查不可用。")
         if supplemental_environment_context:
             environment += (
                 "\n\n## Supplemental caller evidence\n"
@@ -179,6 +199,10 @@ class PrivilegedPlanContextBuilder:
             },
         )
 
+    def _progress(self, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(message)
+
     def _action_catalog(self) -> str:
         lines = [
             "An independent Execution Agent may use registered capabilities or"
@@ -192,7 +216,7 @@ class PrivilegedPlanContextBuilder:
                 continue
             parts = [
                 f"- category={spec.category}",
-                f"risk={spec.risk}",
+                "risk=%s" % normalize_semantic_risk(spec.risk, "medium"),
                 f"description={spec.description or spec.category}",
             ]
             if spec.preconditions:
@@ -234,6 +258,15 @@ class PrivilegedPlanContextBuilder:
                     % (index, name or "missing")
                 )
                 continue
+            self._progress(
+                "只读补证 %s/%s：正在检查 %s%s…"
+                % (
+                    index,
+                    min(len(requests), 8),
+                    name,
+                    "（%s）" % purpose if purpose else "",
+                )
+            )
             path_problem = _recovery_probe_path_problem(name, args, roots)
             if path_problem:
                 sections.append(
@@ -241,16 +274,29 @@ class PrivilegedPlanContextBuilder:
                     % (index, name, path_problem)
                 )
                 continue
-            try:
-                result = probe(args)
-            except Exception as exc:
-                result = "probe unavailable: %s" % _one_line(exc)
+            cache_key = json.dumps(
+                {"probe": name, "args": args},
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if self._probe_cache is not None and cache_key in self._probe_cache:
+                result = self._probe_cache[cache_key]
+                self._progress("关键证据：复用本次规划中已取得的 %s 检查结果。" % name)
+            else:
+                try:
+                    result = probe(args)
+                except Exception as exc:
+                    result = "probe unavailable: %s" % _one_line(exc)
+                if self._probe_cache is not None:
+                    self._probe_cache[cache_key] = str(result)
             sections.append(
                 "## recovery_probe_%s name=%s purpose=%s\n%s"
                 % (index, name, purpose or "补充失败诊断证据", _bounded(result, 7000))
             )
         if not sections:
             return "No adaptive recovery probes were requested."
+        self._progress("关键证据：本轮只读补证完成。")
         return "\n\n".join(sections)
 
     @staticmethod
@@ -322,6 +368,43 @@ def _knowledge_task_type(goal: str) -> str:
         "troubleshooting"
         if any(marker in lowered for marker in recovery_markers)
         else "deployment"
+    )
+
+
+def _environment_fact_progress(facts: UnifiedEnvironmentFacts) -> str:
+    """Render a concise, secret-free evidence summary for interactive progress."""
+
+    projects = []
+    for item in facts.projects[:6]:
+        name = Path(item.backend_package_root).name or Path(item.platform_root).name
+        projects.append("%s:%s" % (name, item.readiness))
+    services = []
+    for label, ports in (
+        ("Redis", facts.redis.ports),
+        ("MySQL", facts.mysql.ports),
+        ("RabbitMQ", facts.rabbitmq.ports),
+    ):
+        if ports:
+            services.append("%s=%s" % (label, ",".join(str(port) for port in ports)))
+    capabilities = [
+        name
+        for name, available in (
+            ("nginx", bool(facts.nginx.binary)),
+            ("docker", bool(facts.capabilities.docker_binary)),
+            ("libvirt", bool(facts.capabilities.libvirt_binary)),
+            ("ovs", bool(facts.capabilities.ovs_binary)),
+            ("screen", bool(facts.capabilities.screen_binary)),
+            ("kvm", facts.capabilities.kvm_device_present),
+        )
+        if available
+    ]
+    return (
+        "关键证据：工程布局=%s；服务端口=%s；可用组件=%s。"
+        % (
+            "、".join(projects) if projects else "未识别",
+            "、".join(services) if services else "未识别",
+            "、".join(capabilities) if capabilities else "未识别",
+        )
     )
 
 

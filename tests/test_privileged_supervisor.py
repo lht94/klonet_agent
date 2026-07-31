@@ -179,10 +179,17 @@ class StubWorkflow:
         self.readonly.append((goal, command))
         return WorkflowResult("completed", "readonly completed")
 
-    def submit(self, goal, environment_context=""):
+    def submit(
+        self,
+        goal,
+        environment_context="",
+        conversation_context="",
+    ):
         from klonet_agent.ops.privileged.workflow import WorkflowResult
 
-        self.mutations.append((goal, environment_context))
+        self.mutations.append(
+            (goal, environment_context, conversation_context)
+        )
         return WorkflowResult("awaiting_confirmation", "confirm plan")
 
 
@@ -218,6 +225,19 @@ def _supervisor(intent="conversation", command="", **decision_kwargs):
         workflow,
         classifier,
     )
+
+
+
+
+def test_supervisor_strips_bom_before_control_command_routing():
+    supervisor, workflow, classifier = _supervisor()
+
+    result = supervisor.handle("\ufeffshow-priv priv-123")
+
+    assert result.handled is True
+    assert result.kind == "show"
+    assert workflow.commands == ["show-priv priv-123"]
+    assert classifier.calls == []
 
 
 def test_supervisor_handles_exact_plan_control_before_classifier():
@@ -293,6 +313,26 @@ def test_supervisor_routes_mutating_action_to_existing_pev():
     assert workflow.mutations
     assert workflow.mutations[0][0] == "帮我部署平台"
     assert "read-only inspection" in workflow.mutations[0][1]
+
+
+def test_supervisor_passes_recent_conversation_to_privileged_planning():
+    supervisor, workflow, classifier = _supervisor(
+        "mutating_action",
+        goal_clarity="discoverable",
+    )
+    dialogue = (
+        "user: 新增一个 Klonet 平台实例\n"
+        "assistant: 请提供实例名"
+    )
+
+    result = supervisor.handle_with_context(
+        "叫 lht 吧",
+        conversation_context=dialogue,
+    )
+
+    assert result.kind == "awaiting_confirmation"
+    assert classifier.calls == [("叫 lht 吧", dialogue)]
+    assert workflow.mutations[0][2] == dialogue
 
 
 def test_supervisor_reports_analysis_and_planning_progress_for_mutation():

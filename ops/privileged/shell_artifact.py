@@ -83,6 +83,13 @@ class ShellArtifactPolicy:
         script = str(artifact.script or "")
         if not script.strip():
             return "shell_artifact_empty"
+        executable_lines = [
+            line.strip()
+            for line in script.splitlines()
+            if line.strip() and line.strip() != "set -euo pipefail"
+        ]
+        if not executable_lines:
+            return "shell_artifact_empty"
         if len(script.encode("utf-8")) > MAX_SCRIPT_BYTES:
             return "shell_artifact_too_large"
         if len(script.splitlines()) > MAX_SCRIPT_LINES:

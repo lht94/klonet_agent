@@ -8,6 +8,7 @@ execution and local filesystem operations.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -32,6 +33,7 @@ from klonet_agent.ops.actions import (
 from klonet_agent.ops.command_policy import command_exists, decide_ops_command
 from klonet_agent.ops.privileged.contracts import PrivilegedStep
 from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+from klonet_agent.ops.privileged.planner_schema import normalize_process_signal
 
 
 DIRECT_PRIVILEGED_ACTIONS = frozenset(
@@ -59,6 +61,7 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "remove_path",
         "manage_service",
         "manage_process",
+        "stop_klonet_runtime_instance",
         "manage_container",
         "install_system_packages",
         "install_python_packages",
@@ -69,6 +72,8 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "sync_directory",
         "merge_json_file",
         "start_redis_instance",
+        "ensure_klonet_redis_instance",
+        "repair_klonet_active_master_ip",
         "run_reviewed_script",
         "manage_libvirt_domain",
         "manage_docker_network",
@@ -441,18 +446,66 @@ class DirectPrivilegedActionRunner:
             component: "%s_%s" % (platform, _COMPONENT_SUFFIX[component])
             for component in _COMPONENTS
         }
-        conflicts = [
-            session for session in sessions.values() if session in existing
-        ]
-        if conflicts:
-            return self._blocked(
-                "screen_session_already_exists=%s" % ",".join(conflicts)
-            )
         configured_ports = _configured_runtime_ports(root)
         if not configured_ports:
             return self._blocked(
                 "runtime_ports_not_found_in_active_config"
             )
+        if all(session in existing for session in sessions.values()):
+            unhealthy = _runtime_ports_with_wrong_cwd(configured_ports, root)
+            if not unhealthy:
+                return DirectActionResult(
+                    "completed",
+                    (
+                        "action=start_platform_screens platform=%s project_root=%s "
+                        "already_running=true screen_sessions=%s environment_changed=false"
+                    )
+                    % (platform, root, ",".join(sessions.values())),
+                )
+        conflicts = [
+            session for session in sessions.values() if session in existing
+        ]
+        stopped_existing = []
+        for session in conflicts:
+            targets = self._screen_session_targets(session)
+            for target in targets or [session]:
+                self._command(["screen", "-S", target, "-X", "quit"], timeout=20)
+            stopped_existing.extend(targets or [session])
+        if stopped_existing and not _wait_screen_sessions_absent(
+            self, stopped_existing, timeout=8.0
+        ):
+            return self._blocked(
+                "screen_session_still_exists=%s" % ",".join(stopped_existing)
+            )
+        restart_authorized = _truthy(step.args.get("allow_stale_runtime_cleanup"))
+        if stopped_existing or (
+            restart_authorized
+            and not all(session in existing for session in sessions.values())
+            and _runtime_ports_owned_by_allowed_cwd(configured_ports, root)
+        ):
+            stop_result = _stop_target_runtime_after_screen_stop(
+                self, root, configured_ports, timeout=min(step.timeout, 60)
+            )
+            if stop_result.status != "completed":
+                return stop_result
+            if not _wait_allowed_runtime_ports_released(
+                root, configured_ports, timeout=20.0
+            ):
+                return self._blocked(
+                    "runtime_ports_still_owned_by_target_after_screen_stop"
+                )
+        cleaned_stale = []
+        if restart_authorized:
+            cleanup = _cleanup_stale_runtime_owners(
+                self, root, configured_ports, timeout=min(step.timeout, 45)
+            )
+            if cleanup.status != "completed":
+                return cleanup
+            cleaned_text = cleanup.output.split("=", 1)[1] if "=" in cleanup.output else ""
+            cleaned_stale = [
+                item for item in cleaned_text.split(",")
+                if item and item != "none"
+            ]
         ss = shutil.which("ss")
         if ss:
             listeners = self._command(
@@ -468,6 +521,7 @@ class DirectPrivilegedActionRunner:
                     "runtime_port_already_listening=%s"
                     % ",".join(str(port) for port in occupied)
                 )
+        runtime_env = _runtime_python_env(root)
         preflight = {
             "master": [
                 python, "-m", "gunicorn", "--check-config",
@@ -484,6 +538,7 @@ class DirectPrivilegedActionRunner:
             result = self._command(
                 preflight[component],
                 cwd=root,
+                env=runtime_env,
                 timeout=min(step.timeout, 30),
             )
             if result.returncode != 0:
@@ -500,10 +555,36 @@ class DirectPrivilegedActionRunner:
                     ),
                     "inspect_project_layout",
                 )
+        if restart_authorized:
+            cleanup = _cleanup_stale_runtime_owners(
+                self, root, configured_ports, timeout=min(step.timeout, 45)
+            )
+            if cleanup.status != "completed":
+                return cleanup
+            cleaned_text = cleanup.output.split("=", 1)[1] if "=" in cleanup.output else ""
+            cleaned_stale.extend(
+                item for item in cleaned_text.split(",")
+                if item and item != "none" and item not in cleaned_stale
+            )
+            if ss:
+                listeners = self._command(
+                    [ss, "-ltn"],
+                    timeout=min(step.timeout, 20),
+                )
+                occupied = _listening_ports(
+                    "%s\n%s" % (listeners.stdout or "", listeners.stderr or ""),
+                    configured_ports,
+                )
+                if occupied:
+                    return self._blocked(
+                        "runtime_port_already_listening=%s"
+                        % ",".join(str(port) for port in occupied)
+                    )
         commands = _component_commands(python)
         started = []
         for component in _COMPONENTS:
-            shell_command = "cd %s && exec %s" % (
+            shell_command = "export PYTHONPATH=%s${PYTHONPATH:+:$PYTHONPATH}; cd %s && exec %s" % (
+                shlex.quote(_runtime_pythonpath(root)),
                 shlex.quote(str(root)),
                 shlex.join(commands[component]),
             )
@@ -517,6 +598,7 @@ class DirectPrivilegedActionRunner:
                     shell_command,
                 ],
                 cwd=root,
+                env=runtime_env,
                 timeout=min(step.timeout, 30),
             )
             if result.returncode != 0:
@@ -535,13 +617,38 @@ class DirectPrivilegedActionRunner:
                     "inspect_runtime",
                 )
             started.append(sessions[component])
+        unhealthy = _wait_platform_runtime_ready(
+            self,
+            root,
+            sessions.values(),
+            configured_ports,
+            timeout=30.0,
+        )
+        if unhealthy:
+            return DirectActionResult(
+                "failed",
+                (
+                    "platform_postcondition_failed reason=%s "
+                    "project_root=%s started=%s environment_changed=unknown"
+                )
+                % (unhealthy, root, ",".join(started)),
+                "inspect_runtime",
+            )
         return DirectActionResult(
             "completed",
             (
                 "action=start_platform_screens platform=%s project_root=%s "
-                "python=%s screen_sessions=%s environment_changed=true"
+                "python=%s screen_sessions=%s stopped_existing=%s "
+                "cleaned_stale=%s environment_changed=true"
             )
-            % (platform, root, python, ",".join(started)),
+            % (
+                platform,
+                root,
+                python,
+                ",".join(started),
+                ",".join(stopped_existing) or "none",
+                ",".join(cleaned_stale) or "none",
+            ),
         )
 
     def _action_restart_screen_component(
@@ -560,7 +667,8 @@ class DirectPrivilegedActionRunner:
             return self._blocked(
                 "screen_session_mismatch expected=%s" % expected
             )
-        self._command(["screen", "-S", session, "-X", "quit"], timeout=20)
+        for target in self._screen_session_targets(session) or [session]:
+            self._command(["screen", "-S", target, "-X", "quit"], timeout=20)
         return self._start_one_component(
             component, session, root, step
         )
@@ -572,21 +680,32 @@ class DirectPrivilegedActionRunner:
         session = str(step.args.get("screen_session") or "").strip()
         if not _safe_token(session):
             return self._blocked("invalid_screen_session")
-        result = self._command(
-            ["screen", "-S", session, "-X", "quit"],
-            timeout=min(step.timeout, 30),
-        )
-        if result.returncode != 0:
+        targets = self._screen_session_targets(session)
+        if not targets:
+            return DirectActionResult(
+                "completed",
+                "action=stop_screen_component session=%s already_stopped=true environment_changed=false"
+                % session,
+            )
+        failed = []
+        for target in targets:
+            result = self._command(
+                ["screen", "-S", target, "-X", "quit"],
+                timeout=min(step.timeout, 30),
+            )
+            if result.returncode != 0:
+                failed.append("%s:%s" % (target, _one_line(result.stderr)))
+        if failed:
             return DirectActionResult(
                 "failed",
                 "screen_stop_failed session=%s stderr=%s environment_changed=unknown"
-                % (session, _one_line(result.stderr)),
+                % (session, ";".join(failed)),
                 "inspect_runtime",
             )
         return DirectActionResult(
             "completed",
-            "action=stop_screen_component session=%s environment_changed=true"
-            % session,
+            "action=stop_screen_component session=%s targets=%s environment_changed=true"
+            % (session, ",".join(targets)),
         )
 
     def _action_stop_platform_screens(
@@ -599,14 +718,18 @@ class DirectPrivilegedActionRunner:
         stopped = []
         for component in _COMPONENTS:
             session = "%s_%s" % (platform, _COMPONENT_SUFFIX[component])
-            result = self._command(
-                ["screen", "-S", session, "-X", "quit"],
-                timeout=min(step.timeout, 30),
-            )
-            if result.returncode == 0:
-                stopped.append(session)
+            for target in self._screen_session_targets(session):
+                result = self._command(
+                    ["screen", "-S", target, "-X", "quit"],
+                    timeout=min(step.timeout, 30),
+                )
+                if result.returncode == 0:
+                    stopped.append(target)
         if not stopped:
-            return self._blocked("platform_screen_sessions_not_found")
+            return DirectActionResult(
+                "completed",
+                "action=stop_platform_screens stopped=none environment_changed=false",
+            )
         return DirectActionResult(
             "completed",
             "action=stop_platform_screens stopped=%s environment_changed=true"
@@ -1063,7 +1186,7 @@ class DirectPrivilegedActionRunner:
             pid = int(step.args.get("pid"))
         except (TypeError, ValueError):
             return self._blocked("invalid_pid")
-        signal_name = str(step.args.get("signal") or "").upper()
+        signal_name = normalize_process_signal(step.args.get("signal"))
         if pid <= 1 or signal_name not in {"TERM", "KILL", "HUP", "INT"}:
             return self._blocked("pid_or_signal_not_allowed")
         expected = str(step.args.get("expected_command") or "").strip()
@@ -1072,8 +1195,18 @@ class DirectPrivilegedActionRunner:
             return self._blocked("pid_not_found")
         if expected and expected not in cmdline:
             return self._blocked("pid_identity_mismatch")
+        scope = str(step.args.get("scope") or "pid").strip().lower()
+        if scope in {"process_group", "pgid"}:
+            pgid = _process_group_id(step.args.get("pgid"), pid)
+            if pgid is None or pgid <= 1:
+                return self._blocked("process_group_not_allowed")
+            kill_target = "-%s" % pgid
+        elif scope == "pid":
+            kill_target = str(pid)
+        else:
+            return self._blocked("process_scope_not_allowed")
         result = self._command(
-            _sudo_if_needed(["kill", "-%s" % signal_name, str(pid)]),
+            _kill_argv_for_owner_pid(pid, signal_name, kill_target),
             timeout=min(step.timeout, 30),
         )
         if result.returncode != 0:
@@ -1087,6 +1220,89 @@ class DirectPrivilegedActionRunner:
             "completed",
             "action=manage_process pid=%s signal=%s observed_command=%s environment_changed=true"
             % (pid, signal_name, _one_line(cmdline, 300)),
+        )
+
+    def _action_stop_klonet_runtime_instance(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        runtime_cwd = _absolute_path(step.args.get("runtime_cwd"))
+        if runtime_cwd is None or _protected_target(runtime_cwd):
+            return self._blocked("invalid_runtime_cwd")
+        if runtime_cwd.name == "mains" and (runtime_cwd.parent / "vemu_config").is_dir():
+            runtime_cwd = runtime_cwd.parent.resolve()
+        if runtime_cwd.name != "vemu_uestc" or not (runtime_cwd / "vemu_config").is_dir():
+            return self._blocked("runtime_cwd_not_klonet_backend")
+        ports = _port_arg_list(step.args.get("ports"))
+        if not ports:
+            return self._blocked("invalid_runtime_ports")
+        processes = _klonet_runtime_processes(runtime_cwd)
+        if not processes:
+            if _ports_currently_listening(self, ports):
+                return self._blocked("runtime_ports_owned_by_unmatched_process")
+            return DirectActionResult(
+                "completed",
+                "action=stop_klonet_runtime_instance runtime_cwd=%s already_stopped=true environment_changed=false"
+                % runtime_cwd,
+            )
+        term_groups = _runtime_process_groups(processes)
+        for group in term_groups:
+            result = self._command(
+                _kill_argv_for_owner_pid(group["owner_pid"], "TERM", "-%s" % group["pgid"]),
+                timeout=min(step.timeout, 30),
+            )
+            if result.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "stop_runtime_term_failed pgid=%s stderr=%s environment_changed=unknown"
+                    % (group["pgid"], _one_line(result.stderr)),
+                    "inspect_process",
+                )
+        stability_seconds = _positive_float(step.args.get("stability_seconds"), default=3.0, maximum=10.0)
+        if _runtime_stopped_stably(self, runtime_cwd, ports, timeout=8.0, stable_for=stability_seconds):
+            return DirectActionResult(
+                "completed",
+                "action=stop_klonet_runtime_instance runtime_cwd=%s signal=TERM pgids=%s ports=%s environment_changed=true"
+                % (
+                    runtime_cwd,
+                    ",".join(str(group["pgid"]) for group in term_groups),
+                    ",".join(str(port) for port in ports),
+                ),
+            )
+        remaining = _klonet_runtime_processes(runtime_cwd)
+        kill_groups = _runtime_process_groups(remaining)
+        for group in kill_groups:
+            result = self._command(
+                _kill_argv_for_owner_pid(group["owner_pid"], "KILL", "-%s" % group["pgid"]),
+                timeout=min(step.timeout, 30),
+            )
+            if result.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "stop_runtime_kill_failed pgid=%s stderr=%s environment_changed=unknown"
+                    % (group["pgid"], _one_line(result.stderr)),
+                    "inspect_process",
+                )
+        if not _runtime_stopped_stably(self, runtime_cwd, ports, timeout=8.0, stable_for=stability_seconds):
+            occupied = _ports_currently_listening(self, ports)
+            return DirectActionResult(
+                "failed",
+                "runtime_not_stopped_stably remaining_pids=%s runtime_ports_still_listening=%s environment_changed=true"
+                % (
+                    ",".join(str(proc["pid"]) for proc in _klonet_runtime_processes(runtime_cwd)) or "none",
+                    ",".join(str(port) for port in occupied) or "none",
+                ),
+                "inspect_process",
+            )
+        all_groups = term_groups + [group for group in kill_groups if group not in term_groups]
+        return DirectActionResult(
+            "completed",
+            "action=stop_klonet_runtime_instance runtime_cwd=%s signal=TERM,KILL pgids=%s ports=%s environment_changed=true"
+            % (
+                runtime_cwd,
+                ",".join(str(group["pgid"]) for group in all_groups),
+                ",".join(str(port) for port in ports),
+            ),
         )
 
     def _action_manage_container(
@@ -1520,7 +1736,7 @@ class DirectPrivilegedActionRunner:
                 % (expected_port, _one_line(result.stderr, 3000)),
                 "inspect_redis",
             )
-        if not _tcp_listening("127.0.0.1", expected_port, timeout=2.0):
+        if not _wait_tcp_listening("127.0.0.1", expected_port, timeout=8.0):
             return DirectActionResult(
                 "failed",
                 "redis_postcondition_failed port=%s environment_changed=unknown"
@@ -1531,6 +1747,99 @@ class DirectPrivilegedActionRunner:
             "completed",
             "action=start_redis_instance port=%s config=%s environment_changed=true"
             % (expected_port, config),
+        )
+
+    def _action_repair_klonet_active_master_ip(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        root = _absolute_path(step.args.get("project_root"))
+        if root is None or _protected_target(root):
+            return self._blocked("invalid_project_root")
+        config = root / "vemu_uestc" / "vemu_config" / "config.py"
+        if not config.is_file():
+            return self._blocked("klonet_config_not_found")
+        local_ip = str(step.args.get("local_ip") or "").strip() or _local_primary_ipv4()
+        if not _safe_ipv4(local_ip):
+            return self._blocked("local_ip_not_found")
+        try:
+            current = config.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return self._blocked("klonet_config_unreadable")
+        active = _active_config_class(current)
+        if not active:
+            return self._blocked("active_config_not_found")
+        updated, previous = _replace_class_assignment(current, active, "master_ip", local_ip)
+        if updated == current:
+            return DirectActionResult(
+                "completed",
+                "action=repair_klonet_active_master_ip active=%s master_ip=%s already_current=true environment_changed=false" % (active, local_ip),
+            )
+        backup = config.with_name(config.name + ".bak.%s" % int(time.time()))
+        try:
+            shutil.copy2(config, backup)
+            config.write_text(updated, encoding="utf-8")
+        except OSError as exc:
+            return DirectActionResult(
+                "failed",
+                "config_update_failed path=%s error=%s environment_changed=unknown" % (config, _one_line(exc)),
+                "inspect_config",
+            )
+        return DirectActionResult(
+            "completed",
+            "action=repair_klonet_active_master_ip active=%s previous=%s current=%s backup=%s environment_changed=true" % (active, previous or "unknown", local_ip, backup),
+        )
+
+    def _action_ensure_klonet_redis_instance(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        root = _absolute_path(step.args.get("project_root"))
+        if root is None or _protected_target(root):
+            return self._blocked("invalid_project_root")
+        config = root / "vemu_uestc" / "vemu_config" / "config.py"
+        if not config.is_file():
+            return self._blocked("klonet_config_not_found")
+        settings = _klonet_redis_settings(config)
+        if not settings:
+            return self._blocked("klonet_redis_settings_not_found")
+        port = int(settings["port"])
+        password = str(settings.get("password") or "")
+        if not 1 <= port <= 65535 or not password:
+            return self._blocked("invalid_klonet_redis_settings")
+        if _tcp_listening("127.0.0.1", port):
+            return DirectActionResult(
+                "completed",
+                "action=ensure_klonet_redis_instance port=%s already_listening=true environment_changed=false" % port,
+            )
+        binary = _redis_server_binary()
+        if not binary:
+            return self._blocked("redis_server_not_found")
+        runtime_dir = root / ".klonet_runtime"
+        runtime_dir.mkdir(mode=0o700, exist_ok=True)
+        redis_config = runtime_dir / ("redis-%s.conf" % port)
+        redis_config.write_text(
+            "bind 0.0.0.0\nprotected-mode no\nport %s\nrequirepass %s\ndir %s\ndaemonize yes\npidfile %s\nlogfile %s\n"
+            % (port, password, runtime_dir, runtime_dir / ("redis-%s.pid" % port), runtime_dir / ("redis-%s.log" % port)),
+            encoding="utf-8",
+        )
+        redis_config.chmod(0o600)
+        result = self._command([binary, str(redis_config)], cwd=runtime_dir, timeout=step.timeout)
+        if result.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "redis_start_failed port=%s stderr=%s environment_changed=unknown" % (port, _one_line(result.stderr, 3000)),
+                "inspect_redis",
+            )
+        if not _wait_tcp_listening("127.0.0.1", port, timeout=8.0):
+            return DirectActionResult(
+                "failed",
+                "redis_postcondition_failed port=%s environment_changed=unknown" % port,
+                "inspect_redis",
+            )
+        return DirectActionResult(
+            "completed",
+            "action=ensure_klonet_redis_instance port=%s config=%s environment_changed=true" % (port, redis_config),
         )
 
     def _action_run_reviewed_script(
@@ -1854,16 +2163,38 @@ class DirectPrivilegedActionRunner:
             % (component, session),
         )
 
-    def _existing_screen_sessions(self) -> set[str]:
+    def _screen_ls_text(self) -> str:
         result = self._command(["screen", "-ls"], timeout=15)
-        text = "%s\n%s" % (result.stdout or "", result.stderr or "")
-        return set(
-            match.group(1)
-            for match in re.finditer(
-                r"(?:^|\s|\.)([A-Za-z0-9_.:-]+)(?:\s|$)",
-                text,
-            )
+        return "%s\n%s" % (result.stdout or "", result.stderr or "")
+
+    def _screen_session_targets(self, session: str) -> list[str]:
+        targets = []
+        pattern = re.compile(
+            r"(?:^|\s)(\d+\.%s)(?:\s|$)" % re.escape(session)
         )
+        for match in pattern.finditer(self._screen_ls_text()):
+            target = match.group(1)
+            if target not in targets:
+                targets.append(target)
+        if not targets and session in self._existing_screen_sessions():
+            targets.append(session)
+        return targets
+
+    def _existing_screen_sessions(self) -> set[str]:
+        text = self._screen_ls_text()
+        sessions = set()
+        for match in re.finditer(
+            r"(?:^|\s)(?:\d+\.)?([A-Za-z0-9_.:-]+)(?:\s|$)",
+            text,
+        ):
+            value = match.group(1)
+            if value not in {
+                "There", "No", "Socket", "Sockets", "screens",
+                "on", "in", "Detached", "Use", "to", "specify",
+                "a", "session",
+            }:
+                sessions.add(value)
+        return sessions
 
     def _write_file(
         self,
@@ -1982,6 +2313,14 @@ def _platform_root(
         return platform, root, problem
     if not _safe_token(platform):
         return platform, root, "invalid_platform"
+    backend = root / platform
+    if (backend / "vemu_config").is_dir():
+        mains = backend / "mains"
+        if all((mains / name).is_file() for name in REQUIRED_ENTRY_FILES):
+            return platform, mains.resolve(), ""
+        if all((backend / name).is_file() for name in REQUIRED_ENTRY_FILES):
+            return platform, backend.resolve(), ""
+        return platform, backend.resolve(), "runtime_entries_missing_in_backend"
     return platform, root, ""
 
 
@@ -2010,16 +2349,65 @@ def _default_entry_source(root: Path) -> Path:
 
 def _python_executable(args: dict) -> str:
     requested = str(args.get("python_executable") or "").strip()
-    candidates = (
-        requested,
-        "/usr/bin/python3.8",
-        "/usr/local/python3/bin/python3.8",
-        "/usr/local/bin/python3.8",
-    )
+    candidates = _python_candidates(requested)
+    required = ("gunicorn", "celery", "flask")
+    for raw in candidates:
+        if _python_has_modules(raw, required):
+            return str(Path(raw).resolve())
     for raw in candidates:
         if raw and Path(raw).is_file() and os.access(raw, os.X_OK):
             return str(Path(raw).resolve())
     return ""
+
+
+def _python_candidates(requested: str) -> list[str]:
+    candidates: list[str] = []
+    for raw in (requested, os.environ.get("KLONET_PYTHON", "")):
+        if raw and raw not in candidates:
+            candidates.append(raw)
+    home = Path.home()
+    for env_root in (home / "miniconda3" / "envs", home / "anaconda3" / "envs"):
+        if env_root.is_dir():
+            for env in sorted(env_root.iterdir()):
+                for name in ("python3.8", "python"):
+                    candidate = str(env / "bin" / name)
+                    if candidate not in candidates:
+                        candidates.append(candidate)
+    for raw in ("/usr/bin/python3.8", "/usr/local/python3/bin/python3.8", "/usr/local/bin/python3.8", "/usr/bin/python3"):
+        if raw not in candidates:
+            candidates.append(raw)
+    return candidates
+
+
+def _python_has_modules(raw: str, modules: tuple[str, ...]) -> bool:
+    if not raw:
+        return False
+    path = Path(raw)
+    if not path.is_file() or not os.access(path, os.X_OK):
+        return False
+    code = "import importlib.util; mods=%r; raise SystemExit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" % (modules,)
+    try:
+        result = subprocess.run([str(path), "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+def _runtime_pythonpath(root: Path) -> str:
+    if root.name == "mains":
+        return str(root.parent.parent.resolve())
+    if (root / "vemu_config").is_dir():
+        return str(root.parent.resolve())
+    return str(root.resolve())
+
+
+def _runtime_python_env(root: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    runtime_path = _runtime_pythonpath(root)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        runtime_path if not existing else runtime_path + os.pathsep + existing
+    )
+    return env
 
 
 def _component_commands(python: str) -> dict[str, list[str]]:
@@ -2040,9 +2428,21 @@ def _component_commands(python: str) -> dict[str, list[str]]:
     }
 
 
+def _runtime_config_path(root: Path) -> Path | None:
+    candidates = []
+    if root.name == "mains":
+        candidates.append(root.parent / "vemu_config" / "config.py")
+    candidates.append(root / "vemu_config" / "config.py")
+    candidates.append(root / "vemu_uestc" / "vemu_config" / "config.py")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _configured_runtime_ports(root: Path) -> list[int]:
-    config = root / "vemu_uestc" / "vemu_config" / "config.py"
-    if not config.is_file():
+    config = _runtime_config_path(root)
+    if config is None or not config.is_file():
         return []
     try:
         content = config.read_text(
@@ -2073,21 +2473,41 @@ def _configured_runtime_ports(root: Path) -> list[int]:
                 if next_class else len(content)
             )
             content = content[class_match.start():end]
-    names = (
-        "master_port",
-        "worker_port",
-        "web_terminal_port",
-        "terminal_port",
-    )
-    ports = []
+    values: dict[str, int] = {}
     for match in re.finditer(
-        rf"\b({'|'.join(names)})\s*=\s*['\"]?(\d{{1,5}})",
+        r"\b(master_port|worker_port|web_terminal_port)\s*=\s*['\"]?(\d{1,5})",
         content,
     ):
         port = int(match.group(2))
-        if 1 <= port <= 65535 and port not in ports:
+        if 1 <= port <= 65535:
+            values[match.group(1)] = port
+    web_port = _web_terminal_entry_port(root) or values.get("web_terminal_port")
+    ports = []
+    for port in (values.get("master_port"), values.get("worker_port"), web_port):
+        if port and port not in ports:
             ports.append(port)
     return ports
+
+
+def _web_terminal_entry_port(root: Path) -> int | None:
+    candidates = []
+    if root.name == "mains":
+        candidates.append(root / "web_terminal_main.py")
+    candidates.append(root / "mains" / "web_terminal_main.py")
+    candidates.append(root / "vemu_uestc" / "mains" / "web_terminal_main.py")
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"WSGIServer\s*\(\s*\([^)]*?,\s*(\d{1,5})\s*\)", content, flags=re.DOTALL)
+        if match:
+            port = int(match.group(1))
+            if 1 <= port <= 65535:
+                return port
+    return None
 
 
 def _listening_ports(text: str, configured: list[int]) -> list[int]:
@@ -2095,6 +2515,221 @@ def _listening_ports(text: str, configured: list[int]) -> list[int]:
         port for port in configured
         if re.search(rf":{port}\b", text)
     ]
+
+
+def _wait_screen_sessions_absent(
+    runner: DirectPrivilegedActionRunner,
+    sessions: list[str],
+    *,
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        existing = runner._existing_screen_sessions()
+        if all(session not in existing for session in sessions):
+            return True
+        time.sleep(0.3)
+    existing = runner._existing_screen_sessions()
+    return all(session not in existing for session in sessions)
+
+
+def _wait_platform_runtime_ready(
+    runner: DirectPrivilegedActionRunner,
+    root: Path,
+    sessions: Iterable[str],
+    ports: list[int],
+    *,
+    timeout: float,
+) -> str:
+    deadline = time.monotonic() + timeout
+    session_list = list(sessions)
+    while time.monotonic() < deadline:
+        missing = [
+            session for session in session_list
+            if session not in runner._existing_screen_sessions()
+        ]
+        wrong_ports = _runtime_ports_with_wrong_cwd(ports, root)
+        if not missing and not wrong_ports:
+            return ""
+        time.sleep(0.5)
+    missing = [
+        session for session in session_list
+        if session not in runner._existing_screen_sessions()
+    ]
+    wrong_ports = _runtime_ports_with_wrong_cwd(ports, root)
+    reasons = []
+    if missing:
+        reasons.append("missing_screen_sessions=%s" % ",".join(missing))
+    if wrong_ports:
+        reasons.append("wrong_port_owners=%s" % ",".join(wrong_ports))
+    return ";".join(reasons)
+
+
+def _stop_target_runtime_after_screen_stop(
+    runner: DirectPrivilegedActionRunner,
+    root: Path,
+    ports: list[int],
+    *,
+    timeout: int,
+) -> DirectActionResult:
+    backend = root.parent if root.name == "mains" else root
+    if not (backend / "vemu_config").is_dir():
+        return DirectActionResult("completed", "target_runtime_stop_skipped=true")
+    if not _runtime_ports_owned_by_allowed_cwd(ports, root):
+        return DirectActionResult("completed", "target_runtime_already_stopped=true")
+    step = PrivilegedStep(
+        step_id="stop-target-runtime-after-screen-stop",
+        title="Stop target runtime after screen stop",
+        command="",
+        action="stop_klonet_runtime_instance",
+        args={"runtime_cwd": str(backend), "ports": ports},
+        risk="high",
+        approval_scope="plan",
+        timeout=timeout,
+    )
+    return runner._action_stop_klonet_runtime_instance(step)
+
+
+def _wait_allowed_runtime_ports_released(
+    root: Path,
+    ports: list[int],
+    *,
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _runtime_ports_owned_by_allowed_cwd(ports, root):
+            return True
+        time.sleep(0.5)
+    return not _runtime_ports_owned_by_allowed_cwd(ports, root)
+
+
+def _runtime_ports_owned_by_allowed_cwd(ports: list[int], root: Path) -> list[int]:
+    allowed = _allowed_runtime_cwds(root)
+    owned = []
+    for port in ports:
+        for pid in _listener_pids_for_port(port):
+            cwd = _proc_cwd(pid)
+            if cwd and any(_path_is_relative_to(Path(cwd), base) for base in allowed):
+                owned.append(port)
+                break
+    return owned
+
+
+def _cleanup_stale_runtime_owners(
+    runner: DirectPrivilegedActionRunner,
+    root: Path,
+    ports: list[int],
+    *,
+    timeout: int,
+) -> DirectActionResult:
+    cwds = _stale_runtime_cwds_for_ports(ports, root)
+    cleaned = []
+    for cwd in cwds:
+        step = PrivilegedStep(
+            step_id="cleanup-stale-runtime",
+            title="Cleanup stale runtime",
+            command="",
+            action="stop_klonet_runtime_instance",
+            args={"runtime_cwd": cwd, "ports": ports},
+            risk="high",
+            approval_scope="plan",
+            timeout=timeout,
+        )
+        result = runner._action_stop_klonet_runtime_instance(step)
+        if result.status != "completed":
+            return DirectActionResult(
+                "failed",
+                "stale_runtime_cleanup_failed cwd=%s reason=%s environment_changed=unknown"
+                % (cwd, result.output),
+                "inspect_runtime",
+            )
+        cleaned.append(cwd)
+    return DirectActionResult(
+        "completed",
+        "cleaned_stale=%s" % (",".join(cleaned) or "none"),
+    )
+
+
+def _stale_runtime_cwds_for_ports(ports: list[int], root: Path) -> list[str]:
+    allowed = _allowed_runtime_cwds(root)
+    cwds = []
+    for port in ports:
+        for pid in _listener_pids_for_port(port):
+            cwd = _proc_cwd(pid)
+            if not cwd:
+                continue
+            path = Path(cwd)
+            if any(_path_is_relative_to(path, allowed_path) for allowed_path in allowed):
+                continue
+            if path.name != "vemu_uestc" or not (path / "vemu_config").is_dir():
+                continue
+            value = str(path)
+            if value not in cwds:
+                cwds.append(value)
+    return cwds
+
+
+def _runtime_ports_with_wrong_cwd(ports: list[int], root: Path) -> list[str]:
+    wrong = []
+    allowed = _allowed_runtime_cwds(root)
+    for port in ports:
+        pids = _listener_pids_for_port(port)
+        if not pids:
+            wrong.append("%s:not_listening" % port)
+            continue
+        cwd_values = []
+        for pid in pids:
+            cwd = _proc_cwd(pid)
+            if cwd:
+                cwd_values.append(cwd)
+        if not cwd_values or not any(
+            _path_is_relative_to(Path(cwd), allowed_path)
+            for cwd in cwd_values
+            for allowed_path in allowed
+        ):
+            wrong.append("%s:%s" % (port, ",".join(cwd_values) or "unknown"))
+    return wrong
+
+
+def _allowed_runtime_cwds(root: Path) -> list[Path]:
+    allowed = [root.resolve()]
+    if root.name == "mains":
+        allowed.append(root.parent.resolve())
+    return allowed
+
+
+def _listener_pids_for_port(port: int) -> list[int]:
+    ss = shutil.which("ss")
+    if not ss:
+        return []
+    try:
+        result = subprocess.run(
+            [ss, "-ltnp"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids = []
+    for line in (result.stdout or "").splitlines():
+        if not re.search(rf":{port}\b", line):
+            continue
+        for match in re.finditer(r"pid=(\d+)", line):
+            pid = int(match.group(1))
+            if pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _absolute_path(value) -> Path | None:
@@ -2157,6 +2792,170 @@ def _proc_cmdline(pid: int) -> str:
         for part in raw.split(b"\x00")
         if part
     )
+
+
+def _port_arg_list(value) -> list[int]:
+    items = value if isinstance(value, list) else []
+    result: list[int] = []
+    for item in items[:20]:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            return []
+        if not 1 <= port <= 65535:
+            return []
+        if port not in result:
+            result.append(port)
+    return result
+
+
+def _klonet_runtime_processes(runtime_cwd: Path) -> list[dict[str, int | str]]:
+    processes: list[dict[str, int | str]] = []
+    proc_root = Path("/proc")
+    allowed_cwds = {str(runtime_cwd)}
+    mains = runtime_cwd / "mains"
+    if mains.is_dir():
+        allowed_cwds.add(str(mains.resolve()))
+    for item in (proc_root.iterdir() if proc_root.is_dir() else []):
+        if not item.name.isdigit():
+            continue
+        pid = int(item.name)
+        cwd = _proc_cwd(pid)
+        if cwd not in allowed_cwds:
+            continue
+        cmdline = _proc_cmdline(pid)
+        if not _is_klonet_runtime_command(cmdline):
+            continue
+        pgid = _proc_pgid(pid)
+        if pgid is None or pgid <= 1:
+            continue
+        processes.append({"pid": pid, "pgid": pgid, "cmdline": cmdline, "cwd": cwd})
+    return processes
+
+
+def _runtime_process_groups(processes: list[dict[str, int | str]]) -> list[dict[str, int]]:
+    groups: dict[int, int] = {}
+    for proc in processes:
+        pgid = int(proc["pgid"])
+        pid = int(proc["pid"])
+        current = groups.get(pgid)
+        if current is None or pid == pgid or pid < current:
+            groups[pgid] = pid
+    return [{"pgid": pgid, "owner_pid": owner_pid} for pgid, owner_pid in groups.items()]
+
+
+def _runtime_stopped_stably(
+    runner: DirectPrivilegedActionRunner,
+    runtime_cwd: Path,
+    ports: list[int],
+    *,
+    timeout: float,
+    stable_for: float,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        stopped = not _klonet_runtime_processes(runtime_cwd)
+        ports_free = not _ports_currently_listening(runner, ports)
+        if stopped and ports_free:
+            if stable_since is None:
+                stable_since = time.monotonic()
+            if time.monotonic() - stable_since >= stable_for:
+                return True
+        else:
+            stable_since = None
+        time.sleep(0.2)
+    return False
+
+
+def _positive_float(value, *, default: float, maximum: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number <= 0:
+        return default
+    return min(number, maximum)
+
+
+def _ports_currently_listening(runner: DirectPrivilegedActionRunner, ports: list[int]) -> list[int]:
+    ss = shutil.which("ss")
+    if not ss:
+        return []
+    result = runner._command([ss, "-ltn"], timeout=20)
+    return _listening_ports("%s\n%s" % (result.stdout or "", result.stderr or ""), ports)
+
+
+def _proc_cwd(pid: int) -> str:
+    try:
+        return str((Path("/proc") / str(pid) / "cwd").resolve())
+    except OSError:
+        return ""
+
+
+def _is_klonet_runtime_command(cmdline: str) -> bool:
+    text = cmdline or ""
+    if "gunicorn" in text and any(
+        marker in text
+        for marker in (
+            "master_main:flask_app",
+            "worker_main:flask_app",
+            "data_server_main:flask_app",
+        )
+    ):
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "web_terminal_main.py",
+            "celery_worker.celery",
+        )
+    )
+
+
+def _proc_uid(pid: int) -> int | None:
+    try:
+        for line in (Path("/proc") / str(pid) / "status").read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            if line.startswith("Uid:"):
+                parts = line.split()
+                return int(parts[1]) if len(parts) > 1 else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _proc_pgid(pid: int) -> int | None:
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        after_comm = stat.rsplit(")", 1)[1].split()
+        return int(after_comm[2]) if len(after_comm) > 2 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _process_group_id(raw_pgid, pid: int) -> int | None:
+    try:
+        pgid = int(raw_pgid) if raw_pgid not in (None, "") else _proc_pgid(pid)
+    except (TypeError, ValueError):
+        return None
+    return pgid if pgid and pgid > 1 else None
+
+
+def _kill_argv_for_owner_pid(pid: int, signal_name: str, target: str) -> list[str]:
+    argv = ["kill", "-%s" % signal_name, target]
+    if hasattr(os, "geteuid"):
+        euid = os.geteuid()
+        if euid == 0 or _proc_uid(pid) == euid:
+            return argv
+    return _sudo_if_needed(argv)
+
+
+def _kill_argv_for_pid(pid: int, signal_name: str) -> list[str]:
+    return _kill_argv_for_owner_pid(pid, signal_name, str(pid))
 
 
 def _git_operation_argv(operation: str, args: dict) -> list[str]:
@@ -2257,6 +3056,105 @@ def _deep_merge_json(current: dict, patch: dict) -> dict:
     return result
 
 
+def _local_primary_ipv4() -> str:
+    try:
+        result = subprocess.run(["hostname", "-I"], text=True, capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    for item in (result.stdout or "").split():
+        if _safe_ipv4(item) and not item.startswith(("127.", "172.", "10.")):
+            return item
+    for item in (result.stdout or "").split():
+        if _safe_ipv4(item) and not item.startswith("127."):
+            return item
+    return ""
+
+
+def _safe_ipv4(value: str) -> bool:
+    parts = str(value or "").split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(part) <= 255 and str(int(part)) == part for part in parts)
+    except ValueError:
+        return False
+
+
+def _active_config_class(content: str) -> str:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return ""
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "PROJ_CONFIG" and isinstance(node.value, ast.Call):
+                    func = node.value.func
+                    if isinstance(func, ast.Name):
+                        return func.id
+    return ""
+
+
+def _replace_class_assignment(content: str, class_name: str, field: str, value: str) -> tuple[str, str]:
+    class_match = re.search(r"(?m)^class\s+%s\b.*?:\s*$" % re.escape(class_name), content)
+    if not class_match:
+        return content, ""
+    next_match = re.search(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\b.*?:\s*$", content[class_match.end():])
+    end = class_match.end() + next_match.start() if next_match else len(content)
+    block = content[class_match.end():end]
+    pattern = re.compile(r'''(?m)^(?P<indent>\s*)%s\s*=\s*(?P<quote>['"])(?P<old>.*?)(?P=quote)(?P<tail>\s*(?:#.*)?$)''' % re.escape(field))
+    match = pattern.search(block)
+    if not match:
+        return content, ""
+    replacement = "%s%s = '%s'%s" % (match.group('indent'), field, value, match.group('tail'))
+    new_block = block[:match.start()] + replacement + block[match.end():]
+    return content[:class_match.end()] + new_block + content[end:], match.group('old')
+
+
+def _redis_server_binary() -> str:
+    for raw in ("/usr/local/bin/redis-server", "/usr/bin/redis-server", "redis-server"):
+        found = shutil.which(raw) if raw == "redis-server" else raw
+        if found and Path(found).is_file() and os.access(found, os.X_OK):
+            return str(Path(found).resolve())
+    return ""
+
+
+def _klonet_redis_settings(config: Path) -> dict[str, str | int]:
+    try:
+        tree = ast.parse(config.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError):
+        return {}
+    classes: dict[str, dict[str, object]] = {}
+    active = ""
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "PROJ_CONFIG" and isinstance(node.value, ast.Call):
+                    func = node.value.func
+                    if isinstance(func, ast.Name):
+                        active = func.id
+        if isinstance(node, ast.ClassDef):
+            values = {}
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            try:
+                                values[target.id] = ast.literal_eval(stmt.value)
+                            except Exception:
+                                pass
+            classes[node.name] = values
+    merged: dict[str, object] = {}
+    for name in ("RedisConfig", active):
+        merged.update(classes.get(name, {}))
+    try:
+        port = int(merged.get("redis_port"))
+    except (TypeError, ValueError):
+        return {}
+    password = str(merged.get("redis_password") or "")
+    return {"port": port, "password": password}
+
+
 def _redis_config_port(path: Path) -> int | None:
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
@@ -2275,6 +3173,15 @@ def _tcp_listening(host: str, port: int, *, timeout: float = 0.5) -> bool:
             return True
     except OSError:
         return False
+
+
+def _wait_tcp_listening(host: str, port: int, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _tcp_listening(host, port, timeout=0.5):
+            return True
+        time.sleep(0.2)
+    return _tcp_listening(host, port, timeout=0.5)
 
 
 def _file_sha256(path: Path) -> str:

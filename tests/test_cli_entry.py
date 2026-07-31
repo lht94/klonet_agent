@@ -135,6 +135,18 @@ def test_piped_prompt_preserves_multiline_chinese_as_one_turn():
     assert route_query(prompt).scope == "general"
 
 
+
+
+def test_piped_prompt_strips_utf8_bom():
+    """UTF-8 BOM from redirected files must not become part of control commands."""
+
+    from klonet_agent.app.cli import read_piped_prompt
+
+    stdin = io.StringIO("\ufeffconfirm-priv priv-123\n")
+
+    assert read_piped_prompt(stdin) == "confirm-priv priv-123"
+
+
 def test_cli_does_not_clear_user_input_line():
     """用户提交的问题应保留在终端历史里，不能被 agent 清掉。"""
 

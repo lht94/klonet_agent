@@ -6,13 +6,18 @@ import json
 import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from klonet_agent.ops.privileged.context import GroundedPlanContext
 from klonet_agent.ops.privileged.contracts import (
     PrivilegedPlan,
     PrivilegedStep,
     RISK_LEVELS,
+)
+from klonet_agent.ops.privileged.planner_schema import (
+    PROCESS_TERMINATING_SIGNALS,
+    normalize_process_signal,
+    normalize_semantic_risk,
 )
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 
@@ -34,6 +39,10 @@ When facts are missing but discoverable, return:
 ]}
 Use at most 4 probes in one round. Probe arguments must come from existing
 evidence. Never request mutation.
+Planning feedback may contain evidence_already_collected from an earlier
+execution-binding attempt. Treat it as authoritative. Do not request the same
+probe with the same arguments again unless the feedback explicitly reports
+that the earlier probe was unavailable or the relevant state has changed.
 
 When ready, return:
 {
@@ -82,12 +91,14 @@ class PrivilegedPlannerAgent:
         policy: Any | None = None,
         action_registry: Any | None = None,
         probe_runner: Any | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> None:
         self.llm = llm
         # Retained only as constructor compatibility. The semantic Planner
         # deliberately cannot inspect execution implementation names.
         del policy, action_registry
         self.probe_runner = probe_runner
+        self.on_progress = on_progress
 
     def plan(
         self,
@@ -95,6 +106,9 @@ class PrivilegedPlannerAgent:
         *,
         environment_context: str = "",
         grounded_context: GroundedPlanContext | None = None,
+        conversation_context: str = "",
+        planning_feedback: str = "",
+        prior_probe_history: list[dict[str, Any]] | None = None,
     ) -> PrivilegedPlan:
         planning_context = (
             grounded_context.render()
@@ -112,8 +126,18 @@ class PrivilegedPlannerAgent:
             {
                 "role": "user",
                 "content": (
-                    "Goal:\n%s\n\nGrounded planning context:\n%s"
-                    % (goal, planning_context)
+                    "Recent conversation (use only to resolve references and"
+                    " continuations; the current request has priority):\n%s\n\n"
+                    "Current request:\n%s\n\n"
+                    "Feedback from a previous execution-binding attempt"
+                    " (if any):\n%s\n\n"
+                    "Grounded planning context:\n%s"
+                    % (
+                        conversation_context or "(none)",
+                        goal,
+                        planning_feedback or "(none)",
+                        planning_context,
+                    )
                 ),
             },
         ]
@@ -122,7 +146,17 @@ class PrivilegedPlannerAgent:
         probe_history: list[dict[str, Any]] = []
         probe_rounds = 0
         invalid_repairs = 0
+        duplicate_probe_repairs = 0
+        known_probe_keys = _probe_history_keys(prior_probe_history or [])
         while True:
+            self._progress(
+                "规划节点：Planner 正在综合目标与证据%s…"
+                % (
+                    "（只读补证第 %s 轮后）" % probe_rounds
+                    if probe_rounds
+                    else ""
+                )
+            )
             response = self._complete(messages)
             content = response.choices[0].message.content or ""
             try:
@@ -136,11 +170,57 @@ class PrivilegedPlannerAgent:
                     requests = self._validate_probe_requests(
                         data.get("probe_requests")
                     )
+                    duplicate_names = [
+                        item["probe"]
+                        for item in requests
+                        if _probe_request_key(item) in known_probe_keys
+                    ]
+                    requests = [
+                        item
+                        for item in requests
+                        if _probe_request_key(item) not in known_probe_keys
+                    ]
+                    if duplicate_names:
+                        self._progress(
+                            "规划结论：已拒绝重复只读检查（%s），将复用证据账本。"
+                            % "、".join(dict.fromkeys(duplicate_names))
+                        )
+                    if not requests:
+                        if duplicate_probe_repairs >= 1:
+                            raise ValueError(
+                                "Planner repeatedly requested probes already"
+                                " present in the evidence ledger"
+                            )
+                        duplicate_probe_repairs += 1
+                        messages.append({"role": "assistant", "content": content})
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "All requested probes duplicate authoritative"
+                                    " evidence_already_collected. Do not request"
+                                    " them again. Use that evidence and return ready"
+                                    " or blocked, or request only materially different"
+                                    " probe arguments."
+                                ),
+                            }
+                        )
+                        continue
+                    self._progress(
+                        "规划结论：还缺少可探测事实，准备执行 %s 个只读检查（%s）。"
+                        % (
+                            len(requests),
+                            "、".join(item["probe"] for item in requests),
+                        )
+                    )
                     if self.probe_runner is None:
                         raise ValueError(
                             "planner requested evidence but probe runner is unavailable"
                         )
                     evidence = self.probe_runner(requests)
+                    known_probe_keys.update(
+                        _probe_request_key(item) for item in requests
+                    )
                     probe_history.append(
                         {
                             "round": probe_rounds + 1,
@@ -163,6 +243,9 @@ class PrivilegedPlannerAgent:
                     )
                     continue
                 if status == "blocked":
+                    self._progress(
+                        "规划结论：存在无法由服务器探测替代的用户决定。"
+                    )
                     reason = str(data.get("reason") or "缺少必要决策").strip()
                     missing = _string_list(data.get("missing_decisions"))
                     raise PlanningBlocked(
@@ -177,6 +260,10 @@ class PrivilegedPlannerAgent:
                 if status != "ready":
                     raise ValueError("planner status must be need_evidence, ready, or blocked")
                 steps = self._build_semantic_steps(data)
+                self._progress(
+                    "规划结论：已形成 %s 个语义步骤，开始匹配安全执行能力。"
+                    % len(steps)
+                )
                 break
             except (KeyError, TypeError, ValueError) as exc:
                 last_error = str(exc)
@@ -186,6 +273,9 @@ class PrivilegedPlannerAgent:
                         % last_error
                     )
                 invalid_repairs += 1
+                self._progress(
+                    "规划节点：Planner 返回格式不完整，正在请求结构化修复…"
+                )
                 messages.append({"role": "assistant", "content": content})
                 messages.append(
                     {
@@ -223,6 +313,10 @@ class PrivilegedPlannerAgent:
             probe_history=probe_history,
         )
         return plan
+
+    def _progress(self, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(message)
 
     def _build_semantic_steps(
         self,
@@ -269,9 +363,10 @@ class PrivilegedPlannerAgent:
                     "semantic dependency must reference an earlier step: %s"
                     % ",".join(unknown)
                 )
-            risk = str(
-                item.get("risk_suggestion") or "medium"
-            ).strip().lower()
+            risk = normalize_semantic_risk(
+                item.get("risk_suggestion"),
+                "medium",
+            )
             if risk not in RISK_LEVELS:
                 raise ValueError("invalid semantic risk suggestion: %s" % risk)
             seen.add(step_id)
@@ -539,8 +634,19 @@ def _default_action_postconditions(
                 },
             }
         ] if expected else []
+    if action == "stop_klonet_runtime_instance":
+        ports = args.get("ports")
+        if not isinstance(ports, list):
+            return []
+        return [
+            {
+                "checker": "port_not_listening",
+                "args": {"port": port},
+            }
+            for port in ports
+        ]
     if action == "manage_process":
-        if str(args.get("signal") or "").upper() in {"TERM", "KILL", "INT"}:
+        if normalize_process_signal(args.get("signal")) in PROCESS_TERMINATING_SIGNALS:
             return [
                 {
                     "checker": "process_pid_absent",
@@ -663,6 +769,36 @@ def _parse_json_object(content: str) -> dict[str, Any]:
     return data
 
 
+def _probe_request_key(request: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "probe": str(request.get("probe") or "").strip(),
+            "args": (
+                request.get("args")
+                if isinstance(request.get("args"), dict)
+                else {}
+            ),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _probe_history_keys(history: list[dict[str, Any]]) -> set[str]:
+    keys = set()
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        requests = item.get("requests")
+        if not isinstance(requests, list):
+            continue
+        for request in requests:
+            if isinstance(request, dict):
+                keys.add(_probe_request_key(request))
+    return keys
+
+
 def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
@@ -670,12 +806,8 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _action_risk(value: str) -> str:
-    return {
-        "normal": "readonly",
-        "controlled": "medium",
-        "privileged": "medium",
-        "dangerous": "high",
-    }.get(str(value or "").lower(), "medium")
+    normalized = normalize_semantic_risk(value, "medium")
+    return normalized if normalized in RISK_LEVELS else "medium"
 
 
 def _highest_risk(steps: list[PrivilegedStep]) -> str:
@@ -690,7 +822,7 @@ def _effective_declared_risk(
 ) -> str:
     """Allow the Planner to raise risk, never lower the action-policy floor."""
 
-    normalized = str(declared or "").strip().lower()
+    normalized = normalize_semantic_risk(declared)
     if not normalized:
         return deterministic_floor
     if normalized not in RISK_LEVELS:

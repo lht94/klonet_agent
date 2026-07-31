@@ -62,8 +62,28 @@ def test_context_builder_collects_knowledge_environment_and_action_catalog():
     assert "服务器只读证据" in context.render()
     assert "action=validate_project_files" not in context.action_catalog
     assert "category=" in context.action_catalog
+    assert "risk=privileged" not in context.action_catalog
+    assert "risk=dangerous" not in context.action_catalog
     assert "Execution Agent" in context.action_catalog
     assert "one-time shell artifact" in context.action_catalog
+
+
+def test_context_builder_reports_safe_evidence_progress():
+    from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
+
+    progress = []
+    builder = PrivilegedPlanContextBuilder(
+        knowledge_search=lambda *args, **kwargs: "部署知识证据",
+        environment_inspector=lambda args: "服务器只读证据",
+        on_progress=progress.append,
+    )
+
+    builder.build("帮我部署平台")
+
+    assert progress[0] == "证据节点 1/3：正在检索 Klonet 知识库…"
+    assert "Klonet 知识检索完成" in progress[1]
+    assert any("关键证据：工程布局=" in item for item in progress)
+    assert progress[-1] == "关键证据：服务器只读状态检查完成。"
 
 
 def test_recovery_diagnostics_execute_only_allowlisted_readonly_probes(monkeypatch):
@@ -95,6 +115,32 @@ def test_recovery_diagnostics_execute_only_allowlisted_readonly_probes(monkeypat
     assert calls == [{"ports": [8080]}]
     assert "port_owner=service-a" in evidence
     assert "probe_not_allowlisted" in evidence
+
+
+def test_readonly_probe_cache_is_scoped_to_one_planning_submission(monkeypatch):
+    from klonet_agent.ops.privileged import context as context_module
+    from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
+
+    calls = []
+    monkeypatch.setitem(
+        context_module._RECOVERY_PROBES,
+        "ports",
+        lambda args: calls.append(args) or "port evidence",
+    )
+    builder = PrivilegedPlanContextBuilder(
+        knowledge_search=lambda *args, **kwargs: "knowledge",
+        environment_inspector=lambda args: "environment",
+    )
+    request = [{"probe": "ports", "args": {"ports": [8080]}, "purpose": "check"}]
+
+    builder.begin_probe_session()
+    first = builder.run_recovery_diagnostics(request)
+    second = builder.run_recovery_diagnostics(request)
+    builder.end_probe_session()
+    third = builder.run_recovery_diagnostics(request)
+
+    assert first == second == third
+    assert calls == [{"ports": [8080]}, {"ports": [8080]}]
 
 
 def test_grounded_context_blocks_planning_when_klonet_evidence_is_missing():
@@ -267,11 +313,76 @@ def test_planner_adds_deterministic_postconditions_for_registered_actions():
         "install_system_packages",
         {"packages": ["screen", "nginx"]},
     )
+    process = _default_action_postconditions(
+        "manage_process",
+        {"pid": "12345", "signal": "SIGTERM"},
+    )
 
     assert redis[0]["checker"] == "port_listening"
     assert network[0]["checker"] == "docker_network_attachment"
     assert network[0]["args"]["attached"] is True
     assert [item["args"]["package"] for item in packages] == ["screen", "nginx"]
+    assert process == [
+        {"checker": "process_pid_absent", "args": {"pid": "12345"}}
+    ]
+
+
+def test_execution_agent_binds_runtime_instance_cleanup():
+    from klonet_agent.ops.privileged.contracts import (
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+
+    response = json.dumps(
+        {
+            "status": "registered_action",
+            "action": "stop_klonet_runtime_instance",
+            "args": {
+                "runtime_cwd": "/home/lzl/test/vemu_uestc",
+                "ports": [45551, 45552],
+            },
+            "binding_reason": "the observed stale runtime owns both ports",
+            "resolved_from_evidence": [
+                "port 45551 cwd=/home/lzl/test/vemu_uestc",
+                "port 45552 cwd=/home/lzl/test/vemu_uestc",
+            ],
+        }
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-test",
+        goal="释放旧 Klonet 实例占用的端口",
+        risk="high",
+        steps=[
+            PrivilegedStep(
+                step_id="stop-stale-runtime",
+                title="停止旧 Klonet 运行实例",
+                objective="stop the stale Klonet runtime that owns the ports",
+                reason="port-owner evidence identifies the stale runtime",
+                success_criteria=["ports 45551 and 45552 are no longer listening"],
+                risk="high",
+            )
+        ],
+    )
+
+    bound = PrivilegedExecutionAgent(FakeLLM([response])).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+    binding = bound.steps[0].execution_binding
+
+    assert binding is not None
+    assert binding.action == "stop_klonet_runtime_instance"
+    assert binding.args == {
+        "runtime_cwd": "/home/lzl/test/vemu_uestc",
+        "ports": ["45551", "45552"],
+    }
+    assert binding.postconditions == [
+        {"checker": "port_not_listening", "args": {"port": 45551}},
+        {"checker": "port_not_listening", "args": {"port": 45552}},
+    ]
 
 
 def test_standard_deploy_has_no_deterministic_resolver_when_llm_plan_is_invalid(

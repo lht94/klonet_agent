@@ -1415,9 +1415,9 @@ def _inspect_port_owners(args: dict) -> list:
         if completed.returncode != 0:
             results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} {output or 'ss failed'}"))
             continue
-        pid = _pid_from_ss_output(output)
-        if pid:
-            results.append(_process_owner_result(port, pid))
+        pids = _pids_from_ss_output(output)
+        if pids:
+            results.append(_process_owner_result(port, pids))
         elif _port_is_listening(output, port):
             results.append(ProbeResult("port_owner", STATUS_DETECTED, f"port={port} pid=unchecked reason=ss did not expose pid"))
         else:
@@ -1441,9 +1441,14 @@ def _inspect_process_details(args: dict) -> list:
     return [_process_detail_result(pid) for pid in selected_pids[:20]]
 
 
-def _process_owner_result(port: int, pid: int) -> ProbeResult:
-    detail = _process_detail(pid)
-    fields = [f"port={port}", f"pid={pid}"]
+def _process_owner_result(port: int, pids: list[int]) -> ProbeResult:
+    details = {pid: _process_detail(pid) for pid in pids}
+    root_pid = _process_tree_root_pid(pids, details)
+    detail = details.get(root_pid, {})
+    fields = [f"port={port}", f"pid={root_pid}"]
+    if len(pids) > 1:
+        fields.append("listener_pids=" + ",".join(str(pid) for pid in pids))
+        fields.append(f"tree_root_pid={root_pid}")
     fields.extend(_detail_fields(detail))
     return ProbeResult("port_owner", STATUS_DETECTED, " ".join(fields))
 
@@ -1463,6 +1468,8 @@ def _process_detail(pid: int) -> dict:
         cmd = ps.get("cmd", "")
     return {
         "ppid": ps.get("ppid", ""),
+        "pgid": ps.get("pgid", ""),
+        "sid": ps.get("sid", ""),
         "user": ps.get("user", ""),
         "cmd": redact_sensitive_text(_single_line(cmd, max_chars=300)) if cmd else "unchecked",
         "cwd": cwd or "unchecked",
@@ -1471,7 +1478,7 @@ def _process_detail(pid: int) -> dict:
 
 def _detail_fields(detail: dict) -> list:
     fields = []
-    for key in ("ppid", "user", "cmd", "cwd"):
+    for key in ("ppid", "pgid", "sid", "user", "cmd", "cwd"):
         value = str(detail.get(key) or "unchecked")
         fields.append(f"{key}={value}")
     return fields
@@ -1482,7 +1489,7 @@ def _ps_detail(pid: int) -> dict:
         return {}
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "pid=,ppid=,user=,args="],
+            ["ps", "-p", str(pid), "-o", "pid=,ppid=,pgid=,sid=,user=,args="],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1492,10 +1499,17 @@ def _ps_detail(pid: int) -> dict:
     except (OSError, subprocess.TimeoutExpired):
         return {}
     line = (completed.stdout or "").strip()
-    match = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$", line)
+    match = re.match(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$", line)
     if not match:
         return {}
-    return {"pid": match.group(1), "ppid": match.group(2), "user": match.group(3), "cmd": match.group(4)}
+    return {
+        "pid": match.group(1),
+        "ppid": match.group(2),
+        "pgid": match.group(3),
+        "sid": match.group(4),
+        "user": match.group(5),
+        "cmd": match.group(6),
+    }
 
 
 def _pids_for_keywords(keywords: list) -> list:
@@ -1518,9 +1532,20 @@ def _pids_for_keywords(keywords: list) -> list:
     return [int(item) for item in re.findall(r"\b\d+\b", completed.stdout or "")]
 
 
-def _pid_from_ss_output(output: str) -> Optional[int]:
-    match = re.search(r"\bpid=(\d+)\b", output or "")
-    return int(match.group(1)) if match else None
+def _pids_from_ss_output(output: str) -> list[int]:
+    return _dedupe_ints(re.findall(r"\bpid=(\d+)\b", output or ""))
+
+
+def _process_tree_root_pid(pids: list[int], details: dict[int, dict]) -> int:
+    pid_set = set(pids)
+    for pid in pids:
+        try:
+            ppid = int(details.get(pid, {}).get("ppid") or 0)
+        except (TypeError, ValueError):
+            ppid = 0
+        if ppid not in pid_set:
+            return pid
+    return pids[0]
 
 
 def _port_is_listening(output: str, port: int) -> bool:

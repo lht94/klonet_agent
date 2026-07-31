@@ -34,6 +34,13 @@ def configure_console_encoding(stdin=None, stdout=None, stderr=None):
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+
+
+def clean_user_input(text: str) -> str:
+    """Normalize raw user text from CLI streams before intent/control parsing."""
+
+    return (text or "").strip().lstrip("\ufeff\u200b\u200c\u200d")
+
 def configure_interactive_input(stdin=None, stdout=None):
     """在 Unix 交互终端启用系统 readline，正确编辑多字节字符。"""
 
@@ -62,7 +69,7 @@ def read_piped_prompt(stdin=None) -> Optional[str]:
     stdin = stdin or sys.stdin
     if not hasattr(stdin, "isatty") or stdin.isatty():
         return None
-    return stdin.read().strip()
+    return clean_user_input(stdin.read())
 
 
 def run_chat(
@@ -100,7 +107,7 @@ def run_chat(
             return
 
         while True:
-            user_input = input("用户：").strip()
+            user_input = clean_user_input(input("用户："))
 
             # 处理空输入。
             if not user_input:

@@ -19,6 +19,86 @@ from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 
 Checker = Callable[[Dict[str, Any], Optional[ExecutionEvidence]], CheckResult]
 
+CHECKER_ARGUMENT_HINTS = {
+    "exit_code_zero": "none",
+    "file_exists": "path",
+    "file_absent": "path",
+    "file_contains": "path,text",
+    "json_file_valid": "path",
+    "service_active": "service",
+    "service_inactive": "service",
+    "process_running": "pattern",
+    "process_not_running": "pattern",
+    "process_pid_absent": "pid",
+    "process_cwd_matches": "pid,cwd",
+    "port_listening": "port; optional host,timeout",
+    "port_not_listening": "port; optional host,timeout",
+    "screen_session_exists": "session",
+    "screen_session_absent": "session",
+    "container_running": "container",
+    "container_absent": "container",
+    "container_restart_policy": "container,policy",
+    "docker_image_state": "image; optional present",
+    "docker_network_state": "network; optional present",
+    "docker_network_attachment": "network,container; optional attached",
+    "network_link_state": "name,state",
+    "libvirt_domain_state": "domain,state",
+    "ovs_resource_state": "resource_type,name; optional present",
+    "http_status": "url; optional status",
+    "git_revision": "repository,revision",
+    "user_in_group": "user,group",
+    "file_mode": "path,mode",
+    "system_package_installed": "package",
+    "python_package_state": "python_executable,package; optional present",
+    "command_available": "command",
+    "python_import_succeeds": "module; optional python_executable,cwd",
+    "package_version": "package; optional version",
+    "nginx_config_valid": "optional binary",
+    "log_has_no_fatal_error": "path; optional tail_chars,pattern",
+}
+
+# Machine-readable counterpart of ``CHECKER_ARGUMENT_HINTS``.  The catalog is
+# shown to the model, but model output must still be validated before a checker
+# contract is accepted; otherwise a known checker with missing arguments only
+# fails after the privileged command has already run.
+CHECKER_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
+    "exit_code_zero": (),
+    "file_exists": ("path",),
+    "file_absent": ("path",),
+    "file_contains": ("path", "text"),
+    "json_file_valid": ("path",),
+    "service_active": ("service",),
+    "service_inactive": ("service",),
+    "process_running": ("pattern",),
+    "process_not_running": ("pattern",),
+    "process_pid_absent": ("pid",),
+    "process_cwd_matches": ("pid", "cwd"),
+    "port_listening": ("port",),
+    "port_not_listening": ("port",),
+    "screen_session_exists": ("session",),
+    "screen_session_absent": ("session",),
+    "container_running": ("container",),
+    "container_absent": ("container",),
+    "container_restart_policy": ("container", "policy"),
+    "docker_image_state": ("image",),
+    "docker_network_state": ("network",),
+    "docker_network_attachment": ("network", "container"),
+    "network_link_state": ("name", "state"),
+    "libvirt_domain_state": ("domain", "state"),
+    "ovs_resource_state": ("resource_type", "name"),
+    "http_status": ("url",),
+    "git_revision": ("repository", "revision"),
+    "user_in_group": ("user", "group"),
+    "file_mode": ("path", "mode"),
+    "system_package_installed": ("package",),
+    "python_package_state": ("python_executable", "package"),
+    "command_available": ("command",),
+    "python_import_succeeds": ("module",),
+    "package_version": ("package",),
+    "nginx_config_valid": (),
+    "log_has_no_fatal_error": ("path",),
+}
+
 
 class DefaultCheckerRegistry:
     """集中管理可审计的确定性检查，未知检查永远不是成功。"""
@@ -65,6 +145,13 @@ class DefaultCheckerRegistry:
     @property
     def names(self) -> tuple[str, ...]:
         return tuple(sorted(self._checkers))
+
+    def render_catalog(self) -> str:
+        return "\n".join(
+            "- checker=%s args=%s"
+            % (name, CHECKER_ARGUMENT_HINTS.get(name, "see checker contract"))
+            for name in self.names
+        )
 
     def run(
         self,
@@ -198,12 +285,22 @@ class DefaultCheckerRegistry:
     def _process_pid_absent(self, args, evidence):
         del evidence
         pid = int(args["pid"])
-        absent = not Path("/proc/%s" % pid).exists()
+        proc_path = Path("/proc/%s" % pid)
+        absent = not proc_path.exists()
+        zombie = False
+        if not absent:
+            try:
+                stat = (proc_path / "stat").read_text(encoding="utf-8", errors="replace")
+                after_comm = stat.rsplit(")", 1)[1].split()
+                zombie = bool(after_comm and after_comm[0] == "Z")
+            except (OSError, IndexError):
+                zombie = False
+        passed = absent or zombie
         return CheckResult(
             "process_pid_absent",
-            "passed" if absent else "failed",
-            expected="PID %s absent" % pid,
-            observed="absent" if absent else "still present",
+            "passed" if passed else "failed",
+            expected="PID %s absent or zombie after signal" % pid,
+            observed="absent" if absent else "zombie" if zombie else "still present",
         )
 
     def _process_cwd_matches(self, args, evidence):

@@ -1225,7 +1225,7 @@ def test_runtime_port_owner_returns_target_pid_cmd_and_cwd(monkeypatch):
         if command[:2] == ["ps", "-p"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stdout="1467095 1467011 1467011 1467011 root python3.8 web_terminal_main.py\n",
                 stderr="",
             )
         return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
@@ -1260,6 +1260,57 @@ def test_runtime_port_owner_returns_target_pid_cmd_and_cwd(monkeypatch):
     assert any(call[:2] == ["ss", "-ltnp"] for call in calls)
 
 
+def test_runtime_port_owner_prefers_process_tree_root_for_shared_listener(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    'LISTEN 0 2048 0.0.0.0:45551 0.0.0.0:* '
+                    'users:(("python3.8",pid=2444773,fd=14),'
+                    '("python3.8",pid=2148367,fd=14),'
+                    '("python3.8",pid=2148261,fd=14))'
+                ),
+                stderr="",
+            )
+        if command[:2] == ["ps", "-p"]:
+            pid = command[2]
+            rows = {
+                "2444773": "2444773 2148261 2148261 2148261 lzl python3.8 gun.py master_main:flask_app\n",
+                "2148367": "2148367 2148261 2148261 2148261 lzl python3.8 gun.py master_main:flask_app\n",
+                "2148261": "2148261 1 2148261 2148261 lzl python3.8 gun.py master_main:flask_app\n",
+            }
+            return SimpleNamespace(returncode=0, stdout=rows[pid], stderr="")
+        return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.os, "name", "posix")
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        environment,
+        "_read_proc_text",
+        lambda path: "python3.8 gun.py master_main:flask_app"
+        if path.endswith("/cmdline")
+        else "",
+    )
+    monkeypatch.setattr(environment, "_read_proc_link", lambda path: "/home/lzl/test/vemu_uestc")
+
+    result = environment.inspect_process_detail({"ports": [45551]})
+
+    assert "port_owner: detected" in result
+    assert "port=45551" in result
+    assert "pid=2148261" in result
+    assert "listener_pids=2444773,2148367,2148261" in result
+    assert "tree_root_pid=2148261" in result
+    assert "ppid=1" in result
+    assert "pgid=2148261" in result
+    assert "sid=2148261" in result
+
+
 def test_process_detail_tool_returns_target_pid_cmd_and_cwd(monkeypatch):
     from types import SimpleNamespace
 
@@ -1275,7 +1326,7 @@ def test_process_detail_tool_returns_target_pid_cmd_and_cwd(monkeypatch):
         if command[:2] == ["ps", "-p"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stdout="1467095 1467011 1467011 1467011 root python3.8 web_terminal_main.py\n",
                 stderr="",
             )
         return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")
@@ -1321,7 +1372,7 @@ def test_process_detail_reports_unchecked_when_proc_cwd_is_unreadable(monkeypatc
         if command[:2] == ["ps", "-p"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="1467095 1467011 root python3.8 web_terminal_main.py\n",
+                stdout="1467095 1467011 1467011 1467011 root python3.8 web_terminal_main.py\n",
                 stderr="",
             )
         return SimpleNamespace(returncode=1, stdout="", stderr="unexpected")

@@ -164,7 +164,12 @@ class AgentOrchestrator:
                         max_retries=0,
                     )
                 )
-            privileged_context_builder = PrivilegedPlanContextBuilder()
+            def privileged_progress(message: str) -> None:
+                print("Klonet Agent：%s" % message, flush=True)
+
+            privileged_context_builder = PrivilegedPlanContextBuilder(
+                on_progress=privileged_progress,
+            )
             privileged_probe_runner = (
                 privileged_context_builder.run_recovery_diagnostics
             )
@@ -172,10 +177,12 @@ class AgentOrchestrator:
                 planner=PrivilegedPlannerAgent(
                     planner_llm,
                     probe_runner=privileged_probe_runner,
+                    on_progress=privileged_progress,
                 ),
                 execution_agent=PrivilegedExecutionAgent(
                     planner_llm,
                     probe_runner=privileged_probe_runner,
+                    on_progress=privileged_progress,
                 ),
                 executor=PrivilegedCommandExecutor(
                     on_output=lambda channel, chunk: print(chunk, end="", flush=True),
@@ -195,7 +202,7 @@ class AgentOrchestrator:
                 event_sink=self._record_privileged_event,
                 context_builder=privileged_context_builder,
                 summarizer=evidence_summarizer,
-                on_progress=lambda message: print("Klonet Agent：%s" % message),
+                on_progress=privileged_progress,
             )
         self.privileged_supervisor = privileged_supervisor
         if self.profile.name == "ops-privilege" and self.privileged_supervisor is None:

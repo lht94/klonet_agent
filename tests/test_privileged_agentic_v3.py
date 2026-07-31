@@ -67,11 +67,13 @@ def test_planner_can_probe_then_returns_semantic_plan_without_actions():
             _semantic_payload(),
         ]
     )
+    progress = []
     planner = PrivilegedPlannerAgent(
         llm,
         probe_runner=lambda requests: (
             probes.extend(requests) or "port 8080 is not listening"
         ),
+        on_progress=progress.append,
     )
 
     plan = planner.plan("inspect platform")
@@ -82,6 +84,88 @@ def test_planner_can_probe_then_returns_semantic_plan_without_actions():
     assert plan.steps[0].action == ""
     assert plan.probe_history[0]["round"] == 1
     assert "action=" not in llm.calls[0]["messages"][0]["content"]
+    assert any("准备执行 1 个只读检查（ports）" in item for item in progress)
+    assert progress[-1] == "规划结论：已形成 1 个语义步骤，开始匹配安全执行能力。"
+
+
+def test_planner_receives_recent_dialogue_for_continuation_resolution():
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    llm = FakeLLM([_semantic_payload(objective="deploy instance lht")])
+    dialogue = (
+        "user: 新增一个 Klonet 平台实例\n"
+        "assistant: 请提供实例名称"
+    )
+
+    PrivilegedPlannerAgent(llm).plan(
+        "叫 lht 吧",
+        conversation_context=dialogue,
+    )
+
+    prompt = llm.calls[0]["messages"][1]["content"]
+    assert dialogue in prompt
+    assert "Current request:\n叫 lht 吧" in prompt
+
+
+def test_planner_reuses_prior_probe_evidence_instead_of_repeating_probe():
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "need_evidence",
+                    "probe_requests": [
+                        {
+                            "probe": "ports",
+                            "args": {"ports": [8080]},
+                            "purpose": "repeat old check",
+                        }
+                    ],
+                }
+            ),
+            _semantic_payload(),
+        ]
+    )
+    progress = []
+    planner = PrivilegedPlannerAgent(
+        llm,
+        probe_runner=lambda requests: (_ for _ in ()).throw(
+            AssertionError("duplicate probe must not execute")
+        ),
+        on_progress=progress.append,
+    )
+
+    plan = planner.plan(
+        "inspect platform",
+        planning_feedback="port 8080 is available",
+        prior_probe_history=[
+            {
+                "requests": [
+                    {"probe": "ports", "args": {"ports": [8080]}}
+                ],
+                "evidence": "port 8080 is available",
+            }
+        ],
+    )
+
+    assert plan.steps
+    assert any("已拒绝重复只读检查（ports）" in item for item in progress)
+
+
+def test_planner_accepts_legacy_action_risk_labels_as_semantic_aliases():
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    payload = json.loads(_semantic_payload())
+    payload["risk"] = "privileged"
+    payload["steps"][0]["risk_suggestion"] = "privileged"
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([json.dumps(payload)])
+    ).plan("inspect platform")
+
+    assert plan.risk == "medium"
+    assert plan.steps[0].risk == "medium"
 
 
 def test_failure_packet_context_routes_rag_to_troubleshooting():
@@ -130,7 +214,11 @@ def test_execution_agent_maps_semantic_step_to_registered_action():
         ]
     )
 
-    bound = PrivilegedExecutionAgent(binder).prepare_plan(
+    progress = []
+    bound = PrivilegedExecutionAgent(
+        binder,
+        on_progress=progress.append,
+    ).prepare_plan(
         plan,
         grounded_context=None,
     )
@@ -141,6 +229,208 @@ def test_execution_agent_maps_semantic_step_to_registered_action():
     assert binding.approval_scope == "plan"
     assert bound.status == "awaiting_confirmation"
     assert "manual_checkpoint" in binder.calls[0]["messages"][1]["content"]
+    assert progress[0].startswith("实现节点 1/1")
+    assert progress[-1].endswith("注册 Action：manual_checkpoint。")
+
+
+def test_execution_agent_repairs_selected_action_args_without_replanning(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    source = tmp_path / "source"
+    destination = tmp_path / "lht"
+    source.mkdir()
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="copy source for lht")])
+    ).plan("deploy lht")
+    binder_llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "sync_directory",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "args": {
+                        "source": str(source),
+                        "destination": str(destination),
+                    },
+                    "resolved_from_evidence": ["observed source directory"],
+                }
+            ),
+        ]
+    )
+    progress = []
+
+    bound = PrivilegedExecutionAgent(
+        binder_llm,
+        on_progress=progress.append,
+    ).prepare_plan(plan, grounded_context=None)
+
+    binding = bound.steps[0].execution_binding
+    assert binding is not None
+    assert binding.action == "sync_directory"
+    assert binding.args == {
+        "source": str(source),
+        "destination": str(destination),
+    }
+    assert len(binder_llm.calls) == 2
+    repair_request = json.loads(binder_llm.calls[1]["messages"][1]["content"])
+    assert repair_request["frozen_action"] == "sync_directory"
+    assert repair_request["required_args"] == ["source", "destination"]
+    assert any("单独补全参数合同" in item for item in progress)
+
+
+def test_execution_agent_accepts_json_stringified_registered_action_args():
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="record deployment checkpoint")])
+    ).plan("record checkpoint")
+    binder_llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "manual_checkpoint",
+                    "args": json.dumps({"reason": "deployment prepared"}),
+                }
+            )
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+
+    assert bound.steps[0].execution_binding.args == {
+        "reason": "deployment prepared"
+    }
+    assert len(binder_llm.calls) == 1
+
+
+def test_missing_action_is_reported_before_missing_args():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+
+    agent = PrivilegedExecutionAgent(FakeLLM([]))
+
+    try:
+        agent._registered_binding(
+            {"status": "registered_action"},
+            PrivilegedStep(
+                step_id="configure",
+                title="修改配置",
+                objective="modify config ports",
+                risk="high",
+            ),
+            None,
+        )
+    except ValueError as exc:
+        assert str(exc) == "action_not_directly_registered=<missing>"
+    else:
+        raise AssertionError("missing action must be rejected")
+
+
+def test_execution_agent_repairs_invalid_status_and_accepts_case_normalization():
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload()])
+    ).plan("inspect platform")
+    valid = {
+        "status": "REGISTERED_ACTION",
+        "action": "manual_checkpoint",
+        "args": {"reason": "record observed platform state"},
+        "binding_reason": "registered action matches",
+        "resolved_from_evidence": ["server facts"],
+    }
+    binder_llm = FakeLLM(
+        [
+            json.dumps({"status": "ready"}),
+            json.dumps({"status": "success"}),
+            json.dumps(valid),
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+
+    assert bound.steps[0].execution_binding.action == "manual_checkpoint"
+    assert len(binder_llm.calls) == 3
+    repair = binder_llm.calls[1]["messages"][-1]["content"]
+    assert "shell_artifact" in repair
+    assert "ready are invalid" in repair
+
+
+def test_execution_binding_prompt_keeps_valid_json_and_complete_catalogs():
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload()])
+    ).plan("inspect platform")
+    binder_llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "test stops after prompt capture",
+                }
+            )
+        ]
+    )
+    context = GroundedPlanContext(
+        knowledge_evidence="K" * 40000,
+        environment_evidence="E" * 40000,
+        action_catalog="summary",
+        facts={"environment_model": {"platform": "lht"}},
+    )
+
+    try:
+        PrivilegedExecutionAgent(binder_llm).prepare_plan(
+            plan,
+            grounded_context=context,
+        )
+    except Exception:
+        pass
+    content = binder_llm.calls[0]["messages"][1]["content"]
+    payload = json.loads(content)
+
+    assert payload["required_status_values"] == [
+        "registered_action",
+        "shell_artifact",
+        "need_evidence",
+        "blocked",
+    ]
+    assert "manual_checkpoint" in payload["registered_action_catalog"]
+    assert "system_environment" in payload["registered_probe_catalog"]
+    assert "checker=file_contains args=path,text" in payload[
+        "registered_checker_catalog"
+    ]
+    assert "section compacted" in payload["grounded_context"]
+    assert len(payload["grounded_context"]) < 30000
 
 
 def test_unregistered_shell_requires_plan_then_exact_step_confirmation(tmp_path):
@@ -223,6 +513,351 @@ def test_unregistered_shell_requires_plan_then_exact_step_confirmation(tmp_path)
     )
 
 
+def test_execution_agent_completes_missing_shell_postconditions_separately(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "generated-marker"
+    plan = PrivilegedPlannerAgent(
+        FakeLLM(
+            [
+                _semantic_payload(
+                    objective="create an observable deployment marker"
+                )
+            ]
+        )
+    ).plan("create marker")
+    binder_llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "script": "touch %s" % target,
+                    "cwd": str(tmp_path),
+                    "run_as": "",
+                    "timeout": 10,
+                    "declared_changes": [str(target)],
+                    "rollback": "remove the marker",
+                    "binding_reason": "no registered action covers this",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "postconditions": [
+                        {
+                            "checker": "file_exists",
+                            "args": {"path": str(target)},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+    progress = []
+
+    bound = PrivilegedExecutionAgent(
+        binder_llm,
+        on_progress=progress.append,
+    ).prepare_plan(plan, grounded_context=None)
+
+    binding = bound.steps[0].execution_binding
+    assert binding is not None
+    assert binding.kind == "shell_artifact"
+    assert binding.postconditions == [
+        {"checker": "file_exists", "args": {"path": str(target)}}
+    ]
+    assert binding.shell_artifact is not None
+    assert "touch %s" % target in binding.shell_artifact.script
+    assert len(binder_llm.calls) == 2
+    verification_request = json.loads(
+        binder_llm.calls[1]["messages"][1]["content"]
+    )
+    assert verification_request["frozen_shell_artifact"]["sha256"] == (
+        binding.shell_artifact.sha256
+    )
+    assert any("脚本已通过安全校验并冻结" in item for item in progress)
+    assert progress[-1].endswith("需要一次性脚本并单独确认。")
+
+
+def test_shell_verification_repair_cannot_replace_frozen_script(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "frozen-marker"
+    original_script = "touch %s" % target
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="create the frozen marker")])
+    ).plan("create marker")
+    binder_llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "script": original_script,
+                    "cwd": str(tmp_path),
+                    "run_as": "",
+                    "timeout": 10,
+                    "declared_changes": [str(target)],
+                    "rollback": "remove the marker",
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {}}
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "script": "rm -f /tmp/unrelated",
+                    "postconditions": [
+                        {
+                            "checker": "file_exists",
+                            "args": {"path": str(target)},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+
+    artifact = bound.steps[0].execution_binding.shell_artifact
+    assert artifact is not None
+    assert original_script in artifact.script
+    assert "unrelated" not in artifact.script
+
+
+def test_shell_postconditions_require_observable_state_not_only_exit_code(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "observable-marker"
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="create an observable marker")])
+    ).plan("create marker")
+    binder_llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "script": "touch %s" % target,
+                    "cwd": str(tmp_path),
+                    "run_as": "",
+                    "timeout": 10,
+                    "declared_changes": [str(target)],
+                    "rollback": "remove marker",
+                    "postconditions": [
+                        {"checker": "exit_code_zero", "args": {}}
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "postconditions": [
+                        {"checker": "exit_code_zero", "args": {}}
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "postconditions": [
+                        {
+                            "checker": "file_exists",
+                            "args": {"path": str(target)},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+
+    assert bound.steps[0].postconditions[0]["checker"] == "file_exists"
+    repair_prompt = binder_llm.calls[2]["messages"][-1]["content"]
+    assert "Repair only postconditions" in repair_prompt
+
+
+def test_initial_binding_failure_returns_to_planner_before_blocking(tmp_path):
+    from klonet_agent.ops.privileged.contracts import ExecutionBinding
+    from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    planner_llm = FakeLLM(
+        [
+            _semantic_payload(objective="deploy lht in one broad step"),
+            _semantic_payload(objective="prepare the lht instance safely"),
+        ]
+    )
+    planner = PrivilegedPlannerAgent(planner_llm)
+
+    class BindingAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def prepare_plan(self, plan, *, grounded_context):
+            del grounded_context
+            self.calls += 1
+            if self.calls == 1:
+                plan.probe_history.append(
+                    {
+                        "phase": "execution_binding",
+                        "step_id": plan.steps[0].step_id,
+                        "round": 1,
+                        "requests": [
+                            {"probe": "ports", "args": {"ports": [8080]}}
+                        ],
+                        "evidence": "port 8080 is available",
+                    }
+                )
+                raise ExecutionBindingError(
+                    "no registered action safely covers the broad step"
+                )
+            step = plan.steps[0]
+            step.execution_binding = ExecutionBinding(
+                kind="registered_action",
+                action="manual_checkpoint",
+                args={"reason": "prepared"},
+                risk="medium",
+                approval_scope="plan",
+                postconditions=[
+                    {"checker": "exit_code_zero", "args": {}}
+                ],
+            )
+            step.risk = "medium"
+            step.postconditions = list(step.execution_binding.postconditions)
+            plan.risk = "medium"
+            plan.status = "awaiting_confirmation"
+            return plan
+
+    binder = BindingAgent()
+    progress = []
+    workflow = PrivilegedOpsWorkflow(
+        planner=planner,
+        execution_agent=binder,
+        executor=object(),
+        verifier=object(),
+        store=PrivilegedPlanStore(
+            tmp_path / "memory",
+            user_id="u",
+            project_id="p",
+        ),
+        on_progress=progress.append,
+    )
+
+    result = workflow.submit("部署名为 lht 的平台实例")
+
+    assert result.kind == "awaiting_confirmation"
+    assert binder.calls == 2
+    assert len(planner_llm.calls) == 2
+    retry_prompt = planner_llm.calls[1]["messages"][1]["content"]
+    assert "execution_binding" in retry_prompt
+    assert "no registered action safely covers" in retry_prompt
+    assert "port 8080 is available" in retry_prompt
+    assert result.plan.probe_history[0]["evidence"] == "port 8080 is available"
+    assert "第 1/2 次" in progress[0]
+    assert "no registered action safely covers" in progress[0]
+
+
+def test_initial_binding_replan_loop_is_bounded(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    planner_llm = FakeLLM([_semantic_payload()] * 3)
+    planner = PrivilegedPlannerAgent(planner_llm)
+
+    class AlwaysFailingBindingAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def prepare_plan(self, plan, *, grounded_context):
+            del plan, grounded_context
+            self.calls += 1
+            raise ExecutionBindingError("binding remains impossible")
+
+    binder = AlwaysFailingBindingAgent()
+    workflow = PrivilegedOpsWorkflow(
+        planner=planner,
+        execution_agent=binder,
+        executor=object(),
+        verifier=object(),
+        store=PrivilegedPlanStore(
+            tmp_path / "memory",
+            user_id="u",
+            project_id="p",
+        ),
+    )
+
+    result = workflow.submit("部署名为 lht 的平台实例")
+
+    assert result.kind == "blocked"
+    assert "2 次重新规划后仍失败" in result.message
+    assert binder.calls == 3
+    assert len(planner_llm.calls) == 3
+
+
+def test_invalid_execute_contract_does_not_consume_planner_replans(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    planner_llm = FakeLLM([_semantic_payload()])
+    progress = []
+
+    class InvalidContractBindingAgent:
+        def prepare_plan(self, plan, *, grounded_context):
+            del plan, grounded_context
+            raise ExecutionBindingError(
+                "registered action args must be an object",
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+
+    workflow = PrivilegedOpsWorkflow(
+        planner=PrivilegedPlannerAgent(planner_llm),
+        execution_agent=InvalidContractBindingAgent(),
+        executor=object(),
+        verifier=object(),
+        store=PrivilegedPlanStore(
+            tmp_path / "memory",
+            user_id="u",
+            project_id="p",
+        ),
+        on_progress=progress.append,
+    )
+
+    result = workflow.submit("部署名为 lht 的平台实例")
+
+    assert result.kind == "blocked"
+    assert "未触发无意义的 Planner 重规划" in result.message
+    assert len(planner_llm.calls) == 1
+    assert any("不消耗 Planner 重规划次数" in item for item in progress)
+
+
 def test_shell_policy_hard_denies_dynamic_egress_secrets_and_agent_changes(
     tmp_path,
 ):
@@ -253,6 +888,27 @@ def test_shell_policy_hard_denies_dynamic_egress_secrets_and_agent_changes(
             nonce="nonce-%s" % index,
         )
         assert policy.validate(artifact), script
+
+
+def test_shell_policy_rejects_normalized_empty_artifact(tmp_path):
+    from klonet_agent.ops.privileged.shell_artifact import (
+        ShellArtifactPolicy,
+        create_shell_artifact,
+    )
+
+    artifact = create_shell_artifact(
+        artifact_id="shell-empty",
+        script="",
+        cwd=str(tmp_path),
+        run_as="",
+        timeout=10,
+        environment_fingerprint="env",
+        declared_changes=[str(tmp_path / "marker")],
+        rollback="none",
+        nonce="nonce",
+    )
+
+    assert ShellArtifactPolicy().validate(artifact) == "shell_artifact_empty"
 
 
 def test_executor_refuses_changed_expired_drifted_or_reused_shell(tmp_path):

@@ -44,7 +44,7 @@ class PrivilegedOpsSupervisor:
         environment_context: str = "",
         conversation_context: str = "",
     ) -> SupervisorResult:
-        normalized = " ".join((text or "").split())
+        normalized = _normalize_user_turn(text)
         if self.workflow.is_control_command(normalized):
             result = self.workflow.handle_command(normalized)
             return self._handled(result)
@@ -89,6 +89,7 @@ class PrivilegedOpsSupervisor:
                             environment_context,
                             decision.goal_clarity,
                         ),
+                        conversation_context=conversation_context,
                     )
                 )
             return self._handled(
@@ -102,6 +103,7 @@ class PrivilegedOpsSupervisor:
                     environment_context,
                     decision.goal_clarity,
                 ),
+                conversation_context=conversation_context,
             )
         )
 
@@ -131,3 +133,14 @@ class PrivilegedOpsSupervisor:
             message=result.message,
             workflow_result=result,
         )
+
+
+def _normalize_user_turn(text: str) -> str:
+    """Normalize user/control text before supervisor routing.
+
+    CLI pipes and some editors may prefix UTF-8 input with BOM or zero-width
+    characters. Keeping this at the supervisor boundary protects API callers,
+    tests, and future frontends in addition to the current CLI.
+    """
+
+    return " ".join((text or "").strip().lstrip("\ufeff\u200b\u200c\u200d").split())
