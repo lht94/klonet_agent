@@ -755,6 +755,59 @@ def test_direct_runner_exact_text_replacement_requires_unique_match(tmp_path):
     assert config.read_text(encoding="utf-8") == "port = 1\nport = 1\n"
 
 
+def test_direct_runner_inserts_text_before_unique_anchor_with_backup(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text(
+        "class WtxConfig:\n    master_port = 45551\n\n"
+        "PROJ_CONFIG = WtxConfig()\n",
+        encoding="utf-8",
+    )
+    inserted = "class LhtConfig(WtxConfig):\n    master_port = 5200\n\n"
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "insert_text_before_anchor",
+            {
+                "path": str(config),
+                "anchor": "PROJ_CONFIG = WtxConfig()",
+                "content": inserted,
+            },
+        )
+    )
+
+    updated = config.read_text(encoding="utf-8")
+    assert result.status == "completed"
+    assert updated.index("class LhtConfig") < updated.index("PROJ_CONFIG")
+    assert updated.count("PROJ_CONFIG = WtxConfig()") == 1
+    backups = list(tmp_path.glob("config.py.klonet-agent.bak.*"))
+    assert len(backups) == 1
+    assert "class LhtConfig" not in backups[0].read_text(encoding="utf-8")
+
+
+def test_direct_runner_text_insertion_requires_unique_anchor(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text("ANCHOR\nANCHOR\n", encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "insert_text_before_anchor",
+            {
+                "path": str(config),
+                "anchor": "ANCHOR",
+                "content": "class LhtConfig:\n    pass",
+            },
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "insertion_anchor_match_count=2" in result.output
+    assert config.read_text(encoding="utf-8") == "ANCHOR\nANCHOR\n"
+
+
 def test_direct_runner_extracts_safe_archive_and_refuses_traversal(tmp_path):
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
 

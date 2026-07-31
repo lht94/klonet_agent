@@ -66,8 +66,11 @@ Return one JSON object with status exactly:
   can implement the unchanged semantic objective.
 
 Prefer a registered Action only when its declared capability actually covers
-the objective. Never invent Action names. All implementation parameters will
-be generated and validated by a separate stage 2 call.
+the objective. The absence of a matching registered Action is not by itself a
+reason to return blocked: select shell_artifact when a bounded, reviewable
+one-time shell implementation is possible. Never invent Action names. All
+implementation parameters will be generated and validated by a separate
+stage 2 call.
 """.strip()
 
 MAX_BINDING_PROBE_ROUNDS = 2
@@ -120,10 +123,14 @@ do not revise the outer semantic plan.
 
 Each implementation step must be atomic enough to bind to exactly one
 registered Action, one safe shell artifact, or one verification_only contract.
-You may include read-only discovery or verification steps. Express dependencies
-between implementation steps, but do not emit Action names, commands, shell,
-paths, ports, or other concrete arguments at this stage. Later binding calls
-will ground those details.
+Do not create standalone steps whose only purpose is to discover, determine,
+locate, or choose arguments for a later step. The Binding Agent performs such
+read-only probes internally. Include a read-only step only when it verifies an
+observable success criterion through a registered checker. Every other step
+must describe one observable state change. Express dependencies between
+implementation steps, but do not emit Action names, commands, shell, paths,
+ports, or other concrete arguments at this stage. Later binding calls will
+ground those details.
 
 Return status=ready with 1-12 implementation_steps. Each step needs id, title,
 objective, reason, depends_on, expected_changes, success_criteria, and

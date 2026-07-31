@@ -450,6 +450,16 @@ def _default_action_postconditions(
                 },
             }
         ]
+    if action == "insert_text_before_anchor":
+        return [
+            {
+                "checker": "file_contains",
+                "args": {
+                    "path": args.get("path"),
+                    "text": args.get("content"),
+                },
+            }
+        ]
     if action == "merge_json_file":
         return [
             {

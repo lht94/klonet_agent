@@ -51,6 +51,7 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "stop_platform_screens",
         "write_ops_file",
         "replace_text_in_file",
+        "insert_text_before_anchor",
         "install_nginx_config",
         "reload_nginx",
         "start_docker_container",
@@ -831,6 +832,85 @@ class DirectPrivilegedActionRunner:
                 "matches=1 environment_changed=true"
             )
             % (path, backup),
+        )
+
+    def _action_insert_text_before_anchor(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Insert bounded text before one exact anchor and retain a backup."""
+
+        path = _absolute_path(step.args.get("path"))
+        anchor = str(step.args.get("anchor") or "")
+        insertion = str(step.args.get("content") or "")
+        if (
+            path is None
+            or not path.is_file()
+            or path.suffix.lower() not in _SAFE_TEXT_SUFFIXES
+            or _SENSITIVE_NAME.search(path.name)
+        ):
+            return self._blocked("invalid_text_insertion_target")
+        if (
+            not anchor
+            or not insertion.strip()
+            or len(anchor) > 4000
+            or len(insertion) > 12000
+            or _SENSITIVE_CONTENT.search(anchor)
+            or _SENSITIVE_CONTENT.search(insertion)
+        ):
+            return self._blocked("invalid_or_sensitive_insertion")
+        try:
+            if path.stat().st_size > 2_000_000:
+                return self._blocked("insertion_target_too_large")
+            original = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return self._blocked("insertion_target_not_readable_text")
+        matches = original.count(anchor)
+        if matches != 1:
+            return self._blocked(
+                "insertion_anchor_match_count=%s expected=1" % matches
+            )
+        if insertion in original:
+            return DirectActionResult(
+                "completed",
+                "action=insert_text_before_anchor path=%s already_present=true "
+                "environment_changed=false" % path,
+            )
+        separator = "" if insertion.endswith("\n") else "\n"
+        updated = original.replace(anchor, insertion + separator + anchor, 1)
+        backup = path.with_name(
+            "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+        )
+        try:
+            if os.access(path.parent, os.W_OK):
+                shutil.copy2(path, backup)
+            else:
+                copied = self._command(
+                    _sudo_if_needed(["cp", "-p", str(path), str(backup)]),
+                    timeout=step.timeout,
+                )
+                if copied.returncode != 0:
+                    return DirectActionResult(
+                        "failed",
+                        "insertion_backup_failed path=%s stderr=%s "
+                        "environment_changed=false"
+                        % (path, _one_line(copied.stderr)),
+                        "inspect_path_permissions",
+                    )
+            result = self._write_file(path, updated, step.timeout)
+        except OSError as exc:
+            return DirectActionResult(
+                "failed",
+                "insertion_failed path=%s error=%s environment_changed=unknown"
+                % (path, exc.__class__.__name__),
+                "inspect_path_permissions",
+            )
+        if result:
+            return result
+        return DirectActionResult(
+            "completed",
+            "action=insert_text_before_anchor path=%s backup=%s matches=1 "
+            "environment_changed=true" % (path, backup),
         )
 
     def _action_install_nginx_config(

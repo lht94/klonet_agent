@@ -16,6 +16,7 @@ REQUIRED_ACTION_ARGS = {
     "ensure_shared_services": ("script_dir",),
     "write_ops_file": ("path", "content"),
     "replace_text_in_file": ("path", "old_text", "new_text"),
+    "insert_text_before_anchor": ("path", "anchor", "content"),
     "install_nginx_config": ("source_path", "config_name"),
     "start_docker_container": ("name",),
     "ensure_user_group": ("user", "group"),

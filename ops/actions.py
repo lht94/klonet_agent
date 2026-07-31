@@ -227,6 +227,23 @@ DEFAULT_OPS_ACTIONS = (
         backends=("ops-privilege",),
     ),
     OpsActionSpec(
+        "insert_text_before_anchor",
+        "_insert_text_before_anchor",
+        "controlled",
+        True,
+        ("path",),
+        category="filesystem",
+        description="在明确文本文件中唯一匹配锚点之前插入受限内容，并保留备份",
+        preconditions=(
+            "target_exists",
+            "anchor_matches_exactly_once",
+            "content_is_not_sensitive",
+        ),
+        effects=("target_content_changed", "backup_created"),
+        postconditions=("inserted_text_present", "anchor_preserved"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
         "install_nginx_config",
         "_install_nginx_config",
         "privileged",
