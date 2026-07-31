@@ -282,9 +282,46 @@ def _network_links(args: dict[str, Any]) -> str:
 def _file_integrity(args: dict[str, Any]) -> str:
     rows = []
     for raw in _string_list(args.get("paths"))[:50]:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            rows.append("path=%s status=refused_relative" % raw)
+            continue
+        try:
+            candidate = candidate.resolve()
+        except OSError as exc:
+            rows.append(
+                "path=%s status=unavailable reason=%s"
+                % (raw, exc.__class__.__name__)
+            )
+            continue
+        if candidate.is_dir():
+            try:
+                with os.scandir(candidate) as entries:
+                    entry_count = sum(1 for _, _entry in zip(range(1001), entries))
+                count_text = ">=1001" if entry_count >= 1001 else str(entry_count)
+                rows.append(
+                    "path=%s type=directory exists=true readable=%s searchable=%s entries=%s"
+                    % (
+                        candidate,
+                        str(os.access(candidate, os.R_OK)).lower(),
+                        str(os.access(candidate, os.X_OK)).lower(),
+                        count_text,
+                    )
+                )
+            except OSError as exc:
+                rows.append(
+                    "path=%s type=directory exists=true status=unavailable reason=%s"
+                    % (candidate, exc.__class__.__name__)
+                )
+            continue
         path = _absolute_file(raw)
         if path is None:
-            rows.append("path=%s status=missing_or_invalid" % raw)
+            status = "missing" if not candidate.exists() else "unsupported_file_type"
+            rows.append("path=%s exists=%s status=%s" % (
+                candidate,
+                str(candidate.exists()).lower(),
+                status,
+            ))
             continue
         digest = hashlib.sha256()
         try:

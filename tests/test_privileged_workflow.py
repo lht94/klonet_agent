@@ -254,6 +254,49 @@ def test_nested_implementation_change_invalidates_plan_authorization():
     assert not plan.is_authorized
 
 
+def test_manual_replan_binding_failure_pauses_instead_of_raising(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    plan = _plan(status="paused")
+    plan.steps[0].status = "paused"
+
+    class ReplanningPlanner:
+        def plan(self, goal, **kwargs):
+            del goal, kwargs
+            return _plan(status="awaiting_confirmation")
+
+    class AlwaysFailingBindingAgent:
+        def prepare_plan(self, current_plan, *, grounded_context):
+            del current_plan, grounded_context
+            raise ExecutionBindingError(
+                "conflicting directory evidence",
+                replan_recommended=True,
+            )
+
+    store = PrivilegedPlanStore(
+        tmp_path,
+        user_id="alice",
+        project_id="p1",
+    )
+    store.save(plan)
+    workflow = PrivilegedOpsWorkflow(
+        planner=ReplanningPlanner(),
+        executor=StubExecutor(),
+        verifier=StubVerifier(),
+        execution_agent=AlwaysFailingBindingAgent(),
+        store=store,
+    )
+
+    result = workflow.replan("priv-test", reason="try another route")
+
+    assert result.kind == "paused"
+    assert result.plan.plan_id == "priv-test"
+    assert store.load("priv-test").status == "paused"
+    assert "请由你决定" in result.message
+
+
 def test_readonly_step_in_mutating_plan_uses_deterministic_verifier(tmp_path):
     from klonet_agent.ops.privileged.contracts import VerificationDecision
 

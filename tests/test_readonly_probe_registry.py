@@ -67,6 +67,22 @@ def test_project_layout_probe_discovers_nested_klonet_package(tmp_path):
     assert "vemu_uestc" in output
 
 
+def test_file_integrity_distinguishes_existing_directory_from_missing(tmp_path):
+    from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+
+    (tmp_path / "entry.py").write_text("# entry\n", encoding="utf-8")
+
+    output = DEFAULT_READONLY_PROBES.run(
+        "file_integrity",
+        {"paths": [str(tmp_path)]},
+    )
+
+    assert "type=directory" in output
+    assert "exists=true" in output
+    assert "readable=true" in output
+    assert "missing_or_invalid" not in output
+
+
 def test_git_repository_probe_reports_branch_and_revision(tmp_path):
     from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 

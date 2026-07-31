@@ -169,30 +169,7 @@ class PrivilegedOpsWorkflow:
                 "该操作计划被安全策略拒绝：%s" % exc,
             )
         except ExecutionBindingError as exc:
-            paused_plan = getattr(exc, "paused_plan", None)
-            if paused_plan is not None:
-                return WorkflowResult(
-                    "paused",
-                    "Implementation Binding Agent 无法形成完整实现，所有自动"
-                    "重选与 Planner replan 已停止；没有执行任何服务器变更。\n"
-                    "原因：%s\n\n请由你决定：\n"
-                    "- 查看当前证据：audit-priv %s\n"
-                    "- 再次要求 Planner 重规划：replan-priv %s\n"
-                    "- 放弃该计划：abort-priv %s\n"
-                    "- 或直接补充目标/约束，提交一条新的请求"
-                    % (
-                        _short_error(exc),
-                        paused_plan.plan_id,
-                        paused_plan.plan_id,
-                        paused_plan.plan_id,
-                    ),
-                    paused_plan,
-                )
-            return WorkflowResult(
-                "blocked",
-                "无法生成可确认的安全计划：%s。当前没有执行任何操作。"
-                % _short_error(exc),
-            )
+            return self._binding_error_result(exc)
         except Exception as exc:
             return WorkflowResult(
                 "blocked",
@@ -229,6 +206,7 @@ class PrivilegedOpsWorkflow:
         """Return binding failures to the semantic Planner before giving up."""
 
         failures: list[str] = []
+        workflow_plan_id = plan.plan_id
         for attempt in range(MAX_INITIAL_BINDING_REPLAN_ATTEMPTS + 1):
             try:
                 return self.execution_agent.prepare_plan(
@@ -315,6 +293,7 @@ class PrivilegedOpsWorkflow:
                 retry_kwargs["planning_feedback"] = feedback
                 retry_kwargs["prior_probe_history"] = previous_probe_history
                 replacement = self.planner.plan(goal, **retry_kwargs)
+                replacement.plan_id = workflow_plan_id
                 replacement.probe_history = (
                     previous_probe_history
                     + list(replacement.probe_history)
@@ -340,6 +319,33 @@ class PrivilegedOpsWorkflow:
             )
         self.store.save(plan)
         error.paused_plan = plan
+
+    @staticmethod
+    def _binding_error_result(exc: ExecutionBindingError) -> WorkflowResult:
+        paused_plan = getattr(exc, "paused_plan", None)
+        if paused_plan is None:
+            return WorkflowResult(
+                "blocked",
+                "无法生成可确认的安全计划：%s。当前没有执行任何操作。"
+                % _short_error(exc),
+            )
+        return WorkflowResult(
+            "paused",
+            "Implementation Binding Agent 无法形成完整实现，所有自动"
+            "重选与 Planner replan 已停止；没有执行任何服务器变更。\n"
+            "原因：%s\n\n请由你决定：\n"
+            "- 查看当前证据：audit-priv %s\n"
+            "- 再次要求 Planner 重规划：replan-priv %s\n"
+            "- 放弃该计划：abort-priv %s\n"
+            "- 或直接补充目标/约束，提交一条新的请求"
+            % (
+                _short_error(exc),
+                paused_plan.plan_id,
+                paused_plan.plan_id,
+                paused_plan.plan_id,
+            ),
+            paused_plan,
+        )
 
     def submit_readonly(self, goal: str, command: str) -> WorkflowResult:
         argv, reason = PrivilegedRiskPolicy().readonly_argv(command)
@@ -780,15 +786,28 @@ class PrivilegedOpsWorkflow:
                     plan,
                 )
             planner_kwargs["grounded_context"] = grounded_context
-        replacement = self.planner.plan(plan.goal, **planner_kwargs)
-        if self.execution_agent is None:
-            raise RuntimeError("Implementation Binding Agent is unavailable")
-        replacement = self._bind_with_replanning(
-            plan.goal,
-            replacement,
-            grounded_context=planner_kwargs.get("grounded_context"),
-            planner_kwargs=planner_kwargs,
-        )
+        try:
+            replacement = self.planner.plan(plan.goal, **planner_kwargs)
+            replacement.plan_id = plan.plan_id
+            if self.execution_agent is None:
+                raise RuntimeError("Implementation Binding Agent is unavailable")
+            replacement = self._bind_with_replanning(
+                plan.goal,
+                replacement,
+                grounded_context=planner_kwargs.get("grounded_context"),
+                planner_kwargs=planner_kwargs,
+            )
+        except PlanningBlocked as exc:
+            plan.status = "paused"
+            self.store.save(plan)
+            return WorkflowResult(
+                "paused",
+                "Planner 重新规划时仍缺少必须由你决定的信息：%s；"
+                "现有步骤没有执行。" % _short_error(exc),
+                plan,
+            )
+        except ExecutionBindingError as exc:
+            return self._binding_error_result(exc)
         plan.risk = replacement.risk
         plan.verification_level = replacement.verification_level
         plan.verification = None
