@@ -244,6 +244,28 @@ DEFAULT_OPS_ACTIONS = (
         backends=("ops-privilege",),
     ),
     OpsActionSpec(
+        "edit_text_file",
+        "_edit_text_file",
+        "controlled",
+        True,
+        ("path",),
+        category="filesystem",
+        description=(
+            "统一修改已有文本文件；operation 支持 replace_file、replace_once、"
+            "insert_before、insert_after、append，锚点型操作要求唯一匹配，"
+            "自动备份并拒绝无效 Python/JSON 结果"
+        ),
+        preconditions=(
+            "target_exists",
+            "operation_is_explicit",
+            "anchor_is_unique_when_required",
+            "content_is_not_sensitive",
+        ),
+        effects=("target_content_changed", "backup_created"),
+        postconditions=("requested_text_present", "structured_text_valid"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
         "install_nginx_config",
         "_install_nginx_config",
         "privileged",

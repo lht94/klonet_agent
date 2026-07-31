@@ -79,7 +79,12 @@ DESTRUCTIVE_TARGET = re.compile(
 class ShellArtifactPolicy:
     """Validate syntax and immutable execution scope before user confirmation."""
 
-    def validate(self, artifact: ShellArtifact) -> str:
+    def validate(
+        self,
+        artifact: ShellArtifact,
+        *,
+        allowed_future_cwds: tuple[Path, ...] = (),
+    ) -> str:
         script = str(artifact.script or "")
         if not script.strip():
             return "shell_artifact_empty"
@@ -108,7 +113,12 @@ class ShellArtifactPolicy:
         if artifact.interpreter != "/bin/bash":
             return "shell_interpreter_not_allowed"
         cwd = Path(str(artifact.cwd or "")).expanduser()
-        if not cwd.is_absolute() or not cwd.is_dir():
+        if not cwd.is_absolute():
+            return "shell_cwd_not_existing_absolute_directory"
+        if not cwd.is_dir() and not _is_allowed_future_cwd(
+            cwd,
+            allowed_future_cwds,
+        ):
             return "shell_cwd_not_existing_absolute_directory"
         if artifact.run_as and not re.fullmatch(
             r"[A-Za-z_][A-Za-z0-9_.-]{0,63}",
@@ -275,3 +285,26 @@ def _command_basename(words: list[str]) -> str:
                 continue
         return os.path.basename(word)
     return ""
+
+
+def _is_allowed_future_cwd(cwd: Path, allowed: tuple[Path, ...]) -> bool:
+    """Permit a dependency-produced cwd during compilation, never execution."""
+
+    try:
+        resolved = cwd.resolve(strict=False)
+    except OSError:
+        return False
+    matches = []
+    for candidate in allowed:
+        try:
+            planned = Path(candidate).expanduser().resolve(strict=False)
+            resolved.relative_to(planned)
+            matches.append(planned)
+        except (OSError, ValueError):
+            continue
+    if not matches:
+        return False
+    parent = resolved
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+    return parent.is_dir()

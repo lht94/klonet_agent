@@ -162,6 +162,9 @@ def test_binding_agent_builds_and_binds_atomic_implementation_plan(tmp_path):
         "verification_only",
     ]
     assert micro_steps[1].depends_on == ["inspect__create-root"]
+    assert "planned predecessor inspect__create-root" in (
+        micro_steps[1].evidence_refs[0]
+    )
     restored = PrivilegedPlan.from_dict(bound.to_dict())
     assert restored.content_hash == bound.content_hash
     assert restored.steps[0].implementation_plan.steps[0].step_id == (
@@ -587,6 +590,7 @@ def test_execution_selection_prompt_is_bounded_and_omits_stage2_catalog():
     assert payload["required_status_values"] == [
         "registered_action",
         "shell_artifact",
+        "verification_only",
         "need_evidence",
         "blocked",
     ]
@@ -608,6 +612,192 @@ def test_execution_selection_prompt_is_bounded_and_omits_stage2_catalog():
     assert selection_tool["function"]["parameters"]["properties"][
         "action"
     ]["enum"] == ["", *payload["allowed_action_names"]]
+    assert selection_tool["function"]["parameters"]["properties"][
+        "status"
+    ]["enum"] == payload["required_status_values"]
+
+
+def test_direct_blocked_selection_must_review_shell_fallback(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "fallback-marker"
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="create a deployment marker")])
+    ).plan("create marker")
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "no registered action covers this operation",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "selection_reason": "a bounded shell fallback is safe",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "script": "touch %s" % target,
+                    "cwd": str(tmp_path),
+                    "run_as": "",
+                    "timeout": 10,
+                    "declared_changes": [str(target)],
+                    "rollback": "remove the marker",
+                    "binding_reason": "bounded shell fallback",
+                    "resolved_from_evidence": [],
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {"path": str(target)}}
+                    ],
+                }
+            ),
+        ]
+    )
+    progress = []
+
+    bound = PrivilegedExecutionAgent(
+        llm,
+        on_progress=progress.append,
+        enable_implementation_plans=False,
+    ).prepare_plan(plan, grounded_context=None)
+
+    assert bound.steps[0].execution_binding.kind == "shell_artifact"
+    assert any("强制评估一次性 Shell 兜底" in item for item in progress)
+    fallback_request = llm.calls[1]["messages"][-1]["content"]
+    assert "absence of a registered Action is not sufficient" in fallback_request
+
+
+def test_binding_agent_uses_unified_text_edit_contract(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    config = tmp_path / "config.py"
+    config.write_text("PROJ_CONFIG = WtxConfig()\n", encoding="utf-8")
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="insert LhtConfig before active config")])
+    ).plan("configure lht")
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "edit_text_file",
+                    "selection_reason": "unified text editor supports anchored insertion",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "",
+                    "args": {
+                        "path": str(config),
+                        "operation": "insert_before",
+                        "anchor": "PROJ_CONFIG = WtxConfig()",
+                        "content": "class LhtConfig(WtxConfig):\n    master_port = 5200\n",
+                    },
+                    "binding_reason": "unique active-config anchor",
+                    "resolved_from_evidence": ["config tail"],
+                    "preconditions": [],
+                    "postconditions": [],
+                }
+            ),
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(
+        llm,
+        enable_implementation_plans=False,
+    ).prepare_plan(plan, grounded_context=None)
+
+    binding = bound.steps[0].execution_binding
+    assert binding.action == "edit_text_file"
+    assert binding.args["operation"] == "insert_before"
+    assert binding.args["anchor"] == "PROJ_CONFIG = WtxConfig()"
+    contract_request = json.loads(llm.calls[1]["messages"][1]["content"])
+    assert contract_request["optional_args"] == ["anchor"]
+    assert "insert_before" in contract_request["action_description"]
+
+
+def test_implementation_plan_locally_rebuilds_discovery_only_step(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "instance"
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="prepare a new instance")])
+    ).plan("prepare instance")
+    discovery = {
+        "status": "ready",
+        "reason": "first locate parameters",
+        "implementation_steps": [
+            {
+                "id": "locate",
+                "title": "定位并读取现有配置",
+                "objective": "locate and read existing configuration",
+                "reason": "obtain arguments for a later step",
+                "depends_on": [],
+                "expected_changes": [],
+                "success_criteria": ["configuration location is known"],
+                "risk_suggestion": "readonly",
+            }
+        ],
+    }
+    actionable = {
+        "status": "ready",
+        "reason": "perform the observable state change directly",
+        "implementation_steps": [
+            {
+                "id": "create",
+                "title": "创建实例目录",
+                "objective": "create the instance directory",
+                "reason": "the deployment requires it",
+                "depends_on": [],
+                "expected_changes": ["the instance directory exists"],
+                "success_criteria": ["the instance directory exists"],
+                "risk_suggestion": "low",
+            }
+        ],
+    }
+    llm = FakeLLM(
+        [
+            json.dumps(discovery),
+            json.dumps(actionable),
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "create_directory",
+                    "selection_reason": "registered action covers the change",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "",
+                    "args": {"path": str(target)},
+                    "binding_reason": "create requested directory",
+                    "resolved_from_evidence": [],
+                    "preconditions": [],
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {"path": str(target)}}
+                    ],
+                }
+            ),
+        ]
+    )
+    progress = []
+
+    bound = PrivilegedExecutionAgent(llm, on_progress=progress.append).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+
+    micro_steps = bound.steps[0].implementation_plan.steps
+    assert [item.step_id for item in micro_steps] == ["inspect__create"]
+    assert any("局部重建" in item for item in progress)
 
 
 def test_unregistered_shell_requires_plan_then_exact_step_confirmation(tmp_path):
@@ -1480,6 +1670,39 @@ def test_shell_policy_allows_bounded_multiline_configuration(tmp_path):
 
     assert MAX_SCRIPT_LINES >= 80
     assert ShellArtifactPolicy().validate(artifact) == ""
+
+
+def test_shell_policy_allows_dependency_produced_cwd_only_during_compilation(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.shell_artifact import (
+        ShellArtifactPolicy,
+        create_shell_artifact,
+    )
+
+    future = tmp_path / "future-instance"
+    artifact = create_shell_artifact(
+        artifact_id="shell-future-cwd",
+        script="touch marker",
+        cwd=str(future),
+        run_as="",
+        timeout=10,
+        environment_fingerprint="env",
+        declared_changes=[str(future / "marker")],
+        rollback="remove marker",
+        nonce="nonce",
+    )
+    policy = ShellArtifactPolicy()
+
+    assert policy.validate(artifact) == (
+        "shell_cwd_not_existing_absolute_directory"
+    )
+    assert policy.validate(
+        artifact,
+        allowed_future_cwds=(future,),
+    ) == ""
+    future.mkdir()
+    assert policy.validate(artifact) == ""
 
 
 def test_shell_policy_reports_actual_line_limit(tmp_path):

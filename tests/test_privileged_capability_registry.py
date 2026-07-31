@@ -21,6 +21,7 @@ def test_direct_action_specs_publish_machine_readable_contracts():
     expected = {
         "replace_text_in_file",
         "insert_text_before_anchor",
+        "edit_text_file",
         "copy_files",
         "move_path",
         "create_directory",

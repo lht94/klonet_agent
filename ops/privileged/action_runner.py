@@ -52,6 +52,7 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "write_ops_file",
         "replace_text_in_file",
         "insert_text_before_anchor",
+        "edit_text_file",
         "install_nginx_config",
         "reload_nginx",
         "start_docker_container",
@@ -911,6 +912,133 @@ class DirectPrivilegedActionRunner:
             "completed",
             "action=insert_text_before_anchor path=%s backup=%s matches=1 "
             "environment_changed=true" % (path, backup),
+        )
+
+    def _action_edit_text_file(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Apply one bounded text edit selected by an explicit operation."""
+
+        path = _absolute_path(step.args.get("path"))
+        operation = str(step.args.get("operation") or "").strip().lower()
+        anchor = str(step.args.get("anchor") or "")
+        content = str(step.args.get("content") or "")
+        if (
+            path is None
+            or not path.is_file()
+            or path.suffix.lower() not in _SAFE_TEXT_SUFFIXES
+            or _SENSITIVE_NAME.search(path.name)
+        ):
+            return self._blocked("invalid_text_edit_target")
+        if (
+            operation not in {
+                "replace_file",
+                "replace_once",
+                "insert_before",
+                "insert_after",
+                "append",
+            }
+            or not content
+            or len(anchor) > 12000
+            or len(content) > 24000
+            or _SENSITIVE_CONTENT.search(anchor)
+            or _SENSITIVE_CONTENT.search(content)
+        ):
+            return self._blocked("invalid_or_sensitive_text_edit")
+        if operation in {"replace_once", "insert_before", "insert_after"}:
+            if not anchor:
+                return self._blocked("text_edit_anchor_required")
+        elif anchor:
+            return self._blocked("text_edit_anchor_must_be_empty")
+        try:
+            if path.stat().st_size > 2_000_000:
+                return self._blocked("text_edit_target_too_large")
+            original = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return self._blocked("text_edit_target_not_readable")
+
+        if operation == "replace_file":
+            updated = content
+        elif operation == "append":
+            if content in original:
+                return DirectActionResult(
+                    "completed",
+                    "action=edit_text_file operation=append path=%s "
+                    "already_present=true environment_changed=false" % path,
+                )
+            separator = "" if original.endswith("\n") or not original else "\n"
+            updated = original + separator + content
+        else:
+            matches = original.count(anchor)
+            if matches != 1:
+                return self._blocked(
+                    "text_edit_anchor_match_count=%s expected=1" % matches
+                )
+            if operation in {"insert_before", "insert_after"} and content in original:
+                return DirectActionResult(
+                    "completed",
+                    "action=edit_text_file operation=%s path=%s "
+                    "already_present=true environment_changed=false"
+                    % (operation, path),
+                )
+            if operation == "replace_once":
+                replacement = content
+            elif operation == "insert_before":
+                replacement = content + ("" if content.endswith("\n") else "\n") + anchor
+            else:
+                replacement = anchor + ("" if anchor.endswith("\n") else "\n") + content
+            updated = original.replace(anchor, replacement, 1)
+
+        if updated == original:
+            return DirectActionResult(
+                "completed",
+                "action=edit_text_file operation=%s path=%s unchanged=true "
+                "environment_changed=false" % (operation, path),
+            )
+        try:
+            if path.suffix.lower() == ".py":
+                ast.parse(updated, filename=str(path))
+            elif path.suffix.lower() == ".json":
+                json.loads(updated)
+        except (SyntaxError, ValueError, json.JSONDecodeError) as exc:
+            return self._blocked(
+                "text_edit_result_invalid_%s" % exc.__class__.__name__
+            )
+
+        backup = path.with_name(
+            "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+        )
+        try:
+            if os.access(path.parent, os.W_OK):
+                shutil.copy2(path, backup)
+            else:
+                copied = self._command(
+                    _sudo_if_needed(["cp", "-p", str(path), str(backup)]),
+                    timeout=step.timeout,
+                )
+                if copied.returncode != 0:
+                    return DirectActionResult(
+                        "failed",
+                        "text_edit_backup_failed path=%s stderr=%s "
+                        "environment_changed=false"
+                        % (path, _one_line(copied.stderr)),
+                        "inspect_path_permissions",
+                    )
+            result = self._write_file(path, updated, step.timeout)
+        except OSError as exc:
+            return DirectActionResult(
+                "failed",
+                "text_edit_failed path=%s error=%s environment_changed=unknown"
+                % (path, exc.__class__.__name__),
+                "inspect_path_permissions",
+            )
+        if result:
+            return result
+        return DirectActionResult(
+            "completed",
+            "action=edit_text_file operation=%s path=%s backup=%s "
+            "environment_changed=true" % (operation, path, backup),
         )
 
     def _action_install_nginx_config(

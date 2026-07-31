@@ -134,9 +134,13 @@ ground those details.
 
 Return status=ready with 1-12 implementation_steps. Each step needs id, title,
 objective, reason, depends_on, expected_changes, success_criteria, and
-risk_suggestion. Dependencies may reference only earlier step ids. Return
-status=blocked only when the frozen semantic objective itself cannot be
-implemented or safely decomposed with the supplied evidence.
+risk_suggestion. Verification steps must be provable by the supplied exact
+registered checker catalog and must not require secret discovery. Dependencies
+may reference only earlier step ids. A dependency's expected changes are future
+facts at execution time: do not add current-state probes that require those
+effects to exist before their producing step runs. Return status=blocked only
+when the frozen semantic objective itself cannot be implemented or safely
+decomposed with the supplied evidence.
 """.strip()
 
 
@@ -454,6 +458,7 @@ class PrivilegedExecutionAgent:
             "grounded_context": _selection_grounded_context(
                 grounded_context
             ),
+            "registered_checker_catalog": self.checkers.render_catalog(),
             "previous_attempt_feedback": feedback,
         }
         result = self._call_function(
@@ -532,6 +537,24 @@ class PrivilegedExecutionAgent:
             }.get(risk, risk)
             if risk not in RISK_LEVELS:
                 risk = semantic_step.risk
+            if _is_discovery_only_implementation_step(item, risk=risk):
+                raise ExecutionBindingError(
+                    "standalone discovery step is not executable: %s"
+                    % str(item.get("title") or item.get("objective") or raw_id),
+                    replan_recommended=False,
+                    category="implementation_contract_invalid",
+                )
+            dependency_evidence = []
+            for dependency in dependencies:
+                producer = steps[raw_ids[:index].index(dependency)]
+                dependency_evidence.append(
+                    "planned predecessor %s executes first; objective=%s; expected_changes=%s"
+                    % (
+                        producer.step_id,
+                        producer.objective,
+                        " | ".join(producer.expected_changes) or "not declared",
+                    )
+                )
             steps.append(
                 PrivilegedStep(
                     step_id=id_map[raw_id],
@@ -540,6 +563,7 @@ class PrivilegedExecutionAgent:
                         item.get("objective") or item.get("title") or raw_id
                     ).strip()[:1000],
                     reason=str(item.get("reason") or "").strip()[:1000],
+                    evidence_refs=dependency_evidence,
                     depends_on=[id_map[dep] for dep in dependencies],
                     expected_changes=_strings(
                         item.get("expected_changes"),
@@ -576,6 +600,8 @@ class PrivilegedExecutionAgent:
         probe_round = 0
         invalid_repairs = 0
         reselection_attempts = 0
+        shell_attempted = False
+        shell_fallback_reviewed = False
         rejected_implementations: list[str] = []
         if implementation_feedback:
             messages.append(
@@ -686,6 +712,7 @@ class PrivilegedExecutionAgent:
                     )
                     return binding
                 if status == "shell_artifact":
+                    shell_attempted = True
                     self._progress(
                         "选择结论：步骤“%s”没有匹配的注册 Action；"
                         "进入一次性脚本合同阶段。"
@@ -725,15 +752,41 @@ class PrivilegedExecutionAgent:
                     )
                     return binding
                 if status == "blocked":
+                    reason = str(
+                        data.get("reason")
+                        or "Implementation Binding Agent 无法实现该步骤"
+                    )
+                    if not shell_attempted and not shell_fallback_reviewed:
+                        shell_fallback_reviewed = True
+                        self._progress(
+                            "实现结论：注册能力未覆盖当前步骤，正在强制评估"
+                            "一次性 Shell 兜底，而不是直接阻塞。"
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "A blocked result is premature because no shell"
+                                    " fallback has been evaluated. Reconsider the same"
+                                    " frozen objective. Return shell_artifact if a bounded,"
+                                    " non-interactive, reviewable and verifiable one-time"
+                                    " bash implementation is possible. Otherwise return"
+                                    " blocked again and name the concrete shell safety or"
+                                    " verification constraint; absence of a registered"
+                                    " Action is not sufficient. Previous reason: %s"
+                                    % reason[:1000]
+                                ),
+                            }
+                        )
+                        continue
                     self._progress(
                         "实现结论：当前证据下无法安全实现步骤“%s”。"
                         % _progress_text(step.title or step.objective)
                     )
                     raise ExecutionBindingError(
-                        str(
-                            data.get("reason")
-                            or "Implementation Binding Agent 无法实现该步骤"
-                        )
+                        reason,
+                        replan_recommended=True,
+                        category="capability_mismatch",
                     )
                 raise ValueError(
                     "invalid execution binding status=%s"
@@ -840,6 +893,7 @@ class PrivilegedExecutionAgent:
             "required_status_values": [
                 "registered_action",
                 "shell_artifact",
+                "verification_only",
                 "need_evidence",
                 "blocked",
             ],
@@ -957,9 +1011,19 @@ class PrivilegedExecutionAgent:
         payload = {
             "frozen_action": action,
             "required_args": list(REQUIRED_ACTION_ARGS.get(action, ())),
+            "optional_args": (
+                ["anchor"] if action == "edit_text_file" else []
+            ),
+            "action_description": (
+                self.action_registry.get(action).description
+                if self.action_registry.get(action) is not None
+                else ""
+            ),
             "semantic_step": {
                 "step_id": semantic_step.step_id,
                 "objective": semantic_step.objective,
+                "depends_on": semantic_step.depends_on,
+                "planned_dependency_evidence": semantic_step.evidence_refs,
                 "expected_effects": semantic_step.expected_changes,
                 "success_criteria": semantic_step.success_criteria,
             },
@@ -1055,6 +1119,8 @@ class PrivilegedExecutionAgent:
             "semantic_step": {
                 "step_id": semantic_step.step_id,
                 "objective": semantic_step.objective,
+                "depends_on": semantic_step.depends_on,
+                "planned_dependency_evidence": semantic_step.evidence_refs,
                 "expected_effects": semantic_step.expected_changes,
                 "success_criteria": semantic_step.success_criteria,
             },
@@ -1173,7 +1239,10 @@ class PrivilegedExecutionAgent:
             rollback=rollback,
             nonce=uuid.uuid4().hex,
         )
-        problem = self.shell_policy.validate(artifact)
+        problem = self.shell_policy.validate(
+            artifact,
+            allowed_future_cwds=_planned_output_paths(semantic_step),
+        )
         if problem:
             raise ValueError(problem)
         try:
@@ -1212,6 +1281,8 @@ class PrivilegedExecutionAgent:
             "semantic_step": {
                 "step_id": semantic_step.step_id,
                 "objective": semantic_step.objective,
+                "depends_on": semantic_step.depends_on,
+                "planned_dependency_evidence": semantic_step.evidence_refs,
                 "success_criteria": semantic_step.success_criteria,
             },
             "grounded_context": _binding_grounded_context(grounded_context),
@@ -1609,6 +1680,7 @@ class PrivilegedExecutionAgent:
         action: str,
     ) -> dict[str, Any]:
         required = list(REQUIRED_ACTION_ARGS.get(action, ()))
+        optional = ["anchor"] if action == "edit_text_file" else []
         return _function_tool(
             "bind_action_%s" % action,
             "Bind grounded arguments for frozen registered Action %s." % action,
@@ -1624,7 +1696,7 @@ class PrivilegedExecutionAgent:
                         "type": "object",
                         "properties": {
                             name: _action_arg_json_schema(name)
-                            for name in required
+                            for name in [*required, *optional]
                         },
                         "required": required,
                         "additionalProperties": True,
@@ -1908,6 +1980,49 @@ def _safe_implementation_step_id(value: Any, *, fallback: str) -> str:
     return (text or fallback)[:80]
 
 
+def _is_discovery_only_implementation_step(
+    item: dict[str, Any],
+    *,
+    risk: str,
+) -> bool:
+    """Reject internal argument discovery accidentally emitted as execution."""
+
+    if risk != "readonly" or _strings(item.get("expected_changes"), 20):
+        return False
+    text = " ".join(
+        str(item.get(key) or "").lower()
+        for key in ("title", "objective", "reason")
+    )
+    discovery_markers = (
+        "定位",
+        "读取",
+        "确定插入位置",
+        "选择参数",
+        "识别路径",
+        "获取配置",
+        "locate ",
+        "read existing",
+        "determine ",
+        "choose ",
+        "identify path",
+        "discover ",
+        "obtain configuration",
+    )
+    return any(marker in text for marker in discovery_markers)
+
+
+def _planned_output_paths(step: PrivilegedStep) -> tuple[Any, ...]:
+    """Extract dependency-produced absolute paths for compile-time cwd checks."""
+
+    paths = []
+    for reference in step.evidence_refs:
+        for raw in re.findall(r"/(?:[^\s|;,]+)", str(reference)):
+            cleaned = raw.rstrip(".。:：)]}'\"")
+            if cleaned and cleaned not in paths:
+                paths.append(cleaned)
+    return tuple(paths)
+
+
 def _apply_binding_to_step(
     step: PrivilegedStep,
     binding: ExecutionBinding,
@@ -1975,7 +2090,9 @@ def _clean_binding_args(value: dict[str, Any]) -> dict[str, Any]:
                 for part_key, part_value in list(item.items())[:40]
             }
         else:
-            result[normalized] = str(item)[:20000 if normalized == "content" else 500]
+            result[normalized] = str(item)[
+                :20000 if normalized in {"content", "anchor"} else 500
+            ]
     return result
 
 

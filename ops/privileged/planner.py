@@ -460,6 +460,16 @@ def _default_action_postconditions(
                 },
             }
         ]
+    if action == "edit_text_file":
+        return [
+            {
+                "checker": "file_contains",
+                "args": {
+                    "path": args.get("path"),
+                    "text": args.get("content"),
+                },
+            }
+        ]
     if action == "merge_json_file":
         return [
             {
@@ -849,13 +859,18 @@ def _validate_host_facts(action: str, args: dict[str, Any]) -> str:
     project_actions = {
         "validate_project_files",
         "prepare_project_files",
+        "start_screen_component",
         "start_platform_screens",
         "restart_screen_component",
     }
     if action in project_actions:
         root = Path(str(args.get("project_root") or "")).expanduser()
         if not root.is_dir():
-            return "grounding_failed=project_root_not_found"
+            # A hierarchical implementation plan may create/copy this root in
+            # an earlier confirmed step. Route-level validation proves that
+            # producer relationship after every micro-step is bound; the
+            # Executor checks the real layout again at execution time.
+            return ""
         required = (
             "gun.py",
             "master_main.py",
@@ -898,6 +913,13 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
 
     operation = str(args.get("operation") or "").strip()
     allowed_operations = {
+        "edit_text_file": {
+            "replace_file",
+            "replace_once",
+            "insert_before",
+            "insert_after",
+            "append",
+        },
         "manage_service": {"start", "stop", "restart", "reload", "enable", "disable"},
         "manage_container": {
             "start", "stop", "restart", "remove", "set_restart_policy",
@@ -922,6 +944,13 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
             action,
             operation or "missing",
         )
+    if action == "edit_text_file":
+        anchor = str(args.get("anchor") or "")
+        if operation in {"replace_once", "insert_before", "insert_after"}:
+            if not anchor:
+                return "action=edit_text_file anchor_required"
+        elif anchor:
+            return "action=edit_text_file anchor_must_be_empty"
     if action == "manage_container" and operation == "set_restart_policy":
         if str(args.get("restart_policy") or "") not in {
             "no", "always", "unless-stopped", "on-failure",
@@ -997,11 +1026,31 @@ def _validate_environment_model(
     project_actions = {
         "validate_project_files",
         "prepare_project_files",
+        "start_screen_component",
         "start_platform_screens",
         "restart_screen_component",
     }
     prepared_roots: set[str] = set()
+    future_paths: set[str] = set()
     for step in steps:
+        if step.action in {"sync_directory", "copy_files"}:
+            raw_destination = str(step.args.get("destination") or "").strip()
+            if raw_destination:
+                try:
+                    future_paths.add(
+                        str(Path(raw_destination).expanduser().resolve())
+                    )
+                except OSError:
+                    future_paths.add(raw_destination)
+        if step.action == "prepare_project_files":
+            raw_prepared = str(step.args.get("project_root") or "").strip()
+            if raw_prepared:
+                try:
+                    prepared_roots.add(
+                        str(Path(raw_prepared).expanduser().resolve())
+                    )
+                except OSError:
+                    prepared_roots.add(raw_prepared)
         if step.action not in project_actions:
             continue
         raw_root = str(step.args.get("project_root") or "").strip()
@@ -1029,15 +1078,23 @@ def _validate_environment_model(
             None,
         )
         if layout is None:
-            raise ValueError(
-                "grounding_failed=project_root_not_in_environment_model"
+            root_path = Path(root)
+            produced = root in future_paths or any(
+                candidate == root_path / "mains"
+                for candidate in (Path(item) for item in future_paths)
             )
+            if not produced:
+                raise ValueError(
+                    "grounding_failed=future_project_root_has_no_prior_producer"
+                )
+            prepared_roots.add(root)
+            continue
         if layout.get("readiness") == "invalid":
             raise ValueError(
                 "grounding_failed=invalid_project_layout:%s"
                 % ",".join(layout.get("violations") or ["unknown"])
             )
-        if step.action == "start_platform_screens" and (
+        if step.action in {"start_platform_screens", "start_screen_component"} and (
             layout.get("readiness") != "runnable"
             and root not in prepared_roots
         ):

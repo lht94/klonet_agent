@@ -808,6 +808,59 @@ def test_direct_runner_text_insertion_requires_unique_anchor(tmp_path):
     assert config.read_text(encoding="utf-8") == "ANCHOR\nANCHOR\n"
 
 
+def test_direct_runner_generic_text_edit_supports_anchored_python_change(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text(
+        "class WtxConfig:\n    master_port = 45551\n\n"
+        "PROJ_CONFIG = WtxConfig()\n",
+        encoding="utf-8",
+    )
+    inserted = "class LhtConfig(WtxConfig):\n    master_port = 5200\n"
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "edit_text_file",
+            {
+                "path": str(config),
+                "operation": "insert_before",
+                "anchor": "PROJ_CONFIG = WtxConfig()",
+                "content": inserted,
+            },
+        )
+    )
+
+    updated = config.read_text(encoding="utf-8")
+    assert result.status == "completed"
+    assert updated.index("class LhtConfig") < updated.index("PROJ_CONFIG")
+    assert len(list(tmp_path.glob("config.py.klonet-agent.bak.*"))) == 1
+
+
+def test_direct_runner_generic_text_edit_rejects_invalid_python_result(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    original = "PROJ_CONFIG = object()\n"
+    config.write_text(original, encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "edit_text_file",
+            {
+                "path": str(config),
+                "operation": "append",
+                "anchor": "",
+                "content": "class Broken(:",
+            },
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "text_edit_result_invalid_SyntaxError" in result.output
+    assert config.read_text(encoding="utf-8") == original
+
+
 def test_direct_runner_extracts_safe_archive_and_refuses_traversal(tmp_path):
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
 
