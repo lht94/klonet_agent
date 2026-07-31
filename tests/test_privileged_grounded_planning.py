@@ -12,11 +12,24 @@ class FakeLLM:
 
     def complete(self, messages, tools=None, **kwargs):
         self.calls.append(messages)
+        content = self.payloads.pop(0)
+        if tools:
+            message = SimpleNamespace(
+                content="",
+                tool_calls=[
+                    SimpleNamespace(
+                        function=SimpleNamespace(
+                            name=tools[0]["function"]["name"],
+                            arguments=content,
+                        )
+                    )
+                ],
+            )
+        else:
+            message = SimpleNamespace(content=content, tool_calls=None)
         return SimpleNamespace(
             choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=self.payloads.pop(0))
-                )
+                SimpleNamespace(message=message)
             ]
         )
 

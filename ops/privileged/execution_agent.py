@@ -48,13 +48,16 @@ implementation capability for one frozen semantic step. Do not generate Action
 arguments, shell code, checker contracts, or a revised semantic plan.
 
 Return one JSON object with status exactly:
-- registered_action: include only action, selection_reason, and optional
-  resolved_from_evidence. action must exactly match the supplied catalog.
-- shell_artifact: only when no registered Action covers the objective; include
-  only selection_reason and optional resolved_from_evidence.
+- registered_action:
+  {"status":"registered_action","action":"<exact allowed name>",
+   "selection_reason":"...","resolved_from_evidence":[]}
+- shell_artifact, only when no registered Action covers the objective:
+  {"status":"shell_artifact","selection_reason":"...",
+   "resolved_from_evidence":[]}
 - need_evidence: include at most 3 registered read-only probe_requests.
-- blocked: include reason only when neither a registered Action nor a safe
-  one-time shell artifact can implement the unchanged semantic objective.
+- blocked: {"status":"blocked","reason":"..."}, only when neither a
+  registered Action nor a safe one-time shell artifact can implement the
+  unchanged semantic objective.
 
 Prefer a registered Action only when its declared capability actually covers
 the objective. Never invent Action names. All implementation parameters will
@@ -243,7 +246,7 @@ class PrivilegedExecutionAgent:
             {"role": "system", "content": EXECUTION_SELECTION_PROMPT},
             {
                 "role": "user",
-                "content": self._binding_request_content(
+                "content": self._selection_request_content(
                     plan,
                     step,
                     grounded_context,
@@ -253,11 +256,14 @@ class PrivilegedExecutionAgent:
         probe_round = 0
         invalid_repairs = 0
         while True:
-            response = self._complete(messages)
-            content = response.choices[0].message.content or ""
             data: dict[str, Any] = {}
             try:
-                data = _parse_json_object(content)
+                data = _normalize_selection(
+                    self._call_function(
+                        messages,
+                        self._selection_function_tool(),
+                    )
+                )
                 status = str(data.get("status") or "").strip().lower()
                 if status == "need_evidence":
                     if (
@@ -288,7 +294,6 @@ class PrivilegedExecutionAgent:
                             "evidence": str(evidence)[:16000],
                         }
                     )
-                    messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {
                             "role": "user",
@@ -382,7 +387,6 @@ class PrivilegedExecutionAgent:
                         invalid_repairs,
                     )
                 )
-                messages.append({"role": "assistant", "content": content})
                 messages.append(
                     {
                         "role": "user",
@@ -401,13 +405,13 @@ class PrivilegedExecutionAgent:
         if self.on_progress is not None:
             self.on_progress(message)
 
-    def _binding_request_content(
+    def _selection_request_content(
         self,
         plan: PrivilegedPlan,
         step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
     ) -> str:
-        """Build valid JSON without truncating action/probe protocol catalogs."""
+        """Build a small stage 1 request; exact evidence belongs to stage 2."""
 
         payload = {
             "goal": plan.goal,
@@ -421,10 +425,11 @@ class PrivilegedExecutionAgent:
                 "success_criteria": step.success_criteria,
                 "risk_suggestion": step.risk,
             },
-            "grounded_context": _binding_grounded_context(grounded_context),
-            # These protocol catalogs deliberately come from independent fields
-            # and are never cut by a final string slice.
+            "selection_context": _selection_grounded_context(
+                grounded_context
+            ),
             "registered_action_catalog": self._action_catalog(),
+            "allowed_action_names": self._direct_action_names(),
             "registered_probe_catalog": DEFAULT_READONLY_PROBES.render(),
             "required_status_values": [
                 "registered_action",
@@ -434,6 +439,13 @@ class PrivilegedExecutionAgent:
             ],
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    def _direct_action_names(self) -> list[str]:
+        return sorted(
+            spec.name
+            for spec in self.action_registry.describe()
+            if spec.name in DIRECT_PRIVILEGED_ACTIONS
+        )
 
     def _registered_binding(
         self,
@@ -563,10 +575,11 @@ class PrivilegedExecutionAgent:
         ]
         last_error = initial_error
         for attempt in range(1, MAX_ACTION_CONTRACT_REPAIRS + 1):
-            response = self._complete(messages)
-            content = response.choices[0].message.content or ""
             try:
-                result = _parse_json_object(content)
+                result = self._call_function(
+                    messages,
+                    self._action_contract_function_tool(action),
+                )
                 status = str(result.get("status") or "").strip().lower()
                 if status == "blocked":
                     raise ValueError(
@@ -607,7 +620,6 @@ class PrivilegedExecutionAgent:
                     "实现节点：Action 参数合同无效，正在请求第 %s 次定向修复…"
                     % attempt
                 )
-                messages.append({"role": "assistant", "content": content})
                 messages.append(
                     {
                         "role": "user",
@@ -652,10 +664,11 @@ class PrivilegedExecutionAgent:
         ]
         last_error = "shell contract was not generated"
         for attempt in range(1, MAX_SHELL_CONTRACT_REPAIRS + 1):
-            response = self._complete(messages)
-            content = response.choices[0].message.content or ""
             try:
-                result = _parse_json_object(content)
+                result = self._call_function(
+                    messages,
+                    self._shell_contract_function_tool(),
+                )
                 status = str(result.get("status") or "").strip().lower()
                 if status == "blocked":
                     raise ExecutionBindingError(
@@ -699,7 +712,6 @@ class PrivilegedExecutionAgent:
                     "实现节点：Shell 合同不完整，正在请求第 %s 次定向修复…"
                     % attempt
                 )
-                messages.append({"role": "assistant", "content": content})
                 messages.append(
                     {
                         "role": "user",
@@ -826,10 +838,11 @@ class PrivilegedExecutionAgent:
         ]
         last_error = initial_error
         for attempt in range(1, MAX_SHELL_VERIFICATION_REPAIRS + 1):
-            response = self._complete(messages)
-            content = response.choices[0].message.content or ""
             try:
-                result = _parse_json_object(content)
+                result = self._call_function(
+                    messages,
+                    self._shell_verification_function_tool(),
+                )
                 status = str(result.get("status") or "").strip().lower()
                 if status == "blocked":
                     raise ExecutionBindingError(
@@ -858,7 +871,6 @@ class PrivilegedExecutionAgent:
                     "实现节点：验收合同无效，正在请求第 %s 次定向修复…"
                     % attempt
                 )
-                messages.append({"role": "assistant", "content": content})
                 messages.append(
                     {
                         "role": "user",
@@ -978,17 +990,350 @@ class PrivilegedExecutionAgent:
             )
         return "\n".join(lines)
 
-    def _complete(self, messages: list[dict[str, str]]) -> Any:
+    def _selection_function_tool(self) -> dict[str, Any]:
+        probe_names = sorted(
+            spec.name for spec in DEFAULT_READONLY_PROBES.describe()
+        )
+        return _function_tool(
+            "select_execution_implementation",
+            "Select one frozen implementation kind for the semantic step.",
+            {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "registered_action",
+                            "shell_artifact",
+                            "need_evidence",
+                            "blocked",
+                        ],
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["", *self._direct_action_names()],
+                    },
+                    "selection_reason": {"type": "string"},
+                    "resolved_from_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "probe_requests": {
+                        "type": "array",
+                        "maxItems": 3,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "probe": {
+                                    "type": "string",
+                                    "enum": probe_names,
+                                },
+                                "args": {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                },
+                                "purpose": {"type": "string"},
+                            },
+                            "required": ["probe", "args", "purpose"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": [
+                    "status",
+                    "action",
+                    "selection_reason",
+                    "resolved_from_evidence",
+                    "probe_requests",
+                    "reason",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
+    def _action_contract_function_tool(
+        self,
+        action: str,
+    ) -> dict[str, Any]:
+        required = list(REQUIRED_ACTION_ARGS.get(action, ()))
+        return _function_tool(
+            "bind_action_%s" % action,
+            "Bind grounded arguments for frozen registered Action %s." % action,
+            {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ready", "blocked"],
+                    },
+                    "reason": {"type": "string"},
+                    "args": {
+                        "type": "object",
+                        "properties": {
+                            name: _action_arg_json_schema(name)
+                            for name in required
+                        },
+                        "required": required,
+                        "additionalProperties": True,
+                    },
+                    "binding_reason": {"type": "string"},
+                    "resolved_from_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "preconditions": self._checker_list_json_schema(),
+                    "postconditions": self._checker_list_json_schema(),
+                },
+                "required": [
+                    "status",
+                    "reason",
+                    "args",
+                    "binding_reason",
+                    "resolved_from_evidence",
+                    "preconditions",
+                    "postconditions",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
+    def _shell_contract_function_tool(self) -> dict[str, Any]:
+        return _function_tool(
+            "build_shell_artifact",
+            "Build the frozen one-time shell execution contract.",
+            {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ready", "blocked"],
+                    },
+                    "reason": {"type": "string"},
+                    "script": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "run_as": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1},
+                    "declared_changes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "rollback": {"type": "string"},
+                    "binding_reason": {"type": "string"},
+                    "resolved_from_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "postconditions": self._checker_list_json_schema(),
+                },
+                "required": [
+                    "status",
+                    "reason",
+                    "script",
+                    "cwd",
+                    "run_as",
+                    "timeout",
+                    "declared_changes",
+                    "rollback",
+                    "binding_reason",
+                    "resolved_from_evidence",
+                    "postconditions",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
+    def _shell_verification_function_tool(self) -> dict[str, Any]:
+        return _function_tool(
+            "bind_shell_postconditions",
+            "Bind deterministic checks to the already frozen shell artifact.",
+            {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ready", "blocked"],
+                    },
+                    "reason": {"type": "string"},
+                    "postconditions": self._checker_list_json_schema(),
+                },
+                "required": ["status", "reason", "postconditions"],
+                "additionalProperties": False,
+            },
+        )
+
+    def _checker_list_json_schema(self) -> dict[str, Any]:
+        return {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "checker": {
+                        "type": "string",
+                        "enum": list(self.checkers.names),
+                    },
+                    "args": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["checker", "args"],
+                "additionalProperties": False,
+            },
+        }
+
+    def _call_function(
+        self,
+        messages: list[dict[str, str]],
+        tool: dict[str, Any],
+    ) -> dict[str, Any]:
+        name = str(tool["function"]["name"])
+        choice = {"type": "function", "function": {"name": name}}
         try:
-            return self.llm.complete(
+            response = self.llm.complete(
                 messages=messages,
-                tools=None,
-                reasoning_effort="high",
-                temperature=0,
-                response_format={"type": "json_object"},
+                tools=[tool],
+                tool_choice=choice,
+                reasoning_effort=None,
+                extra_body={"thinking": {"type": "disabled"}},
             )
         except TypeError:
-            return self.llm.complete(messages=messages, tools=None)
+            response = self.llm.complete(messages=messages, tools=[tool])
+        return _function_arguments(response, name)
+
+
+def _function_tool(
+    name: str,
+    description: str,
+    parameters: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+
+
+def _function_arguments(response: Any, expected_name: str) -> dict[str, Any]:
+    """Extract one forced function call and reject ordinary text responses."""
+
+    choices = getattr(response, "choices", None)
+    if choices is None and isinstance(response, dict):
+        choices = response.get("choices")
+    if not choices:
+        raise ValueError("function_call_response_missing_choices")
+    choice = choices[0]
+    message = getattr(choice, "message", None)
+    if message is None and isinstance(choice, dict):
+        message = choice.get("message")
+    calls = getattr(message, "tool_calls", None)
+    if calls is None and isinstance(message, dict):
+        calls = message.get("tool_calls")
+    if not calls:
+        raise ValueError("required_function_call_missing=%s" % expected_name)
+    if len(calls) != 1:
+        raise ValueError("expected_exactly_one_function_call=%s" % expected_name)
+    call = calls[0]
+    function = getattr(call, "function", None)
+    if function is None and isinstance(call, dict):
+        function = call.get("function")
+    name = getattr(function, "name", None)
+    arguments = getattr(function, "arguments", None)
+    if isinstance(function, dict):
+        name = function.get("name")
+        arguments = function.get("arguments")
+    if str(name or "") != expected_name:
+        raise ValueError(
+            "unexpected_function_call=%s expected=%s"
+            % (name or "<missing>", expected_name)
+        )
+    if isinstance(arguments, dict):
+        data = arguments
+    else:
+        try:
+            data = json.loads(str(arguments or ""))
+        except json.JSONDecodeError as exc:
+            raise ValueError("function_arguments_not_valid_json") from exc
+    if not isinstance(data, dict):
+        raise ValueError("function_arguments_must_be_object")
+    return data
+
+
+def _action_arg_json_schema(name: str) -> dict[str, Any]:
+    if name in {"ports"}:
+        return {"type": "array", "items": {"type": "integer"}}
+    if name in {"packages", "argv", "sources", "entries"}:
+        return {"type": "array", "items": {"type": "string"}}
+    if name in {"patch"}:
+        return {"type": "object", "additionalProperties": True}
+    if name in {"pid", "expected_port"}:
+        return {"type": "integer"}
+    return {"type": "string"}
+
+
+def _normalize_selection(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize common function-argument aliases, then validate downstream."""
+
+    result = dict(data)
+    nested = next(
+        (
+            result.get(key)
+            for key in ("selection", "implementation", "binding")
+            if isinstance(result.get(key), dict)
+        ),
+        {},
+    )
+    if not result.get("status"):
+        result["status"] = (
+            nested.get("status")
+            or nested.get("kind")
+            or result.get("kind")
+            or result.get("type")
+        )
+    if not result.get("action"):
+        result["action"] = (
+            nested.get("action")
+            or nested.get("action_name")
+            or nested.get("name")
+            or result.get("action_name")
+            or result.get("selected_action")
+        )
+    aliases = {
+        "action": "registered_action",
+        "registered": "registered_action",
+        "shell": "shell_artifact",
+        "script": "shell_artifact",
+    }
+    normalized = str(result.get("status") or "").strip().lower()
+    result["status"] = aliases.get(normalized, normalized)
+    return result
+
+
+def _selection_grounded_context(
+    grounded_context: GroundedPlanContext | None,
+) -> str:
+    """Expose evidence availability, not the large evidence body, in stage 1."""
+
+    if grounded_context is None:
+        return "(no structured context)"
+    payload = {
+        "available_fact_keys": sorted(str(key) for key in grounded_context.facts),
+        "environment_model": grounded_context.facts.get("environment_model"),
+        "knowledge_evidence_available": bool(
+            str(grounded_context.knowledge_evidence or "").strip()
+        ),
+        "server_evidence_available": bool(
+            str(grounded_context.environment_evidence or "").strip()
+        ),
+        "note": "exact grounded values will be supplied to stage 2",
+    }
+    return _head_tail(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        6000,
+    )
 
 
 def _strings(value: Any, limit: int) -> list[str]:

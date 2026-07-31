@@ -294,11 +294,25 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
                     ),
             ]
 
-        def complete(self, messages, tools=None):
-            del messages, tools
+        def complete(self, messages, tools=None, **kwargs):
+            del messages, kwargs
             content = self.responses.pop(0)
+            if tools:
+                message = SimpleNamespace(
+                    content="",
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name=tools[0]["function"]["name"],
+                                arguments=content,
+                            )
+                        )
+                    ],
+                )
+            else:
+                message = SimpleNamespace(content=content, tool_calls=None)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+                choices=[SimpleNamespace(message=message)]
             )
 
     llm = SequentialLLM()

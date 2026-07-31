@@ -14,10 +14,26 @@ class FakeLLM:
         self.calls.append(
             {"messages": messages, "tools": tools, "kwargs": kwargs}
         )
+        content = self.responses.pop(0)
+        if tools:
+            function_name = tools[0]["function"]["name"]
+            message = SimpleNamespace(
+                content="",
+                tool_calls=[
+                    SimpleNamespace(
+                        function=SimpleNamespace(
+                            name=function_name,
+                            arguments=content,
+                        )
+                    )
+                ],
+            )
+        else:
+            message = SimpleNamespace(content=content, tool_calls=None)
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content=self.responses.pop(0))
+                    message=message
                 )
             ]
         )
@@ -295,6 +311,19 @@ def test_execution_agent_repairs_selected_action_args_without_replanning(
     repair_request = json.loads(binder_llm.calls[1]["messages"][1]["content"])
     assert repair_request["frozen_action"] == "sync_directory"
     assert repair_request["required_args"] == ["source", "destination"]
+    contract_call = binder_llm.calls[1]
+    contract_tool = contract_call["tools"][0]["function"]
+    assert contract_tool["name"] == "bind_action_sync_directory"
+    assert contract_tool["parameters"]["properties"]["args"]["required"] == [
+        "source",
+        "destination",
+    ]
+    assert contract_call["kwargs"]["tool_choice"]["function"]["name"] == (
+        "bind_action_sync_directory"
+    )
+    assert contract_call["kwargs"]["extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
     assert any("单独补全参数合同" in item for item in progress)
 
 
@@ -444,10 +473,23 @@ def test_execution_selection_prompt_is_bounded_and_omits_stage2_catalog():
         "blocked",
     ]
     assert "manual_checkpoint" in payload["registered_action_catalog"]
+    assert "sync_directory" in payload["allowed_action_names"]
     assert "system_environment" in payload["registered_probe_catalog"]
     assert "registered_checker_catalog" not in payload
-    assert "section compacted" in payload["grounded_context"]
-    assert len(payload["grounded_context"]) < 30000
+    assert "exact grounded values will be supplied to stage 2" in payload[
+        "selection_context"
+    ]
+    assert "K" * 100 not in payload["selection_context"]
+    assert "E" * 100 not in payload["selection_context"]
+    assert len(payload["selection_context"]) < 7000
+    selection_call = binder_llm.calls[0]
+    selection_tool = selection_call["tools"][0]
+    assert selection_call["kwargs"]["tool_choice"]["function"]["name"] == (
+        "select_execution_implementation"
+    )
+    assert selection_tool["function"]["parameters"]["properties"][
+        "action"
+    ]["enum"] == ["", *payload["allowed_action_names"]]
 
 
 def test_unregistered_shell_requires_plan_then_exact_step_confirmation(tmp_path):

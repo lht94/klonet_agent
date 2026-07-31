@@ -66,12 +66,13 @@ class LLMClient:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+        reasoning_effort: str | None = DEFAULT_REASONING_EFFORT,
         stream: bool = False,
         *,
         temperature: float | None = None,
         response_format: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ):
         """发送一次 Chat Completions 请求并返回原始模型响应。
 
@@ -89,14 +90,19 @@ class LLMClient:
         }
         create = self.client.chat.completions.create
         parameters = inspect.signature(create).parameters
-        if "reasoning_effort" in parameters or any(
-            item.kind == inspect.Parameter.VAR_KEYWORD
-            for item in parameters.values()
+        if reasoning_effort is not None and (
+            "reasoning_effort" in parameters
+            or any(
+                item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values()
+            )
         ):
             request["reasoning_effort"] = reasoning_effort
         # tools 是可选参数。没有工具时不传 tools 字段，避免某些模型接口对空列表兼容不好。
         if tools is not None:
             request["tools"] = tools
+        if tool_choice is not None:
+            request["tool_choice"] = tool_choice
         if temperature is not None:
             request["temperature"] = temperature
         if response_format is not None:

@@ -14,7 +14,20 @@ class FakeLLM:
             {"messages": messages, "tools": tools, "kwargs": kwargs}
         )
         content = self.contents.pop(0)
-        message = SimpleNamespace(content=content)
+        if tools:
+            message = SimpleNamespace(
+                content="",
+                tool_calls=[
+                    SimpleNamespace(
+                        function=SimpleNamespace(
+                            name=tools[0]["function"]["name"],
+                            arguments=content,
+                        )
+                    )
+                ],
+            )
+        else:
+            message = SimpleNamespace(content=content, tool_calls=None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
