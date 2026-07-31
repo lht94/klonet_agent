@@ -336,10 +336,16 @@ def test_execution_agent_binds_runtime_instance_cleanup():
         PrivilegedExecutionAgent,
     )
 
-    response = json.dumps(
+    selection = json.dumps(
         {
             "status": "registered_action",
             "action": "stop_klonet_runtime_instance",
+            "selection_reason": "registered cleanup covers the objective",
+        }
+    )
+    contract = json.dumps(
+        {
+            "status": "ready",
             "args": {
                 "runtime_cwd": "/home/lzl/test/vemu_uestc",
                 "ports": [45551, 45552],
@@ -367,7 +373,9 @@ def test_execution_agent_binds_runtime_instance_cleanup():
         ],
     )
 
-    bound = PrivilegedExecutionAgent(FakeLLM([response])).prepare_plan(
+    bound = PrivilegedExecutionAgent(
+        FakeLLM([selection, contract])
+    ).prepare_plan(
         plan,
         grounded_context=None,
     )

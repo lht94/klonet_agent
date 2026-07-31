@@ -168,6 +168,12 @@ def test_planner_replaces_source_repo_runtime_with_grounded_parent_plan(tmp_path
                 {
                     "status": "registered_action",
                     "action": "prepare_project_files",
+                    "selection_reason": "registered preparation action",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "args": {
                         "project_root": str(backend.parent),
                         "source_root": str(backend / "mains"),
@@ -179,6 +185,12 @@ def test_planner_replaces_source_repo_runtime_with_grounded_parent_plan(tmp_path
                 {
                     "status": "registered_action",
                     "action": "start_platform_screens",
+                    "selection_reason": "registered platform startup action",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "args": {
                         "platform": "demo",
                         "project_root": str(backend.parent),

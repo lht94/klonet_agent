@@ -203,6 +203,12 @@ def test_execution_agent_maps_semantic_step_to_registered_action():
                 {
                     "status": "registered_action",
                     "action": "manual_checkpoint",
+                    "selection_reason": "registered checkpoint covers objective",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "args": {"reason": "record observed platform state"},
                     "binding_reason": "the registered checkpoint covers the objective",
                     "resolved_from_evidence": ["server facts"],
@@ -229,6 +235,8 @@ def test_execution_agent_maps_semantic_step_to_registered_action():
     assert binding.approval_scope == "plan"
     assert bound.status == "awaiting_confirmation"
     assert "manual_checkpoint" in binder.calls[0]["messages"][1]["content"]
+    assert len(binder.calls) == 2
+    assert "frozen_action" in binder.calls[1]["messages"][1]["content"]
     assert progress[0].startswith("实现节点 1/1")
     assert progress[-1].endswith("注册 Action：manual_checkpoint。")
 
@@ -258,6 +266,8 @@ def test_execution_agent_repairs_selected_action_args_without_replanning(
             json.dumps(
                 {
                     "status": "ready",
+                    # Stage 2 is not allowed to switch the frozen selection.
+                    "action": "write_ops_file",
                     "args": {
                         "source": str(source),
                         "destination": str(destination),
@@ -303,6 +313,11 @@ def test_execution_agent_accepts_json_stringified_registered_action_args():
                 {
                     "status": "registered_action",
                     "action": "manual_checkpoint",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "args": json.dumps({"reason": "deployment prepared"}),
                 }
             )
@@ -317,7 +332,7 @@ def test_execution_agent_accepts_json_stringified_registered_action_args():
     assert bound.steps[0].execution_binding.args == {
         "reason": "deployment prepared"
     }
-    assert len(binder_llm.calls) == 1
+    assert len(binder_llm.calls) == 2
 
 
 def test_missing_action_is_reported_before_missing_args():
@@ -354,9 +369,12 @@ def test_execution_agent_repairs_invalid_status_and_accepts_case_normalization()
     plan = PrivilegedPlannerAgent(
         FakeLLM([_semantic_payload()])
     ).plan("inspect platform")
-    valid = {
+    valid_selection = {
         "status": "REGISTERED_ACTION",
         "action": "manual_checkpoint",
+    }
+    valid_contract = {
+        "status": "ready",
         "args": {"reason": "record observed platform state"},
         "binding_reason": "registered action matches",
         "resolved_from_evidence": ["server facts"],
@@ -365,7 +383,8 @@ def test_execution_agent_repairs_invalid_status_and_accepts_case_normalization()
         [
             json.dumps({"status": "ready"}),
             json.dumps({"status": "success"}),
-            json.dumps(valid),
+            json.dumps(valid_selection),
+            json.dumps(valid_contract),
         ]
     )
 
@@ -375,13 +394,13 @@ def test_execution_agent_repairs_invalid_status_and_accepts_case_normalization()
     )
 
     assert bound.steps[0].execution_binding.action == "manual_checkpoint"
-    assert len(binder_llm.calls) == 3
+    assert len(binder_llm.calls) == 4
     repair = binder_llm.calls[1]["messages"][-1]["content"]
     assert "shell_artifact" in repair
-    assert "ready are invalid" in repair
+    assert "stage 2 status ready is invalid" in repair
 
 
-def test_execution_binding_prompt_keeps_valid_json_and_complete_catalogs():
+def test_execution_selection_prompt_is_bounded_and_omits_stage2_catalog():
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.execution_agent import (
         PrivilegedExecutionAgent,
@@ -426,9 +445,7 @@ def test_execution_binding_prompt_keeps_valid_json_and_complete_catalogs():
     ]
     assert "manual_checkpoint" in payload["registered_action_catalog"]
     assert "system_environment" in payload["registered_probe_catalog"]
-    assert "checker=file_contains args=path,text" in payload[
-        "registered_checker_catalog"
-    ]
+    assert "registered_checker_catalog" not in payload
     assert "section compacted" in payload["grounded_context"]
     assert len(payload["grounded_context"]) < 30000
 
@@ -459,6 +476,12 @@ def test_unregistered_shell_requires_plan_then_exact_step_confirmation(tmp_path)
                 json.dumps(
                     {
                         "status": "shell_artifact",
+                        "selection_reason": "no registered action covers marker",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "ready",
                         "script": "touch %s" % target,
                         "cwd": str(tmp_path),
                         "run_as": "",
@@ -536,6 +559,12 @@ def test_execution_agent_completes_missing_shell_postconditions_separately(
             json.dumps(
                 {
                     "status": "shell_artifact",
+                    "selection_reason": "no registered action covers marker",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "script": "touch %s" % target,
                     "cwd": str(tmp_path),
                     "run_as": "",
@@ -573,9 +602,16 @@ def test_execution_agent_completes_missing_shell_postconditions_separately(
     ]
     assert binding.shell_artifact is not None
     assert "touch %s" % target in binding.shell_artifact.script
-    assert len(binder_llm.calls) == 2
-    verification_request = json.loads(
+    assert len(binder_llm.calls) == 3
+    shell_request = json.loads(
         binder_llm.calls[1]["messages"][1]["content"]
+    )
+    assert shell_request["frozen_implementation_kind"] == "shell_artifact"
+    assert "checker=file_contains args=path,text" in shell_request[
+        "registered_checker_catalog"
+    ]
+    verification_request = json.loads(
+        binder_llm.calls[2]["messages"][1]["content"]
     )
     assert verification_request["frozen_shell_artifact"]["sha256"] == (
         binding.shell_artifact.sha256
@@ -600,6 +636,12 @@ def test_shell_verification_repair_cannot_replace_frozen_script(tmp_path):
             json.dumps(
                 {
                     "status": "shell_artifact",
+                    "selection_reason": "no registered action covers marker",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "script": original_script,
                     "cwd": str(tmp_path),
                     "run_as": "",
@@ -654,6 +696,12 @@ def test_shell_postconditions_require_observable_state_not_only_exit_code(
             json.dumps(
                 {
                     "status": "shell_artifact",
+                    "selection_reason": "no registered action covers marker",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
                     "script": "touch %s" % target,
                     "cwd": str(tmp_path),
                     "run_as": "",
@@ -693,7 +741,7 @@ def test_shell_postconditions_require_observable_state_not_only_exit_code(
     )
 
     assert bound.steps[0].postconditions[0]["checker"] == "file_exists"
-    repair_prompt = binder_llm.calls[2]["messages"][-1]["content"]
+    repair_prompt = binder_llm.calls[3]["messages"][-1]["content"]
     assert "Repair only postconditions" in repair_prompt
 
 

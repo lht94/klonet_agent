@@ -273,6 +273,12 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
                         {
                             "status": "registered_action",
                             "action": "write_ops_file",
+                            "selection_reason": "registered writer covers objective",
+                        }
+                    ),
+                json.dumps(
+                        {
+                            "status": "ready",
                             "args": {
                                 "path": str(target),
                                 "content": "ready",

@@ -42,37 +42,29 @@ from klonet_agent.ops.privileged.shell_artifact import (
 )
 
 
-EXECUTION_BINDER_PROMPT = """
-You are the Klonet Ops-Privilege Execution Agent.
-You receive one semantic plan step, grounded environment evidence, and an exact
-registered Action catalog. You choose an implementation; you do not change the
-step objective, dependencies, expected effects, or success criteria.
+EXECUTION_SELECTION_PROMPT = """
+You are stage 1 of the Klonet Ops-Privilege Execution Agent. Select exactly one
+implementation capability for one frozen semantic step. Do not generate Action
+arguments, shell code, checker contracts, or a revised semantic plan.
 
 Return one JSON object with status exactly:
-- registered_action: include action, args, binding_reason,
-  resolved_from_evidence, and optional registered checker postconditions.
-- shell_artifact: only when no registered Action can implement the objective;
-  include script, cwd, run_as, timeout, declared_changes, rollback,
-  binding_reason, resolved_from_evidence, and postconditions.
+- registered_action: include only action, selection_reason, and optional
+  resolved_from_evidence. action must exactly match the supplied catalog.
+- shell_artifact: only when no registered Action covers the objective; include
+  only selection_reason and optional resolved_from_evidence.
 - need_evidence: include at most 3 registered read-only probe_requests.
-- blocked: include reason.
+- blocked: include reason only when neither a registered Action nor a safe
+  one-time shell artifact can implement the unchanged semantic objective.
 
-Prefer a registered Action whenever it actually covers the objective. Never
-misuse a vaguely related Action merely to avoid shell review. All paths, ports,
-services, users, process IDs, file contents and command arguments must be
-grounded in supplied evidence. Never include passwords or secret values.
-
-A shell artifact must implement only this one semantic step, use ordinary bash,
-be non-interactive, and have observable postconditions. Do not use eval, source,
-command substitution, background execution, dynamic download-and-execute,
-unbounded deletion, or changes to sudoers/SSH/Agent security policy.
-For shell_artifact, postconditions are required and every checker name and its
-arguments must come from the supplied registered checker catalog.
+Prefer a registered Action only when its declared capability actually covers
+the objective. Never invent Action names. All implementation parameters will
+be generated and validated by a separate stage 2 call.
 """.strip()
 
 MAX_BINDING_PROBE_ROUNDS = 2
 MAX_BINDING_INVALID_REPAIRS = 2
 MAX_ACTION_CONTRACT_REPAIRS = 2
+MAX_SHELL_CONTRACT_REPAIRS = 2
 MAX_SHELL_VERIFICATION_REPAIRS = 2
 MAX_BINDING_GROUNDING_SECTION_CHARS = 12000
 
@@ -106,6 +98,25 @@ JSON object with status:
 Use the exact required argument names and grounded evidence supplied. Do not
 change the Action, return a shell script, request probes, or alter the semantic
 objective.
+""".strip()
+
+
+SHELL_CONTRACT_PROMPT = """
+You are stage 2 of the Klonet Ops-Privilege Execution Agent. The semantic step
+and the decision to use a one-time shell artifact are frozen. Generate only the
+complete shell execution contract for this one step.
+
+Return exactly one JSON object with status:
+- ready: include script, cwd, run_as, timeout, declared_changes, rollback,
+  binding_reason, resolved_from_evidence, and registered postconditions.
+- blocked: include reason if a safe, grounded and verifiable shell contract
+  cannot implement the frozen objective.
+
+The script must use ordinary bash, be non-interactive, and produce observable
+state. Do not use eval, source, command substitution, background execution,
+dynamic download-and-execute, unbounded deletion, or changes to sudoers, SSH,
+or Agent security policy. Every checker and required argument must come from
+the supplied checker catalog. Do not return an Action or alter the objective.
 """.strip()
 
 
@@ -229,7 +240,7 @@ class PrivilegedExecutionAgent:
         grounded_context: GroundedPlanContext | None,
     ) -> ExecutionBinding:
         messages = [
-            {"role": "system", "content": EXECUTION_BINDER_PROMPT},
+            {"role": "system", "content": EXECUTION_SELECTION_PROMPT},
             {
                 "role": "user",
                 "content": self._binding_request_content(
@@ -289,25 +300,35 @@ class PrivilegedExecutionAgent:
                     )
                     continue
                 if status == "registered_action":
-                    try:
-                        binding = self._registered_binding(
-                            data,
-                            step,
-                            grounded_context,
+                    action = str(data.get("action") or "").strip()
+                    if (
+                        self.action_registry.get(action) is None
+                        or action not in DIRECT_PRIVILEGED_ACTIONS
+                    ):
+                        raise ValueError(
+                            "action_not_directly_registered=%s"
+                            % (action or "<missing>")
                         )
-                    except ValueError as exc:
-                        action = str(data.get("action") or "").strip()
-                        if (
-                            self.action_registry.get(action) is None
-                            or action not in DIRECT_PRIVILEGED_ACTIONS
-                        ):
-                            raise
-                        binding = self._complete_registered_action_contract(
-                            data=data,
-                            semantic_step=step,
-                            grounded_context=grounded_context,
-                            initial_error=str(exc),
+                    self._progress(
+                        "选择结论：步骤“%s”选用注册 Action：%s；"
+                        "进入参数绑定阶段。"
+                        % (
+                            _progress_text(step.title or step.objective),
+                            _progress_text(action),
                         )
+                    )
+                    binding = self._complete_registered_action_contract(
+                        data={
+                            "action": action,
+                            "binding_reason": data.get("selection_reason"),
+                            "resolved_from_evidence": data.get(
+                                "resolved_from_evidence"
+                            ),
+                        },
+                        semantic_step=step,
+                        grounded_context=grounded_context,
+                        initial_error="stage 2 Action arguments are not bound yet",
+                    )
                     self._progress(
                         "实现结论：步骤“%s”将使用注册 Action：%s。"
                         % (
@@ -317,10 +338,15 @@ class PrivilegedExecutionAgent:
                     )
                     return binding
                 if status == "shell_artifact":
-                    binding = self._shell_binding(
-                        data,
-                        step,
-                        grounded_context,
+                    self._progress(
+                        "选择结论：步骤“%s”没有匹配的注册 Action；"
+                        "进入一次性脚本合同阶段。"
+                        % _progress_text(step.title or step.objective)
+                    )
+                    binding = self._complete_shell_contract(
+                        selection=data,
+                        semantic_step=step,
+                        grounded_context=grounded_context,
                     )
                     self._progress(
                         "实现结论：没有合适的注册 Action，步骤“%s”需要一次性脚本并单独确认。"
@@ -361,11 +387,11 @@ class PrivilegedExecutionAgent:
                     {
                         "role": "user",
                         "content": (
-                            "Repair only the implementation binding JSON without"
-                            " changing the semantic objective. Return one complete"
-                            " JSON object. status must be exactly one of"
+                            "Repair only the stage 1 capability selection JSON."
+                            " Do not return args, script, or checker contracts."
+                            " Return one complete JSON object. status must be one of"
                             " registered_action, shell_artifact, need_evidence,"
-                            " or blocked; Planner statuses such as ready are invalid."
+                            " or blocked; stage 2 status ready is invalid here."
                             " Error: %s" % exc
                         ),
                     }
@@ -400,7 +426,6 @@ class PrivilegedExecutionAgent:
             # and are never cut by a final string slice.
             "registered_action_catalog": self._action_catalog(),
             "registered_probe_catalog": DEFAULT_READONLY_PROBES.render(),
-            "registered_checker_catalog": self.checkers.render_catalog(),
             "required_status_values": [
                 "registered_action",
                 "shell_artifact",
@@ -595,6 +620,101 @@ class PrivilegedExecutionAgent:
         raise ValueError(
             "registered action contract repair exhausted for %s: %s"
             % (action, last_error)
+        )
+
+    def _complete_shell_contract(
+        self,
+        *,
+        selection: dict[str, Any],
+        semantic_step: PrivilegedStep,
+        grounded_context: GroundedPlanContext | None,
+    ) -> ExecutionBinding:
+        """Generate stage 2 Shell fields without reopening capability choice."""
+
+        payload = {
+            "frozen_implementation_kind": "shell_artifact",
+            "selection_reason": selection.get("selection_reason"),
+            "semantic_step": {
+                "step_id": semantic_step.step_id,
+                "objective": semantic_step.objective,
+                "expected_effects": semantic_step.expected_changes,
+                "success_criteria": semantic_step.success_criteria,
+            },
+            "grounded_context": _binding_grounded_context(grounded_context),
+            "registered_checker_catalog": self.checkers.render_catalog(),
+        }
+        messages = [
+            {"role": "system", "content": SHELL_CONTRACT_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False),
+            },
+        ]
+        last_error = "shell contract was not generated"
+        for attempt in range(1, MAX_SHELL_CONTRACT_REPAIRS + 1):
+            response = self._complete(messages)
+            content = response.choices[0].message.content or ""
+            try:
+                result = _parse_json_object(content)
+                status = str(result.get("status") or "").strip().lower()
+                if status == "blocked":
+                    raise ExecutionBindingError(
+                        str(
+                            result.get("reason")
+                            or "无法为该语义步骤生成安全的一次性脚本"
+                        ),
+                        category="semantic_binding",
+                    )
+                if status != "ready":
+                    raise ValueError(
+                        "invalid shell contract status=%s"
+                        % (status or "<missing>")
+                    )
+                contract = dict(result)
+                contract.pop("status", None)
+                contract["binding_reason"] = (
+                    contract.get("binding_reason")
+                    or selection.get("selection_reason")
+                )
+                if not contract.get("resolved_from_evidence"):
+                    contract["resolved_from_evidence"] = selection.get(
+                        "resolved_from_evidence"
+                    )
+                binding = self._shell_binding(
+                    contract,
+                    semantic_step,
+                    grounded_context,
+                )
+                self._progress(
+                    "实现节点：一次性脚本执行合同已生成并通过安全校验。"
+                )
+                return binding
+            except ExecutionBindingError:
+                raise
+            except (KeyError, TypeError, ValueError) as exc:
+                last_error = str(exc)
+                if attempt >= MAX_SHELL_CONTRACT_REPAIRS:
+                    break
+                self._progress(
+                    "实现节点：Shell 合同不完整，正在请求第 %s 次定向修复…"
+                    % attempt
+                )
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair only the stage 2 shell contract. Keep the"
+                            " semantic objective and shell implementation kind"
+                            " frozen. Return status ready or blocked. Error: %s"
+                            % exc
+                        ),
+                    }
+                )
+        raise ExecutionBindingError(
+            "Execution Agent Shell 合同修复耗尽：%s" % last_error,
+            replan_recommended=False,
+            category="implementation_contract_invalid",
         )
 
     def _shell_binding(
