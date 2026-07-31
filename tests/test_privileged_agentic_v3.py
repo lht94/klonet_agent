@@ -1268,10 +1268,13 @@ def test_unfinished_plan_options_prevent_plain_continue_from_replanning(tmp_path
     )
 
     result = workflow.unfinished_plan_options()
+    classifier_context = workflow.unfinished_plan_context()
 
     assert result.kind == "recovery_options"
     assert "不会自动执行" in result.message
     assert "confirm-priv priv-resume-choice" in result.message
+    assert "plan_id=priv-resume-choice" in classifier_context
+    assert "goal=deploy lht" in classifier_context
 
 
 def test_shell_policy_hard_denies_dynamic_egress_secrets_and_agent_changes(

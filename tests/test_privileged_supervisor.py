@@ -35,6 +35,7 @@ def _intent_payload(intent, **overrides):
         "confidence": 0.95,
         "reason": "classified from the user request",
         "clarification_question": "",
+        "plan_reference": "",
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -42,7 +43,13 @@ def _intent_payload(intent, **overrides):
 
 @pytest.mark.parametrize(
     "intent",
-    ["conversation", "readonly_action", "mutating_action", "ambiguous"],
+    [
+        "conversation",
+        "readonly_action",
+        "mutating_action",
+        "resume_plan",
+        "ambiguous",
+    ],
 )
 def test_intent_classifier_returns_structured_toolless_decision(intent):
     from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
@@ -254,10 +261,10 @@ def test_supervisor_handles_exact_plan_control_before_classifier():
 def test_supervisor_turns_plain_continue_into_recovery_choices():
     from klonet_agent.ops.privileged.workflow import WorkflowResult
 
-    supervisor, workflow, classifier = _supervisor("mutating_action")
-    workflow.unfinished_plan_options = lambda: WorkflowResult(
+    supervisor, workflow, classifier = _supervisor("resume_plan")
+    workflow.unfinished_plan_options = lambda reference="": WorkflowResult(
         "recovery_options",
-        "检查现场状态后恢复：resume-priv priv-123",
+        "检查现场状态后恢复：resume-priv priv-123；reference=%s" % reference,
     )
 
     result = supervisor.handle("继续")
@@ -265,8 +272,29 @@ def test_supervisor_turns_plain_continue_into_recovery_choices():
     assert result.handled is True
     assert result.kind == "recovery_options"
     assert "resume-priv priv-123" in result.message
-    assert classifier.calls == []
+    assert classifier.calls == [("继续", "")]
     assert workflow.mutations == []
+
+
+def test_resume_intent_is_classified_semantically_with_plan_reference():
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    llm = FakeLLM(
+        [
+            _intent_payload(
+                "resume_plan",
+                plan_reference="latest",
+                reason="the user refers to the previous plan",
+            )
+        ]
+    )
+
+    decision = PrivilegedIntentClassifier(llm).classify("接着上次部署")
+
+    assert decision.intent == "resume_plan"
+    assert decision.requires_execution is False
+    assert decision.plan_reference == "latest"
+    assert "resume_plan" in llm.calls[0]["messages"][0]["content"]
 
 
 def test_supervisor_denies_raw_goal_before_classifier_or_planner():

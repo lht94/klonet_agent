@@ -48,25 +48,25 @@ class PrivilegedOpsSupervisor:
         if self.workflow.is_control_command(normalized):
             result = self.workflow.handle_command(normalized)
             return self._handled(result)
-        if normalized in {"继续", "恢复", "继续执行", "恢复上次任务"}:
-            recovery_options = getattr(
-                self.workflow,
-                "unfinished_plan_options",
-                None,
-            )
-            if recovery_options is not None:
-                result = recovery_options()
-                if result is not None:
-                    return self._handled(result)
 
         safety = self.goal_guard.check(normalized)
         if safety.denied:
             return SupervisorResult(True, "denied", "Denied: %s" % safety.reason)
 
         self._progress("正在分析请求并规划下一步…")
+        classifier_context = conversation_context
+        unfinished_context = getattr(
+            self.workflow,
+            "unfinished_plan_context",
+            lambda: "",
+        )()
+        if unfinished_context:
+            classifier_context = (
+                (classifier_context + "\n\n") if classifier_context else ""
+            ) + unfinished_context
         decision = self.classifier.classify(
             normalized,
-            conversation_context=conversation_context,
+            conversation_context=classifier_context,
         )
         if decision.intent == "classifier_error":
             return SupervisorResult(
@@ -74,6 +74,25 @@ class PrivilegedOpsSupervisor:
                 "blocked",
                 "当前无法可靠判断这条请求属于问答、只读检查还是变更操作。"
                 "这是分类服务异常，不是你的表达问题；当前没有执行任何操作，请稍后重试。",
+            )
+        if decision.intent == "resume_plan":
+            recovery_options = getattr(
+                self.workflow,
+                "unfinished_plan_options",
+                None,
+            )
+            result = (
+                recovery_options(decision.plan_reference)
+                if recovery_options is not None
+                else None
+            )
+            if result is not None:
+                return self._handled(result)
+            return SupervisorResult(
+                True,
+                "clarification",
+                "没有找到与你描述匹配的未完成高权限计划；当前没有执行任何操作。"
+                "你可以输入 list-priv 查看历史计划，或明确描述一个新目标。",
             )
         if decision.should_clarify:
             question = decision.clarification_question

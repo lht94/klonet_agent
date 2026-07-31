@@ -419,8 +419,29 @@ class PrivilegedOpsWorkflow:
             "Error: invalid privileged control command",
         )
 
-    def unfinished_plan_options(self) -> WorkflowResult | None:
-        """Turn an ambiguous 'continue' into explicit recovery choices."""
+    def unfinished_plan_context(self) -> str:
+        """Give the intent classifier a bounded summary of resumable plans."""
+
+        unfinished = [
+            plan
+            for plan in self.store.list()
+            if plan.status not in {"completed", "aborted", "blocked", "failed"}
+        ]
+        if not unfinished:
+            return ""
+        lines = ["Available unfinished privileged plans:"]
+        for plan in unfinished[:5]:
+            lines.append(
+                "- plan_id=%s status=%s goal=%s"
+                % (plan.plan_id, plan.status, plan.goal[:300])
+            )
+        return "\n".join(lines)
+
+    def unfinished_plan_options(
+        self,
+        plan_reference: str = "",
+    ) -> WorkflowResult | None:
+        """Resolve a classified resume intent into explicit safe choices."""
 
         unfinished = [
             plan
@@ -429,7 +450,32 @@ class PrivilegedOpsWorkflow:
         ]
         if not unfinished:
             return None
-        plan = unfinished[0]
+        reference = " ".join(str(plan_reference or "").lower().split())
+        candidates = unfinished
+        if reference and reference != "latest":
+            exact = [plan for plan in unfinished if plan.plan_id.lower() == reference]
+            if exact:
+                candidates = exact
+            else:
+                candidates = [
+                    plan
+                    for plan in unfinished
+                    if reference in plan.goal.lower()
+                    or reference in plan.plan_id.lower()
+                ]
+                if not candidates:
+                    return None
+        if len(candidates) > 1 and reference not in {"", "latest"}:
+            return WorkflowResult(
+                "recovery_options",
+                "找到多个可能的未完成计划，请先选择一个：\n%s"
+                % "\n".join(
+                    "- %s status=%s goal=%s；查看：show-priv %s"
+                    % (plan.plan_id, plan.status, plan.goal, plan.plan_id)
+                    for plan in candidates[:5]
+                ),
+            )
+        plan = candidates[0]
         lines = [
             "发现一个尚未结束的高权限计划；为避免把“继续”误当成新目标，"
             "系统不会自动执行。",

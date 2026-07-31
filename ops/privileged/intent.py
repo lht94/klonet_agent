@@ -13,6 +13,7 @@ INTENTS = {
     "conversation",
     "readonly_action",
     "mutating_action",
+    "resume_plan",
     "ambiguous",
     "classifier_error",
 }
@@ -27,6 +28,9 @@ intent must be exactly one of:
 - conversation: explanation or discussion that does not request real execution
 - readonly_action: requests real inspection without changing machine state
 - mutating_action: requests any real state change
+- resume_plan: asks to continue, recover, inspect, retry, or otherwise return
+  to a previously persisted privileged plan; this intent does not itself
+  authorize execution
 - ambiguous: the desired outcome or target is genuinely missing
 
 Separately classify goal_clarity:
@@ -46,6 +50,11 @@ Important:
   ambiguous.
 - For readonly_action, command is optional. Provide it only when one concrete,
   deterministically read-only command follows safely from the request.
+- Use resume_plan for natural-language references to an earlier unfinished
+  plan, such as "继续上次部署", "恢复刚才的任务", or "接着之前的计划".
+  Set plan_reference to an explicit priv-* id when supplied or when exactly
+  one matching id is visible in the unfinished-plan context; otherwise use
+  "latest". Never turn resume_plan into a new deploy, restart, or repair goal.
 - clarification_question must be a concise Chinese question and is required only
   for goal_clarity=missing.
 
@@ -54,12 +63,14 @@ Examples:
 - "检查 Klonet 为什么没启动" -> readonly_action, discoverable
 - "查看 Python 版本" -> readonly_action, clear
 - "什么是 tc qdisc" -> conversation, clear
+- "继续上次的部署计划" -> resume_plan, clear, plan_reference="latest"
 - "把它删掉" with no referent in recent context -> ambiguous, missing
 - "帮我处理一下" -> ambiguous, missing
 
 Return one JSON object only with intent, goal_clarity, requires_execution,
 command, confidence, reason, and clarification_question. Never execute tools.
-Do not classify command risk.
+Also return plan_reference; use an empty string for non-resume intents. Do not
+classify command risk.
 """.strip()
 
 
@@ -73,6 +84,7 @@ class PrivilegedIntentDecision:
     goal_clarity: str = "clear"
     clarification_question: str = ""
     classifier_status: str = "ok"
+    plan_reference: str = ""
 
     @property
     def should_clarify(self) -> bool:
@@ -176,4 +188,5 @@ class PrivilegedIntentClassifier:
             clarification_question=str(
                 data.get("clarification_question") or ""
             ).strip(),
+            plan_reference=str(data.get("plan_reference") or "").strip()[:500],
         )
