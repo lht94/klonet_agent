@@ -200,7 +200,10 @@ def test_planner_replaces_source_repo_runtime_with_grounded_parent_plan(tmp_path
             ),
         ]
     )
-    bound = PrivilegedExecutionAgent(binder).prepare_plan(
+    bound = PrivilegedExecutionAgent(
+        binder,
+        enable_implementation_plans=False,
+    ).prepare_plan(
         plan,
         grounded_context=context,
     )

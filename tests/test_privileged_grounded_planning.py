@@ -387,7 +387,8 @@ def test_execution_agent_binds_runtime_instance_cleanup():
     )
 
     bound = PrivilegedExecutionAgent(
-        FakeLLM([selection, contract])
+        FakeLLM([selection, contract]),
+        enable_implementation_plans=False,
     ).prepare_plan(
         plan,
         grounded_context=None,

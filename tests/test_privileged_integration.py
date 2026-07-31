@@ -334,7 +334,10 @@ def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
 
     workflow = PrivilegedOpsWorkflow(
         planner=PrivilegedPlannerAgent(llm),
-        execution_agent=PrivilegedExecutionAgent(llm),
+        execution_agent=PrivilegedExecutionAgent(
+            llm,
+            enable_implementation_plans=False,
+        ),
         executor=PrivilegedCommandExecutor(action_runner=action_runner),
         verifier=PrivilegedVerifierAgent(llm),
         store=store,

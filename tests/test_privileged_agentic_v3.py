@@ -62,6 +62,113 @@ def _semantic_payload(*, objective="inspect the current platform state"):
     )
 
 
+def test_binding_agent_builds_and_binds_atomic_implementation_plan(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "lht"
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="prepare a new lht instance")])
+    ).plan("prepare lht")
+    binder = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "creation and validation are separate operations",
+                    "implementation_steps": [
+                        {
+                            "id": "create-root",
+                            "title": "创建实例目录",
+                            "objective": "create the lht instance root directory",
+                            "reason": "the instance needs a root directory",
+                            "depends_on": [],
+                            "expected_changes": ["the directory exists"],
+                            "success_criteria": ["the directory exists"],
+                            "risk_suggestion": "low",
+                        },
+                        {
+                            "id": "verify-root",
+                            "title": "验证实例目录",
+                            "objective": "verify the lht instance root directory exists",
+                            "reason": "the created state must be observed",
+                            "depends_on": ["create-root"],
+                            "expected_changes": [],
+                            "success_criteria": ["the directory exists"],
+                            "risk_suggestion": "readonly",
+                        },
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "create_directory",
+                    "selection_reason": "registered directory creation is atomic",
+                    "resolved_from_evidence": [],
+                    "probe_requests": [],
+                    "reason": "",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "",
+                    "args": {"path": str(target)},
+                    "binding_reason": "create the requested root",
+                    "resolved_from_evidence": [],
+                    "preconditions": [],
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {"path": str(target)}}
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "verification_only",
+                    "action": "",
+                    "selection_reason": "only observation remains",
+                    "resolved_from_evidence": [],
+                    "probe_requests": [],
+                    "reason": "",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "",
+                    "binding_reason": "observe the requested state",
+                    "resolved_from_evidence": [],
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {"path": str(target)}}
+                    ],
+                }
+            ),
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(binder).prepare_plan(
+        plan,
+        grounded_context=None,
+    )
+
+    semantic = bound.steps[0]
+    assert semantic.execution_binding is None
+    assert semantic.implementation_plan is not None
+    micro_steps = semantic.implementation_plan.steps
+    assert [item.execution_binding.kind for item in micro_steps] == [
+        "registered_action",
+        "verification_only",
+    ]
+    assert micro_steps[1].depends_on == ["inspect__create-root"]
+    restored = PrivilegedPlan.from_dict(bound.to_dict())
+    assert restored.content_hash == bound.content_hash
+    assert restored.steps[0].implementation_plan.steps[0].step_id == (
+        "inspect__create-root"
+    )
+
+
 def test_planner_can_probe_then_returns_semantic_plan_without_actions():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
@@ -240,6 +347,7 @@ def test_execution_agent_maps_semantic_step_to_registered_action():
     bound = PrivilegedExecutionAgent(
         binder,
         on_progress=progress.append,
+        enable_implementation_plans=False,
     ).prepare_plan(
         plan,
         grounded_context=None,
@@ -298,6 +406,7 @@ def test_execution_agent_repairs_selected_action_args_without_replanning(
     bound = PrivilegedExecutionAgent(
         binder_llm,
         on_progress=progress.append,
+        enable_implementation_plans=False,
     ).prepare_plan(plan, grounded_context=None)
 
     binding = bound.steps[0].execution_binding
@@ -353,7 +462,10 @@ def test_execution_agent_accepts_json_stringified_registered_action_args():
         ]
     )
 
-    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+    bound = PrivilegedExecutionAgent(
+        binder_llm,
+        enable_implementation_plans=False,
+    ).prepare_plan(
         plan,
         grounded_context=None,
     )
@@ -417,7 +529,10 @@ def test_execution_agent_repairs_invalid_status_and_accepts_case_normalization()
         ]
     )
 
-    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+    bound = PrivilegedExecutionAgent(
+        binder_llm,
+        enable_implementation_plans=False,
+    ).prepare_plan(
         plan,
         grounded_context=None,
     )
@@ -457,7 +572,10 @@ def test_execution_selection_prompt_is_bounded_and_omits_stage2_catalog():
     )
 
     try:
-        PrivilegedExecutionAgent(binder_llm).prepare_plan(
+        PrivilegedExecutionAgent(
+            binder_llm,
+            enable_implementation_plans=False,
+        ).prepare_plan(
             plan,
             grounded_context=context,
         )
@@ -540,7 +658,8 @@ def test_unregistered_shell_requires_plan_then_exact_step_confirmation(tmp_path)
                     }
                 )
             ]
-        )
+        ),
+        enable_implementation_plans=False,
     )
     workflow = PrivilegedOpsWorkflow(
         planner=planner,
@@ -634,6 +753,7 @@ def test_execution_agent_completes_missing_shell_postconditions_separately(
     bound = PrivilegedExecutionAgent(
         binder_llm,
         on_progress=progress.append,
+        enable_implementation_plans=False,
     ).prepare_plan(plan, grounded_context=None)
 
     binding = bound.steps[0].execution_binding
@@ -710,7 +830,10 @@ def test_shell_verification_repair_cannot_replace_frozen_script(tmp_path):
         ]
     )
 
-    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+    bound = PrivilegedExecutionAgent(
+        binder_llm,
+        enable_implementation_plans=False,
+    ).prepare_plan(
         plan,
         grounded_context=None,
     )
@@ -777,7 +900,10 @@ def test_shell_postconditions_require_observable_state_not_only_exit_code(
         ]
     )
 
-    bound = PrivilegedExecutionAgent(binder_llm).prepare_plan(
+    bound = PrivilegedExecutionAgent(
+        binder_llm,
+        enable_implementation_plans=False,
+    ).prepare_plan(
         plan,
         grounded_context=None,
     )
@@ -988,7 +1114,8 @@ def test_execution_agent_binds_verification_only_without_command(tmp_path):
                     }
                 ),
             ]
-        )
+        ),
+        enable_implementation_plans=False,
     )
 
     bound = binder.prepare_plan(plan, grounded_context=None)
@@ -1063,6 +1190,7 @@ def test_execution_agent_reselects_after_action_contract_is_not_grounded(
             ]
         ),
         on_progress=progress.append,
+        enable_implementation_plans=False,
     )
 
     bound = binder.prepare_plan(plan, grounded_context=None)

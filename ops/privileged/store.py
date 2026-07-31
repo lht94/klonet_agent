@@ -7,7 +7,11 @@ import os
 import re
 from pathlib import Path
 
-from klonet_agent.ops.privileged.contracts import PrivilegedPlan, utc_now
+from klonet_agent.ops.privileged.contracts import (
+    PrivilegedPlan,
+    PrivilegedStep,
+    utc_now,
+)
 
 
 class PrivilegedPlanStore:
@@ -57,18 +61,46 @@ class PrivilegedPlanStore:
     def recover(self, plan_id: str) -> PrivilegedPlan:
         plan = self.load(plan_id)
         interrupted = False
-        for step in plan.steps:
+        for step in _execution_steps(plan):
             if step.status in {"running", "verifying"}:
                 step.status = "execution_unknown"
                 step.observation = (
                     "process restarted while step was active; verify current state and "
                     "never auto-reexecute this command"
                 )
+                parent = _semantic_parent(plan, step)
+                if parent is not step:
+                    parent.status = "paused"
+                    if parent.implementation_plan is not None:
+                        parent.implementation_plan.status = "paused"
                 interrupted = True
         if interrupted or plan.status in {"executing", "verifying"}:
             plan.status = "paused"
         self.save(plan)
         return plan
+
+
+def _execution_steps(plan: PrivilegedPlan) -> list[PrivilegedStep]:
+    steps: list[PrivilegedStep] = []
+    for semantic_step in plan.steps:
+        if semantic_step.implementation_plan is None:
+            steps.append(semantic_step)
+        else:
+            steps.extend(semantic_step.implementation_plan.steps)
+    return steps
+
+
+def _semantic_parent(
+    plan: PrivilegedPlan,
+    target: PrivilegedStep,
+) -> PrivilegedStep:
+    for semantic_step in plan.steps:
+        implementation = semantic_step.implementation_plan
+        if semantic_step is target:
+            return semantic_step
+        if implementation is not None and target in implementation.steps:
+            return semantic_step
+    return target
 
 
 def _safe_component(value: str) -> str:

@@ -313,6 +313,58 @@ class FailurePacket:
 
 
 @dataclass
+class ImplementationPlan:
+    """Auditable micro-plan that realizes one frozen semantic step."""
+
+    implementation_id: str
+    semantic_step_id: str
+    objective: str
+    steps: list[PrivilegedStep]
+    status: str = "draft"
+
+    def __post_init__(self) -> None:
+        if self.status not in PLAN_STATUSES:
+            raise ValueError("invalid implementation plan status: %s" % self.status)
+        if not self.steps:
+            raise ValueError("implementation plan requires at least one step")
+        if any(step.implementation_plan is not None for step in self.steps):
+            raise ValueError("nested implementation plans are not allowed")
+
+    def executable_dict(self) -> dict[str, Any]:
+        return {
+            "implementation_id": self.implementation_id,
+            "semantic_step_id": self.semantic_step_id,
+            "objective": self.objective,
+            "steps": [step.executable_dict() for step in self.steps],
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "implementation_id": self.implementation_id,
+            "semantic_step_id": self.semantic_step_id,
+            "objective": self.objective,
+            "status": self.status,
+            "steps": [step.to_dict() for step in self.steps],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ImplementationPlan | None:
+        if not data:
+            return None
+        return cls(
+            implementation_id=str(data.get("implementation_id") or ""),
+            semantic_step_id=str(data.get("semantic_step_id") or ""),
+            objective=str(data.get("objective") or ""),
+            status=str(data.get("status") or "draft"),
+            steps=[
+                PrivilegedStep.from_dict(item)
+                for item in data.get("steps", [])
+                if isinstance(item, dict)
+            ],
+        )
+
+
+@dataclass
 class PrivilegedStep:
     step_id: str
     title: str
@@ -322,6 +374,7 @@ class PrivilegedStep:
     depends_on: list[str] = field(default_factory=list)
     success_criteria: list[str] = field(default_factory=list)
     execution_binding: ExecutionBinding | None = None
+    implementation_plan: ImplementationPlan | None = None
     # v2 compatibility fields. New Planner output never writes these directly.
     command: str = ""
     action: str = ""
@@ -346,9 +399,28 @@ class PrivilegedStep:
             raise ValueError("invalid risk: %s" % self.risk)
         if self.status not in STEP_STATUSES:
             raise ValueError("invalid step status: %s" % self.status)
+        if self.execution_binding is not None and self.implementation_plan is not None:
+            raise ValueError(
+                "semantic step cannot have both a direct binding and an implementation plan"
+            )
         self.timeout = max(1, min(int(self.timeout), 3600))
 
     def executable_dict(self) -> dict[str, Any]:
+        if self.implementation_plan is not None:
+            return {
+                "step_id": self.step_id,
+                "title": self.title,
+                "objective": self.objective,
+                "reason": self.reason,
+                "evidence_refs": self.evidence_refs,
+                "depends_on": self.depends_on,
+                "success_criteria": self.success_criteria,
+                "implementation_plan": (
+                    self.implementation_plan.executable_dict()
+                ),
+                "expected_changes": self.expected_changes,
+                "rollback": self.rollback,
+            }
         if self.execution_binding is not None:
             return {
                 "step_id": self.step_id,
@@ -381,6 +453,11 @@ class PrivilegedStep:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
+        data["implementation_plan"] = (
+            self.implementation_plan.to_dict()
+            if self.implementation_plan is not None
+            else None
+        )
         return data
 
     @classmethod
@@ -389,6 +466,9 @@ class PrivilegedStep:
         values["evidence"] = ExecutionEvidence.from_dict(values.get("evidence"))
         values["execution_binding"] = ExecutionBinding.from_dict(
             values.get("execution_binding")
+        )
+        values["implementation_plan"] = ImplementationPlan.from_dict(
+            values.get("implementation_plan")
         )
         values["checks"] = [
             CheckResult.from_dict(item) for item in values.get("checks", [])

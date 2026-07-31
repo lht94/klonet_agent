@@ -329,7 +329,7 @@ class PrivilegedOpsWorkflow:
     ) -> None:
         plan.status = "paused"
         unbound = next(
-            (step for step in plan.steps if step.execution_binding is None),
+            (step for step in _execution_steps(plan) if step.execution_binding is None),
             None,
         )
         if unbound is not None:
@@ -508,7 +508,7 @@ class PrivilegedOpsWorkflow:
                 plan,
             )
         plan.authorize()
-        for step in plan.steps:
+        for step in _all_plan_steps(plan):
             if step.approval_scope != "step" and step.status == "pending":
                 step.status = "approved"
         self.store.save(plan)
@@ -569,7 +569,7 @@ class PrivilegedOpsWorkflow:
     def resume(self, plan_id: str) -> WorkflowResult:
         plan = self.store.recover(plan_id)
         recovered_readonly = False
-        for step in plan.steps:
+        for step in _execution_steps(plan):
             if (
                 step.status == "blocked"
                 and step.risk == "readonly"
@@ -602,7 +602,7 @@ class PrivilegedOpsWorkflow:
             self.store.save(plan)
 
         unknown_steps = [
-            step for step in plan.steps if step.status == "execution_unknown"
+            step for step in _execution_steps(plan) if step.status == "execution_unknown"
         ]
         for step in unknown_steps:
             verify_recovered = getattr(self.verifier, "verify_recovered_step", None)
@@ -640,7 +640,14 @@ class PrivilegedOpsWorkflow:
                 )
             step.status = "completed"
             self.store.save(plan)
-        if plan.steps and all(step.status == "completed" for step in plan.steps):
+        if plan.steps and all(
+            step.status in {"completed", "skipped"}
+            for step in _execution_steps(plan)
+        ):
+            for semantic_step in plan.steps:
+                if semantic_step.implementation_plan is not None:
+                    semantic_step.implementation_plan.status = "completed"
+                    semantic_step.status = "completed"
             plan.status = "completed"
             self.store.save(plan)
             self._event("privileged_plan_completed", plan, {"recovered": True})
@@ -664,7 +671,7 @@ class PrivilegedOpsWorkflow:
         if plan.status == "completed":
             return WorkflowResult("blocked", "Completed plan cannot be aborted.", plan)
         plan.status = "aborted"
-        for step in plan.steps:
+        for step in _all_plan_steps(plan):
             if step.status in {
                 "pending",
                 "approved",
@@ -733,7 +740,7 @@ class PrivilegedOpsWorkflow:
         failed_step = next(
             (
                 step
-                for step in reversed(plan.steps)
+                for step in reversed(_execution_steps(plan))
                 if step.evidence is not None
                 and step.status in {
                     "paused",
@@ -823,7 +830,7 @@ class PrivilegedOpsWorkflow:
                 )
             missing_bindings = [
                 step.step_id
-                for step in plan.steps
+                for step in _execution_steps(plan)
                 if step.execution_binding is None
             ]
             if missing_bindings:
@@ -838,7 +845,7 @@ class PrivilegedOpsWorkflow:
                 )
             legacy_bindings = [
                 step.step_id
-                for step in plan.steps
+                for step in _execution_steps(plan)
                 if step.execution_binding is not None
                 and step.execution_binding.kind == "legacy_command"
             ]
@@ -861,6 +868,13 @@ class PrivilegedOpsWorkflow:
                 "blocked",
                 "Plan authorization is missing or stale; execution refused.",
                 plan,
+            )
+
+        if any(step.implementation_plan is not None for step in plan.steps):
+            return self._execute_hierarchical_plan(
+                plan,
+                persist=persist,
+                deterministic_verification=deterministic_verification,
             )
 
         for step_index, step in enumerate(plan.steps, start=1):
@@ -1092,6 +1106,266 @@ class PrivilegedOpsWorkflow:
                 render_plan(plan) + _pause_controls(plan),
                 plan,
             )
+
+        plan.status = "completed"
+        if persist:
+            self.store.save(plan)
+        self._event("privileged_plan_completed", plan)
+        return WorkflowResult("completed", render_plan(plan), plan)
+
+    def _execute_hierarchical_plan(
+        self,
+        plan: PrivilegedPlan,
+        *,
+        persist: bool,
+        deterministic_verification: bool,
+    ) -> WorkflowResult:
+        """Run the inner Binding-Agent/Executor/Verifier implementation loop."""
+
+        execution_steps = _execution_steps(plan)
+        total_micro_steps = len(execution_steps)
+        completed_micro_steps = sum(
+            step.status in {"completed", "skipped"}
+            for step in execution_steps
+        )
+        for semantic_step in plan.steps:
+            if semantic_step.status in {"completed", "skipped"}:
+                continue
+            implementation = semantic_step.implementation_plan
+            if implementation is None:
+                semantic_step.status = "paused"
+                semantic_step.observation = (
+                    "层级计划缺少 Implementation Plan，等待重新绑定"
+                )
+                plan.status = "paused"
+                if persist:
+                    self.store.save(plan)
+                return WorkflowResult(
+                    "paused",
+                    render_plan(plan) + _pause_controls(plan),
+                    plan,
+                )
+            incomplete_semantic_dependencies = [
+                dependency
+                for dependency in semantic_step.depends_on
+                if _find_semantic_step(plan, dependency).status != "completed"
+            ]
+            if incomplete_semantic_dependencies:
+                semantic_step.status = "paused"
+                semantic_step.observation = "语义依赖尚未完成：%s" % "、".join(
+                    incomplete_semantic_dependencies
+                )
+                plan.status = "paused"
+                if persist:
+                    self.store.save(plan)
+                return WorkflowResult(
+                    "paused",
+                    render_plan(plan) + _pause_controls(plan),
+                    plan,
+                )
+
+            semantic_step.status = "running"
+            implementation.status = "executing"
+            for micro_step in implementation.steps:
+                if micro_step.status in {"completed", "skipped"}:
+                    continue
+                if micro_step.status == "execution_unknown":
+                    semantic_step.status = "paused"
+                    implementation.status = "paused"
+                    plan.status = "paused"
+                    if persist:
+                        self.store.save(plan)
+                    return WorkflowResult(
+                        "paused",
+                        render_plan(plan) + _pause_controls(plan),
+                        plan,
+                    )
+                incomplete_dependencies = [
+                    dependency
+                    for dependency in micro_step.depends_on
+                    if _find_step(plan, dependency).status != "completed"
+                ]
+                if incomplete_dependencies:
+                    micro_step.status = "paused"
+                    micro_step.observation = "实现依赖尚未完成：%s" % "、".join(
+                        incomplete_dependencies
+                    )
+                    semantic_step.status = "paused"
+                    implementation.status = "paused"
+                    plan.status = "paused"
+                    if persist:
+                        self.store.save(plan)
+                    return WorkflowResult(
+                        "paused",
+                        render_plan(plan) + _pause_controls(plan),
+                        plan,
+                    )
+                if (
+                    micro_step.approval_scope == "step"
+                    and micro_step.status != "approved"
+                ):
+                    micro_step.status = "awaiting_confirmation"
+                    semantic_step.status = "awaiting_confirmation"
+                    implementation.status = "awaiting_confirmation"
+                    plan.status = "awaiting_confirmation"
+                    if persist:
+                        self.store.save(plan)
+                    return WorkflowResult(
+                        "awaiting_step_confirmation",
+                        render_plan(plan)
+                        + "\n确认该实现子步骤：confirm-priv-step %s %s"
+                        % (plan.plan_id, micro_step.step_id),
+                        plan,
+                    )
+                precondition_problem = self._precondition_problem(micro_step)
+                if precondition_problem:
+                    micro_step.status = "paused"
+                    micro_step.observation = precondition_problem
+                    semantic_step.status = "paused"
+                    implementation.status = "paused"
+                    plan.status = "paused"
+                    if persist:
+                        self.store.save(plan)
+                    return WorkflowResult(
+                        "paused",
+                        render_plan(plan) + _pause_controls(plan),
+                        plan,
+                    )
+
+                current_index = completed_micro_steps + 1
+                if self.on_progress is not None:
+                    self.on_progress(
+                        "Execution Agent：Implementation %s/%s（语义步骤“%s”）：%s"
+                        % (
+                            current_index,
+                            total_micro_steps,
+                            semantic_step.title,
+                            self._describe_step_execution(
+                                micro_step,
+                                index=current_index,
+                                total=total_micro_steps,
+                            ),
+                        )
+                    )
+                plan.status = "executing"
+                micro_step.status = "running"
+                micro_step.execution_attempts += 1
+                if persist:
+                    self.store.save(plan)
+                self._event(
+                    "privileged_implementation_step_started",
+                    plan,
+                    {
+                        "semantic_step_id": semantic_step.step_id,
+                        "step_id": micro_step.step_id,
+                    },
+                )
+                micro_step.evidence = self.executor.execute(micro_step)
+                micro_step.status = (
+                    "executed"
+                    if not micro_step.evidence.timed_out
+                    else "execution_unknown"
+                )
+                if persist:
+                    self.store.save(plan)
+                plan.status = "verifying"
+                if micro_step.status != "execution_unknown":
+                    micro_step.status = "verifying"
+                if persist:
+                    self.store.save(plan)
+                if deterministic_verification or micro_step.risk == "readonly":
+                    verify = (
+                        getattr(
+                            self.verifier,
+                            "verify_deterministic_step",
+                            None,
+                        )
+                        or self.verifier.verify_step
+                    )
+                else:
+                    verify = self.verifier.verify_step
+                decision = verify(plan, micro_step)
+                plan.verification = decision
+                if self.on_progress is not None:
+                    self.on_progress(
+                        "Verifier：Implementation %s/%s 验收%s：%s"
+                        % (
+                            current_index,
+                            total_micro_steps,
+                            "通过" if decision.status == "passed" else "未通过",
+                            decision.reason or decision.status,
+                        )
+                    )
+                if decision.status == "passed":
+                    micro_step.status = "completed"
+                    micro_step.observation = self._summarize_step(
+                        micro_step,
+                        "completed",
+                        decision.reason,
+                    )
+                    completed_micro_steps += 1
+                    if persist:
+                        self.store.save(plan)
+                    continue
+                if self._can_safely_retry_execution(micro_step, decision):
+                    micro_step.status = "approved"
+                    micro_step.checks = []
+                    plan.status = "approved"
+                    if persist:
+                        self.store.save(plan)
+                    if self.on_progress is not None:
+                        self.on_progress(
+                            "Execution Agent：实现子步骤“%s”出现可安全重试的"
+                            "瞬时错误，正在有限重试。" % micro_step.title
+                        )
+                    return self._execute_hierarchical_plan(
+                        plan,
+                        persist=persist,
+                        deterministic_verification=deterministic_verification,
+                    )
+
+                micro_step.status = "paused"
+                micro_step.observation = self._summarize_step(
+                    micro_step,
+                    decision.status,
+                    decision.reason,
+                )
+                semantic_step.status = "paused"
+                implementation.status = "paused"
+                plan.status = "paused"
+                if persist:
+                    self.store.save(plan)
+                rebound = self._automatic_implementation_rebind(
+                    plan,
+                    micro_step,
+                    persist=persist,
+                )
+                if rebound is not None:
+                    semantic_step.status = "pending"
+                    implementation.status = "awaiting_confirmation"
+                    if persist:
+                        self.store.save(plan)
+                    return rebound
+                recovery = self._automatic_recovery_plan(
+                    plan,
+                    micro_step,
+                    persist=persist,
+                )
+                if recovery is not None:
+                    return recovery
+                return WorkflowResult(
+                    "paused",
+                    render_plan(plan) + _pause_controls(plan),
+                    plan,
+                )
+
+            implementation.status = "completed"
+            semantic_step.status = "completed"
+            semantic_step.observation = (
+                "Implementation Plan 的全部原子步骤均已执行并通过验收。"
+            )
+            if persist:
+                self.store.save(plan)
 
         plan.status = "completed"
         if persist:
@@ -1536,10 +1810,41 @@ class PrivilegedOpsWorkflow:
 
 
 def _find_step(plan: PrivilegedPlan, step_id: str) -> PrivilegedStep:
-    for step in plan.steps:
+    for step in _all_plan_steps(plan):
         if step.step_id == step_id:
             return step
     raise KeyError("unknown privileged step: %s" % step_id)
+
+
+def _find_semantic_step(plan: PrivilegedPlan, step_id: str) -> PrivilegedStep:
+    for step in plan.steps:
+        if step.step_id == step_id:
+            return step
+    raise KeyError("unknown semantic step: %s" % step_id)
+
+
+def _execution_steps(plan: PrivilegedPlan) -> list[PrivilegedStep]:
+    """Return the atomic steps that may reach Executor/Verifier."""
+
+    result: list[PrivilegedStep] = []
+    for semantic_step in plan.steps:
+        implementation = semantic_step.implementation_plan
+        if implementation is None:
+            result.append(semantic_step)
+        else:
+            result.extend(implementation.steps)
+    return result
+
+
+def _all_plan_steps(plan: PrivilegedPlan) -> list[PrivilegedStep]:
+    """Return semantic parents and atomic implementation children."""
+
+    result: list[PrivilegedStep] = []
+    for semantic_step in plan.steps:
+        result.append(semantic_step)
+        if semantic_step.implementation_plan is not None:
+            result.extend(semantic_step.implementation_plan.steps)
+    return result
 
 
 def render_plan(plan: PrivilegedPlan) -> str:
@@ -1591,6 +1896,20 @@ def render_plan(plan: PrivilegedPlan) -> str:
         }:
             line += "：" + _visible_observation(step.observation)[:160]
         lines.append(line)
+        implementation = step.implementation_plan
+        if implementation is not None:
+            completed = sum(
+                item.status in {"completed", "skipped"}
+                for item in implementation.steps
+            )
+            lines.append(
+                "   Implementation Plan：%s/%s 个原子步骤完成（%s）"
+                % (
+                    completed,
+                    len(implementation.steps),
+                    status_labels.get(implementation.status, implementation.status),
+                )
+            )
     remaining = len(plan.steps) - preview_limit
     if remaining > 0:
         lines.append("…另有 %s 个步骤，使用 show-priv 查看详情。" % remaining)
@@ -1651,8 +1970,35 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
             lines.append(
                 "   当前结果：%s" % _visible_observation(step.observation)
             )
-        binding = step.execution_binding
-        if binding is not None:
+        implementation = step.implementation_plan
+        implementation_steps = (
+            implementation.steps if implementation is not None else [step]
+        )
+        for implementation_index, implementation_step in enumerate(
+            implementation_steps,
+            start=1,
+        ):
+            binding = implementation_step.execution_binding
+            if implementation is not None:
+                lines.extend(
+                    (
+                        "   Implementation %s.%s：%s"
+                        % (index, implementation_index, implementation_step.title),
+                        "      状态：%s；风险：%s。"
+                        % (
+                            status_labels.get(
+                                implementation_step.status,
+                                implementation_step.status,
+                            ),
+                            risk_labels.get(
+                                implementation_step.risk,
+                                implementation_step.risk,
+                            ),
+                        ),
+                    )
+                )
+            if binding is None:
+                continue
             implementation_description = {
                 "registered_action": "已注册受控动作，随计划确认后自动执行。",
                 "shell_artifact": (
@@ -1662,12 +2008,10 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
                     "纯验证步骤，只运行已注册检查器，不执行变更命令。"
                 ),
             }.get(binding.kind, "未知执行绑定，不会自动执行。")
-            lines.append(
-                "   执行方式：%s"
-                % implementation_description
-            )
+            prefix = "      " if implementation is not None else "   "
+            lines.append("%s执行方式：%s" % (prefix, implementation_description))
             if binding.binding_reason:
-                lines.append("   绑定依据：%s" % binding.binding_reason)
+                lines.append("%s绑定依据：%s" % (prefix, binding.binding_reason))
     lines.append("")
     if plan.status in {"awaiting_confirmation", "draft"}:
         lines.append("确认当前计划：confirm-priv %s" % plan.plan_id)
@@ -1704,7 +2048,7 @@ def render_plan_list(plans: list[PrivilegedPlan]) -> str:
 
 def _render_shell_review(plan: PrivilegedPlan) -> str:
     sections = []
-    for index, step in enumerate(plan.steps, start=1):
+    for index, step in enumerate(_execution_steps(plan), start=1):
         binding = step.execution_binding
         artifact = (
             binding.shell_artifact
@@ -1740,6 +2084,12 @@ def _first_step_with_status(
     plan: PrivilegedPlan,
     status: str,
 ) -> PrivilegedStep | None:
+    nested = next(
+        (step for step in _execution_steps(plan) if step.status == status),
+        None,
+    )
+    if nested is not None:
+        return nested
     return next((step for step in plan.steps if step.status == status), None)
 
 
@@ -1860,6 +2210,19 @@ def _build_failure_packet(
             )
         ).encode("utf-8")
     ).hexdigest()
+    semantic_parent = next(
+        (
+            item
+            for item in plan.steps
+            if item is failed_step
+            or (
+                item.implementation_plan is not None
+                and failed_step in item.implementation_plan.steps
+            )
+        ),
+        failed_step,
+    )
+    atomic_steps = _execution_steps(plan)
     return FailurePacket(
         original_goal=plan.goal,
         failed_step={
@@ -1870,6 +2233,8 @@ def _build_failure_packet(
             "success_criteria": failed_step.success_criteria,
             "expected_effects": failed_step.expected_changes,
             "status": failed_step.status,
+            "semantic_step_id": semantic_parent.step_id,
+            "semantic_objective": semantic_parent.objective or semantic_parent.title,
         },
         execution_binding=binding,
         execution_evidence=evidence,
@@ -1881,7 +2246,7 @@ def _build_failure_packet(
                 "objective": item.objective or item.title,
                 "result": item.observation,
             }
-            for item in plan.steps
+            for item in atomic_steps
             if item.status == "completed"
         ],
         remaining_steps=[
@@ -1890,7 +2255,7 @@ def _build_failure_packet(
                 "objective": item.objective or item.title,
                 "depends_on": item.depends_on,
             }
-            for item in plan.steps
+            for item in atomic_steps
             if item.step_id != failed_step.step_id
             and item.status not in {"completed", "skipped"}
         ],
@@ -1936,6 +2301,11 @@ def _semantic_plan_signature(steps: list[PrivilegedStep]) -> str:
                 if step.execution_binding is not None
                 and step.execution_binding.shell_artifact is not None
                 else ""
+            ),
+            "implementation_plan": (
+                step.implementation_plan.executable_dict()
+                if step.implementation_plan is not None
+                else None
             ),
         }
         for step in steps

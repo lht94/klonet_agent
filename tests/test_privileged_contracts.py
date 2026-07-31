@@ -226,6 +226,48 @@ def test_store_marks_interrupted_running_steps_unknown_without_reexecuting(tmp_p
     assert "never auto-reexecute" in recovered.steps[0].observation
 
 
+def test_store_recovers_interrupted_nested_implementation_step(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        ImplementationPlan,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+
+    store = PrivilegedPlanStore(tmp_path, user_id="alice", project_id="p1")
+    micro_step = _step(step_id="deploy__copy", status="running")
+    semantic_step = PrivilegedStep(
+        step_id="deploy",
+        title="deploy platform",
+        risk="medium",
+        status="running",
+        implementation_plan=ImplementationPlan(
+            implementation_id="impl-deploy",
+            semantic_step_id="deploy",
+            objective="deploy platform",
+            steps=[micro_step],
+            status="executing",
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-123",
+        goal="deploy platform",
+        risk="medium",
+        status="executing",
+        steps=[semantic_step],
+    )
+    store.save(plan)
+
+    recovered = store.recover("priv-123")
+
+    parent = recovered.steps[0]
+    nested = parent.implementation_plan.steps[0]
+    assert recovered.status == "paused"
+    assert parent.status == "paused"
+    assert parent.implementation_plan.status == "paused"
+    assert nested.status == "execution_unknown"
+
+
 def test_store_rejects_path_traversal_in_session_or_plan_identifiers(tmp_path):
     from klonet_agent.ops.privileged.store import PrivilegedPlanStore
 

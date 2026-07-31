@@ -170,6 +170,90 @@ def test_multi_step_plan_waits_for_one_confirmation_then_executes_all(tmp_path):
     assert completed.plan.status == "completed"
 
 
+def test_hierarchical_plan_executes_and_verifies_inner_steps(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        ImplementationPlan,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+
+    first = _step("semantic__prepare")
+    second = _step("semantic__verify", risk="readonly")
+    second.depends_on = [first.step_id]
+    parent = PrivilegedStep(
+        step_id="semantic",
+        title="准备平台实例",
+        objective="prepare the platform instance",
+        risk="low",
+        implementation_plan=ImplementationPlan(
+            implementation_id="impl-semantic",
+            semantic_step_id="semantic",
+            objective="prepare the platform instance",
+            steps=[first, second],
+            status="awaiting_confirmation",
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-test",
+        goal="prepare platform",
+        risk="low",
+        status="awaiting_confirmation",
+        steps=[parent],
+    )
+    executor = StubExecutor()
+    verifier = StubVerifier()
+    workflow = _workflow(
+        tmp_path,
+        plan,
+        executor=executor,
+        verifier=verifier,
+    )
+
+    waiting = workflow.submit("prepare platform")
+    completed = workflow.approve_plan(waiting.plan.plan_id)
+
+    assert waiting.kind == "awaiting_confirmation"
+    assert completed.kind == "completed"
+    assert executor.calls == ["semantic__prepare", "semantic__verify"]
+    assert verifier.calls == ["semantic__prepare", "semantic__verify"]
+    assert completed.plan.steps[0].status == "completed"
+    implementation = completed.plan.steps[0].implementation_plan
+    assert implementation.status == "completed"
+    assert all(step.status == "completed" for step in implementation.steps)
+
+
+def test_nested_implementation_change_invalidates_plan_authorization():
+    from klonet_agent.ops.privileged.contracts import (
+        ImplementationPlan,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+
+    micro_step = _step("semantic__prepare")
+    parent = PrivilegedStep(
+        step_id="semantic",
+        title="prepare",
+        implementation_plan=ImplementationPlan(
+            implementation_id="impl-semantic",
+            semantic_step_id="semantic",
+            objective="prepare",
+            steps=[micro_step],
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-test",
+        goal="prepare",
+        risk="low",
+        steps=[parent],
+    )
+    plan.authorize()
+    assert plan.is_authorized
+
+    micro_step.execution_binding.args["reason"] = "changed after approval"
+
+    assert not plan.is_authorized
+
+
 def test_readonly_step_in_mutating_plan_uses_deterministic_verifier(tmp_path):
     from klonet_agent.ops.privileged.contracts import VerificationDecision
 

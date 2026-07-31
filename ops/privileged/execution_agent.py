@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any, Callable
 
@@ -19,6 +20,7 @@ from klonet_agent.ops.privileged.checkers import (
 )
 from klonet_agent.ops.privileged.contracts import (
     ExecutionBinding,
+    ImplementationPlan,
     PrivilegedPlan,
     PrivilegedStep,
     RISK_LEVELS,
@@ -74,6 +76,7 @@ MAX_ACTION_CONTRACT_REPAIRS = 2
 MAX_SHELL_CONTRACT_REPAIRS = 2
 MAX_SHELL_VERIFICATION_REPAIRS = 2
 MAX_IMPLEMENTATION_RESELECTIONS = 2
+MAX_IMPLEMENTATION_PLAN_REBUILDS = 2
 MAX_BINDING_GROUNDING_SECTION_CHARS = 12000
 
 
@@ -107,6 +110,26 @@ Return exactly one JSON object with status:
 
 Do not return an Action, command, shell script, precondition, or probe request.
 exit_code_zero is not valid evidence for a verification-only step.
+""".strip()
+
+
+IMPLEMENTATION_PLANNING_PROMPT = """
+You are the Klonet Implementation Planner. Expand exactly one frozen semantic
+step into a small ordered implementation plan. Preserve the parent objective;
+do not revise the outer semantic plan.
+
+Each implementation step must be atomic enough to bind to exactly one
+registered Action, one safe shell artifact, or one verification_only contract.
+You may include read-only discovery or verification steps. Express dependencies
+between implementation steps, but do not emit Action names, commands, shell,
+paths, ports, or other concrete arguments at this stage. Later binding calls
+will ground those details.
+
+Return status=ready with 1-12 implementation_steps. Each step needs id, title,
+objective, reason, depends_on, expected_changes, success_criteria, and
+risk_suggestion. Dependencies may reference only earlier step ids. Return
+status=blocked only when the frozen semantic objective itself cannot be
+implemented or safely decomposed with the supplied evidence.
 """.strip()
 
 
@@ -181,6 +204,7 @@ class PrivilegedExecutionAgent:
         probe_runner: Callable[[list[dict[str, Any]]], str] | None = None,
         shell_policy: ShellArtifactPolicy | None = None,
         on_progress: Callable[[str], None] | None = None,
+        enable_implementation_plans: bool = True,
     ) -> None:
         self.llm = llm
         self.action_registry = (
@@ -190,6 +214,7 @@ class PrivilegedExecutionAgent:
         self.shell_policy = shell_policy or ShellArtifactPolicy()
         self.checkers = DefaultCheckerRegistry()
         self.on_progress = on_progress
+        self.enable_implementation_plans = bool(enable_implementation_plans)
 
     def prepare_plan(
         self,
@@ -197,6 +222,11 @@ class PrivilegedExecutionAgent:
         *,
         grounded_context: GroundedPlanContext | None,
     ) -> PrivilegedPlan:
+        if self.enable_implementation_plans:
+            return self._prepare_hierarchical_plan(
+                plan,
+                grounded_context=grounded_context,
+            )
         for index, step in enumerate(plan.steps, start=1):
             self._progress(
                 "实现节点 %s/%s：正在为“%s”匹配注册 Action 或一次性脚本…"
@@ -268,6 +298,254 @@ class PrivilegedExecutionAgent:
         )
         plan.status = "awaiting_confirmation"
         return plan
+
+    def _prepare_hierarchical_plan(
+        self,
+        plan: PrivilegedPlan,
+        *,
+        grounded_context: GroundedPlanContext | None,
+    ) -> PrivilegedPlan:
+        bound_micro_steps: list[PrivilegedStep] = []
+        for index, semantic_step in enumerate(plan.steps, start=1):
+            self._progress(
+                "语义步骤 %s/%s：正在把“%s”展开为原子 Implementation Plan…"
+                % (
+                    index,
+                    len(plan.steps),
+                    _progress_text(
+                        semantic_step.title or semantic_step.objective
+                    ),
+                )
+            )
+            feedback = ""
+            last_error = "implementation plan was not generated"
+            for attempt in range(MAX_IMPLEMENTATION_PLAN_REBUILDS):
+                try:
+                    micro_steps = self._decompose_semantic_step(
+                        semantic_step,
+                        grounded_context=grounded_context,
+                        feedback=feedback,
+                    )
+                    for micro_index, micro_step in enumerate(
+                        micro_steps,
+                        start=1,
+                    ):
+                        self._progress(
+                            "实现子步骤 %s/%s：正在为“%s”绑定原子能力…"
+                            % (
+                                micro_index,
+                                len(micro_steps),
+                                _progress_text(
+                                    micro_step.title or micro_step.objective
+                                ),
+                            )
+                        )
+                        binding = self.prepare_step(
+                            plan,
+                            micro_step,
+                            grounded_context=grounded_context,
+                        )
+                        _apply_binding_to_step(micro_step, binding)
+                except ExecutionBindingError as exc:
+                    last_error = str(exc)
+                    if attempt + 1 >= MAX_IMPLEMENTATION_PLAN_REBUILDS:
+                        raise ExecutionBindingError(
+                            "Implementation Plan 在局部重建后仍无法绑定：%s"
+                            % last_error,
+                            replan_recommended=True,
+                            category="implementation_plan_unavailable",
+                        ) from exc
+                    feedback = (
+                        "The previous implementation decomposition could not be"
+                        " bound. Rebuild the micro-plan without changing the"
+                        " semantic objective. Binding failure: %s" % last_error
+                    )
+                    self._progress(
+                        "Implementation Plan 的原子步骤无法落地，正在保持语义目标"
+                        "不变并进行第 %s/%s 次局部重建。"
+                        % (attempt + 2, MAX_IMPLEMENTATION_PLAN_REBUILDS)
+                    )
+                    continue
+                implementation = ImplementationPlan(
+                    implementation_id="impl-%s-%s"
+                    % (semantic_step.step_id, uuid.uuid4().hex[:8]),
+                    semantic_step_id=semantic_step.step_id,
+                    objective=semantic_step.objective or semantic_step.title,
+                    steps=micro_steps,
+                    status="awaiting_confirmation",
+                )
+                semantic_step.execution_binding = None
+                semantic_step.implementation_plan = implementation
+                semantic_step.risk = max(
+                    (item.risk for item in micro_steps),
+                    key=RISK_LEVELS.index,
+                )
+                semantic_step.approval_scope = "plan"
+                semantic_step.status = "pending"
+                bound_micro_steps.extend(micro_steps)
+                break
+            else:
+                raise ExecutionBindingError(last_error)
+
+        if grounded_context is not None:
+            registered_steps = []
+            for micro_step in bound_micro_steps:
+                binding = micro_step.execution_binding
+                if binding is None or binding.kind != "registered_action":
+                    continue
+                registered_steps.append(
+                    PrivilegedStep(
+                        step_id=micro_step.step_id,
+                        title=micro_step.title,
+                        objective=micro_step.objective,
+                        reason=micro_step.reason,
+                        depends_on=list(micro_step.depends_on),
+                        action=binding.action,
+                        args=dict(binding.args),
+                        risk=binding.risk,
+                    )
+                )
+            _validate_environment_model(registered_steps, grounded_context)
+        plan.risk = max(
+            (step.risk for step in plan.steps),
+            key=RISK_LEVELS.index,
+        )
+        plan.verification_level = (
+            "partial"
+            if any(
+                not step.postconditions
+                or all(
+                    item.get("checker") == "exit_code_zero"
+                    for item in step.postconditions
+                )
+                for step in bound_micro_steps
+                if step.risk != "readonly"
+            )
+            else "full"
+        )
+        plan.status = "awaiting_confirmation"
+        return plan
+
+    def _decompose_semantic_step(
+        self,
+        semantic_step: PrivilegedStep,
+        *,
+        grounded_context: GroundedPlanContext | None,
+        feedback: str = "",
+    ) -> list[PrivilegedStep]:
+        payload = {
+            "semantic_step": {
+                "step_id": semantic_step.step_id,
+                "title": semantic_step.title,
+                "objective": semantic_step.objective,
+                "reason": semantic_step.reason,
+                "depends_on": semantic_step.depends_on,
+                "expected_changes": semantic_step.expected_changes,
+                "success_criteria": semantic_step.success_criteria,
+                "risk_suggestion": semantic_step.risk,
+            },
+            "grounded_context": _selection_grounded_context(
+                grounded_context
+            ),
+            "previous_attempt_feedback": feedback,
+        }
+        result = self._call_function(
+            [
+                {"role": "system", "content": IMPLEMENTATION_PLANNING_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            self._implementation_plan_function_tool(),
+        )
+        status = str(result.get("status") or "").strip().lower()
+        if status == "blocked":
+            raise ExecutionBindingError(
+                str(result.get("reason") or "semantic step cannot be decomposed"),
+                replan_recommended=True,
+                category="semantic_step_unimplementable",
+            )
+        if status != "ready":
+            raise ExecutionBindingError(
+                "invalid implementation planning status=%s"
+                % (status or "<missing>"),
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+        items = result.get("implementation_steps")
+        if not isinstance(items, list) or not items or len(items) > 12:
+            raise ExecutionBindingError(
+                "implementation_steps must contain 1-12 items",
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+        raw_ids: list[str] = []
+        for index, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                raise ExecutionBindingError(
+                    "implementation step must be an object",
+                    replan_recommended=False,
+                    category="implementation_contract_invalid",
+                )
+            raw_id = _safe_implementation_step_id(
+                item.get("id"),
+                fallback="step-%s" % index,
+            )
+            if raw_id in raw_ids:
+                raise ExecutionBindingError(
+                    "duplicate implementation step id=%s" % raw_id,
+                    replan_recommended=False,
+                    category="implementation_contract_invalid",
+                )
+            raw_ids.append(raw_id)
+        id_map = {
+            raw_id: "%s__%s" % (semantic_step.step_id, raw_id)
+            for raw_id in raw_ids
+        }
+        steps = []
+        for index, item in enumerate(items):
+            raw_id = raw_ids[index]
+            dependencies = [
+                _safe_implementation_step_id(value, fallback="")
+                for value in item.get("depends_on", [])
+            ] if isinstance(item.get("depends_on"), list) else []
+            if any(dep not in raw_ids[:index] for dep in dependencies):
+                raise ExecutionBindingError(
+                    "implementation dependencies must reference earlier steps",
+                    replan_recommended=False,
+                    category="implementation_contract_invalid",
+                )
+            risk = str(item.get("risk_suggestion") or semantic_step.risk).lower()
+            risk = {
+                "normal": "readonly",
+                "controlled": "medium",
+                "privileged": "high",
+                "dangerous": "destructive",
+            }.get(risk, risk)
+            if risk not in RISK_LEVELS:
+                risk = semantic_step.risk
+            steps.append(
+                PrivilegedStep(
+                    step_id=id_map[raw_id],
+                    title=str(item.get("title") or raw_id).strip()[:300],
+                    objective=str(
+                        item.get("objective") or item.get("title") or raw_id
+                    ).strip()[:1000],
+                    reason=str(item.get("reason") or "").strip()[:1000],
+                    depends_on=[id_map[dep] for dep in dependencies],
+                    expected_changes=_strings(
+                        item.get("expected_changes"),
+                        20,
+                    ),
+                    success_criteria=_strings(
+                        item.get("success_criteria"),
+                        20,
+                    ),
+                    risk=risk,
+                )
+            )
+        return steps
 
     def prepare_step(
         self,
@@ -1260,6 +1538,65 @@ class PrivilegedExecutionAgent:
             },
         )
 
+    def _implementation_plan_function_tool(self) -> dict[str, Any]:
+        step_schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "title": {"type": "string"},
+                "objective": {"type": "string"},
+                "reason": {"type": "string"},
+                "depends_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "expected_changes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "success_criteria": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "risk_suggestion": {
+                    "type": "string",
+                    "enum": list(RISK_LEVELS),
+                },
+            },
+            "required": [
+                "id",
+                "title",
+                "objective",
+                "reason",
+                "depends_on",
+                "expected_changes",
+                "success_criteria",
+                "risk_suggestion",
+            ],
+            "additionalProperties": False,
+        }
+        return _function_tool(
+            "build_implementation_plan",
+            "Decompose one semantic step into atomic implementation steps.",
+            {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ready", "blocked"],
+                    },
+                    "reason": {"type": "string"},
+                    "implementation_steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "items": step_schema,
+                    },
+                },
+                "required": ["status", "reason", "implementation_steps"],
+                "additionalProperties": False,
+            },
+        )
     def _action_contract_function_tool(
         self,
         action: str,
@@ -1553,6 +1890,34 @@ def _normalize_selection(data: dict[str, Any]) -> dict[str, Any]:
     normalized = str(result.get("status") or "").strip().lower()
     result["status"] = aliases.get(normalized, normalized)
     return result
+
+
+def _safe_implementation_step_id(value: Any, *, fallback: str) -> str:
+    text = re.sub(
+        r"[^A-Za-z0-9_-]+",
+        "-",
+        str(value or "").strip(),
+    ).strip("-_")
+    return (text or fallback)[:80]
+
+
+def _apply_binding_to_step(
+    step: PrivilegedStep,
+    binding: ExecutionBinding,
+) -> None:
+    step.execution_binding = binding
+    step.implementation_plan = None
+    step.risk = binding.risk
+    step.approval_scope = binding.approval_scope
+    step.preconditions = list(binding.preconditions)
+    step.postconditions = list(binding.postconditions)
+    if binding.shell_artifact is not None:
+        step.timeout = binding.shell_artifact.timeout
+    step.status = (
+        "awaiting_confirmation"
+        if binding.approval_scope == "step"
+        else "pending"
+    )
 
 
 def _selection_grounded_context(
