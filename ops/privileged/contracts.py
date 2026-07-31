@@ -48,6 +48,7 @@ VERIFICATION_STATUSES = {
 EXECUTION_BINDING_KINDS = {
     "registered_action",
     "shell_artifact",
+    "verification_only",
     "legacy_command",
 }
 SHELL_ARTIFACT_STATUSES = {
@@ -234,6 +235,13 @@ class ExecutionBinding:
             raise ValueError("registered action binding requires action")
         if self.kind == "shell_artifact" and self.shell_artifact is None:
             raise ValueError("shell binding requires artifact")
+        if self.kind == "verification_only":
+            if self.action or self.shell_artifact is not None:
+                raise ValueError(
+                    "verification-only binding cannot execute an implementation"
+                )
+            if not self.postconditions:
+                raise ValueError("verification-only binding requires postconditions")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -330,6 +338,8 @@ class PrivilegedStep:
     evidence: ExecutionEvidence | None = None
     checks: list[CheckResult] = field(default_factory=list)
     observation: str = ""
+    execution_attempts: int = 0
+    implementation_rebind_attempts: int = 0
 
     def __post_init__(self) -> None:
         if self.risk not in RISK_LEVELS:

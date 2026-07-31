@@ -100,7 +100,7 @@ class AnswerLLM:
         )
 
 
-def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first():
+def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys):
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
     from klonet_agent.orchestrator import AgentOrchestrator
@@ -127,6 +127,10 @@ def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first():
     assert supervisor.calls == [("请重启 nginx 服务", "")]
     assert history[-1] == {"role": "assistant", "content": reply}
     assert token == 0
+    assert (
+        "Workflow Coordinator：privileged supervisor completed"
+        in capsys.readouterr().out
+    )
 
 
 def test_orchestrator_returns_handled_supervisor_result_before_main_llm():

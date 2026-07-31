@@ -70,6 +70,15 @@ class PrivilegedCommandExecutor:
             return self.execute_action(bound_step)
         if binding.kind == "shell_artifact":
             return self.execute_shell_artifact(step)
+        if binding.kind == "verification_only":
+            now = utc_now()
+            return ExecutionEvidence(
+                return_code=0,
+                stdout="verification_only=true environment_changed=false",
+                started_at=now,
+                finished_at=now,
+                environment_changed=False,
+            )
         return ExecutionEvidence(
             return_code=2,
             stderr="legacy_or_unknown_execution_binding_refused",

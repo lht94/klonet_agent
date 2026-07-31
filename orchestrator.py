@@ -148,6 +148,24 @@ class AgentOrchestrator:
             memory_store=self.memory_store,
         )
         self.privileged_workflow = privileged_workflow
+
+        def privileged_progress(role: str):
+            def emit(message: str) -> None:
+                text = str(message or "").strip()
+                known_prefixes = (
+                    "Planner：",
+                    "Implementation Binding Agent：",
+                    "Execution Agent：",
+                    "Verifier：",
+                    "Workflow Coordinator：",
+                )
+                if text.startswith(known_prefixes):
+                    print(text, flush=True)
+                else:
+                    print("%s：%s" % (role, text), flush=True)
+
+            return emit
+
         if self.profile.name == "ops-privilege" and self.privileged_workflow is None:
             planner_llm = self.llm
             evidence_summarizer = None
@@ -164,11 +182,9 @@ class AgentOrchestrator:
                         max_retries=0,
                     )
                 )
-            def privileged_progress(message: str) -> None:
-                print("Klonet Agent：%s" % message, flush=True)
 
             privileged_context_builder = PrivilegedPlanContextBuilder(
-                on_progress=privileged_progress,
+                on_progress=privileged_progress("Evidence Collector"),
             )
             privileged_probe_runner = (
                 privileged_context_builder.run_recovery_diagnostics
@@ -177,12 +193,14 @@ class AgentOrchestrator:
                 planner=PrivilegedPlannerAgent(
                     planner_llm,
                     probe_runner=privileged_probe_runner,
-                    on_progress=privileged_progress,
+                    on_progress=privileged_progress("Planner"),
                 ),
                 execution_agent=PrivilegedExecutionAgent(
                     planner_llm,
                     probe_runner=privileged_probe_runner,
-                    on_progress=privileged_progress,
+                    on_progress=privileged_progress(
+                        "Implementation Binding Agent"
+                    ),
                 ),
                 executor=PrivilegedCommandExecutor(
                     on_output=lambda channel, chunk: print(chunk, end="", flush=True),
@@ -202,7 +220,7 @@ class AgentOrchestrator:
                 event_sink=self._record_privileged_event,
                 context_builder=privileged_context_builder,
                 summarizer=evidence_summarizer,
-                on_progress=privileged_progress,
+                on_progress=privileged_progress("Workflow Coordinator"),
             )
         self.privileged_supervisor = privileged_supervisor
         if self.profile.name == "ops-privilege" and self.privileged_supervisor is None:
@@ -216,10 +234,7 @@ class AgentOrchestrator:
             self.privileged_supervisor = PrivilegedOpsSupervisor(
                 workflow=self.privileged_workflow,
                 classifier=PrivilegedIntentClassifier(classifier_llm),
-                on_progress=lambda message: print(
-                    "Klonet Agent：%s" % message,
-                    flush=True,
-                ),
+                on_progress=privileged_progress("Supervisor"),
             )
 
     def init_history(self) -> list[dict]:
@@ -559,7 +574,7 @@ class AgentOrchestrator:
             assistant_msg = {"role": "assistant", "content": privileged_reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
-            print(f"Klonet Agent：{privileged_reply}")
+            print(f"Workflow Coordinator：{privileged_reply}")
             return privileged_reply, history, token
 
         thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."

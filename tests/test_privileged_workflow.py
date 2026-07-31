@@ -846,7 +846,9 @@ def test_each_step_is_explained_before_execution(tmp_path):
 
     assert result.kind == "completed"
     assert progress == [
-        "第 1/1 步：将检查项目入口文件是否完整；这是只读操作，不会修改服务器。"
+        "Execution Agent：第 1/1 步：将检查项目入口文件是否完整；"
+        "这是只读操作，不会修改服务器。",
+        "Verifier：第 1/1 步验收通过：stub",
     ]
 
 

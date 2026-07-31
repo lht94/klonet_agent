@@ -44,7 +44,12 @@ class PrivilegedEvidenceSummarizer:
             else (
                 "一次性 Shell 脚本"
                 if binding is not None and binding.kind == "shell_artifact"
-                else step.action or "受控操作"
+                else (
+                    "纯验证检查"
+                    if binding is not None
+                    and binding.kind == "verification_only"
+                    else step.action or "受控操作"
+                )
             )
         )
         prompt = (
@@ -112,6 +117,9 @@ class PrivilegedEvidenceSummarizer:
                     "run_as": binding.shell_artifact.run_as,
                     "declared_changes": binding.shell_artifact.declared_changes,
                 }
+            elif binding.kind == "verification_only":
+                action_name = "纯验证检查（不执行变更命令）"
+                args = {"postconditions": binding.postconditions}
         safe_args = redact_sensitive_text(
             json.dumps(args, ensure_ascii=False)
         )[:3000]

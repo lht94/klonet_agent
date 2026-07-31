@@ -48,6 +48,16 @@ class PrivilegedOpsSupervisor:
         if self.workflow.is_control_command(normalized):
             result = self.workflow.handle_command(normalized)
             return self._handled(result)
+        if normalized in {"继续", "恢复", "继续执行", "恢复上次任务"}:
+            recovery_options = getattr(
+                self.workflow,
+                "unfinished_plan_options",
+                None,
+            )
+            if recovery_options is not None:
+                result = recovery_options()
+                if result is not None:
+                    return self._handled(result)
 
         safety = self.goal_guard.check(normalized)
         if safety.denied:

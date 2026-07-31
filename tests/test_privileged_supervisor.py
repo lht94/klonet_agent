@@ -251,6 +251,24 @@ def test_supervisor_handles_exact_plan_control_before_classifier():
     assert classifier.calls == []
 
 
+def test_supervisor_turns_plain_continue_into_recovery_choices():
+    from klonet_agent.ops.privileged.workflow import WorkflowResult
+
+    supervisor, workflow, classifier = _supervisor("mutating_action")
+    workflow.unfinished_plan_options = lambda: WorkflowResult(
+        "recovery_options",
+        "检查现场状态后恢复：resume-priv priv-123",
+    )
+
+    result = supervisor.handle("继续")
+
+    assert result.handled is True
+    assert result.kind == "recovery_options"
+    assert "resume-priv priv-123" in result.message
+    assert classifier.calls == []
+    assert workflow.mutations == []
+
+
 def test_supervisor_denies_raw_goal_before_classifier_or_planner():
     supervisor, workflow, classifier = _supervisor("mutating_action")
 

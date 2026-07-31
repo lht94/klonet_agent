@@ -1,4 +1,4 @@
-"""Execution Agent: bind semantic objectives to Actions or frozen shell artifacts."""
+"""Implementation Binding Agent: compile semantic steps into safe contracts."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ from klonet_agent.ops.privileged.shell_artifact import (
 
 
 EXECUTION_SELECTION_PROMPT = """
-You are stage 1 of the Klonet Ops-Privilege Execution Agent. Select exactly one
+You are stage 1 of the Klonet Implementation Binding Agent. Select exactly one
 implementation capability for one frozen semantic step. Do not generate Action
 arguments, shell code, checker contracts, or a revised semantic plan.
 
@@ -56,10 +56,12 @@ Return one JSON object with status exactly:
 - shell_artifact, only when no registered Action covers the objective:
   {"status":"shell_artifact","selection_reason":"...",
    "resolved_from_evidence":[]}
+- verification_only, when the semantic step only observes post-execution state
+  and needs registered checkers but no state-changing Action or shell command.
 - need_evidence: include at most 3 registered read-only probe_requests.
-- blocked: {"status":"blocked","reason":"..."}, only when neither a
-  registered Action nor a safe one-time shell artifact can implement the
-  unchanged semantic objective.
+- blocked: {"status":"blocked","reason":"..."}, only when no registered
+  Action, safe one-time shell artifact, or verification-only checker contract
+  can implement the unchanged semantic objective.
 
 Prefer a registered Action only when its declared capability actually covers
 the objective. Never invent Action names. All implementation parameters will
@@ -71,6 +73,7 @@ MAX_BINDING_INVALID_REPAIRS = 2
 MAX_ACTION_CONTRACT_REPAIRS = 2
 MAX_SHELL_CONTRACT_REPAIRS = 2
 MAX_SHELL_VERIFICATION_REPAIRS = 2
+MAX_IMPLEMENTATION_RESELECTIONS = 2
 MAX_BINDING_GROUNDING_SECTION_CHARS = 12000
 
 
@@ -92,6 +95,21 @@ script or any other replacement implementation.
 """.strip()
 
 
+VERIFICATION_ONLY_PROMPT = """
+You bind a frozen verification-only semantic step. It must execute no Action
+and no shell command. Select deterministic postconditions from the exact
+registered checker catalog that directly prove the supplied success criteria.
+
+Return exactly one JSON object with status:
+- ready: include binding_reason, resolved_from_evidence, and postconditions.
+- blocked: include reason when the goal cannot be proven by registered
+  checkers with grounded arguments.
+
+Do not return an Action, command, shell script, precondition, or probe request.
+exit_code_zero is not valid evidence for a verification-only step.
+""".strip()
+
+
 ACTION_CONTRACT_PROMPT = """
 You complete the argument contract for one already selected registered Klonet
 Action. The Action name and semantic objective are frozen. Return exactly one
@@ -107,7 +125,7 @@ objective.
 
 
 SHELL_CONTRACT_PROMPT = """
-You are stage 2 of the Klonet Ops-Privilege Execution Agent. The semantic step
+You are stage 2 of the Klonet Implementation Binding Agent. The semantic step
 and the decision to use a one-time shell artifact are frozen. Generate only the
 complete shell execution contract for this one step.
 
@@ -144,6 +162,14 @@ class ExecutionBindingError(Exception):
         super().__init__(message)
         self.replan_recommended = replan_recommended
         self.category = category
+
+
+class ImplementationRejected(Exception):
+    """The selected implementation cannot realize the frozen semantic step."""
+
+    def __init__(self, implementation: str, reason: str) -> None:
+        super().__init__(reason)
+        self.implementation = implementation
 
 
 class PrivilegedExecutionAgent:
@@ -249,6 +275,7 @@ class PrivilegedExecutionAgent:
         step: PrivilegedStep,
         *,
         grounded_context: GroundedPlanContext | None,
+        implementation_feedback: str = "",
     ) -> ExecutionBinding:
         messages = [
             {"role": "system", "content": EXECUTION_SELECTION_PROMPT},
@@ -263,6 +290,21 @@ class PrivilegedExecutionAgent:
         ]
         probe_round = 0
         invalid_repairs = 0
+        reselection_attempts = 0
+        rejected_implementations: list[str] = []
+        if implementation_feedback:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Implementation feedback from a previous confirmed"
+                        " execution attempt:\n%s\nSelect a materially different"
+                        " implementation when the previous one did not satisfy"
+                        " the semantic objective."
+                        % implementation_feedback[:6000]
+                    ),
+                }
+            )
         while True:
             data: dict[str, Any] = {}
             try:
@@ -330,18 +372,26 @@ class PrivilegedExecutionAgent:
                             _progress_text(action),
                         )
                     )
-                    binding = self._complete_registered_action_contract(
-                        data={
-                            "action": action,
-                            "binding_reason": data.get("selection_reason"),
-                            "resolved_from_evidence": data.get(
-                                "resolved_from_evidence"
+                    try:
+                        binding = self._complete_registered_action_contract(
+                            data={
+                                "action": action,
+                                "binding_reason": data.get("selection_reason"),
+                                "resolved_from_evidence": data.get(
+                                    "resolved_from_evidence"
+                                ),
+                            },
+                            semantic_step=step,
+                            grounded_context=grounded_context,
+                            initial_error=(
+                                "stage 2 Action arguments are not bound yet"
                             ),
-                        },
-                        semantic_step=step,
-                        grounded_context=grounded_context,
-                        initial_error="stage 2 Action arguments are not bound yet",
-                    )
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ImplementationRejected(
+                            "registered_action:%s" % action,
+                            str(exc),
+                        ) from exc
                     self._progress(
                         "实现结论：步骤“%s”将使用注册 Action：%s。"
                         % (
@@ -356,13 +406,36 @@ class PrivilegedExecutionAgent:
                         "进入一次性脚本合同阶段。"
                         % _progress_text(step.title or step.objective)
                     )
-                    binding = self._complete_shell_contract(
-                        selection=data,
-                        semantic_step=step,
-                        grounded_context=grounded_context,
-                    )
+                    try:
+                        binding = self._complete_shell_contract(
+                            selection=data,
+                            semantic_step=step,
+                            grounded_context=grounded_context,
+                        )
+                    except ExecutionBindingError as exc:
+                        raise ImplementationRejected(
+                            "shell_artifact",
+                            str(exc),
+                        ) from exc
                     self._progress(
                         "实现结论：没有合适的注册 Action，步骤“%s”需要一次性脚本并单独确认。"
+                        % _progress_text(step.title or step.objective)
+                    )
+                    return binding
+                if status == "verification_only":
+                    try:
+                        binding = self._complete_verification_only_contract(
+                            selection=data,
+                            semantic_step=step,
+                            grounded_context=grounded_context,
+                        )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ImplementationRejected(
+                            "verification_only",
+                            str(exc),
+                        ) from exc
+                    self._progress(
+                        "实现结论：步骤“%s”仅运行确定性验收检查，不执行变更命令。"
                         % _progress_text(step.title or step.objective)
                     )
                     return binding
@@ -372,18 +445,57 @@ class PrivilegedExecutionAgent:
                         % _progress_text(step.title or step.objective)
                     )
                     raise ExecutionBindingError(
-                        str(data.get("reason") or "Execution Agent 无法实现该步骤")
+                        str(
+                            data.get("reason")
+                            or "Implementation Binding Agent 无法实现该步骤"
+                        )
                     )
                 raise ValueError(
                     "invalid execution binding status=%s"
                     % (status or "<missing>")
                 )
+            except ImplementationRejected as exc:
+                rejected_implementations.append(
+                    "%s: %s" % (exc.implementation, str(exc)[:500])
+                )
+                if reselection_attempts >= MAX_IMPLEMENTATION_RESELECTIONS:
+                    raise ExecutionBindingError(
+                        "所有候选实现均无法完成语义步骤：%s"
+                        % "；".join(rejected_implementations),
+                        replan_recommended=True,
+                        category="capability_mismatch",
+                    ) from exc
+                reselection_attempts += 1
+                self._progress(
+                    "实现结论：%s 不适合当前步骤，正在重新选择"
+                    " Action、Shell 或纯验证实现（第 %s/%s 次）。"
+                    % (
+                        _progress_text(exc.implementation),
+                        reselection_attempts,
+                        MAX_IMPLEMENTATION_RESELECTIONS,
+                    )
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The selected implementation was rejected after"
+                            " contract validation. Do not repeat it unchanged."
+                            " Select another registered Action, shell_artifact,"
+                            " or verification_only. If none can implement the"
+                            " frozen semantic step, return blocked. Rejected: %s"
+                            % rejected_implementations[-1]
+                        ),
+                    }
+                )
+                continue
             except ExecutionBindingError:
                 raise
             except (KeyError, TypeError, ValueError) as exc:
                 if invalid_repairs >= MAX_BINDING_INVALID_REPAIRS:
                     raise ExecutionBindingError(
-                        "Execution Agent 实现合同修复耗尽：%s" % exc,
+                        "Implementation Binding Agent 实现合同修复耗尽：%s"
+                        % exc,
                         replan_recommended=False,
                         category="implementation_contract_invalid",
                     ) from exc
@@ -403,7 +515,8 @@ class PrivilegedExecutionAgent:
                             " Do not return args, script, or checker contracts."
                             " Return one complete JSON object. status must be one of"
                             " registered_action, shell_artifact, need_evidence,"
-                            " or blocked; stage 2 status ready is invalid here."
+                            " verification_only, or blocked; stage 2 status ready"
+                            " is invalid here."
                             " Error: %s" % exc
                         ),
                     }
@@ -735,7 +848,8 @@ class PrivilegedExecutionAgent:
                     }
                 )
         raise ExecutionBindingError(
-            "Execution Agent Shell 合同修复耗尽：%s" % last_error,
+            "Implementation Binding Agent Shell 合同修复耗尽：%s"
+            % last_error,
             replan_recommended=False,
             category="implementation_contract_invalid",
         )
@@ -799,6 +913,88 @@ class PrivilegedExecutionAgent:
             ),
             postconditions=postconditions,
             binding_reason=str(data.get("binding_reason") or "").strip()[:1000],
+        )
+
+    def _complete_verification_only_contract(
+        self,
+        *,
+        selection: dict[str, Any],
+        semantic_step: PrivilegedStep,
+        grounded_context: GroundedPlanContext | None,
+    ) -> ExecutionBinding:
+        payload = {
+            "frozen_implementation_kind": "verification_only",
+            "semantic_step": {
+                "step_id": semantic_step.step_id,
+                "objective": semantic_step.objective,
+                "success_criteria": semantic_step.success_criteria,
+            },
+            "grounded_context": _binding_grounded_context(grounded_context),
+            "registered_checker_catalog": self.checkers.render_catalog(),
+        }
+        messages = [
+            {"role": "system", "content": VERIFICATION_ONLY_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        last_error = "verification-only contract was not generated"
+        for attempt in range(1, MAX_ACTION_CONTRACT_REPAIRS + 1):
+            try:
+                result = self._call_function(
+                    messages,
+                    self._verification_only_function_tool(),
+                )
+                status = str(result.get("status") or "").strip().lower()
+                if status == "blocked":
+                    raise ValueError(
+                        "verification_only_not_grounded=%s"
+                        % str(result.get("reason") or "unspecified")[:500]
+                    )
+                if status != "ready":
+                    raise ValueError(
+                        "invalid verification-only status=%s"
+                        % (status or "<missing>")
+                    )
+                checks, errors = self._validated_checks(
+                    result.get("postconditions")
+                )
+                if errors:
+                    raise ValueError("; ".join(errors))
+                if not checks or all(
+                    item["checker"] == "exit_code_zero" for item in checks
+                ):
+                    raise ValueError(
+                        "verification_only_requires_observable_postconditions"
+                    )
+                return ExecutionBinding(
+                    kind="verification_only",
+                    risk="readonly",
+                    approval_scope="plan",
+                    resolved_from_evidence=_strings(
+                        result.get("resolved_from_evidence"),
+                        20,
+                    ),
+                    postconditions=checks,
+                    binding_reason=str(
+                        result.get("binding_reason")
+                        or selection.get("selection_reason")
+                        or ""
+                    ).strip()[:1000],
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                last_error = str(exc)
+                if attempt >= MAX_ACTION_CONTRACT_REPAIRS:
+                    break
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Repair only the verification checker contract."
+                            " Keep verification_only frozen. Error: %s" % exc
+                        ),
+                    }
+                )
+        raise ValueError(
+            "verification-only contract repair exhausted: %s" % last_error
         )
 
     def _complete_shell_postconditions(
@@ -1016,6 +1212,7 @@ class PrivilegedExecutionAgent:
                         "enum": [
                             "registered_action",
                             "shell_artifact",
+                            "verification_only",
                             "need_evidence",
                             "blocked",
                         ],
@@ -1176,6 +1373,36 @@ class PrivilegedExecutionAgent:
             },
         )
 
+    def _verification_only_function_tool(self) -> dict[str, Any]:
+        return _function_tool(
+            "bind_verification_only",
+            "Bind deterministic checkers without executing an implementation.",
+            {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["ready", "blocked"],
+                    },
+                    "reason": {"type": "string"},
+                    "binding_reason": {"type": "string"},
+                    "resolved_from_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "postconditions": self._checker_list_json_schema(),
+                },
+                "required": [
+                    "status",
+                    "reason",
+                    "binding_reason",
+                    "resolved_from_evidence",
+                    "postconditions",
+                ],
+                "additionalProperties": False,
+            },
+        )
+
     def _checker_list_json_schema(self) -> dict[str, Any]:
         return {
             "type": "array",
@@ -1320,6 +1547,8 @@ def _normalize_selection(data: dict[str, Any]) -> dict[str, Any]:
         "registered": "registered_action",
         "shell": "shell_artifact",
         "script": "shell_artifact",
+        "verification": "verification_only",
+        "checker": "verification_only",
     }
     normalized = str(result.get("status") or "").strip().lower()
     result["status"] = aliases.get(normalized, normalized)

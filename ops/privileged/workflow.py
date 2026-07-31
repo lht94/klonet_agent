@@ -29,6 +29,24 @@ COMMAND_PATTERN = re.compile(
     r"confirm-priv-step\s+\S+\s+\S+)$"
 )
 MAX_INITIAL_BINDING_REPLAN_ATTEMPTS = 2
+MAX_SAFE_EXECUTION_ATTEMPTS = 2
+MAX_RUNTIME_IMPLEMENTATION_REBINDS = 1
+SAFE_RETRY_ACTIONS = {
+    "start_docker_container",
+    "start_platform_screens",
+    "start_screen_component",
+    "restart_screen_component",
+    "reload_nginx",
+}
+TRANSIENT_FAILURE_MARKERS = (
+    "temporarily unavailable",
+    "try again",
+    "connection refused",
+    "connection reset",
+    "resource busy",
+    "startup_not_ready",
+    "service_not_ready",
+)
 
 
 @dataclass
@@ -132,7 +150,7 @@ class PrivilegedOpsWorkflow:
                 planner_kwargs["conversation_context"] = conversation_context
             plan = self.planner.plan(goal, **planner_kwargs)
             if self.execution_agent is None:
-                raise RuntimeError("Execution Agent is unavailable")
+                raise RuntimeError("Implementation Binding Agent is unavailable")
             plan = self._bind_with_replanning(
                 goal,
                 plan,
@@ -149,6 +167,31 @@ class PrivilegedOpsWorkflow:
             return WorkflowResult(
                 "denied",
                 "该操作计划被安全策略拒绝：%s" % exc,
+            )
+        except ExecutionBindingError as exc:
+            paused_plan = getattr(exc, "paused_plan", None)
+            if paused_plan is not None:
+                return WorkflowResult(
+                    "paused",
+                    "Implementation Binding Agent 无法形成完整实现，所有自动"
+                    "重选与 Planner replan 已停止；没有执行任何服务器变更。\n"
+                    "原因：%s\n\n请由你决定：\n"
+                    "- 查看当前证据：audit-priv %s\n"
+                    "- 再次要求 Planner 重规划：replan-priv %s\n"
+                    "- 放弃该计划：abort-priv %s\n"
+                    "- 或直接补充目标/约束，提交一条新的请求"
+                    % (
+                        _short_error(exc),
+                        paused_plan.plan_id,
+                        paused_plan.plan_id,
+                        paused_plan.plan_id,
+                    ),
+                    paused_plan,
+                )
+            return WorkflowResult(
+                "blocked",
+                "无法生成可确认的安全计划：%s。当前没有执行任何操作。"
+                % _short_error(exc),
             )
         except Exception as exc:
             return WorkflowResult(
@@ -198,11 +241,13 @@ class PrivilegedOpsWorkflow:
                 if not getattr(exc, "replan_recommended", True):
                     if self.on_progress is not None:
                         self.on_progress(
-                            "Execute 内部实现合同修复已耗尽；语义目标没有变化，"
+                            "Implementation Binding Agent：内部合同格式修复已耗尽；"
+                            "语义目标没有变化，"
                             "因此不消耗 Planner 重规划次数。"
                         )
-                    raise ExecutionBindingError(
-                        "Execute 无法形成有效实现合同，未触发无意义的 Planner "
+                    terminal = ExecutionBindingError(
+                        "Implementation Binding Agent 无法形成有效实现合同，"
+                        "未触发无意义的 Planner "
                         "重规划：%s" % failure,
                         replan_recommended=False,
                         category=getattr(
@@ -210,18 +255,23 @@ class PrivilegedOpsWorkflow:
                             "category",
                             "implementation_contract_invalid",
                         ),
-                    ) from exc
+                    )
+                    self._attach_paused_binding_plan(terminal, plan)
+                    raise terminal from exc
                 if attempt >= MAX_INITIAL_BINDING_REPLAN_ATTEMPTS:
-                    raise ExecutionBindingError(
+                    terminal = ExecutionBindingError(
                         "执行绑定在 %s 次重新规划后仍失败：%s"
                         % (
                             MAX_INITIAL_BINDING_REPLAN_ATTEMPTS,
                             "；".join(failures),
                         )
-                    ) from exc
+                    )
+                    self._attach_paused_binding_plan(terminal, plan)
+                    raise terminal from exc
                 if self.on_progress is not None:
                     self.on_progress(
-                        "执行实现无法安全绑定（第 %s/%s 次）：%s；"
+                        "Implementation Binding Agent：实现无法安全绑定"
+                        "（第 %s/%s 次）：%s；"
                         "正在把原因返回 Planner 重新规划…"
                         % (
                             attempt + 1,
@@ -271,6 +321,25 @@ class PrivilegedOpsWorkflow:
                 )
                 plan = replacement
         raise AssertionError("unreachable binding replan loop")
+
+    def _attach_paused_binding_plan(
+        self,
+        error: ExecutionBindingError,
+        plan: PrivilegedPlan,
+    ) -> None:
+        plan.status = "paused"
+        unbound = next(
+            (step for step in plan.steps if step.execution_binding is None),
+            None,
+        )
+        if unbound is not None:
+            unbound.status = "paused"
+            unbound.observation = _append_observation(
+                unbound.observation,
+                "实现绑定与自动重规划均未形成安全路线，等待用户决定",
+            )
+        self.store.save(plan)
+        error.paused_plan = plan
 
     def submit_readonly(self, goal: str, command: str) -> WorkflowResult:
         argv, reason = PrivilegedRiskPolicy().readonly_argv(command)
@@ -349,6 +418,40 @@ class PrivilegedOpsWorkflow:
             "error",
             "Error: invalid privileged control command",
         )
+
+    def unfinished_plan_options(self) -> WorkflowResult | None:
+        """Turn an ambiguous 'continue' into explicit recovery choices."""
+
+        unfinished = [
+            plan
+            for plan in self.store.list()
+            if plan.status not in {"completed", "aborted", "blocked", "failed"}
+        ]
+        if not unfinished:
+            return None
+        plan = unfinished[0]
+        lines = [
+            "发现一个尚未结束的高权限计划；为避免把“继续”误当成新目标，"
+            "系统不会自动执行。",
+            "计划：%s；状态：%s；目标：%s"
+            % (plan.plan_id, plan.status, plan.goal),
+            "查看计划：show-priv %s" % plan.plan_id,
+            "查看证据：audit-priv %s" % plan.plan_id,
+        ]
+        if plan.status in {"awaiting_confirmation", "draft"}:
+            lines.append("确认并执行：confirm-priv %s" % plan.plan_id)
+        elif plan.status in {"approved", "executing", "verifying", "partially_completed"}:
+            lines.append("检查现场状态后恢复：resume-priv %s" % plan.plan_id)
+        elif plan.status == "paused":
+            lines.extend(
+                (
+                    "重试暂停步骤：retry-priv %s" % plan.plan_id,
+                    "根据证据重规划：replan-priv %s" % plan.plan_id,
+                    "跳过暂停步骤：continue-priv %s" % plan.plan_id,
+                )
+            )
+        lines.append("放弃计划：abort-priv %s" % plan.plan_id)
+        return WorkflowResult("recovery_options", "\n".join(lines), plan)
 
     def approve_plan(self, plan_id: str) -> WorkflowResult:
         plan = self.store.load(plan_id)
@@ -626,7 +729,7 @@ class PrivilegedOpsWorkflow:
             planner_kwargs["grounded_context"] = grounded_context
         replacement = self.planner.plan(plan.goal, **planner_kwargs)
         if self.execution_agent is None:
-            raise RuntimeError("Execution Agent is unavailable")
+            raise RuntimeError("Implementation Binding Agent is unavailable")
         replacement = self._bind_with_replanning(
             plan.goal,
             replacement,
@@ -803,7 +906,8 @@ class PrivilegedOpsWorkflow:
 
             if self.on_progress is not None:
                 self.on_progress(
-                    self._describe_step_execution(
+                    "Execution Agent：%s"
+                    % self._describe_step_execution(
                         step,
                         index=step_index,
                         total=len(plan.steps),
@@ -811,6 +915,7 @@ class PrivilegedOpsWorkflow:
                 )
             plan.status = "executing"
             step.status = "running"
+            step.execution_attempts += 1
             if persist:
                 self.store.save(plan)
             self._event("privileged_step_started", plan, {"step_id": step.step_id})
@@ -849,6 +954,16 @@ class PrivilegedOpsWorkflow:
                 decision = verify(plan, step)
             else:
                 decision = self.verifier.verify_step(plan, step)
+            if self.on_progress is not None:
+                self.on_progress(
+                    "Verifier：第 %s/%s 步验收%s：%s"
+                    % (
+                        step_index,
+                        len(plan.steps),
+                        "通过" if decision.status == "passed" else "未通过",
+                        decision.reason or decision.status,
+                    )
+                )
             plan.verification = decision
             self._event(
                 "privileged_verification",
@@ -865,6 +980,32 @@ class PrivilegedOpsWorkflow:
                 if persist:
                     self.store.save(plan)
                 continue
+            if self._can_safely_retry_execution(step, decision):
+                step.status = "approved"
+                step.observation = _append_observation(
+                    step.observation,
+                    "检测到可安全重试的瞬时错误；将进行第 %s/%s 次执行"
+                    % (
+                        step.execution_attempts + 1,
+                        MAX_SAFE_EXECUTION_ATTEMPTS,
+                    ),
+                )
+                step.checks = []
+                plan.status = "approved"
+                if persist:
+                    self.store.save(plan)
+                if self.on_progress is not None:
+                    self.on_progress(
+                        "Execution Agent：步骤“%s”出现瞬时错误，"
+                        "该 Action 已登记为可安全重试；重新检查后有限重试。"
+                        % step.title
+                    )
+                return self._execute_plan(
+                    plan,
+                    persist=persist,
+                    deterministic_verification=deterministic_verification,
+                    readonly_argv=readonly_argv,
+                )
             step.status = "paused"
             step.observation = self._summarize_step(
                 step,
@@ -886,6 +1027,13 @@ class PrivilegedOpsWorkflow:
                     "verification_status": decision.status,
                 },
             )
+            rebound = self._automatic_implementation_rebind(
+                plan,
+                step,
+                persist=persist,
+            )
+            if rebound is not None:
+                return rebound
             recovery = self._automatic_recovery_plan(
                 plan,
                 step,
@@ -904,6 +1052,153 @@ class PrivilegedOpsWorkflow:
             self.store.save(plan)
         self._event("privileged_plan_completed", plan)
         return WorkflowResult("completed", render_plan(plan), plan)
+
+    @staticmethod
+    def _can_safely_retry_execution(
+        step: PrivilegedStep,
+        decision: Any,
+    ) -> bool:
+        binding = step.execution_binding
+        evidence = step.evidence
+        if (
+            binding is None
+            or binding.kind != "registered_action"
+            or binding.action not in SAFE_RETRY_ACTIONS
+            or evidence is None
+            or evidence.timed_out
+            or evidence.environment_changed
+            or step.execution_attempts >= MAX_SAFE_EXECUTION_ATTEMPTS
+        ):
+            return False
+        failure_text = " ".join(
+            (
+                str(evidence.stderr or ""),
+                str(getattr(decision, "reason", "") or ""),
+            )
+        ).lower()
+        return any(marker in failure_text for marker in TRANSIENT_FAILURE_MARKERS)
+
+    def _automatic_implementation_rebind(
+        self,
+        plan: PrivilegedPlan,
+        failed_step: PrivilegedStep,
+        *,
+        persist: bool,
+    ) -> WorkflowResult | None:
+        """Try one materially different implementation before semantic replan."""
+
+        old_binding = failed_step.execution_binding
+        evidence = failed_step.evidence
+        if (
+            not persist
+            or self.context_builder is None
+            or self.execution_agent is None
+            or not hasattr(self.execution_agent, "prepare_step")
+            or old_binding is None
+            or old_binding.kind == "verification_only"
+            or evidence is None
+            or evidence.timed_out
+            or failed_step.implementation_rebind_attempts
+                >= MAX_RUNTIME_IMPLEMENTATION_REBINDS
+        ):
+            return None
+        feedback = redact_sensitive_text(
+            json.dumps(
+                {
+                    "rejected_implementation": old_binding.to_dict(),
+                    "execution_evidence": evidence.to_dict(),
+                    "verification": (
+                        plan.verification.to_dict()
+                        if plan.verification is not None
+                        else {}
+                    ),
+                    "instruction": (
+                        "Keep the semantic objective unchanged and select a"
+                        " materially different implementation."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )[:12000]
+        try:
+            grounded_context = self.context_builder.build(
+                failed_step.objective or failed_step.title,
+                supplemental_environment_context=feedback,
+            )
+            if grounded_context.planning_blocker():
+                return None
+            candidate = PrivilegedStep.from_dict(failed_step.to_dict())
+            candidate.execution_binding = None
+            candidate.evidence = None
+            candidate.checks = []
+            candidate.status = "pending"
+            replacement = self.execution_agent.prepare_step(
+                plan,
+                candidate,
+                grounded_context=grounded_context,
+                implementation_feedback=feedback,
+            )
+        except Exception as exc:
+            if self.on_progress is not None:
+                self.on_progress(
+                    "Implementation Binding Agent：运行失败后的实现重选未成功：%s；"
+                    "将把 Failure Packet 交还 Planner。" % _short_error(exc)
+                )
+            return None
+        if _binding_execution_signature(replacement) == _binding_execution_signature(
+            old_binding
+        ):
+            if self.on_progress is not None:
+                self.on_progress(
+                    "Implementation Binding Agent：拒绝重复刚刚失败的实现；"
+                    "将把 Failure Packet 交还 Planner。"
+                )
+            return None
+
+        failed_step.execution_binding = replacement
+        failed_step.risk = replacement.risk
+        failed_step.approval_scope = replacement.approval_scope
+        failed_step.preconditions = list(replacement.preconditions)
+        failed_step.postconditions = list(replacement.postconditions)
+        failed_step.evidence = None
+        failed_step.checks = []
+        failed_step.observation = _append_observation(
+            failed_step.observation,
+            "Implementation Binding Agent 已选择不同实现；旧授权失效，"
+            "等待用户确认",
+        )
+        failed_step.status = (
+            "awaiting_confirmation"
+            if replacement.approval_scope == "step"
+            else "pending"
+        )
+        failed_step.implementation_rebind_attempts += 1
+        plan.authorized_hash = ""
+        plan.status = "awaiting_confirmation"
+        plan.verification = None
+        if persist:
+            self.store.save(plan)
+        self._event(
+            "privileged_implementation_rebound",
+            plan,
+            {"step_id": failed_step.step_id, "kind": replacement.kind},
+        )
+        return WorkflowResult(
+            "awaiting_confirmation",
+            "原实现未通过验收，Implementation Binding Agent 已为同一语义目标"
+            "选择不同实现。"
+            "新实现尚未执行，旧授权已经失效。\n\n%s\n\n"
+            "确认新实现：confirm-priv %s\n"
+            "查看完整计划：show-priv %s\n"
+            "放弃计划：abort-priv %s"
+            % (
+                render_plan(plan),
+                plan.plan_id,
+                plan.plan_id,
+                plan.plan_id,
+            ),
+            plan,
+        )
 
     def _summarize_step(
         self,
@@ -984,7 +1279,8 @@ class PrivilegedOpsWorkflow:
         )
         if self.on_progress is not None:
             self.on_progress(
-                "步骤未达到成功标准，正在把执行证据和反思返回 Planner…"
+                "Planner：步骤未达到成功标准，正在根据 Failure Packet"
+                " 反思并重新规划…"
             )
         try:
             fingerprint = self.context_builder.current_environment_fingerprint()
@@ -1140,12 +1436,17 @@ class PrivilegedOpsWorkflow:
             "当前步骤失败，后续操作已停止。\n"
             "失败与反思：%s\n"
             "未继续自动规划：%s\n\n"
-            "查看证据：audit-priv %s\n"
-            "重新要求规划：replan-priv %s\n"
-            "终止计划：abort-priv %s"
+            "请由你决定下一步：\n"
+            "- 查看证据：audit-priv %s\n"
+            "- 重试当前步骤：retry-priv %s\n"
+            "- 跳过当前步骤继续：continue-priv %s\n"
+            "- 再次要求规划：replan-priv %s\n"
+            "- 终止计划：abort-priv %s"
             % (
                 failure_summary,
                 reason,
+                plan.plan_id,
+                plan.plan_id,
                 plan.plan_id,
                 plan.plan_id,
                 plan.plan_id,
@@ -1306,13 +1607,18 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
             )
         binding = step.execution_binding
         if binding is not None:
+            implementation_description = {
+                "registered_action": "已注册受控动作，随计划确认后自动执行。",
+                "shell_artifact": (
+                    "固定的一次性 Shell 脚本，执行前还需单步确认。"
+                ),
+                "verification_only": (
+                    "纯验证步骤，只运行已注册检查器，不执行变更命令。"
+                ),
+            }.get(binding.kind, "未知执行绑定，不会自动执行。")
             lines.append(
                 "   执行方式：%s"
-                % (
-                    "已注册受控动作，随计划确认后自动执行。"
-                    if binding.kind == "registered_action"
-                    else "固定的一次性 Shell 脚本，执行前还需单步确认。"
-                )
+                % implementation_description
             )
             if binding.binding_reason:
                 lines.append("   绑定依据：%s" % binding.binding_reason)
@@ -1594,6 +1900,20 @@ def _semantic_plan_signature(steps: list[PrivilegedStep]) -> str:
             ensure_ascii=False,
             sort_keys=True,
         ).encode("utf-8")
+    ).hexdigest()
+
+
+def _binding_execution_signature(binding: Any) -> str:
+    artifact = getattr(binding, "shell_artifact", None)
+    payload = {
+        "kind": getattr(binding, "kind", ""),
+        "action": getattr(binding, "action", ""),
+        "args": getattr(binding, "args", {}),
+        "shell_sha256": getattr(artifact, "sha256", "") if artifact else "",
+        "postconditions": getattr(binding, "postconditions", []),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 

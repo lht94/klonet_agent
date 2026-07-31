@@ -903,8 +903,11 @@ def test_initial_binding_replan_loop_is_bounded(tmp_path):
 
     result = workflow.submit("部署名为 lht 的平台实例")
 
-    assert result.kind == "blocked"
+    assert result.kind == "paused"
     assert "2 次重新规划后仍失败" in result.message
+    assert "请由你决定" in result.message
+    assert "replan-priv" in result.message
+    assert result.plan.status == "paused"
     assert binder.calls == 3
     assert len(planner_llm.calls) == 3
 
@@ -942,10 +945,333 @@ def test_invalid_execute_contract_does_not_consume_planner_replans(tmp_path):
 
     result = workflow.submit("部署名为 lht 的平台实例")
 
-    assert result.kind == "blocked"
+    assert result.kind == "paused"
     assert "未触发无意义的 Planner 重规划" in result.message
+    assert "请由你决定" in result.message
     assert len(planner_llm.calls) == 1
     assert any("不消耗 Planner 重规划次数" in item for item in progress)
+
+
+def test_execution_agent_binds_verification_only_without_command(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    marker = tmp_path / "healthy"
+    marker.write_text("ok", encoding="utf-8")
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="verify deployment health")])
+    ).plan("verify deployment")
+    binder = PrivilegedExecutionAgent(
+        FakeLLM(
+            [
+                json.dumps(
+                    {
+                        "status": "verification_only",
+                        "action": "",
+                        "selection_reason": "the step only verifies state",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "binding_reason": "file state proves health",
+                        "postconditions": [
+                            {
+                                "checker": "file_exists",
+                                "args": {"path": str(marker)},
+                            }
+                        ],
+                    }
+                ),
+            ]
+        )
+    )
+
+    bound = binder.prepare_plan(plan, grounded_context=None)
+    step = bound.steps[0]
+    evidence = PrivilegedCommandExecutor().execute(step)
+    step.evidence = evidence
+    decision = PrivilegedVerifierAgent(None).verify_deterministic_step(
+        bound,
+        step,
+    )
+
+    assert step.execution_binding.kind == "verification_only"
+    assert evidence.return_code == 0
+    assert evidence.environment_changed is False
+    assert decision.status == "passed"
+
+
+def test_execution_agent_reselects_after_action_contract_is_not_grounded(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    marker = tmp_path / "healthy"
+    progress = []
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="verify deployment health")])
+    ).plan("verify deployment")
+    binder = PrivilegedExecutionAgent(
+        FakeLLM(
+            [
+                json.dumps(
+                    {
+                        "status": "registered_action",
+                        "action": "run_ops_command",
+                        "selection_reason": "initial but unsuitable choice",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "blocked",
+                        "reason": "no grounded program and argv",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "blocked",
+                        "reason": "no grounded program and argv",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "verification_only",
+                        "action": "",
+                        "selection_reason": "no execution is required",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "ready",
+                        "binding_reason": "use a deterministic state check",
+                        "postconditions": [
+                            {
+                                "checker": "file_exists",
+                                "args": {"path": str(marker)},
+                            }
+                        ],
+                    }
+                ),
+            ]
+        ),
+        on_progress=progress.append,
+    )
+
+    bound = binder.prepare_plan(plan, grounded_context=None)
+
+    assert bound.steps[0].execution_binding.kind == "verification_only"
+    assert any("正在重新选择" in item for item in progress)
+
+
+def test_workflow_safely_retries_one_transient_idempotent_action(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ExecutionEvidence,
+        PrivilegedPlan,
+        PrivilegedStep,
+        VerificationDecision,
+    )
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    class Executor:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, step):
+            del step
+            self.calls += 1
+            if self.calls == 1:
+                return ExecutionEvidence(
+                    return_code=1,
+                    stderr="connection refused environment_changed=false",
+                    environment_changed=False,
+                )
+            return ExecutionEvidence(return_code=0, environment_changed=False)
+
+    class Verifier:
+        def __init__(self):
+            self.calls = 0
+
+        def verify_step(self, plan, step):
+            del plan, step
+            self.calls += 1
+            if self.calls == 1:
+                return VerificationDecision(
+                    status="failed",
+                    reason="service temporarily unavailable",
+                )
+            return VerificationDecision(status="passed", reason="healthy")
+
+    step = PrivilegedStep(
+        step_id="start",
+        title="启动组件",
+        objective="start component",
+        risk="medium",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="start_screen_component",
+            args={"project_root": str(tmp_path), "component": "worker"},
+            risk="medium",
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-transient-retry",
+        goal="start platform",
+        risk="medium",
+        steps=[step],
+        status="awaiting_confirmation",
+    )
+    store = PrivilegedPlanStore(tmp_path / "memory", user_id="u", project_id="p")
+    store.save(plan)
+    executor = Executor()
+    progress = []
+    workflow = PrivilegedOpsWorkflow(
+        planner=object(),
+        execution_agent=object(),
+        executor=executor,
+        verifier=Verifier(),
+        store=store,
+        on_progress=progress.append,
+    )
+
+    result = workflow.approve_plan(plan.plan_id)
+
+    assert result.kind == "completed"
+    assert executor.calls == 2
+    assert result.plan.steps[0].execution_attempts == 2
+    assert any("有限重试" in item for item in progress)
+
+
+def test_runtime_failure_rebinds_implementation_and_requires_confirmation(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ExecutionEvidence,
+        PrivilegedPlan,
+        PrivilegedStep,
+        VerificationDecision,
+    )
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    class Executor:
+        def execute(self, step):
+            del step
+            return ExecutionEvidence(
+                return_code=1,
+                stderr="implementation did not satisfy objective",
+                environment_changed=False,
+            )
+
+    class Verifier:
+        def verify_step(self, plan, step):
+            del plan, step
+            return VerificationDecision(
+                status="failed",
+                reason="expected state is absent",
+            )
+
+    class Context:
+        def build(self, goal, supplemental_environment_context=""):
+            del goal, supplemental_environment_context
+            return SimpleNamespace(planning_blocker=lambda: "")
+
+    class Binder:
+        def prepare_step(
+            self,
+            plan,
+            step,
+            *,
+            grounded_context,
+            implementation_feedback="",
+        ):
+            del plan, step, grounded_context
+            assert "rejected_implementation" in implementation_feedback
+            return ExecutionBinding(
+                kind="verification_only",
+                risk="readonly",
+                postconditions=[
+                    {"checker": "file_exists", "args": {"path": str(tmp_path)}}
+                ],
+                binding_reason="materially different implementation",
+            )
+
+    step = PrivilegedStep(
+        step_id="repair",
+        title="修复实例",
+        objective="repair instance",
+        risk="medium",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="stop_klonet_runtime_instance",
+            args={"project_root": str(tmp_path)},
+            risk="medium",
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-runtime-rebind",
+        goal="repair platform",
+        risk="medium",
+        steps=[step],
+        status="awaiting_confirmation",
+    )
+    store = PrivilegedPlanStore(tmp_path / "memory", user_id="u", project_id="p")
+    store.save(plan)
+    workflow = PrivilegedOpsWorkflow(
+        planner=object(),
+        execution_agent=Binder(),
+        executor=Executor(),
+        verifier=Verifier(),
+        store=store,
+        context_builder=Context(),
+    )
+
+    result = workflow.approve_plan(plan.plan_id)
+
+    assert result.kind == "awaiting_confirmation"
+    assert result.plan.is_authorized is False
+    assert result.plan.steps[0].execution_binding.kind == "verification_only"
+    assert "旧授权已经失效" in result.message
+    assert "confirm-priv" in result.message
+
+
+def test_unfinished_plan_options_prevent_plain_continue_from_replanning(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    plan = PrivilegedPlan(
+        plan_id="priv-resume-choice",
+        goal="deploy lht",
+        risk="medium",
+        steps=[PrivilegedStep(step_id="deploy", title="部署", risk="medium")],
+        status="awaiting_confirmation",
+    )
+    store = PrivilegedPlanStore(tmp_path / "memory", user_id="u", project_id="p")
+    store.save(plan)
+    workflow = PrivilegedOpsWorkflow(
+        planner=object(),
+        execution_agent=object(),
+        executor=object(),
+        verifier=object(),
+        store=store,
+    )
+
+    result = workflow.unfinished_plan_options()
+
+    assert result.kind == "recovery_options"
+    assert "不会自动执行" in result.message
+    assert "confirm-priv priv-resume-choice" in result.message
 
 
 def test_shell_policy_hard_denies_dynamic_egress_secrets_and_agent_changes(
