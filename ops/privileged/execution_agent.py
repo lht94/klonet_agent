@@ -37,6 +37,8 @@ from klonet_agent.ops.privileged.planner import (
 from klonet_agent.ops.privileged.planner_schema import REQUIRED_ACTION_ARGS
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 from klonet_agent.ops.privileged.shell_artifact import (
+    MAX_SCRIPT_BYTES,
+    MAX_SCRIPT_LINES,
     ShellArtifactPolicy,
     create_shell_artifact,
 )
@@ -115,12 +117,18 @@ Return exactly one JSON object with status:
 - blocked: include reason if a safe, grounded and verifiable shell contract
   cannot implement the frozen objective.
 
-The script must use ordinary bash, be non-interactive, and produce observable
-state. Do not use eval, source, command substitution, background execution,
-dynamic download-and-execute, unbounded deletion, or changes to sudoers, SSH,
-or Agent security policy. Every checker and required argument must come from
-the supplied checker catalog. Do not return an Action or alter the objective.
+The script must use ordinary bash, be non-interactive, produce observable
+state, contain at most {max_lines} lines, and occupy at most {max_bytes} UTF-8
+bytes. Prefer compact commands and heredocs when writing configuration. Do not
+use eval, source, command substitution, background execution, dynamic
+download-and-execute, unbounded deletion, or changes to sudoers, SSH, or Agent
+security policy. Every checker and required argument must come from the
+supplied checker catalog. Do not return an Action or alter the objective.
 """.strip()
+SHELL_CONTRACT_PROMPT = SHELL_CONTRACT_PROMPT.format(
+    max_lines=MAX_SCRIPT_LINES,
+    max_bytes=MAX_SCRIPT_BYTES,
+)
 
 
 class ExecutionBindingError(Exception):
@@ -718,8 +726,11 @@ class PrivilegedExecutionAgent:
                         "content": (
                             "Repair only the stage 2 shell contract. Keep the"
                             " semantic objective and shell implementation kind"
-                            " frozen. Return status ready or blocked. Error: %s"
-                            % exc
+                            " frozen. Return status ready or blocked. The script"
+                            " must remain within %s lines and %s UTF-8 bytes;"
+                            " compact it if the error reports a size limit."
+                            " Error: %s"
+                            % (MAX_SCRIPT_LINES, MAX_SCRIPT_BYTES, exc)
                         ),
                     }
                 )
@@ -1110,7 +1121,10 @@ class PrivilegedExecutionAgent:
                         "enum": ["ready", "blocked"],
                     },
                     "reason": {"type": "string"},
-                    "script": {"type": "string"},
+                    "script": {
+                        "type": "string",
+                        "maxLength": MAX_SCRIPT_BYTES,
+                    },
                     "cwd": {"type": "string"},
                     "run_as": {"type": "string"},
                     "timeout": {"type": "integer", "minimum": 1},

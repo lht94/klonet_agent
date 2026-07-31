@@ -1001,6 +1001,57 @@ def test_shell_policy_rejects_normalized_empty_artifact(tmp_path):
     assert ShellArtifactPolicy().validate(artifact) == "shell_artifact_empty"
 
 
+def test_shell_policy_allows_bounded_multiline_configuration(tmp_path):
+    from klonet_agent.ops.privileged.shell_artifact import (
+        MAX_SCRIPT_LINES,
+        ShellArtifactPolicy,
+        create_shell_artifact,
+    )
+
+    script = "\n".join("printf '%s\\n' line-%s" % ("%s", index) for index in range(80))
+    artifact = create_shell_artifact(
+        artifact_id="shell-multiline",
+        script=script,
+        cwd=str(tmp_path),
+        run_as="",
+        timeout=10,
+        environment_fingerprint="env",
+        declared_changes=[str(tmp_path / "config")],
+        rollback="remove config",
+        nonce="nonce",
+    )
+
+    assert MAX_SCRIPT_LINES >= 80
+    assert ShellArtifactPolicy().validate(artifact) == ""
+
+
+def test_shell_policy_reports_actual_line_limit(tmp_path):
+    from klonet_agent.ops.privileged.shell_artifact import (
+        MAX_SCRIPT_LINES,
+        ShellArtifactPolicy,
+        create_shell_artifact,
+    )
+
+    actual_lines = MAX_SCRIPT_LINES + 1
+    script = "\n".join("true" for _ in range(actual_lines))
+    artifact = create_shell_artifact(
+        artifact_id="shell-too-many-lines",
+        script=script,
+        cwd=str(tmp_path),
+        run_as="",
+        timeout=10,
+        environment_fingerprint="env",
+        declared_changes=[str(tmp_path / "config")],
+        rollback="remove config",
+        nonce="nonce",
+    )
+
+    assert ShellArtifactPolicy().validate(artifact) == (
+        "shell_artifact_too_many_lines=%s>%s"
+        % (actual_lines, MAX_SCRIPT_LINES)
+    )
+
+
 def test_executor_refuses_changed_expired_drifted_or_reused_shell(tmp_path):
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,

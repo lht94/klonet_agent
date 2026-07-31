@@ -15,7 +15,7 @@ from klonet_agent.ops.privileged.contracts import ShellArtifact
 
 
 MAX_SCRIPT_BYTES = 16 * 1024
-MAX_SCRIPT_LINES = 50
+MAX_SCRIPT_LINES = 120
 ALLOWED_ENV_KEYS = {"PATH", "LANG", "LC_ALL", "PYTHONNOUSERSITE"}
 FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 FORBIDDEN_COMMANDS = {
@@ -90,10 +90,21 @@ class ShellArtifactPolicy:
         ]
         if not executable_lines:
             return "shell_artifact_empty"
-        if len(script.encode("utf-8")) > MAX_SCRIPT_BYTES:
-            return "shell_artifact_too_large"
-        if len(script.splitlines()) > MAX_SCRIPT_LINES:
-            return "shell_artifact_too_many_lines"
+        script_bytes = len(script.encode("utf-8"))
+        if script_bytes > MAX_SCRIPT_BYTES:
+            return "shell_artifact_too_large=%s>%s" % (
+                script_bytes,
+                MAX_SCRIPT_BYTES,
+            )
+        # The normalization guard is injected by us, so it must not consume
+        # one of the model's contract lines. Blank lines do not add execution
+        # complexity either.
+        script_lines = len(executable_lines)
+        if script_lines > MAX_SCRIPT_LINES:
+            return "shell_artifact_too_many_lines=%s>%s" % (
+                script_lines,
+                MAX_SCRIPT_LINES,
+            )
         if artifact.interpreter != "/bin/bash":
             return "shell_interpreter_not_allowed"
         cwd = Path(str(artifact.cwd or "")).expanduser()
