@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
+from pathlib import Path
 from typing import Any, Callable
 
 from klonet_agent.ops.actions import (
@@ -21,6 +23,7 @@ from klonet_agent.ops.privileged.checkers import (
 from klonet_agent.ops.privileged.contracts import (
     ExecutionBinding,
     ImplementationPlan,
+    PlanResource,
     PrivilegedPlan,
     PrivilegedStep,
     RISK_LEVELS,
@@ -74,6 +77,10 @@ reason to return blocked: select shell_artifact when a bounded, reviewable
 one-time shell implementation is possible. Never invent Action names. All
 implementation parameters will be generated and validated by a separate
 stage 2 call.
+Plan resources are immutable shared inputs. Never replace a frozen resource
+with a currently existing value from another instance. A deferred resource is
+unknown, not permission to guess; choose an implementation that does not need
+it or return blocked with the missing resource name.
 """.strip()
 
 MAX_BINDING_PROBE_ROUNDS = 2
@@ -140,6 +147,8 @@ must describe one observable state change. Express dependencies between
 implementation steps, but do not emit Action names, commands, shell, paths,
 ports, or other concrete arguments at this stage. Later binding calls will
 ground those details.
+The supplied plan resource manifest is already frozen. Implementation steps
+must preserve it; a deferred value remains unknown until its declared boundary.
 
 Return status=ready with 1-12 implementation_steps. Each step needs id, title,
 objective, reason, depends_on, expected_changes, success_criteria, and
@@ -163,7 +172,9 @@ JSON object with status:
 
 Use the exact required argument names and grounded evidence supplied. Do not
 change the Action, return a shell script, request probes, or alter the semantic
-objective.
+objective. For every matching resource consumer, use the frozen value exactly.
+Never substitute another instance's existing path or port. Do not guess a
+deferred resource.
 """.strip()
 
 
@@ -184,7 +195,9 @@ bytes. Prefer compact commands and heredocs when writing configuration. Do not
 use eval, source, command substitution, background execution, dynamic
 download-and-execute, unbounded deletion, or changes to sudoers, SSH, or Agent
 security policy. Every checker and required argument must come from the
-supplied checker catalog. Do not return an Action or alter the objective.
+supplied checker catalog. Frozen plan resources must be used exactly and
+deferred resources must not be guessed. Do not return an Action or alter the
+objective.
 """.strip()
 SHELL_CONTRACT_PROMPT = SHELL_CONTRACT_PROMPT.format(
     max_lines=MAX_SCRIPT_LINES,
@@ -280,7 +293,27 @@ class PrivilegedExecutionAgent:
             registered_steps = []
             for step in plan.steps:
                 binding = step.execution_binding
-                if binding is None or binding.kind != "registered_action":
+                if binding is None:
+                    continue
+                if binding.kind == "shell_artifact":
+                    registered_steps.append(
+                        PrivilegedStep(
+                            step_id=step.step_id,
+                            title=step.title,
+                            objective=step.objective,
+                            depends_on=list(step.depends_on),
+                            action="shell_artifact",
+                            args={
+                                "cwd": binding.shell_artifact.cwd,
+                                "declared_changes": list(
+                                    binding.shell_artifact.declared_changes
+                                )
+                            },
+                            risk=binding.risk,
+                        )
+                    )
+                    continue
+                if binding.kind != "registered_action":
                     continue
                 registered_steps.append(
                     PrivilegedStep(
@@ -342,6 +375,7 @@ class PrivilegedExecutionAgent:
             for attempt in range(MAX_IMPLEMENTATION_PLAN_REBUILDS):
                 try:
                     micro_steps = self._decompose_semantic_step(
+                        plan,
                         semantic_step,
                         grounded_context=grounded_context,
                         feedback=feedback,
@@ -411,7 +445,27 @@ class PrivilegedExecutionAgent:
             registered_steps = []
             for micro_step in bound_micro_steps:
                 binding = micro_step.execution_binding
-                if binding is None or binding.kind != "registered_action":
+                if binding is None:
+                    continue
+                if binding.kind == "shell_artifact":
+                    registered_steps.append(
+                        PrivilegedStep(
+                            step_id=micro_step.step_id,
+                            title=micro_step.title,
+                            objective=micro_step.objective,
+                            depends_on=list(micro_step.depends_on),
+                            action="shell_artifact",
+                            args={
+                                "cwd": binding.shell_artifact.cwd,
+                                "declared_changes": list(
+                                    binding.shell_artifact.declared_changes
+                                )
+                            },
+                            risk=binding.risk,
+                        )
+                    )
+                    continue
+                if binding.kind != "registered_action":
                     continue
                 registered_steps.append(
                     PrivilegedStep(
@@ -448,6 +502,7 @@ class PrivilegedExecutionAgent:
 
     def _decompose_semantic_step(
         self,
+        plan: PrivilegedPlan,
         semantic_step: PrivilegedStep,
         *,
         grounded_context: GroundedPlanContext | None,
@@ -468,6 +523,9 @@ class PrivilegedExecutionAgent:
                 grounded_context
             ),
             "registered_checker_catalog": self.checkers.render_catalog(),
+            "frozen_plan_resources": _resource_manifest_payload(
+                plan.resources
+            ),
             "previous_attempt_feedback": feedback,
         }
         result = self._call_function(
@@ -706,6 +764,7 @@ class PrivilegedExecutionAgent:
                             initial_error=(
                                 "stage 2 Action arguments are not bound yet"
                             ),
+                            plan_resources=plan.resources,
                         )
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ImplementationRejected(
@@ -745,6 +804,7 @@ class PrivilegedExecutionAgent:
                             selection=data,
                             semantic_step=step,
                             grounded_context=grounded_context,
+                            plan_resources=plan.resources,
                         )
                     except ExecutionBindingError as exc:
                         raise ImplementationRejected(
@@ -762,6 +822,7 @@ class PrivilegedExecutionAgent:
                             selection=data,
                             semantic_step=step,
                             grounded_context=grounded_context,
+                            plan_resources=plan.resources,
                         )
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ImplementationRejected(
@@ -1004,6 +1065,9 @@ class PrivilegedExecutionAgent:
                 grounded_context
             ),
             "registered_action_catalog": self._action_catalog(),
+            "frozen_plan_resources": _resource_manifest_payload(
+                plan.resources
+            ),
             "allowed_action_names": self._direct_action_names(),
             "registered_probe_catalog": DEFAULT_READONLY_PROBES.render(),
             "required_status_values": [
@@ -1028,6 +1092,7 @@ class PrivilegedExecutionAgent:
         data: dict[str, Any],
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
+        plan_resources: list[PlanResource] | None = None,
     ) -> ExecutionBinding:
         action = str(data.get("action") or "").strip()
         spec = self.action_registry.get(action)
@@ -1062,6 +1127,12 @@ class PrivilegedExecutionAgent:
             problem = _validate_host_facts(action, args)
             if problem:
                 raise ValueError(problem)
+        _validate_action_resource_bindings(
+            semantic_step,
+            action,
+            args,
+            plan_resources or [],
+        )
         command_decision = (
             decide_ops_command(args)
             if action == "run_ops_command"
@@ -1116,6 +1187,7 @@ class PrivilegedExecutionAgent:
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
         initial_error: str,
+        plan_resources: list[PlanResource] | None = None,
     ) -> ExecutionBinding:
         """Repair Action arguments without reopening semantic route selection."""
 
@@ -1144,6 +1216,9 @@ class PrivilegedExecutionAgent:
                 "success_criteria": semantic_step.success_criteria,
             },
             "grounded_context": _binding_grounded_context(grounded_context),
+            "frozen_plan_resources": _resource_manifest_payload(
+                plan_resources or []
+            ),
             "registered_checker_catalog": self.checkers.render_catalog(),
             "rejected_contract": {
                 "args": data.get("args"),
@@ -1192,6 +1267,7 @@ class PrivilegedExecutionAgent:
                     repaired,
                     semantic_step,
                     grounded_context,
+                    plan_resources,
                 )
                 self._progress(
                     "实现节点：注册 Action“%s”的参数合同已补全。"
@@ -1226,6 +1302,7 @@ class PrivilegedExecutionAgent:
         selection: dict[str, Any],
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
+        plan_resources: list[PlanResource] | None = None,
     ) -> ExecutionBinding:
         """Generate stage 2 Shell fields without reopening capability choice."""
 
@@ -1241,6 +1318,9 @@ class PrivilegedExecutionAgent:
                 "success_criteria": semantic_step.success_criteria,
             },
             "grounded_context": _binding_grounded_context(grounded_context),
+            "frozen_plan_resources": _resource_manifest_payload(
+                plan_resources or []
+            ),
             "registered_checker_catalog": self.checkers.render_catalog(),
         }
         messages = [
@@ -1285,6 +1365,7 @@ class PrivilegedExecutionAgent:
                     contract,
                     semantic_step,
                     grounded_context,
+                    plan_resources,
                 )
                 self._progress(
                     "实现节点：一次性脚本执行合同已生成并通过安全校验。"
@@ -1326,6 +1407,7 @@ class PrivilegedExecutionAgent:
         data: dict[str, Any],
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
+        plan_resources: list[PlanResource] | None = None,
     ) -> ExecutionBinding:
         raw_script = str(data.get("script") or "")
         if not raw_script.strip():
@@ -1355,12 +1437,29 @@ class PrivilegedExecutionAgent:
             rollback=rollback,
             nonce=uuid.uuid4().hex,
         )
+        allowed_future_cwds = list(_planned_output_paths(semantic_step))
+        for resource in plan_resources or []:
+            if resource.status != "frozen" or resource.kind != "path":
+                continue
+            if any(
+                semantic_step.step_id == consumer.rsplit(".", 1)[0]
+                or semantic_step.step_id.startswith(
+                    consumer.rsplit(".", 1)[0] + "__"
+                )
+                for consumer in resource.consumers
+            ):
+                allowed_future_cwds.append(resource.value)
         problem = self.shell_policy.validate(
             artifact,
-            allowed_future_cwds=_planned_output_paths(semantic_step),
+            allowed_future_cwds=tuple(allowed_future_cwds),
         )
         if problem:
             raise ValueError(problem)
+        _validate_shell_resource_bindings(
+            semantic_step,
+            artifact,
+            plan_resources or [],
+        )
         try:
             postconditions = self._strict_shell_postconditions(
                 data.get("postconditions")
@@ -1391,6 +1490,7 @@ class PrivilegedExecutionAgent:
         selection: dict[str, Any],
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
+        plan_resources: list[PlanResource] | None = None,
     ) -> ExecutionBinding:
         payload = {
             "frozen_implementation_kind": "verification_only",
@@ -1402,6 +1502,9 @@ class PrivilegedExecutionAgent:
                 "success_criteria": semantic_step.success_criteria,
             },
             "grounded_context": _binding_grounded_context(grounded_context),
+            "frozen_plan_resources": _resource_manifest_payload(
+                plan_resources or []
+            ),
             "registered_checker_catalog": self.checkers.render_catalog(),
         }
         messages = [
@@ -2189,6 +2292,107 @@ def _selection_grounded_context(
         json.dumps(payload, ensure_ascii=False, sort_keys=True),
         6000,
     )
+
+
+def _resource_manifest_payload(
+    resources: list[PlanResource],
+) -> list[dict[str, Any]]:
+    return [resource.to_dict() for resource in resources]
+
+
+def _validate_action_resource_bindings(
+    step: PrivilegedStep,
+    action: str,
+    args: dict[str, Any],
+    resources: list[PlanResource],
+) -> None:
+    """Reject per-step arguments that diverge from the plan-wide manifest."""
+
+    del action  # Consumers intentionally bind semantic step + argument name.
+    for resource in resources:
+        for consumer in resource.consumers:
+            semantic_id, arg_name = consumer.rsplit(".", 1)
+            if not (
+                step.step_id == semantic_id
+                or step.step_id.startswith(semantic_id + "__")
+            ):
+                continue
+            if arg_name not in args:
+                continue
+            if resource.status == "deferred":
+                raise ValueError(
+                    "deferred_plan_resource_required=%s resolve_before=%s"
+                    % (resource.name, resource.resolve_before)
+                )
+            observed = args.get(arg_name)
+            if not _resource_values_equal(resource, observed):
+                raise ValueError(
+                    "resource_binding_violation=%s.%s must use ${%s}"
+                    % (semantic_id, arg_name, resource.name)
+                )
+
+
+def _validate_shell_resource_bindings(
+    step: PrivilegedStep,
+    artifact: ShellArtifact,
+    resources: list[PlanResource],
+) -> None:
+    for resource in resources:
+        relevant_targets = set()
+        for consumer in resource.consumers:
+            semantic_id, target = consumer.rsplit(".", 1)
+            if target not in {"script", "cwd", "declared_changes", "content"}:
+                continue
+            if step.step_id == semantic_id or step.step_id.startswith(
+                semantic_id + "__"
+            ):
+                relevant_targets.add(target)
+        if not relevant_targets:
+            continue
+        if resource.status == "deferred":
+            if resource.name in {"git_remote", "repository_url"}:
+                if not re.search(
+                    r"(?:^|[;&|\n])\s*git\s+clone\b",
+                    artifact.script,
+                ):
+                    continue
+            raise ValueError(
+                "deferred_plan_resource_required=%s resolve_before=%s"
+                % (resource.name, resource.resolve_before)
+            )
+        materials = []
+        if relevant_targets & {"script", "content"}:
+            materials.append(artifact.script)
+        if "cwd" in relevant_targets:
+            materials.append(artifact.cwd)
+        if "declared_changes" in relevant_targets:
+            materials.extend(artifact.declared_changes)
+        if not any(str(resource.value) in value for value in materials):
+            raise ValueError(
+                "resource_binding_violation=shell step %s must use ${%s}"
+                % (step.step_id, resource.name)
+            )
+
+
+def _resource_values_equal(resource: PlanResource, observed: Any) -> bool:
+    if resource.kind == "path":
+        try:
+            return os.path.abspath(
+                os.path.expanduser(str(observed))
+            ) == os.path.abspath(os.path.expanduser(str(resource.value)))
+        except OSError:
+            return False
+    if resource.kind == "port":
+        try:
+            return int(observed) == int(resource.value)
+        except (TypeError, ValueError):
+            return bool(
+                re.search(
+                    r"(?<![0-9])%s(?![0-9])" % re.escape(str(resource.value)),
+                    str(observed),
+                )
+            )
+    return str(observed) == str(resource.value)
 
 
 def _strings(value: Any, limit: int) -> list[str]:

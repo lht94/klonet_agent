@@ -136,6 +136,21 @@ def test_planner_replaces_source_repo_runtime_with_grounded_parent_plan(tmp_path
         {
             "status": "ready",
             "goal": "部署平台",
+            "resources": [
+                {
+                    "name": "instance_root",
+                    "kind": "path",
+                    "status": "frozen",
+                    "value": str(backend.parent),
+                    "source": "environment_evidence",
+                    "reason": "",
+                    "resolve_before": "",
+                    "consumers": [
+                        "prepare.project_root",
+                        "start.project_root",
+                    ],
+                },
+            ],
             "steps": [
                 {
                     "step_id": "prepare",
@@ -296,6 +311,60 @@ def test_environment_model_allows_future_project_root_only_with_prior_producer(
     _validate_environment_model([producer, start], context)
 
 
+def test_environment_model_requires_a_prior_producer_for_future_shell_cwd(
+    tmp_path,
+):
+    import pytest
+
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.environment_facts import (
+        EnvironmentFactCollector,
+    )
+    from klonet_agent.ops.privileged.planner import _validate_environment_model
+
+    backend = _backend_repo(tmp_path)
+    context = GroundedPlanContext(
+        knowledge_evidence="knowledge",
+        environment_evidence="environment",
+        action_catalog="actions",
+        facts={
+            "environment_model": EnvironmentFactCollector()
+            .collect([str(backend)])
+            .to_dict()
+        },
+    )
+    future_root = tmp_path / "lht"
+    start = PrivilegedStep(
+        step_id="start",
+        title="start from future root",
+        action="shell_artifact",
+        args={
+            "cwd": str(future_root),
+            "declared_changes": ["lht screen sessions"],
+        },
+        risk="high",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="shell_future_cwd_has_no_prior_producer",
+    ):
+        _validate_environment_model([start], context)
+
+    producer = PrivilegedStep(
+        step_id="copy",
+        title="produce lht root",
+        action="shell_artifact",
+        args={
+            "cwd": str(tmp_path),
+            "declared_changes": [str(future_root)],
+        },
+        risk="medium",
+    )
+    _validate_environment_model([producer, start], context)
+
+
 def test_new_platform_deployment_replay_compiles_to_confirmable_plan(tmp_path):
     from klonet_agent.ops.privileged.context import GroundedPlanContext
     from klonet_agent.ops.privileged.environment_facts import (
@@ -322,6 +391,31 @@ def test_new_platform_deployment_replay_compiles_to_confirmable_plan(tmp_path):
         {
             "status": "ready",
             "goal": "deploy codexsim",
+            "resources": [
+                {
+                    "name": "instance_root",
+                    "kind": "path",
+                    "status": "frozen",
+                    "value": str(target_root),
+                    "source": "derived",
+                    "reason": "",
+                    "resolve_before": "",
+                    "consumers": [
+                        "copy.destination",
+                        "start.project_root",
+                    ],
+                },
+                {
+                    "name": "master_port",
+                    "kind": "port",
+                    "status": "frozen",
+                    "value": 60001,
+                    "source": "environment_evidence",
+                    "reason": "",
+                    "resolve_before": "",
+                    "consumers": ["configure.content", "route.content"],
+                },
+            ],
             "steps": [
                 {
                     "step_id": "copy",

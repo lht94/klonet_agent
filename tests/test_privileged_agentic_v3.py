@@ -673,6 +673,308 @@ def test_direct_blocked_selection_must_review_shell_fallback(tmp_path):
     assert "absence of a registered Action is not sufficient" in fallback_request
 
 
+def test_plan_resources_freeze_paths_ports_and_keep_git_remote_deferred(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+    from klonet_agent.ops.privileged.workflow import render_plan
+
+    instance_root = tmp_path / "lht"
+    payload = json.loads(
+        _semantic_payload(objective="deploy a new lht platform instance")
+    )
+    payload["goal"] = "deploy lht"
+    payload["steps"][0]["step_id"] = "start"
+    payload["resources"] = [
+        {
+            "name": "instance_name",
+            "kind": "identifier",
+            "status": "frozen",
+            "value": "lht",
+            "source": "user_input",
+            "reason": "",
+            "resolve_before": "",
+            "consumers": ["start.platform"],
+        },
+        {
+            "name": "instance_root",
+            "kind": "path",
+            "status": "frozen",
+            "value": str(instance_root),
+            "source": "derived",
+            "reason": "",
+            "resolve_before": "",
+            "consumers": ["start.project_root"],
+        },
+        {
+            "name": "master_port",
+            "kind": "port",
+            "status": "frozen",
+            "value": 52101,
+            "source": "environment_evidence",
+            "reason": "",
+            "resolve_before": "",
+            "consumers": [],
+        },
+        {
+            "name": "git_remote",
+            "kind": "url",
+            "status": "deferred",
+            "value": None,
+            "source": "",
+            "reason": "the user may choose local copy instead",
+            "resolve_before": "start",
+            "consumers": [],
+        },
+    ]
+
+    plan = PrivilegedPlannerAgent(FakeLLM([json.dumps(payload)])).plan(
+        "deploy lht"
+    )
+
+    assert plan.resources[1].value == str(instance_root)
+    assert plan.resources[2].value == 52101
+    assert plan.resources[3].status == "deferred"
+    assert "start.project_root" in plan.resources[1].consumers
+    assert "start.master_port" in plan.resources[2].consumers
+    binding_payload = json.loads(
+        PrivilegedExecutionAgent(FakeLLM([]))._selection_request_content(
+            plan,
+            plan.steps[0],
+            grounded_context=None,
+        )
+    )
+    assert binding_payload["frozen_plan_resources"][1]["value"] == str(
+        instance_root
+    )
+    preview = render_plan(plan)
+    assert "instance_root=%s（已冻结）" % instance_root in preview
+    assert "git_remote（待补全" in preview
+
+
+def test_mutating_deployment_plan_cannot_omit_resource_manifest(tmp_path):
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    missing = json.loads(
+        _semantic_payload(objective="deploy a new lht platform instance")
+    )
+    missing["goal"] = "deploy lht"
+    missing["steps"][0]["risk_suggestion"] = "medium"
+    repaired = dict(missing)
+    repaired["resources"] = [
+        {
+            "name": "instance_root",
+            "kind": "path",
+            "status": "frozen",
+            "value": str(tmp_path / "lht"),
+            "source": "derived",
+            "reason": "",
+            "resolve_before": "",
+            "consumers": [],
+        }
+    ]
+    llm = FakeLLM([json.dumps(missing), json.dumps(repaired)])
+
+    plan = PrivilegedPlannerAgent(llm).plan("deploy lht")
+
+    assert len(llm.calls) == 2
+    assert "requires a path resource manifest" in (
+        llm.calls[1]["messages"][-1]["content"]
+    )
+    assert plan.resources[0].name == "instance_root"
+
+
+def test_frozen_instance_root_rejects_binding_to_existing_old_instance(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        PrivilegedExecutionAgent,
+    )
+
+    new_root = tmp_path / "lht"
+    old_root = tmp_path / "vemu_uestc"
+    old_root.mkdir()
+    resource = PlanResource(
+        name="instance_root",
+        kind="path",
+        status="frozen",
+        value=str(new_root),
+        source="derived",
+        consumers=["start.project_root"],
+    )
+    step = PrivilegedStep(
+        step_id="start__screens",
+        title="start lht",
+        objective="start the lht platform",
+        risk="high",
+    )
+    agent = PrivilegedExecutionAgent(FakeLLM([]))
+    contract = {
+        "action": "start_platform_screens",
+        "args": {"platform": "lht", "project_root": str(old_root)},
+    }
+
+    with pytest.raises(ValueError, match="resource_binding_violation"):
+        agent._registered_binding(
+            contract,
+            step,
+            grounded_context=None,
+            plan_resources=[resource],
+        )
+
+    contract["args"]["project_root"] = str(new_root)
+    binding = agent._registered_binding(
+        contract,
+        step,
+        grounded_context=None,
+        plan_resources=[resource],
+    )
+    assert binding.args["project_root"] == str(new_root)
+
+
+def test_frozen_port_is_enforced_inside_configuration_content():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_resource_bindings,
+    )
+
+    resource = PlanResource(
+        name="master_port",
+        kind="port",
+        status="frozen",
+        value=52101,
+        source="environment_evidence",
+        consumers=["configure.content"],
+    )
+    step = PrivilegedStep(
+        step_id="configure__edit",
+        title="configure lht",
+        risk="medium",
+    )
+
+    _validate_action_resource_bindings(
+        step,
+        "edit_text_file",
+        {"content": "master_port = 52101"},
+        [resource],
+    )
+    with pytest.raises(ValueError, match="resource_binding_violation"):
+        _validate_action_resource_bindings(
+            step,
+            "edit_text_file",
+            {"content": "master_port = 52001"},
+            [resource],
+        )
+
+
+def test_resolving_deferred_resource_invalidates_previous_confirmation():
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+
+    plan = PrivilegedPlan(
+        plan_id="priv-resources",
+        goal="deploy lht",
+        risk="medium",
+        steps=[PrivilegedStep(step_id="copy", title="copy", risk="medium")],
+        resources=[
+            PlanResource(
+                name="git_remote",
+                kind="url",
+                status="deferred",
+                reason="repository choice is not known",
+                resolve_before="copy",
+            )
+        ],
+        status="awaiting_confirmation",
+    )
+    plan.authorize()
+    old_hash = plan.authorized_hash
+
+    plan.resolve_resource(
+        "git_remote",
+        "git@github.com:example/klonet.git",
+        source="user_input",
+    )
+
+    assert old_hash != plan.content_hash
+    assert plan.authorized_hash == ""
+    assert plan.status == "awaiting_confirmation"
+    assert plan.resources[0].status == "frozen"
+
+
+def test_shell_fallback_obeys_frozen_and_deferred_resources(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_shell_resource_bindings,
+    )
+    from klonet_agent.ops.privileged.shell_artifact import create_shell_artifact
+
+    new_root = tmp_path / "lht"
+    old_root = tmp_path / "old"
+    step = PrivilegedStep(
+        step_id="start__shell",
+        title="start lht",
+        risk="high",
+    )
+    root = PlanResource(
+        name="instance_root",
+        kind="path",
+        status="frozen",
+        value=str(new_root),
+        source="derived",
+        consumers=["start.script"],
+    )
+    remote = PlanResource(
+        name="git_remote",
+        kind="url",
+        status="deferred",
+        reason="remote was not selected",
+        resolve_before="start",
+        consumers=["start.script"],
+    )
+
+    def artifact(script):
+        return create_shell_artifact(
+            artifact_id="shell-resource-test",
+                script=script,
+                cwd=str(tmp_path),
+                run_as="",
+                timeout=10,
+                environment_fingerprint="",
+                declared_changes=[str(new_root)],
+                rollback="remove test output",
+                nonce="resource-test",
+            )
+
+    with pytest.raises(ValueError, match="resource_binding_violation"):
+        _validate_shell_resource_bindings(
+            step,
+            artifact("cd %s && ./start.sh" % old_root),
+            [root],
+        )
+    _validate_shell_resource_bindings(
+        step,
+        artifact("cd %s && ./start.sh" % new_root),
+        [root],
+    )
+    with pytest.raises(ValueError, match="deferred_plan_resource_required"):
+        _validate_shell_resource_bindings(
+            step,
+            artifact("mkdir -p %s && git clone guessed %s" % (new_root, new_root)),
+            [root, remote],
+        )
+
+
 def test_shell_failure_cannot_block_before_candidate_budget(tmp_path):
     from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent

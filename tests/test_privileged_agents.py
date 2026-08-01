@@ -180,7 +180,25 @@ def test_planner_rejects_hard_denied_command_even_if_model_calls_it_low_risk():
 def test_semantic_nginx_plan_keeps_observable_success_criteria():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
-    llm = FakeLLM([_planner_payload(goal="deploy nginx config")])
+    llm = FakeLLM(
+        [
+            _planner_payload(
+                goal="deploy nginx config",
+                resources=[
+                    {
+                        "name": "nginx_config_path",
+                        "kind": "path",
+                        "status": "frozen",
+                        "value": "/etc/nginx/nginx.conf",
+                        "source": "environment_evidence",
+                        "reason": "",
+                        "resolve_before": "",
+                        "consumers": [],
+                    }
+                ],
+            )
+        ]
+    )
 
     plan = PrivilegedPlannerAgent(llm).plan("deploy nginx config")
 

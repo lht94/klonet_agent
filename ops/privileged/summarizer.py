@@ -180,6 +180,18 @@ class PrivilegedEvidenceSummarizer:
             "risk": plan.risk,
             "status": plan.status,
             "verification_level": plan.verification_level,
+            "resources": [
+                {
+                    "name": item.name,
+                    "kind": item.kind,
+                    "status": item.status,
+                    "value": item.value if item.status == "frozen" else None,
+                    "source": item.source,
+                    "reason": item.reason,
+                    "resolve_before": item.resolve_before,
+                }
+                for item in plan.resources
+            ],
             "steps": [
                 {
                     "index": index,
@@ -200,7 +212,9 @@ class PrivilegedEvidenceSummarizer:
         prompt = (
             "请把下面的高权限操作计划写成详细、清晰的中文计划，面向普通用户。\n"
             "必须包含：目标、整体风险、当前状态，以及每一步的操作对象、准备做什么、"
-            "可能影响、当前结果和回退方式（有则写）。使用分段和编号。\n"
+            "可能影响、当前结果和回退方式（有则写）。如果存在计划资源，单独说明"
+            "已经冻结的路径、端口等值，以及仍待补全的资源和最晚补全节点。"
+            "使用分段和编号。\n"
             "不要输出 JSON、内部字段名、哈希、命令、Schema 或校验器；不要编造输入中"
             "不存在的动作。结尾按当前状态给出以下可用控制方式：%s；"
             "原始审计数据命令为 audit-priv %s。\n\n已脱敏计划：\n%s"

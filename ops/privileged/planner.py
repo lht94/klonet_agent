@@ -10,6 +10,7 @@ from typing import Any, Callable
 
 from klonet_agent.ops.privileged.context import GroundedPlanContext
 from klonet_agent.ops.privileged.contracts import (
+    PlanResource,
     PrivilegedPlan,
     PrivilegedStep,
     RISK_LEVELS,
@@ -49,6 +50,16 @@ When ready, return:
  "status":"ready",
  "goal":"the actual user goal",
  "assumptions":[],
+ "resources":[{
+   "name":"stable_name such as instance_root or master_port",
+   "kind":"path|port|url|identifier|string",
+   "status":"frozen|deferred",
+   "value":"exact value for frozen; null for deferred",
+   "source":"user_input|environment_evidence|derived",
+   "reason":"why this value is deferred, otherwise empty",
+   "resolve_before":"semantic step id that needs a deferred value, otherwise empty",
+   "consumers":["semantic_step_id.argument_name"]
+ }],
  "steps":[{
    "step_id":"stable id",
    "title":"concise Chinese title",
@@ -66,6 +77,16 @@ reason, and at least one observable success criterion. Dependencies may referenc
 only earlier steps. Do not invent paths, platform names, services, hosts or
 ports. If a material choice belongs to the user and cannot be discovered, use
 status="blocked" with a concise reason and missing_decisions array.
+
+Freeze shared implementation resources once at plan creation. Paths, instance
+names, ports, session prefixes, and routes that are known or safely derived
+must be status=frozen. A value that is genuinely unavailable, such as an
+unspecified Git remote URL, may be status=deferred with a concrete reason and
+the semantic step id before which it must be resolved. Never substitute an old
+instance's value for a deferred resource. consumers lock a resource to an
+argument in the later implementation, for example copy.destination and
+start.project_root. Do not add consumers for parameters that do not directly
+carry that exact value.
 
 Never include passwords. You have no mutation tools. An independent Execution
 Agent will map semantic steps to registered Actions or frozen one-time shell
@@ -260,6 +281,27 @@ class PrivilegedPlannerAgent:
                 if status != "ready":
                     raise ValueError("planner status must be need_evidence, ready, or blocked")
                 steps = self._build_semantic_steps(data)
+                resources = self._build_plan_resources(data, steps)
+                if _requires_plan_resource_manifest(
+                    str(data.get("goal") or goal),
+                    steps,
+                ):
+                    if not any(
+                        resource.kind == "path" for resource in resources
+                    ):
+                        raise ValueError(
+                            "mutating deployment plan requires a path resource manifest"
+                        )
+                    resource_text = " ".join(
+                        "%s %s" % (step.title, step.objective)
+                        for step in steps
+                    ).lower()
+                    if re.search(r"端口|\bports?\b", resource_text) and not any(
+                        resource.kind == "port" for resource in resources
+                    ):
+                        raise ValueError(
+                            "deployment plan that assigns ports requires frozen port resources"
+                        )
                 self._progress(
                     "规划结论：已形成 %s 个语义步骤，开始匹配安全执行能力。"
                     % len(steps)
@@ -303,6 +345,7 @@ class PrivilegedPlannerAgent:
             goal=str(data.get("goal") or goal).strip(),
             risk=risk,
             steps=steps,
+            resources=resources,
             verification_level="semantic",
             status="draft",
             grounding=_grounding_summary(
@@ -313,6 +356,120 @@ class PrivilegedPlannerAgent:
             probe_history=probe_history,
         )
         return plan
+
+    @staticmethod
+    def _build_plan_resources(
+        data: dict[str, Any],
+        steps: list[PrivilegedStep],
+    ) -> list[PlanResource]:
+        raw = data.get("resources", [])
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list) or len(raw) > 40:
+            raise ValueError("resources must be an array with at most 40 items")
+        step_ids = {step.step_id for step in steps}
+        resources = []
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("plan resource must be an object")
+            consumers = _string_list(item.get("consumers"))
+            for consumer in consumers:
+                semantic_id = consumer.rsplit(".", 1)[0]
+                if semantic_id not in step_ids:
+                    raise ValueError(
+                        "plan resource consumer references unknown step: %s"
+                        % consumer
+                    )
+            resource = PlanResource(
+                name=str(item.get("name") or "").strip(),
+                kind=str(item.get("kind") or "string").strip().lower(),
+                status=str(item.get("status") or "").strip().lower(),
+                value=item.get("value"),
+                source=str(item.get("source") or "").strip()[:200],
+                reason=str(item.get("reason") or "").strip()[:1000],
+                resolve_before=str(
+                    item.get("resolve_before") or ""
+                ).strip()[:100],
+                consumers=consumers,
+            )
+            for step in steps:
+                text = "%s %s" % (step.title, step.objective)
+                copy_like = bool(
+                    re.search(
+                        r"复制|克隆|git|\bcopy\b|\bclone\b",
+                        text.lower(),
+                    )
+                )
+                create_like = bool(
+                    re.search(
+                        r"创建.{0,8}目录|新建.{0,8}目录|\bcreate.{0,8}director",
+                        text.lower(),
+                    )
+                )
+                implicit_args: tuple[str, ...] = ()
+                if resource.name == "instance_name":
+                    implicit_args = ("platform",)
+                elif resource.name == "instance_root":
+                    implicit_args = ("project_root",)
+                    if copy_like:
+                        implicit_args += ("destination", "repository")
+                    if create_like:
+                        implicit_args += ("path",)
+                elif resource.name == "source_root" and copy_like:
+                    implicit_args = ("source",)
+                elif (
+                    resource.name in {"git_remote", "repository_url"}
+                    and copy_like
+                ):
+                    implicit_args = ("url",)
+                elif resource.kind == "port":
+                    implicit_args = (resource.name,)
+                for arg_name in implicit_args:
+                    step_id = step.step_id
+                    consumer = "%s.%s" % (step_id, arg_name)
+                    if consumer not in resource.consumers:
+                        resource.consumers.append(consumer)
+            if resource.name == "instance_root":
+                for step in steps:
+                    text = "%s %s" % (step.title, step.objective)
+                    if re.search(
+                        r"启动|复制|克隆|创建.{0,8}目录|\bstart\b|\bcopy\b|\bclone\b|\bcreate.{0,8}director",
+                        text.lower(),
+                    ):
+                        consumer = "%s.script" % step.step_id
+                        if consumer not in resource.consumers:
+                            resource.consumers.append(consumer)
+            if resource.name in {"git_remote", "repository_url"}:
+                for step in steps:
+                    text = "%s %s" % (step.title, step.objective)
+                    if re.search(
+                        r"克隆|复制|git|\bclone\b|\bcopy\b",
+                        text.lower(),
+                    ):
+                        consumer = "%s.script" % step.step_id
+                        if consumer not in resource.consumers:
+                            resource.consumers.append(consumer)
+            if (
+                resource.status == "deferred"
+                and resource.resolve_before not in step_ids
+            ):
+                raise ValueError(
+                    "deferred resource resolve_before must reference a semantic step"
+                )
+            resources.append(resource)
+        names = [item.name for item in resources]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate plan resource name")
+        owners: dict[str, str] = {}
+        for resource in resources:
+            for consumer in resource.consumers:
+                previous = owners.setdefault(consumer, resource.name)
+                if previous != resource.name:
+                    raise ValueError(
+                        "plan resource consumer has multiple owners: %s"
+                        % consumer
+                    )
+        return resources
 
     def _progress(self, message: str) -> None:
         if self.on_progress is not None:
@@ -836,6 +993,27 @@ def _highest_risk(steps: list[PrivilegedStep]) -> str:
     return max(steps, key=lambda item: RISK_LEVELS.index(item.risk)).risk
 
 
+def _requires_plan_resource_manifest(
+    goal: str,
+    steps: list[PrivilegedStep],
+) -> bool:
+    text = " ".join(
+        [goal]
+        + [
+            "%s %s" % (step.title, step.objective)
+            for step in steps
+        ]
+    ).lower()
+    deployment = bool(
+        re.search(r"部署|新增.{0,12}实例|新.{0,8}平台|\bdeploy(?:ment)?\b|\bnew instance\b", text)
+    )
+    mutating = any(
+        step.risk != "readonly" or bool(step.expected_changes)
+        for step in steps
+    )
+    return deployment and mutating
+
+
 def _effective_declared_risk(
     deterministic_floor: str,
     declared: Any,
@@ -1033,8 +1211,38 @@ def _validate_environment_model(
     prepared_roots: set[str] = set()
     future_paths: set[str] = set()
     for step in steps:
+        produced_path = ""
         if step.action in {"sync_directory", "copy_files"}:
-            raw_destination = str(step.args.get("destination") or "").strip()
+            produced_path = str(step.args.get("destination") or "").strip()
+        elif step.action == "create_directory":
+            produced_path = str(step.args.get("path") or "").strip()
+        elif step.action == "extract_archive":
+            produced_path = str(
+                step.args.get("destination_dir") or ""
+            ).strip()
+        elif (
+            step.action == "git_operation"
+            and str(step.args.get("operation") or "") == "clone"
+        ):
+            produced_path = str(step.args.get("repository") or "").strip()
+        elif step.action == "shell_artifact":
+            raw_cwd = str(step.args.get("cwd") or "").strip()
+            if raw_cwd:
+                cwd = str(Path(raw_cwd).expanduser().resolve())
+                if not Path(cwd).is_dir() and cwd not in future_paths:
+                    raise ValueError(
+                        "grounding_failed=shell_future_cwd_has_no_prior_producer"
+                    )
+            changes = step.args.get("declared_changes")
+            if isinstance(changes, list):
+                for value in changes:
+                    raw = str(value or "").strip()
+                    if raw:
+                        future_paths.add(
+                            str(Path(raw).expanduser().resolve())
+                        )
+        if produced_path:
+            raw_destination = produced_path
             if raw_destination:
                 try:
                     future_paths.add(

@@ -811,6 +811,7 @@ class PrivilegedOpsWorkflow:
         plan.risk = replacement.risk
         plan.verification_level = replacement.verification_level
         plan.verification = None
+        plan.resources = list(replacement.resources)
         plan.replace_steps(replacement.steps)
         for step in plan.steps:
             if step.status == "approved":
@@ -1900,8 +1901,23 @@ def render_plan(plan: PrivilegedPlan) -> str:
             risk_labels.get(plan.risk, plan.risk),
             status_labels.get(plan.status, plan.status),
         ),
-        "步骤：",
     ]
+    if plan.resources:
+        lines.append("计划资源（路径、端口等在执行前统一确定）：")
+        for resource in plan.resources[:12]:
+            if resource.status == "frozen":
+                value = redact_sensitive_text(str(resource.value))[:240]
+                lines.append("- %s=%s（已冻结）" % (resource.name, value))
+            else:
+                lines.append(
+                    "- %s（待补全，最晚在 %s 前确定）：%s"
+                    % (
+                        resource.name,
+                        resource.resolve_before,
+                        resource.reason,
+                    )
+                )
+    lines.append("步骤：")
     preview_limit = 6
     for index, step in enumerate(plan.steps[:preview_limit], start=1):
         step_status = status_labels.get(step.status, step.status)
@@ -1959,9 +1975,29 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
             risk_labels.get(plan.risk, plan.risk),
             status_labels.get(plan.status, plan.status),
         ),
-        "",
-        "详细步骤：",
     ]
+    if plan.resources:
+        lines.extend(["", "计划资源："])
+        for resource in plan.resources:
+            if resource.status == "frozen":
+                lines.append(
+                    "- %s：%s（已冻结，来源：%s）"
+                    % (
+                        resource.name,
+                        redact_sensitive_text(str(resource.value))[:500],
+                        resource.source or "计划证据",
+                    )
+                )
+            else:
+                lines.append(
+                    "- %s：待补全；最晚在 %s 前确定；原因：%s"
+                    % (
+                        resource.name,
+                        resource.resolve_before,
+                        resource.reason,
+                    )
+                )
+    lines.extend(["", "详细步骤："])
     for index, step in enumerate(plan.steps, start=1):
         lines.extend(
             [

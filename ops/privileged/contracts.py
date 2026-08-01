@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 
@@ -59,10 +61,81 @@ SHELL_ARTIFACT_STATUSES = {
     "failed",
     "expired",
 }
+PLAN_RESOURCE_STATUSES = {"frozen", "deferred"}
+PLAN_RESOURCE_KINDS = {"path", "port", "url", "identifier", "string"}
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass
+class PlanResource:
+    """One plan-wide value frozen before implementation binding."""
+
+    name: str
+    kind: str
+    status: str
+    value: Any = None
+    source: str = ""
+    reason: str = ""
+    resolve_before: str = ""
+    consumers: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", self.name):
+            raise ValueError("invalid plan resource name: %s" % self.name)
+        if self.kind not in PLAN_RESOURCE_KINDS:
+            raise ValueError("invalid plan resource kind: %s" % self.kind)
+        if self.status not in PLAN_RESOURCE_STATUSES:
+            raise ValueError("invalid plan resource status: %s" % self.status)
+        if len(set(self.consumers)) != len(self.consumers):
+            raise ValueError("duplicate plan resource consumer: %s" % self.name)
+        for consumer in self.consumers:
+            if not re.fullmatch(
+                r"[A-Za-z0-9_-]+\.[A-Za-z_][A-Za-z0-9_]*",
+                consumer,
+            ):
+                raise ValueError(
+                    "invalid plan resource consumer: %s" % consumer
+                )
+        if self.status == "deferred":
+            if self.value not in (None, ""):
+                raise ValueError("deferred plan resource cannot have a value")
+            if not self.reason or not self.resolve_before:
+                raise ValueError(
+                    "deferred plan resource requires reason and resolve_before"
+                )
+            return
+        if self.value in (None, ""):
+            raise ValueError("frozen plan resource requires a value")
+        if self.kind == "path":
+            value = str(self.value)
+            expanded = Path(value).expanduser()
+            if not expanded.is_absolute():
+                raise ValueError("frozen path resource must be absolute")
+            self.value = str(expanded.absolute())
+        elif self.kind == "port":
+            if isinstance(self.value, bool):
+                raise ValueError("frozen port resource must be an integer")
+            try:
+                port = int(self.value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "frozen port resource must be an integer"
+                ) from exc
+            if not 1 <= port <= 65535:
+                raise ValueError("frozen port resource is out of range")
+            self.value = port
+        else:
+            self.value = str(self.value)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PlanResource:
+        return cls(**data)
 
 
 @dataclass
@@ -482,6 +555,7 @@ class PrivilegedPlan:
     goal: str
     risk: str
     steps: list[PrivilegedStep]
+    resources: list[PlanResource] = field(default_factory=list)
     schema_version: int = 3
     status: str = "draft"
     verification_level: str = "none"
@@ -501,6 +575,18 @@ class PrivilegedPlan:
             raise ValueError("invalid risk: %s" % self.risk)
         if self.status not in PLAN_STATUSES:
             raise ValueError("invalid plan status: %s" % self.status)
+        names = [resource.name for resource in self.resources]
+        if len(set(names)) != len(names):
+            raise ValueError("duplicate plan resource name")
+        owners: dict[str, str] = {}
+        for resource in self.resources:
+            for consumer in resource.consumers:
+                previous = owners.setdefault(consumer, resource.name)
+                if previous != resource.name:
+                    raise ValueError(
+                        "plan resource consumer has multiple owners: %s"
+                        % consumer
+                    )
 
     @property
     def content_hash(self) -> str:
@@ -509,6 +595,7 @@ class PrivilegedPlan:
             "goal": self.goal,
             "risk": self.risk,
             "assumptions": self.assumptions,
+            "resources": [item.to_dict() for item in self.resources],
             "steps": [step.executable_dict() for step in self.steps],
         }
         encoded = json.dumps(
@@ -531,6 +618,26 @@ class PrivilegedPlan:
         self.status = "awaiting_confirmation"
         self.updated_at = utc_now()
 
+    def resolve_resource(self, name: str, value: Any, *, source: str) -> None:
+        resource = next(
+            (item for item in self.resources if item.name == name),
+            None,
+        )
+        if resource is None:
+            raise KeyError("unknown plan resource: %s" % name)
+        replacement = PlanResource(
+            name=resource.name,
+            kind=resource.kind,
+            status="frozen",
+            value=value,
+            source=source,
+            consumers=list(resource.consumers),
+        )
+        self.resources[self.resources.index(resource)] = replacement
+        self.authorized_hash = ""
+        self.status = "awaiting_confirmation"
+        self.updated_at = utc_now()
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -543,6 +650,7 @@ class PrivilegedPlan:
             "updated_at": self.updated_at,
             "authorized_hash": self.authorized_hash,
             "content_hash": self.content_hash,
+            "resources": [item.to_dict() for item in self.resources],
             "steps": [step.to_dict() for step in self.steps],
             "verification": self.verification.to_dict() if self.verification else None,
             "grounding": self.grounding,
@@ -562,6 +670,11 @@ class PrivilegedPlan:
         original_schema = int(values.get("schema_version") or 1)
         values["steps"] = [
             PrivilegedStep.from_dict(item) for item in values.get("steps", [])
+        ]
+        values["resources"] = [
+            PlanResource.from_dict(item)
+            for item in values.get("resources", [])
+            if isinstance(item, dict)
         ]
         values["verification"] = VerificationDecision.from_dict(
             values.get("verification")
