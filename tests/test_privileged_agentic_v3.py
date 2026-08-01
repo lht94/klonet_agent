@@ -4,6 +4,8 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pytest
+
 
 class FakeLLM:
     def __init__(self, responses):
@@ -669,6 +671,159 @@ def test_direct_blocked_selection_must_review_shell_fallback(tmp_path):
     assert any("强制评估一次性 Shell 兜底" in item for item in progress)
     fallback_request = llm.calls[1]["messages"][-1]["content"]
     assert "absence of a registered Action is not sufficient" in fallback_request
+
+
+def test_shell_failure_cannot_block_before_candidate_budget(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    target = tmp_path / "alternate-marker"
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="create a deployment marker")])
+    ).plan("create marker")
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "selection_reason": "try the first shell implementation",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "the first candidate cannot be verified",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "the previous shell candidate failed",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "selection_reason": "use a materially different command",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "script": "touch %s" % target,
+                    "cwd": str(tmp_path),
+                    "run_as": "",
+                    "timeout": 10,
+                    "declared_changes": [str(target)],
+                    "rollback": "remove the marker",
+                    "binding_reason": "bounded alternate shell candidate",
+                    "resolved_from_evidence": [],
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {"path": str(target)}}
+                    ],
+                }
+            ),
+        ]
+    )
+    progress = []
+
+    bound = PrivilegedExecutionAgent(
+        llm,
+        on_progress=progress.append,
+        enable_implementation_plans=False,
+    ).prepare_plan(plan, grounded_context=None)
+
+    assert bound.steps[0].execution_binding.kind == "shell_artifact"
+    assert len(llm.calls) == 5
+    assert any("Shell 候选 1/3 校验失败" in item for item in progress)
+    assert any("拒绝提前 blocked" in item for item in progress)
+    assert any("候选 2/3" in item for item in progress)
+
+
+def test_hard_shell_blocker_can_stop_before_candidate_budget(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="perform a forbidden mutation")])
+    ).plan("perform mutation")
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "shell_artifact",
+                    "selection_reason": "evaluate a bounded shell implementation",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "the policy forbids this mutation",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "the requested mutation is prohibited by policy",
+                    "shell_blocker_category": "hard_policy",
+                }
+            ),
+        ]
+    )
+
+    with pytest.raises(ExecutionBindingError) as captured:
+        PrivilegedExecutionAgent(
+            llm,
+            enable_implementation_plans=False,
+        ).prepare_plan(plan, grounded_context=None)
+
+    assert captured.value.category == "capability_mismatch"
+    assert len(llm.calls) == 3
+
+
+def test_shell_candidate_budget_exhaustion_recommends_replan(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        PrivilegedExecutionAgent,
+    )
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="create an unusual deployment file")])
+    ).plan("create deployment file")
+    responses = []
+    for candidate in range(1, 4):
+        responses.extend(
+            [
+                json.dumps(
+                    {
+                        "status": "shell_artifact",
+                        "selection_reason": "shell candidate %s" % candidate,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "status": "blocked",
+                        "reason": "candidate %s has no safe contract" % candidate,
+                    }
+                ),
+            ]
+        )
+    llm = FakeLLM(responses)
+
+    with pytest.raises(ExecutionBindingError) as captured:
+        PrivilegedExecutionAgent(
+            llm,
+            enable_implementation_plans=False,
+        ).prepare_plan(plan, grounded_context=None)
+
+    assert captured.value.category == "capability_mismatch"
+    assert captured.value.replan_recommended is True
+    assert "所有 Shell 候选" in str(captured.value)
+    assert len(llm.calls) == 6
 
 
 def test_binding_agent_uses_unified_text_edit_contract(tmp_path):

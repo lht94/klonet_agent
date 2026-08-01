@@ -61,9 +61,12 @@ Return one JSON object with status exactly:
 - verification_only, when the semantic step only observes post-execution state
   and needs registered checkers but no state-changing Action or shell command.
 - need_evidence: include at most 3 registered read-only probe_requests.
-- blocked: {"status":"blocked","reason":"..."}, only when no registered
+- blocked: {"status":"blocked","reason":"...",
+  "shell_blocker_category":"<optional hard blocker>"}, only when no registered
   Action, safe one-time shell artifact, or verification-only checker contract
-  can implement the unchanged semantic objective.
+  can implement the unchanged semantic objective. The only hard Shell blocker
+  categories are hard_policy, unverifiable, and no_safe_command. Do not claim
+  a hard blocker merely because one candidate script or contract failed.
 
 Prefer a registered Action only when its declared capability actually covers
 the objective. The absence of a matching registered Action is not by itself a
@@ -78,9 +81,15 @@ MAX_BINDING_INVALID_REPAIRS = 2
 MAX_ACTION_CONTRACT_REPAIRS = 2
 MAX_SHELL_CONTRACT_REPAIRS = 2
 MAX_SHELL_VERIFICATION_REPAIRS = 2
+MAX_SHELL_CANDIDATE_ATTEMPTS = 3
 MAX_IMPLEMENTATION_RESELECTIONS = 2
 MAX_IMPLEMENTATION_PLAN_REBUILDS = 2
 MAX_BINDING_GROUNDING_SECTION_CHARS = 12000
+HARD_SHELL_BLOCKER_CATEGORIES = {
+    "hard_policy",
+    "unverifiable",
+    "no_safe_command",
+}
 
 
 SHELL_VERIFICATION_PROMPT = """
@@ -600,7 +609,7 @@ class PrivilegedExecutionAgent:
         probe_round = 0
         invalid_repairs = 0
         reselection_attempts = 0
-        shell_attempted = False
+        shell_candidate_attempts = 0
         shell_fallback_reviewed = False
         rejected_implementations: list[str] = []
         if implementation_feedback:
@@ -712,11 +721,24 @@ class PrivilegedExecutionAgent:
                     )
                     return binding
                 if status == "shell_artifact":
-                    shell_attempted = True
+                    if (
+                        shell_candidate_attempts
+                        >= MAX_SHELL_CANDIDATE_ATTEMPTS
+                    ):
+                        raise ExecutionBindingError(
+                            "Shell 候选次数已耗尽，无法安全实现该语义步骤",
+                            replan_recommended=True,
+                            category="capability_mismatch",
+                        )
+                    shell_candidate_attempts += 1
                     self._progress(
                         "选择结论：步骤“%s”没有匹配的注册 Action；"
-                        "进入一次性脚本合同阶段。"
-                        % _progress_text(step.title or step.objective)
+                        "进入一次性脚本合同阶段（候选 %s/%s）。"
+                        % (
+                            _progress_text(step.title or step.objective),
+                            shell_candidate_attempts,
+                            MAX_SHELL_CANDIDATE_ATTEMPTS,
+                        )
                     )
                     try:
                         binding = self._complete_shell_contract(
@@ -756,7 +778,16 @@ class PrivilegedExecutionAgent:
                         data.get("reason")
                         or "Implementation Binding Agent 无法实现该步骤"
                     )
-                    if not shell_attempted and not shell_fallback_reviewed:
+                    blocker_category = str(
+                        data.get("shell_blocker_category") or ""
+                    ).strip().lower()
+                    hard_shell_blocker = (
+                        blocker_category in HARD_SHELL_BLOCKER_CATEGORIES
+                    )
+                    if (
+                        shell_candidate_attempts == 0
+                        and not shell_fallback_reviewed
+                    ):
                         shell_fallback_reviewed = True
                         self._progress(
                             "实现结论：注册能力未覆盖当前步骤，正在强制评估"
@@ -779,9 +810,54 @@ class PrivilegedExecutionAgent:
                             }
                         )
                         continue
+                    if (
+                        shell_candidate_attempts
+                        < MAX_SHELL_CANDIDATE_ATTEMPTS
+                        and not hard_shell_blocker
+                    ):
+                        self._progress(
+                            "实现结论：仅尝试了 %s/%s 个 Shell 候选，"
+                            "且未提供硬性阻断；拒绝提前 blocked，正在要求"
+                            "一个实质不同的候选。"
+                            % (
+                                shell_candidate_attempts,
+                                MAX_SHELL_CANDIDATE_ATTEMPTS,
+                            )
+                        )
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "A blocked result is premature. Only %s of %s"
+                                    " distinct shell candidates have been attempted."
+                                    " Select shell_artifact and design a materially"
+                                    " different bounded implementation, or return"
+                                    " blocked with one truthful hard category:"
+                                    " hard_policy, unverifiable, or no_safe_command."
+                                    " A previous candidate validation failure is not"
+                                    " itself a hard blocker. Previous reason: %s"
+                                    % (
+                                        shell_candidate_attempts,
+                                        MAX_SHELL_CANDIDATE_ATTEMPTS,
+                                        reason[:1000],
+                                    )
+                                ),
+                            }
+                        )
+                        continue
                     self._progress(
-                        "实现结论：当前证据下无法安全实现步骤“%s”。"
-                        % _progress_text(step.title or step.objective)
+                        "实现结论：当前证据下无法安全实现步骤“%s”"
+                        "（Shell 候选=%s/%s%s）。"
+                        % (
+                            _progress_text(step.title or step.objective),
+                            shell_candidate_attempts,
+                            MAX_SHELL_CANDIDATE_ATTEMPTS,
+                            (
+                                "，硬性阻断=%s" % blocker_category
+                                if hard_shell_blocker
+                                else "，候选已耗尽"
+                            ),
+                        )
                     )
                     raise ExecutionBindingError(
                         reason,
@@ -796,6 +872,46 @@ class PrivilegedExecutionAgent:
                 rejected_implementations.append(
                     "%s: %s" % (exc.implementation, str(exc)[:500])
                 )
+                if exc.implementation == "shell_artifact":
+                    if (
+                        shell_candidate_attempts
+                        >= MAX_SHELL_CANDIDATE_ATTEMPTS
+                    ):
+                        raise ExecutionBindingError(
+                            "所有 Shell 候选均无法安全完成语义步骤：%s"
+                            % "；".join(rejected_implementations),
+                            replan_recommended=True,
+                            category="capability_mismatch",
+                        ) from exc
+                    self._progress(
+                        "实现结论：Shell 候选 %s/%s 校验失败（%s）；"
+                        "正在要求实质不同的 Shell 候选。"
+                        % (
+                            shell_candidate_attempts,
+                            MAX_SHELL_CANDIDATE_ATTEMPTS,
+                            _progress_text(str(exc), 180),
+                        )
+                    )
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Shell candidate %s of %s failed contract or"
+                                " safety validation: %s. Select shell_artifact"
+                                " again with a materially different implementation;"
+                                " do not repeat the rejected script or merely repair"
+                                " its formatting. You may return blocked early only"
+                                " for a truthful hard_policy, unverifiable, or"
+                                " no_safe_command blocker."
+                                % (
+                                    shell_candidate_attempts,
+                                    MAX_SHELL_CANDIDATE_ATTEMPTS,
+                                    str(exc)[:1000],
+                                )
+                            ),
+                        }
+                    )
+                    continue
                 if reselection_attempts >= MAX_IMPLEMENTATION_RESELECTIONS:
                     raise ExecutionBindingError(
                         "所有候选实现均无法完成语义步骤：%s"
@@ -1181,8 +1297,8 @@ class PrivilegedExecutionAgent:
                 if attempt >= MAX_SHELL_CONTRACT_REPAIRS:
                     break
                 self._progress(
-                    "实现节点：Shell 合同不完整，正在请求第 %s 次定向修复…"
-                    % attempt
+                    "实现节点：Shell 合同不完整（%s），正在请求第 %s 次定向修复…"
+                    % (_progress_text(str(exc), 180), attempt)
                 )
                 messages.append(
                     {
@@ -1603,6 +1719,15 @@ class PrivilegedExecutionAgent:
                         },
                     },
                     "reason": {"type": "string"},
+                    "shell_blocker_category": {
+                        "type": "string",
+                        "enum": [
+                            "",
+                            "hard_policy",
+                            "unverifiable",
+                            "no_safe_command",
+                        ],
+                    },
                 },
                 "required": [
                     "status",
