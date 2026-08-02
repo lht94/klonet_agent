@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
+from klonet_agent.tools.environment import redact_sensitive_text
 
 
 @dataclass
@@ -69,11 +70,18 @@ class PrivilegedOpsSupervisor:
             conversation_context=classifier_context,
         )
         if decision.intent == "classifier_error":
+            detail = redact_sensitive_text(
+                str(decision.reason or "未提供具体错误")
+            )
+            detail = " ".join(detail.split())[:400]
+            self._progress("意图分类失败：%s" % detail)
             return SupervisorResult(
                 True,
                 "blocked",
                 "当前无法可靠判断这条请求属于问答、只读检查还是变更操作。"
-                "这是分类服务异常，不是你的表达问题；当前没有执行任何操作，请稍后重试。",
+                "这是分类服务异常，不是你的表达问题。原因：%s；"
+                "当前没有执行任何操作，请检查模型服务配置、网络或额度后重试。"
+                % detail,
             )
         if decision.intent == "resume_plan":
             recovery_options = getattr(

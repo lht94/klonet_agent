@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from klonet_agent.ops.privileged.planner import _parse_json_object
+from klonet_agent.tools.environment import redact_sensitive_text
 
 
 INTENTS = {
@@ -112,6 +114,7 @@ class PrivilegedIntentClassifier:
             },
         ]
         failure_status = "invalid_output"
+        failure_reason = "意图分类器连续两次返回了无效的结构化结果"
         for attempt in range(2):
             content = ""
             try:
@@ -120,6 +123,10 @@ class PrivilegedIntentClassifier:
                 data = _parse_json_object(content)
                 return self._decision(data)
             except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                failure_reason = (
+                    "意图分类器返回无效 JSON 或字段：%s"
+                    % _safe_classifier_error(exc)
+                )
                 if attempt == 0:
                     messages.append({"role": "assistant", "content": content})
                     messages.append(
@@ -131,21 +138,20 @@ class PrivilegedIntentClassifier:
                             ),
                         }
                     )
-            except Exception:
+            except Exception as exc:
                 # Provider/network failures are internal failures. A retry may recover,
                 # but they must never be presented as if the user had described the
                 # goal poorly.
                 failure_status = "provider_error"
+                failure_reason = "模型服务请求失败：%s" % _safe_classifier_error(
+                    exc
+                )
                 continue
         return PrivilegedIntentDecision(
             intent="classifier_error",
             requires_execution=False,
             confidence=0.0,
-            reason=(
-                "intent classifier provider request failed"
-                if failure_status == "provider_error"
-                else "intent classifier returned invalid structured output"
-            ),
+            reason=failure_reason,
             goal_clarity="clear",
             classifier_status=failure_status,
         )
@@ -190,3 +196,43 @@ class PrivilegedIntentClassifier:
             ).strip(),
             plan_reference=str(data.get("plan_reference") or "").strip()[:500],
         )
+
+
+def _safe_classifier_error(exc: Exception) -> str:
+    """Return a useful provider/schema failure without leaking credentials."""
+
+    status = getattr(exc, "status_code", None)
+    body = getattr(exc, "body", None)
+    message = ""
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or "").strip()
+        elif error:
+            message = str(error).strip()
+        if not message:
+            message = str(body.get("message") or "").strip()
+    if not message:
+        message = str(exc or "").strip()
+    message = redact_sensitive_text(message)
+    message = re.sub(
+        r"\b(?:sk|ds|ak)-[A-Za-z0-9_-]{8,}\b",
+        "[REDACTED]",
+        message,
+        flags=re.IGNORECASE,
+    )
+    message = " ".join(message.split())[:300]
+    error_name = type(exc).__name__
+    if status:
+        return "HTTP %s%s" % (
+            status,
+            "：%s" % message if message else "",
+        )
+    if "timeout" in error_name.lower() or "timed out" in message.lower():
+        return "请求超时%s" % ("：%s" % message if message else "")
+    if "connect" in error_name.lower():
+        return "连接失败%s" % ("：%s" % message if message else "")
+    return "%s%s" % (
+        error_name,
+        "：%s" % message if message else "",
+    )

@@ -26,6 +26,20 @@ class FailingLLM:
         raise RuntimeError("provider unavailable")
 
 
+class BillingError(Exception):
+    status_code = 402
+    body = {
+        "error": {
+            "message": "Insufficient Balance for sk-secret12345678",
+        }
+    }
+
+
+class BillingLLM:
+    def complete(self, *args, **kwargs):
+        raise BillingError("provider response includes sensitive details")
+
+
 def _intent_payload(intent, **overrides):
     payload = {
         "intent": intent,
@@ -77,6 +91,7 @@ def test_intent_classifier_repairs_once_then_reports_internal_failure():
     assert decision.intent == "classifier_error"
     assert decision.requires_execution is False
     assert decision.classifier_status == "invalid_output"
+    assert "无效 JSON 或字段" in decision.reason
     assert len(llm.calls) == 2
     assert "repair" in llm.calls[1]["messages"][-1]["content"].lower()
 
@@ -89,6 +104,19 @@ def test_intent_classifier_reports_provider_failure_separately_from_ambiguity():
     assert decision.intent == "classifier_error"
     assert decision.classifier_status == "provider_error"
     assert decision.should_clarify is False
+    assert "RuntimeError：provider unavailable" in decision.reason
+
+
+def test_intent_classifier_exposes_safe_http_failure_reason():
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    decision = PrivilegedIntentClassifier(BillingLLM()).classify("部署平台")
+
+    assert decision.intent == "classifier_error"
+    assert "HTTP 402" in decision.reason
+    assert "Insufficient Balance" in decision.reason
+    assert "sk-secret" not in decision.reason
+    assert "[REDACTED]" in decision.reason
 
 
 def test_intent_classifier_does_not_turn_low_confidence_into_user_ambiguity():
@@ -469,5 +497,7 @@ def test_supervisor_reports_classifier_failure_as_system_error_not_clarification
     assert result.kind == "blocked"
     assert "分类服务异常" in result.message
     assert "不是你的表达问题" in result.message
+    assert "原因：test" in result.message
+    assert "模型服务配置、网络或额度" in result.message
     assert workflow.readonly == []
     assert workflow.mutations == []
