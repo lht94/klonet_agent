@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Optional
 
 from klonet_agent.ops.privileged.contracts import CheckResult, ExecutionEvidence
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
+from klonet_agent.tools.environment import redact_sensitive_text
 
 
 Checker = Callable[[Dict[str, Any], Optional[ExecutionEvidence]], CheckResult]
@@ -172,11 +173,14 @@ class DefaultCheckerRegistry:
             args = {}
         try:
             return checker(args, evidence)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             return CheckResult(
                 checker=name,
                 status="unavailable",
-                observed=str(exc),
+                observed=(
+                    "%s: %s"
+                    % (type(exc).__name__, redact_sensitive_text(str(exc)))
+                )[:500],
             )
 
     def _exit_code_zero(self, args, evidence):
@@ -643,12 +647,40 @@ class DefaultCheckerRegistry:
 
     def _python_import_succeeds(self, args, evidence):
         del evidence
-        module = str(args["module"])
-        found = importlib.util.find_spec(module) is not None
-        return CheckResult(
-            "python_import_succeeds", "passed" if found else "failed",
-            expected="import %s" % module,
-            observed="module found" if found else "module not found",
+        target = str(args["module"]).strip()
+        if not re.fullmatch(
+            r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*",
+            target,
+        ):
+            raise ValueError("invalid Python import target")
+        python = str(args.get("python_executable") or sys.executable).strip()
+        cwd_value = str(args.get("cwd") or "").strip()
+        cwd = None
+        if cwd_value:
+            cwd_path = Path(cwd_value).expanduser()
+            if not cwd_path.is_dir():
+                raise ValueError("python import cwd is not a directory: %s" % cwd_path)
+            cwd = str(cwd_path)
+        script = (
+            "import importlib,sys\n"
+            "p=sys.argv[1].split('.')\n"
+            "last=None\n"
+            "for i in range(len(p),0,-1):\n"
+            " candidate='.'.join(p[:i])\n"
+            " try:\n"
+            "  obj=importlib.import_module(candidate)\n"
+            " except ModuleNotFoundError as exc:\n"
+            "  if exc.name and not (candidate==exc.name or candidate.startswith(exc.name+'.')): raise\n"
+            "  last=exc; continue\n"
+            " for name in p[i:]: obj=getattr(obj,name)\n"
+            " raise SystemExit(0)\n"
+            "raise last\n"
+        )
+        return self._command_check(
+            "python_import_succeeds",
+            [python, "-c", script, target],
+            cwd=cwd,
+            expected="import %s" % target,
         )
 
     def _package_version(self, args, evidence):
@@ -687,7 +719,14 @@ class DefaultCheckerRegistry:
         )
 
     @staticmethod
-    def _command_check(name, command, *, expected, success=None):
+    def _command_check(
+        name,
+        command,
+        *,
+        expected,
+        success=None,
+        cwd=None,
+    ):
         result = subprocess.run(
             command,
             capture_output=True,
@@ -696,16 +735,18 @@ class DefaultCheckerRegistry:
             errors="replace",
             timeout=15,
             shell=False,
+            cwd=cwd,
         )
         predicate = success or (lambda item: item.returncode == 0)
         passed = bool(predicate(result))
         combined = (result.stdout or "") + (result.stderr or "")
+        detail = combined.strip()
         return CheckResult(
             name,
             "passed" if passed else "failed",
             expected=expected,
-            observed=combined.strip()[:500],
-            evidence=combined.strip()[:2000],
+            observed=(detail[:500] if passed else detail[-500:]),
+            evidence=(detail[:2000] if passed else detail[-2000:]),
         )
 
 

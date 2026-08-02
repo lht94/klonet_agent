@@ -202,6 +202,63 @@ def test_checker_registry_reports_unknown_or_missing_dependency_as_unavailable()
     assert unavailable.status == "failed"
 
 
+def test_python_import_checker_uses_requested_interpreter_and_cwd(tmp_path):
+    import sys
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    package = tmp_path / "demo_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "config.py").write_text(
+        "class DemoConfig:\n    pass\n",
+        encoding="utf-8",
+    )
+    registry = DefaultCheckerRegistry()
+
+    found = registry.run(
+        {
+            "checker": "python_import_succeeds",
+            "args": {
+                "module": "demo_pkg.config.DemoConfig",
+                "python_executable": sys.executable,
+                "cwd": str(tmp_path),
+            },
+        }
+    )
+    missing = registry.run(
+        {
+            "checker": "python_import_succeeds",
+            "args": {
+                "module": "missing_pkg.config.DemoConfig",
+                "python_executable": sys.executable,
+                "cwd": str(tmp_path),
+            },
+        }
+    )
+
+    assert found.status == "passed"
+    assert missing.status == "failed"
+
+
+def test_checker_bug_is_reported_unavailable_instead_of_escaping():
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    registry = DefaultCheckerRegistry()
+
+    def crash(args, evidence):
+        del args, evidence
+        raise RuntimeError("api_key=secret-value")
+
+    registry._checkers["crash"] = crash
+    result = registry.run({"checker": "crash", "args": {}})
+
+    assert result.status == "unavailable"
+    assert "RuntimeError" in result.observed
+    assert "secret-value" not in result.observed
+    assert "[REDACTED]" in result.observed
+
+
 def test_checker_registry_exit_code_zero_uses_execution_evidence():
     from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence

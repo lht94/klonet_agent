@@ -13,6 +13,7 @@ from klonet_agent.ops.privileged.contracts import (
     FailurePacket,
     PrivilegedPlan,
     PrivilegedStep,
+    VerificationDecision,
 )
 from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
@@ -583,12 +584,11 @@ class PrivilegedOpsWorkflow:
                 and not step.evidence.timed_out
                 and step.evidence.return_code == 0
             ):
-                verify = getattr(
-                    self.verifier,
-                    "verify_deterministic_step",
-                    None,
-                ) or self.verifier.verify_step
-                decision = verify(plan, step)
+                decision = self._verify_step_safely(
+                    plan,
+                    step,
+                    deterministic=True,
+                )
                 plan.verification = decision
                 if decision.status == "passed":
                     step.status = "completed"
@@ -627,7 +627,19 @@ class PrivilegedOpsWorkflow:
                     % ", ".join(item.step_id for item in unknown_steps),
                     plan,
                 )
-            decision = verify_recovered(plan, step)
+            try:
+                decision = verify_recovered(plan, step)
+            except Exception as exc:
+                decision = VerificationDecision(
+                    status="inconclusive",
+                    goal_achieved=False,
+                    verification_level=plan.verification_level,
+                    missing_evidence=[type(exc).__name__],
+                    reason=(
+                        "恢复验收内部异常：%s" % _short_error(exc)
+                    ),
+                    next_action="inspect state and replan; do not replay blindly",
+                )
             plan.verification = decision
             self._event(
                 "privileged_verification",
@@ -639,6 +651,20 @@ class PrivilegedOpsWorkflow:
                 plan.status = "paused"
                 self.store.save(plan)
                 self._event("privileged_plan_paused", plan, {"reason": decision.reason})
+                rebound = self._automatic_implementation_rebind(
+                    plan,
+                    step,
+                    persist=True,
+                )
+                if rebound is not None:
+                    return rebound
+                recovery = self._automatic_recovery_plan(
+                    plan,
+                    step,
+                    persist=True,
+                )
+                if recovery is not None:
+                    return recovery
                 return WorkflowResult(
                     "paused",
                     render_plan(plan) + _pause_controls(plan),
@@ -1025,15 +1051,13 @@ class PrivilegedOpsWorkflow:
                 step.status = "verifying"
             if persist:
                 self.store.save(plan)
-            if deterministic_verification or step.risk == "readonly":
-                verify = getattr(
-                    self.verifier,
-                    "verify_deterministic_step",
-                    None,
-                ) or self.verifier.verify_step
-                decision = verify(plan, step)
-            else:
-                decision = self.verifier.verify_step(plan, step)
+            decision = self._verify_step_safely(
+                plan,
+                step,
+                deterministic=(
+                    deterministic_verification or step.risk == "readonly"
+                ),
+            )
             if self.on_progress is not None:
                 self.on_progress(
                     "Verifier：第 %s/%s 步验收%s：%s"
@@ -1293,18 +1317,14 @@ class PrivilegedOpsWorkflow:
                     micro_step.status = "verifying"
                 if persist:
                     self.store.save(plan)
-                if deterministic_verification or micro_step.risk == "readonly":
-                    verify = (
-                        getattr(
-                            self.verifier,
-                            "verify_deterministic_step",
-                            None,
-                        )
-                        or self.verifier.verify_step
-                    )
-                else:
-                    verify = self.verifier.verify_step
-                decision = verify(plan, micro_step)
+                decision = self._verify_step_safely(
+                    plan,
+                    micro_step,
+                    deterministic=(
+                        deterministic_verification
+                        or micro_step.risk == "readonly"
+                    ),
+                )
                 plan.verification = decision
                 if self.on_progress is not None:
                     self.on_progress(
@@ -1418,6 +1438,46 @@ class PrivilegedOpsWorkflow:
         ).lower()
         return any(marker in failure_text for marker in TRANSIENT_FAILURE_MARKERS)
 
+    def _verify_step_safely(
+        self,
+        plan: PrivilegedPlan,
+        step: PrivilegedStep,
+        *,
+        deterministic: bool,
+    ) -> VerificationDecision:
+        """Turn Verifier/Checker bugs into recoverable workflow evidence."""
+
+        verify = self.verifier.verify_step
+        if deterministic:
+            verify = (
+                getattr(
+                    self.verifier,
+                    "verify_deterministic_step",
+                    None,
+                )
+                or verify
+            )
+        try:
+            return verify(plan, step)
+        except Exception as exc:
+            reason = "Verifier 或 Checker 内部异常：%s" % _short_error(exc)
+            if self.on_progress is not None:
+                self.on_progress(
+                    "Verifier：内部异常已转换为可恢复的验收失败，不会终止进程：%s"
+                    % _short_error(exc)
+                )
+            return VerificationDecision(
+                status="inconclusive",
+                goal_achieved=False,
+                verification_level=plan.verification_level,
+                missing_evidence=[type(exc).__name__],
+                reason=reason,
+                next_action=(
+                    "Implementation Binding Agent should repair the checker"
+                    " contract or Planner should replan"
+                ),
+            )
+
     def _automatic_implementation_rebind(
         self,
         plan: PrivilegedPlan,
@@ -1435,7 +1495,6 @@ class PrivilegedOpsWorkflow:
             or self.execution_agent is None
             or not hasattr(self.execution_agent, "prepare_step")
             or old_binding is None
-            or old_binding.kind == "verification_only"
             or evidence is None
             or evidence.timed_out
             or failed_step.implementation_rebind_attempts
@@ -1452,6 +1511,9 @@ class PrivilegedOpsWorkflow:
                         if plan.verification is not None
                         else {}
                     ),
+                    "checker_results": [
+                        item.to_dict() for item in failed_step.checks
+                    ],
                     "instruction": (
                         "Keep the semantic objective unchanged and select a"
                         " materially different implementation."

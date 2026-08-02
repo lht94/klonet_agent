@@ -222,6 +222,61 @@ def test_hierarchical_plan_executes_and_verifies_inner_steps(tmp_path):
     assert all(step.status == "completed" for step in implementation.steps)
 
 
+def test_hierarchical_verifier_exception_pauses_instead_of_crashing_cli(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.contracts import (
+        ImplementationPlan,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+
+    class CrashingVerifier:
+        @staticmethod
+        def verify_step(plan, step):
+            del plan, step
+            raise ModuleNotFoundError("No module named 'vemu_config'")
+
+    micro_step = _step("semantic__verify", risk="readonly")
+    parent = PrivilegedStep(
+        step_id="semantic",
+        title="验证配置",
+        objective="verify configuration import",
+        risk="low",
+        implementation_plan=ImplementationPlan(
+            implementation_id="impl-semantic",
+            semantic_step_id="semantic",
+            objective="verify configuration import",
+            steps=[micro_step],
+            status="awaiting_confirmation",
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-test",
+        goal="verify configuration",
+        risk="low",
+        status="awaiting_confirmation",
+        steps=[parent],
+    )
+    progress = []
+    workflow = _workflow(
+        tmp_path,
+        plan,
+        executor=StubExecutor(),
+        verifier=CrashingVerifier(),
+    )
+    workflow.on_progress = progress.append
+
+    waiting = workflow.submit("verify configuration")
+    result = workflow.approve_plan(waiting.plan.plan_id)
+
+    assert result.kind == "paused"
+    assert result.plan.status == "paused"
+    assert result.plan.verification.status == "inconclusive"
+    assert "Verifier 或 Checker 内部异常" in result.plan.verification.reason
+    assert any("不会终止进程" in item for item in progress)
+
+
 def test_nested_implementation_change_invalidates_plan_authorization():
     from klonet_agent.ops.privileged.contracts import (
         ImplementationPlan,
