@@ -803,6 +803,61 @@ def test_change_planner_rejects_resource_consumer_with_multiple_owners():
     ) in errors
 
 
+def test_change_planner_normalizes_ambiguous_consumer_owners_by_resource_role():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    resources = [
+        PlanResource(
+            "instance_root",
+            "path",
+            "frozen",
+            "instance_root",
+            "/srv/v4e2e",
+            "user_input",
+            consumers=["change-2.config", "change-3.config_name"],
+        ),
+        PlanResource(
+            "instance_identifier",
+            "identifier",
+            "frozen",
+            "instance_identifier",
+            "v4e2e",
+            "user_input",
+            consumers=["change-2.config"],
+        ),
+        PlanResource(
+            "nginx_config_name",
+            "identifier",
+            "frozen",
+            "nginx_config_name",
+            "klonet-v4-e2e",
+            "user_input",
+            consumers=["change-3.config_name"],
+        ),
+    ]
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(
+        {"changes": []}, resources
+    )
+    consumers = {
+        resource.name: set(resource.consumers) for resource in normalized
+    }
+
+    assert consumers["instance_root"] == {
+        "change-2.instance_root",
+        "change-3.instance_root",
+    }
+    assert consumers["instance_identifier"] == {
+        "change-2.instance_identifier"
+    }
+    assert consumers["nginx_config_name"] == {"change-3.config_name"}
+    all_consumers = [
+        consumer for resource in normalized for consumer in resource.consumers
+    ]
+    assert len(all_consumers) == len(set(all_consumers))
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

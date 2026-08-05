@@ -855,11 +855,11 @@ class V4ChangePlannerAgent:
             None,
         )
         if root is None:
-            return normalized
+            return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
         root_text = str(root.value).rstrip("/")
         changes = data.get("changes")
         if not isinstance(changes, list):
-            return normalized
+            return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
         for change in changes:
             if not isinstance(change, dict):
                 continue
@@ -898,7 +898,75 @@ class V4ChangePlannerAgent:
                         consumers=[consumer],
                     )
                 )
-        return normalized
+        return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
+
+    @staticmethod
+    def _normalize_consumer_owners(
+        resources: list[PlanResource],
+    ) -> list[PlanResource]:
+        """Give ambiguous model consumers deterministic role-specific slots."""
+
+        claimants: dict[str, list[PlanResource]] = {}
+        for resource in resources:
+            for consumer in resource.consumers:
+                claimants.setdefault(consumer, []).append(resource)
+        reserved = set(claimants)
+        for consumer, owners in claimants.items():
+            unique_owners = list(dict.fromkeys(owner.name for owner in owners))
+            if len(unique_owners) < 2:
+                continue
+            semantic_id, field = consumer.rsplit(".", 1)
+            scored = sorted(
+                (
+                    V4ChangePlannerAgent._consumer_owner_score(owner, field),
+                    index,
+                    owner,
+                )
+                for index, owner in enumerate(owners)
+            )
+            best_score = scored[-1][0]
+            best = None
+            if best_score > 0 and sum(
+                1 for score, _, _ in scored if score == best_score
+            ) == 1:
+                best = scored[-1][2]
+                reserved.add(consumer)
+            for owner in owners:
+                if owner is best:
+                    continue
+                replacement_field = re.sub(
+                    r"[^a-z0-9_]+",
+                    "_",
+                    str(owner.role or owner.name).lower(),
+                ).strip("_") or "resource"
+                replacement = "%s.%s" % (semantic_id, replacement_field)
+                suffix = 2
+                while replacement in reserved:
+                    replacement = "%s.%s_%s" % (
+                        semantic_id,
+                        replacement_field,
+                        suffix,
+                    )
+                    suffix += 1
+                owner.consumers = [
+                    replacement if item == consumer else item
+                    for item in owner.consumers
+                ]
+                reserved.add(replacement)
+        return resources
+
+    @staticmethod
+    def _consumer_owner_score(resource: PlanResource, field: str) -> int:
+        candidates = {
+            re.sub(r"[^a-z0-9_]+", "_", str(value).lower()).strip("_")
+            for value in (resource.role, resource.name)
+            if str(value or "").strip()
+        }
+        if field in candidates:
+            return 2
+        if any(candidate.endswith("_" + field) for candidate in candidates):
+            return 1
+        return 0
 
     @staticmethod
     def _used_ports_by_step(data: dict[str, Any]) -> dict[str, set[int]]:
