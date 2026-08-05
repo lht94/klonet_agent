@@ -23,6 +23,7 @@ class V4MutationWorkflow:
         discovery: Any | None = None,
         synthesis: Any | None = None,
         max_replanning_rounds: int = 2,
+        max_candidate_replans: int = 1,
     ) -> None:
         self.planner = planner
         self.binder = binder
@@ -32,6 +33,7 @@ class V4MutationWorkflow:
         self.discovery = discovery
         self.synthesis = synthesis
         self.max_replanning_rounds = max(0, int(max_replanning_rounds))
+        self.max_candidate_replans = max(0, int(max_candidate_replans))
 
     def submit(
         self,
@@ -43,41 +45,64 @@ class V4MutationWorkflow:
     ) -> V4WorkflowResult:
         outcome = self.planner.plan(goal, evidence_bundle, evidence_conclusion)
         replanning_rounds = 0
-        while outcome.status == "need_evidence":
-            if replanning_rounds >= self.max_replanning_rounds:
-                return V4WorkflowResult(
-                    True,
-                    "blocked",
-                    "Planner-to-Discovery evidence budget exhausted.",
-                    evidence=evidence_bundle,
+        candidate_replans = 0
+        while True:
+            if outcome.status == "need_evidence":
+                if replanning_rounds >= self.max_replanning_rounds:
+                    return V4WorkflowResult(
+                        True,
+                        "blocked",
+                        "Planner-to-Discovery evidence budget exhausted.",
+                        evidence=evidence_bundle,
+                    )
+                if self.discovery is None or self.synthesis is None:
+                    return V4WorkflowResult(
+                        True,
+                        "blocked",
+                        "Planner requested evidence but Discovery is unavailable.",
+                        evidence=evidence_bundle,
+                    )
+                evidence_bundle = self.discovery.collect_requests(
+                    outcome.probe_requests,
+                    evidence_bundle,
                 )
-            if self.discovery is None or self.synthesis is None:
-                return V4WorkflowResult(
-                    True,
-                    "blocked",
-                    "Planner requested evidence but Discovery is unavailable.",
-                    evidence=evidence_bundle,
+                evidence_conclusion = self.synthesis.synthesize(goal, evidence_bundle)
+                replanning_rounds += 1
+                candidate_plan = getattr(outcome, "candidate_plan", None)
+                finalize_candidate = getattr(
+                    self.planner,
+                    "finalize_candidate",
+                    None,
                 )
-            evidence_bundle = self.discovery.collect_requests(
-                outcome.probe_requests,
-                evidence_bundle,
+                if candidate_plan is not None and finalize_candidate is not None:
+                    outcome = finalize_candidate(candidate_plan, evidence_bundle)
+                else:
+                    outcome = self.planner.plan(
+                        goal,
+                        evidence_bundle,
+                        evidence_conclusion,
+                    )
+                continue
+            occupied_candidate = (
+                outcome.status == "blocked"
+                and str(outcome.reason or "").startswith(
+                    "candidate ports became occupied:"
+                )
             )
-            evidence_conclusion = self.synthesis.synthesize(goal, evidence_bundle)
-            replanning_rounds += 1
-            candidate_plan = getattr(outcome, "candidate_plan", None)
-            finalize_candidate = getattr(
-                self.planner,
-                "finalize_candidate",
-                None,
-            )
-            if candidate_plan is not None and finalize_candidate is not None:
-                outcome = finalize_candidate(candidate_plan, evidence_bundle)
-            else:
+            if occupied_candidate and candidate_replans < self.max_candidate_replans:
+                candidate_replans += 1
                 outcome = self.planner.plan(
                     goal,
                     evidence_bundle,
                     evidence_conclusion,
+                    binding_feedback=(
+                        "%s. Select different ports that are not reported as occupied, "
+                        "freeze them, and preserve every other grounded decision."
+                        % outcome.reason
+                    ),
                 )
+                continue
+            break
         if outcome.status != "ready" or outcome.plan is None:
             return V4WorkflowResult(
                 True,

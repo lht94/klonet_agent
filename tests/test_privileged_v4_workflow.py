@@ -309,6 +309,64 @@ def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path
     assert planner.calls == planner.finalize_calls == 1
 
 
+def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
+    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    candidate = _change_plan()
+    replacement = _change_plan()
+
+    class CandidatePlanner:
+        def __init__(self):
+            self.calls = []
+            self.finalize_calls = 0
+
+        def plan(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return V4PlanningOutcome(
+                    status="need_evidence",
+                    candidate_plan=candidate,
+                    probe_requests=[
+                        ProbeRequest("ports", {"ports": [6379]}, "verify port")
+                    ],
+                )
+            return V4PlanningOutcome(status="ready", plan=replacement)
+
+        def finalize_candidate(self, plan, bundle):
+            self.finalize_calls += 1
+            return V4PlanningOutcome(
+                status="blocked",
+                candidate_plan=plan,
+                reason="candidate ports became occupied: 6379",
+            )
+
+    planner = CandidatePlanner()
+    workflow = V4MutationWorkflow(
+        planner=planner,
+        binder=FakeBinder(),
+        store=MemoryStore(),
+        executor=FakeExecutor(),
+        verifier=FakeVerifier(),
+        discovery=SimpleNamespace(
+            collect_requests=lambda requests, evidence_bundle: evidence_bundle
+        ),
+        synthesis=SimpleNamespace(
+            synthesize=lambda goal, evidence_bundle: SimpleNamespace()
+        ),
+    )
+
+    result = workflow.submit(
+        "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
+    )
+
+    assert result.kind == "awaiting_confirmation"
+    assert len(planner.calls) == 2
+    assert planner.finalize_calls == 1
+    assert "candidate ports became occupied: 6379" in planner.calls[1]["binding_feedback"]
+
+
 def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
     from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome

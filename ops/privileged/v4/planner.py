@@ -151,9 +151,10 @@ class V4ChangePlannerAgent:
                 {
                     "role": "user",
                     "content": (
-                        "The previous semantic plan could not be bound to an audited "
-                        "Action or Shell capability. Replan once without changing the "
-                        "goal or inventing evidence. Binding feedback: %s"
+                        "The previous semantic plan could not proceed safely. Replan "
+                        "once without changing the goal or inventing evidence. Preserve "
+                        "all grounded decisions except those explicitly rejected by the "
+                        "feedback. Planning or binding feedback: %s"
                         % binding_feedback
                     ),
                 }
