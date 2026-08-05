@@ -231,6 +231,21 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
         "use the selected Screen source",
         bundle,
     ) == {"/home/lzl/vemu_uestc"}
+    section_only = EvidenceBundle(goal="use the selected Screen source")
+    section_only.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("screen", {}, "source"),
+            (
+                "path=/home/lzl/vemu_uestc inside_work_tree=true revision=abc\n"
+                "status=## develop...origin/develop\n"
+                "remotes=origin\tgitee:example/vemu.git (fetch)"
+            ),
+        )
+    )
+    assert V4ChangePlannerAgent._authoritative_screen_source_roots(
+        section_only.goal,
+        section_only,
+    ) == {"/home/lzl/vemu_uestc"}
 
     with pytest.raises(ValueError, match="authoritative Screen source evidence"):
         V4ChangePlannerAgent(None)._outcome(

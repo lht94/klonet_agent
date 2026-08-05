@@ -354,6 +354,14 @@ class V4ChangePlannerAgent:
             if record.status != "available" or record.request.probe != "screen":
                 continue
             output = record.output
+            if "remotes=origin" in output:
+                all_grounded_roots.update(
+                    match.group(1)
+                    for match in re.finditer(
+                        r"\bpath=(/[^\s]+)\s+inside_work_tree=true",
+                        output,
+                    )
+                )
             for match in re.finditer(
                 r"(?m)^session=([A-Za-z0-9_.-]+).*?\bgit_roots=([^\s]+)",
                 output,
