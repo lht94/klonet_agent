@@ -351,6 +351,7 @@ class V4ChangePlannerAgent:
             "git_revision": {"path": "repository"},
             "file_contains": {"content": "text"},
             "screen_session_exists": {"name": "session"},
+            "process_running": {"name": "pattern"},
         }
         changes = data.get("changes")
         if not isinstance(changes, list):

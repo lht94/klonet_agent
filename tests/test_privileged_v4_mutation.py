@@ -877,6 +877,10 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
                         "checker": "screen_session_exists",
                         "args": {"name": "v4e2e_web"},
                     },
+                    {
+                        "checker": "process_running",
+                        "args": {"name": "v4e2e-redis"},
+                    },
                 ]
             }
         ]
@@ -894,6 +898,7 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
         "text": "47001",
     }
     assert checks[2]["args"] == {"session": "v4e2e_web"}
+    assert checks[3]["args"] == {"pattern": "v4e2e-redis"}
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
