@@ -84,6 +84,12 @@ def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
     monkeypatch.setattr(probes, "_safe_readlink", fake_readlink)
     monkeypatch.setattr(
         probes,
+        "_nearest_git_root",
+        lambda cwd: "/home/lzl/vemu_uestc" if "vemu_uestc" in cwd else "",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        probes,
         "_proc_children",
         lambda pid: [101] if pid == 100 else [],
         raising=False,
@@ -93,6 +99,7 @@ def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
 
     assert "session=vemu_uestc_m" in output
     assert "runtime_cwds=/home/lzl/vemu_uestc/mains" in output
+    assert "git_roots=/home/lzl/vemu_uestc" in output
 
 
 def test_file_integrity_distinguishes_existing_directory_from_missing(tmp_path):

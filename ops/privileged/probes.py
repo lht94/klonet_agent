@@ -218,9 +218,22 @@ def _screen_runtime_rows(screen_listing: str) -> list[str]:
                 for other in cwd_values
             )
         )
+        git_roots = sorted(
+            {
+                git_root
+                for cwd in deepest
+                for git_root in [_nearest_git_root(cwd)]
+                if git_root
+            }
+        )
         rows.append(
-            "session=%s screen_pid=%s runtime_cwds=%s"
-            % (session, screen_pid, ",".join(deepest) or "unknown")
+            "session=%s screen_pid=%s runtime_cwds=%s git_roots=%s"
+            % (
+                session,
+                screen_pid,
+                ",".join(deepest) or "unknown",
+                ",".join(git_roots) or "unknown",
+            )
         )
     return rows
 
@@ -231,6 +244,20 @@ def _proc_children(pid: int) -> list[int]:
         return [int(item) for item in path.read_text(encoding="utf-8").split()]
     except (OSError, ValueError):
         return []
+
+
+def _nearest_git_root(cwd: str) -> str:
+    path = Path(str(cwd or ""))
+    if not path.is_absolute():
+        return ""
+    candidates = [path, *list(path.parents)[:8]]
+    for candidate in candidates:
+        try:
+            if (candidate / ".git").exists():
+                return str(candidate)
+        except OSError:
+            continue
+    return ""
 
 
 def _docker(args: dict[str, Any]) -> str:

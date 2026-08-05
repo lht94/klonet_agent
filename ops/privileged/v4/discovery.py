@@ -25,6 +25,12 @@ For need_evidence return at most four probe_requests with probe, args, purpose.
 Request only facts materially needed for the current goal. Do not repeat an
 identical probe and arguments after evidence was returned.
 
+When the user identifies a source instance by a Screen session name or prefix,
+treat matching `screen_runtime` cwd/git_roots evidence as authoritative for
+that source. Do not replace it with an unrelated path found by a broad runtime
+or process probe. If a candidate path is not a Git repository, try the matching
+Screen git_root or cwd ancestors before returning blocked.
+
 Registered probes:
 %s
 """.strip()
