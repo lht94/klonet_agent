@@ -1089,7 +1089,21 @@ class V4ChangePlannerAgent:
                 if "nginx" in change_text(item)
                 and str(item.get("step_id") or "") not in verification_step_ids
             ]
-            for nginx_change in nginx_changes:
+            nginx_activations = [
+                item
+                for item in nginx_changes
+                if re.search(
+                    r"\b(?:reload|activate|restart)\b|重载|激活|重新加载",
+                    change_text(item),
+                    re.I,
+                )
+                or any(
+                    isinstance(check, dict)
+                    and check.get("checker") in {"http_status", "service_active"}
+                    for check in item.get("postconditions", [])
+                )
+            ]
+            for nginx_change in nginx_activations:
                 nginx_id = str(nginx_change.get("step_id") or "")
                 nginx_ancestors = ancestors(nginx_id)
                 for application in application_starts:
@@ -1112,12 +1126,11 @@ class V4ChangePlannerAgent:
             used_ports_by_step = (
                 V4ChangePlannerAgent._declared_listening_ports_by_step(data)
             )
-            for change in indexed_changes:
-                text = change_text(change)
-                step_id = str(change.get("step_id") or "")
-                if "nginx" not in text or step_id in verification_step_ids:
-                    continue
-                http_ports: set[int] = set()
+            nginx_ids = {
+                str(change.get("step_id") or "") for change in nginx_changes
+            }
+            http_ports: set[int] = set()
+            for change in nginx_changes:
                 for check in change.get("postconditions", []):
                     if not isinstance(check, dict) or check.get("checker") != "http_status":
                         continue
@@ -1126,24 +1139,24 @@ class V4ChangePlannerAgent:
                     match = re.match(r"https?://[^/:]+:(\d+)(?:/|$)", url, re.I)
                     if match:
                         http_ports.add(int(match.group(1)))
-                grounded = any(
-                    port in frozen_host_ports
-                    and any(
-                        consumer.rsplit(".", 1)[0] == step_id
-                        for consumer in frozen_host_ports[port].consumers
-                    )
-                    and not any(
-                        port in used_ports
-                        for other_step, used_ports in used_ports_by_step.items()
-                        if other_step != step_id
-                    )
-                    for port in http_ports
+            grounded = any(
+                port in frozen_host_ports
+                and any(
+                    consumer.rsplit(".", 1)[0] in nginx_ids
+                    for consumer in frozen_host_ports[port].consumers
                 )
-                if not grounded:
-                    errors.append(
-                        "isolated Nginx requires an explicit frozen dedicated "
-                        "listen port=%s" % step_id
-                    )
+                and not any(
+                    port in used_ports
+                    for other_step, used_ports in used_ports_by_step.items()
+                    if other_step not in nginx_ids
+                )
+                for port in http_ports
+            )
+            if nginx_changes and not grounded:
+                errors.append(
+                    "isolated Nginx requires an explicit frozen dedicated "
+                    "listen port=%s" % ",".join(sorted(nginx_ids))
+                )
         errors.extend(
             V4ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
         )

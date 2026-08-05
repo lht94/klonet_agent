@@ -1346,8 +1346,8 @@ def test_isolated_nginx_must_depend_on_started_application():
     changes = [
         {
             "step_id": "nginx",
-            "title": "Create Nginx configuration",
-            "objective": "Listen on port 47008 and proxy to the application",
+            "title": "Activate Nginx configuration",
+            "objective": "Reload Nginx to serve port 47008 and proxy to the application",
             "depends_on": ["configure"],
             "expected_changes": ["Create isolated Nginx site"],
             "postconditions": [{"checker": "nginx_config_valid", "args": {}}],
@@ -1540,6 +1540,62 @@ def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
     assert expected in missing
     assert expected not in explicit
     assert expected in shared
+
+
+def test_isolated_nginx_allows_prepare_before_app_and_activation_after_app():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    port = PlanResource(
+        "nginx_listen_port", "port", "frozen", "nginx_listen_port", 47008,
+        "planner_choice", consumers=["nginx-config.listen_port"],
+    )
+    changes = [
+        {
+            "step_id": "nginx-config",
+            "title": "Create Nginx site configuration",
+            "objective": "Write the isolated site and symlink",
+            "depends_on": [],
+            "risk": "medium",
+            "expected_changes": ["Create Nginx config listening on 47008"],
+            "postconditions": [{"checker": "nginx_config_valid", "args": {}}],
+        },
+        {
+            "step_id": "start-app",
+            "title": "Start application Screen components",
+            "objective": "Start master worker web terminal",
+            "depends_on": [],
+            "risk": "high",
+            "expected_changes": ["Start application"],
+            "postconditions": [
+                {"checker": "screen_session_exists", "args": {"session": "demo_m"}}
+            ],
+        },
+        {
+            "step_id": "nginx-activate",
+            "title": "Activate Nginx site",
+            "objective": "Reload Nginx after the application is running",
+            "depends_on": ["nginx-config", "start-app"],
+            "risk": "medium",
+            "expected_changes": ["Reload Nginx"],
+            "postconditions": [
+                {
+                    "checker": "http_status",
+                    "args": {"url": "http://127.0.0.1:47008", "status": 200},
+                }
+            ],
+        },
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy isolated instance", "changes": changes, "assumptions": []},
+        "deploy isolated instance",
+        [port],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert not any("Nginx activation must depend" in error for error in errors)
+    assert not any("dedicated listen port" in error for error in errors)
 
 
 def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
