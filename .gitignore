@@ -44,3 +44,6 @@ knowledge/staging/
 # Local Codex skill/plugin cache copied during experiments
 skills/.system/
 .claude/
+
+# Local Git worktrees
+.worktrees/
