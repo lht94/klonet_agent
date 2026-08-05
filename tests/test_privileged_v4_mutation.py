@@ -479,6 +479,15 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
                 "consumers": ["deploy.instance_name"],
             },
             {
+                "name": "config_path",
+                "kind": "path",
+                "status": "frozen",
+                "role": "instance_config_path",
+                "value": "/srv/v4e2e/config.py",
+                "source": "derived_from_evidence",
+                "consumers": ["deploy.path"],
+            },
+            {
                 "name": "master_port",
                 "kind": "port",
                 "status": "frozen",
@@ -518,6 +527,7 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
     repair = llm.calls[1]["messages"][-1]["content"]
     assert "frozen resources" in repair
     assert "missing_required_args=text" in repair
+    assert "Freeze every future configuration file path" in repair
 
 
 def test_deployment_contract_preserves_fixed_names_from_original_goal():

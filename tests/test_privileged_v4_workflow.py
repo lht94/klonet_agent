@@ -169,7 +169,9 @@ def test_exact_confirmation_executes_then_verifies_and_completes(tmp_path, hiera
 
     assert result.kind == "completed"
     assert executor.steps == (["deploy-1"] if hierarchical else ["deploy"])
-    assert verifier.steps == executor.steps
+    assert verifier.steps == (
+        ["deploy-1", "deploy"] if hierarchical else ["deploy"]
+    )
     assert store.load(submitted.plan.plan_id).status == "completed"
     if not hierarchical:
         persisted = store.load(submitted.plan.plan_id).steps[0]

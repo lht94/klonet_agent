@@ -197,6 +197,52 @@ class V4MutationWorkflow:
                 step.observation = str(getattr(decision, "reason", "passed"))
                 self.store.save(plan)
             if change.implementation_plan is not None:
+                semantic_evidence = change.implementation_plan.steps[-1].evidence
+                semantic_step = PrivilegedStep(
+                    step_id=change.step_id,
+                    title=change.title,
+                    objective=change.objective,
+                    reason=change.reason,
+                    risk=change.risk,
+                    expected_changes=list(change.expected_changes),
+                    postconditions=list(change.postconditions),
+                    status="verifying",
+                    evidence=semantic_evidence,
+                )
+                try:
+                    semantic_decision = self.verifier.verify_step(
+                        verification_plan,
+                        semantic_step,
+                    )
+                except Exception as exc:
+                    change.status = plan.status = "paused"
+                    change.observation = (
+                        "Semantic Verifier or Checker failed safely: %s" % exc
+                    )
+                    self.store.save(plan)
+                    return V4WorkflowResult(
+                        True,
+                        "paused",
+                        change.observation,
+                        plan=plan,
+                    )
+                if semantic_decision.status != "passed":
+                    change.status = plan.status = "paused"
+                    change.observation = str(
+                        getattr(
+                            semantic_decision,
+                            "reason",
+                            "semantic verification failed",
+                        )
+                    )
+                    self.store.save(plan)
+                    return V4WorkflowResult(
+                        True,
+                        "paused",
+                        change.observation,
+                        plan=plan,
+                        verification=semantic_decision,
+                    )
                 change.implementation_plan.status = "completed"
             change.status = "completed"
             change.observation = "all executable changes passed verification"

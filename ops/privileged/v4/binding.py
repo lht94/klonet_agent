@@ -56,6 +56,7 @@ class V4ChangeBinder:
         by_id = {step.step_id: step for step in bound.steps}
         for change in plan.steps:
             implementation = by_id[change.step_id]
+            self._lift_hierarchical_verification(change, implementation)
             self._validate_step_bindings(implementation)
             change.execution_binding = implementation.execution_binding
             change.implementation_plan = implementation.implementation_plan
@@ -64,6 +65,42 @@ class V4ChangeBinder:
         plan.status = "awaiting_confirmation"
         plan.authorized_hash = ""
         return plan
+
+    @staticmethod
+    def _lift_hierarchical_verification(change: Any, step: PrivilegedStep) -> None:
+        implementation = step.implementation_plan
+        if implementation is None:
+            return
+        verification_steps = [
+            item
+            for item in implementation.steps
+            if item.execution_binding is not None
+            and item.execution_binding.kind == "verification_only"
+        ]
+        if not verification_steps:
+            return
+        verification_ids = {item.step_id for item in verification_steps}
+        executable = [
+            item for item in implementation.steps if item.step_id not in verification_ids
+        ]
+        if not executable:
+            raise V4BindingError(
+                "hierarchical change has no Action or Shell implementation"
+            )
+        if any(
+            dependency in verification_ids
+            for item in executable
+            for dependency in item.depends_on
+        ):
+            raise V4BindingError(
+                "executable step cannot depend on lifted verification step"
+            )
+        for verification in verification_steps:
+            binding = verification.execution_binding
+            for postcondition in binding.postconditions:
+                if postcondition not in change.postconditions:
+                    change.postconditions.append(dict(postcondition))
+        implementation.steps = executable
 
     def _validate_step_bindings(self, step: PrivilegedStep) -> None:
         candidates = (

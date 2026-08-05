@@ -119,8 +119,7 @@ def test_v4_binder_preserves_action_shell_hierarchical_implementation():
     assert restored.steps[0].implementation_plan.steps[1].step_id == "deploy-2"
 
 
-@pytest.mark.parametrize("hierarchical", [False, True])
-def test_v4_binder_rejects_verification_only_as_an_execution_step(hierarchical):
+def test_v4_binder_rejects_direct_verification_only_as_a_change_implementation():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
         ImplementationPlan,
@@ -134,25 +133,63 @@ def test_v4_binder_rejects_verification_only_as_an_execution_step(hierarchical):
             risk="readonly",
             postconditions=[{"checker": "exit_code_zero"}],
         )
-        if hierarchical:
-            plan.steps[0].implementation_plan = ImplementationPlan(
-                implementation_id="impl-deploy",
-                semantic_step_id="deploy",
-                objective="deploy",
-                steps=[
-                    PrivilegedStep(
-                        step_id="deploy-verify",
-                        title="summarize",
-                        risk="readonly",
-                        execution_binding=binding,
-                    )
-                ],
-            )
-        else:
-            plan.steps[0].execution_binding = binding
+        plan.steps[0].execution_binding = binding
 
     with pytest.raises(V4BindingError, match="verification_only"):
         V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+
+
+def test_v4_binder_lifts_hierarchical_verification_out_of_execution_plan():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ImplementationPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+
+    def apply(plan):
+        plan.steps[0].implementation_plan = ImplementationPlan(
+            implementation_id="impl-deploy",
+            semantic_step_id="deploy",
+            objective="deploy",
+            steps=[
+                PrivilegedStep(
+                    step_id="deploy-action",
+                    title="deploy",
+                    risk="high",
+                    execution_binding=ExecutionBinding(
+                        kind="registered_action",
+                        risk="high",
+                        action="service_control",
+                        args={"service": "v4e2e", "operation": "start"},
+                        postconditions=[{"checker": "exit_code_zero"}],
+                    ),
+                ),
+                PrivilegedStep(
+                    step_id="deploy-verify",
+                    title="verify deployment",
+                    risk="readonly",
+                    depends_on=["deploy-action"],
+                    execution_binding=ExecutionBinding(
+                        kind="verification_only",
+                        risk="readonly",
+                        postconditions=[
+                            {"checker": "service_active", "args": {"service": "v4e2e"}}
+                        ],
+                    ),
+                ),
+            ],
+        )
+
+    plan = V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+
+    assert [
+        item.step_id for item in plan.steps[0].implementation_plan.steps
+    ] == ["deploy-action"]
+    assert {item["checker"] for item in plan.steps[0].postconditions} == {
+        "exit_code_zero",
+        "service_active",
+    }
 
 
 def test_v4_binder_translates_shared_binding_failure_to_v4_boundary():

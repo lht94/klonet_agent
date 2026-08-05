@@ -175,6 +175,8 @@ class V4ChangePlannerAgent:
                                 "source_remote, source_branch, instance identifiers, and "
                                 "every selected port, with semantic-step consumers such "
                                 "as change-1.repository, change-1.url, and change-1.ref. "
+                                "Freeze every future configuration file path derived "
+                                "from instance_root and bind it as change-N.path. "
                                 "Do not reuse or modify existing instance resources."
                             )
                             % exc,
@@ -467,6 +469,40 @@ class V4ChangePlannerAgent:
             consumer.endswith(".repository") for consumer in root_resource.consumers
         ):
             errors.append("instance_root requires a .repository consumer")
+        if root_resource is not None and isinstance(changes, list):
+            root_text = str(root_resource.value).rstrip("/")
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                step_id = str(change.get("step_id") or "")
+                postconditions = change.get("postconditions")
+                if not isinstance(postconditions, list):
+                    continue
+                for check in postconditions:
+                    if not isinstance(check, dict):
+                        continue
+                    args = check.get("args")
+                    path = str(args.get("path") or "") if isinstance(args, dict) else ""
+                    if not path.startswith(root_text + "/"):
+                        continue
+                    if path == root_text + "/.git":
+                        continue
+                    matching = [
+                        resource
+                        for resource in frozen
+                        if resource.kind == "path" and str(resource.value) == path
+                    ]
+                    if not any(
+                        consumer.rsplit(".", 1)[0] == step_id
+                        and consumer.rsplit(".", 1)[1]
+                        in {"path", "source_path", "repository"}
+                        for resource in matching
+                        for consumer in resource.consumers
+                    ):
+                        errors.append(
+                            "future file path is not frozen for %s=%s"
+                            % (step_id, path)
+                        )
         source_remote = next(
             (
                 item
