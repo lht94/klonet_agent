@@ -243,6 +243,26 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             bundle.goal,
             bundle,
         )
+    mixed = V4ChangePlannerAgent(None)._outcome(
+        {
+            "status": "need_evidence",
+            "probe_requests": [
+                {
+                    "probe": "git_repository",
+                    "args": {"repository": "/home/lzl/vemu_uestc"},
+                    "purpose": "determine source remote and branch",
+                },
+                {
+                    "probe": "ports",
+                    "args": {"ports": [47001]},
+                    "purpose": "verify candidate port",
+                },
+            ],
+        },
+        bundle.goal,
+        bundle,
+    )
+    assert [item.probe for item in mixed.probe_requests] == ["ports"]
 
 
 def test_change_planner_builds_only_mutating_change_steps():

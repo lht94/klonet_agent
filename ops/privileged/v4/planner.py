@@ -236,15 +236,22 @@ class V4ChangePlannerAgent:
                 goal,
                 bundle,
             )
-            if authoritative_roots and requests and all(
-                self._is_redundant_source_request(request, authoritative_roots)
-                for request in requests
-            ):
-                raise ValueError(
-                    "authoritative Screen source evidence already provides Git root, "
-                    "remote, branch, and revision; return a ready plan instead of "
-                    "requesting duplicate source probes"
-                )
+            if authoritative_roots and requests:
+                fresh_requests = [
+                    request
+                    for request in requests
+                    if not self._is_redundant_source_request(
+                        request,
+                        authoritative_roots,
+                    )
+                ]
+                if not fresh_requests:
+                    raise ValueError(
+                        "authoritative Screen source evidence already provides Git root, "
+                        "remote, branch, and revision; return a ready plan instead of "
+                        "requesting duplicate source probes"
+                    )
+                requests = fresh_requests
             return V4PlanningOutcome(
                 status=status,
                 probe_requests=requests,
