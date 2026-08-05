@@ -857,6 +857,13 @@ class V4ChangePlannerAgent:
             for item in normalized
             if V4ChangePlannerAgent._requires_host_port_availability(item)
         }
+        explicit_internal_ports = {
+            int(item.value)
+            for item in normalized
+            if item.status == "frozen"
+            and item.kind == "port"
+            and not V4ChangePlannerAgent._requires_host_port_availability(item)
+        }
         for step_id, ports in V4ChangePlannerAgent._used_ports_by_step(data).items():
             for port in sorted(ports):
                 consumer = "%s.port_%s" % (step_id, port)
@@ -864,6 +871,8 @@ class V4ChangePlannerAgent:
                 if existing is not None:
                     if consumer not in existing.consumers:
                         existing.consumers.append(consumer)
+                    continue
+                if port in explicit_internal_ports:
                     continue
                 resource = PlanResource(
                     name="derived_host_port_%s" % port,

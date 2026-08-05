@@ -901,6 +901,45 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
     assert checks[3]["args"] == {"pattern": "v4e2e-redis"}
 
 
+def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    resources = [
+        PlanResource(
+            "redis_container_internal_port",
+            "port",
+            "frozen",
+            "container_internal_port",
+            6379,
+            "image_contract",
+            consumers=["change-3.redis_internal_port"],
+        )
+    ]
+    data = {
+        "changes": [
+            {
+                "step_id": "change-3",
+                "title": "Create isolated Redis container",
+                "objective": "Publish host port 47006 to Redis internal port 6379",
+                "expected_changes": ["Map 47006:6379 for the new container"],
+                "postconditions": [
+                    {"checker": "port_listening", "args": {"port": 47006}}
+                ],
+            }
+        ]
+    }
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(
+        data, resources
+    )
+
+    port_resources = {item.value: item for item in normalized if item.kind == "port"}
+    assert port_resources[6379].role == "container_internal_port"
+    assert port_resources[47006].role == "selected_host_port"
+    assert len([item for item in normalized if item.value == 6379]) == 1
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
