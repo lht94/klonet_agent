@@ -1105,6 +1105,66 @@ def test_isolated_application_start_must_depend_on_stateful_provisioning():
     ) in errors
 
 
+def test_isolated_stateful_services_must_use_new_named_containers():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    changes = [
+        {
+            "step_id": "redis",
+            "title": "Provision dedicated Redis process",
+            "objective": "Start a new Redis server process on port 47005",
+            "depends_on": [],
+            "expected_changes": ["Start redis-server with a separate data directory"],
+            "postconditions": [
+                {"checker": "port_listening", "args": {"port": 47005}}
+            ],
+        }
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
+        "deploy a new isolated instance without reusing existing services",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert "isolated stateful service must use a new named container=redis" in errors
+
+
+def test_isolated_nginx_must_depend_on_started_application():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    changes = [
+        {
+            "step_id": "nginx",
+            "title": "Create Nginx configuration",
+            "objective": "Listen on port 47008 and proxy to the application",
+            "depends_on": ["configure"],
+            "expected_changes": ["Create isolated Nginx site"],
+            "postconditions": [{"checker": "nginx_config_valid", "args": {}}],
+        },
+        {
+            "step_id": "start-app",
+            "title": "Start application components",
+            "objective": "Launch master, worker, web terminal, and celery in Screen",
+            "depends_on": ["configure"],
+            "expected_changes": ["Create application Screen sessions"],
+            "postconditions": [
+                {"checker": "screen_session_exists", "args": {"session": "v4e2e_m"}}
+            ],
+        },
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
+        "deploy a new isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert "Nginx activation must depend on earlier application start=nginx:start-app" in errors
+
+
 def test_change_planner_topologically_orders_forward_semantic_dependencies():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 
@@ -1301,6 +1361,40 @@ def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
     assert data["changes"][0]["postconditions"][-1] == {
         "checker": "http_status",
         "args": {"url": "http://127.0.0.1:47008", "expected_status": 200},
+    }
+
+
+def test_http_observation_does_not_claim_a_listening_port():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "verify",
+                "title": "Observe endpoint",
+                "objective": "Request the endpoint after startup",
+                "postconditions": [
+                    {
+                        "checker": "http_status",
+                        "args": {"url": "http://127.0.0.1:47008", "expected_status": 200},
+                    }
+                ],
+            },
+            {
+                "step_id": "server",
+                "title": "Start server",
+                "objective": "Listen on port 47009",
+                "expected_changes": ["Server listens on 47009"],
+                "postconditions": [
+                    {"checker": "port_listening", "args": {"port": 47009}}
+                ],
+            },
+        ]
+    }
+
+    assert V4ChangePlannerAgent._declared_listening_ports_by_step(data) == {
+        "verify": set(),
+        "server": {47009},
     }
 
 

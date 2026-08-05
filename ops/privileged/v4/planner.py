@@ -100,7 +100,9 @@ only host/listening ports require availability proof.
 If MySQL, Redis, RabbitMQ, or another stateful dependency is required by an
 isolated deployment, add semantic ChangeSteps that create new instance-named
 containers. Application startup must depend on those provisioning steps and
-must appear after them. An isolated Nginx site must listen on its own explicit,
+must appear after them. Do not substitute host server processes for the new
+instance-named stateful containers. Nginx activation must depend on and appear
+after application startup. An isolated Nginx site must listen on its own explicit,
 availability-verified frozen port; its http_status postcondition must include
 that port instead of implicitly checking an existing port 80 route. Missing
 image or credential details are resolvable by Discovery and Binding and must
@@ -210,6 +212,8 @@ class V4ChangePlannerAgent:
                                 "shared services merely because image or credential "
                                 "details still need Binding-time discovery. Application "
                                 "startup must depend on and follow stateful provisioning. "
+                                "Use new instance-named containers, not host server "
+                                "processes. Nginx activation must follow application startup. "
                                 "An isolated Nginx site must use an explicit dedicated "
                                 "frozen listen port, and http_status must check that port."
                             )
@@ -991,7 +995,7 @@ class V4ChangePlannerAgent:
                         % str(change.get("step_id") or "")
                     )
 
-            stateful = [
+            stateful_candidates = [
                 item
                 for item in indexed_changes
                 if re.search(
@@ -1006,6 +1010,18 @@ class V4ChangePlannerAgent:
                     re.I,
                 )
             ]
+            stateful = [
+                item
+                for item in stateful_candidates
+                if re.search(r"containers?\b|容器", change_text(item), re.I)
+            ]
+            for service in stateful_candidates:
+                if service in stateful:
+                    continue
+                errors.append(
+                    "isolated stateful service must use a new named container=%s"
+                    % str(service.get("step_id") or "")
+                )
             application_starts = [
                 item
                 for item in indexed_changes
@@ -1033,12 +1049,35 @@ class V4ChangePlannerAgent:
                             "provisioning=%s:%s" % (application_id, service_id)
                         )
 
+            nginx_changes = [
+                item
+                for item in indexed_changes
+                if "nginx" in change_text(item)
+                and str(item.get("step_id") or "") not in verification_step_ids
+            ]
+            for nginx_change in nginx_changes:
+                nginx_id = str(nginx_change.get("step_id") or "")
+                nginx_ancestors = ancestors(nginx_id)
+                for application in application_starts:
+                    application_id = str(application.get("step_id") or "")
+                    if (
+                        step_positions.get(application_id, -1)
+                        >= step_positions.get(nginx_id, -1)
+                        or application_id not in nginx_ancestors
+                    ):
+                        errors.append(
+                            "Nginx activation must depend on earlier application "
+                            "start=%s:%s" % (nginx_id, application_id)
+                        )
+
             frozen_host_ports = {
                 int(item.value): item
                 for item in frozen
                 if V4ChangePlannerAgent._requires_host_port_availability(item)
             }
-            used_ports_by_step = V4ChangePlannerAgent._used_ports_by_step(data)
+            used_ports_by_step = (
+                V4ChangePlannerAgent._declared_listening_ports_by_step(data)
+            )
             for change in indexed_changes:
                 text = change_text(change)
                 step_id = str(change.get("step_id") or "")
@@ -1482,6 +1521,52 @@ class V4ChangePlannerAgent:
                             port = int(match)
                             if 1 <= port <= 65535:
                                 ports.add(port)
+            result[step_id] = ports
+        return result
+
+    @staticmethod
+    def _declared_listening_ports_by_step(
+        data: dict[str, Any],
+    ) -> dict[str, set[int]]:
+        """Return ports a change claims to bind, excluding observation URLs."""
+
+        result: dict[str, set[int]] = {}
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return result
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            step_id = str(change.get("step_id") or "")
+            ports: set[int] = set()
+            text_parts = [
+                str(change.get("title") or ""),
+                str(change.get("objective") or ""),
+            ]
+            expected = change.get("expected_changes")
+            if isinstance(expected, list):
+                text_parts.extend(str(item) for item in expected)
+            text = "\n".join(text_parts)
+            for match in re.findall(
+                r"(?:listen(?:s|ing)?(?:\s+on)?|监听).{0,20}?([1-9]\d{1,4})",
+                text,
+                re.I,
+            ):
+                port = int(match)
+                if 1 <= port <= 65535:
+                    ports.add(port)
+            postconditions = change.get("postconditions")
+            if isinstance(postconditions, list):
+                for check in postconditions:
+                    if not isinstance(check, dict) or check.get("checker") != "port_listening":
+                        continue
+                    args = check.get("args")
+                    try:
+                        port = int(args.get("port")) if isinstance(args, dict) else 0
+                    except (TypeError, ValueError):
+                        port = 0
+                    if 1 <= port <= 65535:
+                        ports.add(port)
             result[step_id] = ports
         return result
 
