@@ -90,6 +90,12 @@ def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
     )
     monkeypatch.setattr(
         probes,
+        "_git_repository",
+        lambda args: "inspect_git_repository\npath=%s inside_work_tree=true branch=develop remotes=origin=gitee:example/vemu.git"
+        % args["repository"],
+    )
+    monkeypatch.setattr(
+        probes,
         "_proc_children",
         lambda pid: [101] if pid == 100 else [],
         raising=False,
@@ -100,6 +106,8 @@ def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
     assert "session=vemu_uestc_m" in output
     assert "runtime_cwds=/home/lzl/vemu_uestc/mains" in output
     assert "git_roots=/home/lzl/vemu_uestc" in output
+    assert "inside_work_tree=true" in output
+    assert "origin=gitee:example/vemu.git" in output
 
 
 def test_file_integrity_distinguishes_existing_directory_from_missing(tmp_path):

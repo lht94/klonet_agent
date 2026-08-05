@@ -30,6 +30,9 @@ treat matching `screen_runtime` cwd/git_roots evidence as authoritative for
 that source. Do not replace it with an unrelated path found by a broad runtime
 or process probe. If a candidate path is not a Git repository, try the matching
 Screen git_root or cwd ancestors before returning blocked.
+Once a matching `screen_git_repositories` section reports
+inside_work_tree=true with remote and branch, source discovery is complete.
+Do not request screen_session or broad process probes to rediscover that source.
 
 Registered probes:
 %s

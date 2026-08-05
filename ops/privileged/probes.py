@@ -180,9 +180,23 @@ def _screen(args: dict[str, Any]) -> str:
         return inspect_screen_session({"session": session})
     listing = _run(["screen", "-ls"], timeout=8)
     runtime_rows = _screen_runtime_rows(listing)
-    return "inspect_screen\n%s\nscreen_runtime\n%s" % (
+    git_roots = sorted(
+        {
+            root
+            for row in runtime_rows
+            for value in re.findall(r"\bgit_roots=([^\s]+)", row)
+            for root in value.split(",")
+            if root and root != "unknown"
+        }
+    )
+    git_sections = [
+        _git_repository({"repository": root})
+        for root in git_roots[:20]
+    ]
+    return "inspect_screen\n%s\nscreen_runtime\n%s\nscreen_git_repositories\n%s" % (
         listing,
         "\n".join(runtime_rows) or "no runtime cwd mappings",
+        "\n\n".join(git_sections) or "no mapped Git repositories",
     )
 
 
