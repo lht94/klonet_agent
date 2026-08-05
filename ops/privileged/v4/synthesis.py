@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from klonet_agent.ops.privileged.v4.contracts import (
@@ -63,7 +64,7 @@ class V4EvidenceSynthesizer:
                 content = response.choices[0].message.content or ""
                 conclusion = self._conclusion(parse_json_object(content))
                 conclusion.validate_against(bundle)
-                return conclusion
+                return self._with_deterministic_claims(goal, bundle, conclusion)
             except Exception as exc:
                 if attempt == 0:
                     messages.append({"role": "assistant", "content": content if 'content' in locals() else ""})
@@ -74,7 +75,67 @@ class V4EvidenceSynthesizer:
                             % exc,
                         }
                     )
-        return self._fallback(bundle)
+        return self._with_deterministic_claims(goal, bundle, self._fallback(bundle))
+
+    @staticmethod
+    def _with_deterministic_claims(
+        goal: str,
+        bundle: EvidenceBundle,
+        conclusion: EvidenceConclusion,
+    ) -> EvidenceConclusion:
+        promoted: list[EvidenceClaim] = []
+        goal_text = str(goal or "").lower()
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "screen":
+                continue
+            output = record.output
+            selected_roots: set[str] = set()
+            for match in re.finditer(
+                r"(?m)^session=([A-Za-z0-9_.-]+).*?\bgit_roots=([^\s]+)",
+                output,
+            ):
+                session = match.group(1)
+                prefix = re.sub(
+                    r"_(?:web|m|c|w|worker|master|controller)$",
+                    "",
+                    session,
+                    flags=re.I,
+                )
+                if prefix.lower() not in goal_text:
+                    continue
+                selected_roots.update(
+                    root
+                    for root in match.group(2).split(",")
+                    if root and root != "unknown"
+                )
+            for root in sorted(selected_roots):
+                section = re.search(
+                    r"path=%s\s+inside_work_tree=true\s+revision=([^\s]+)\s+"
+                    r"status=##\s+([^\s]+).*?remotes=origin\s+([^\s]+)"
+                    % re.escape(root),
+                    output,
+                    re.S,
+                )
+                if section is None:
+                    continue
+                revision, branch_value, remote = section.groups()
+                branch = branch_value.split("...", 1)[0]
+                promoted.append(
+                    EvidenceClaim(
+                        (
+                            "User-selected Screen source maps authoritatively to Git "
+                            "repository %s; remote=%s; branch=%s; revision=%s"
+                            % (root, remote, branch, revision)
+                        ),
+                        [record.evidence_id],
+                    )
+                )
+        existing = {item.text for item in conclusion.confirmed_facts}
+        conclusion.confirmed_facts = [
+            item for item in promoted if item.text not in existing
+        ] + conclusion.confirmed_facts
+        conclusion.validate_against(bundle)
+        return conclusion
 
     @staticmethod
     def _conclusion(data: dict[str, Any]) -> EvidenceConclusion:

@@ -182,6 +182,43 @@ def test_synthesis_repairs_unknown_evidence_reference_once():
     assert len(llm.calls) == 2
 
 
+def test_synthesis_promotes_user_selected_screen_git_mapping_deterministically():
+    from klonet_agent.ops.privileged.v4.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
+
+    bundle = EvidenceBundle(goal="use Screen prefix vemu_uestc as source")
+    record = bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("screen", {}, "source"),
+            (
+                "screen_runtime\n"
+                "session=vemu_uestc_m screen_pid=100 "
+                "runtime_cwds=/home/lzl/vemu_uestc/mains "
+                "git_roots=/home/lzl/vemu_uestc\n"
+                "screen_git_repositories\ninspect_git_repository\n"
+                "path=/home/lzl/vemu_uestc inside_work_tree=true "
+                "revision=af418698\nstatus=## develop...origin/develop\n"
+                "remotes=origin\tgitee:uestc-minenet/vemu_uestc.git (fetch)"
+            ),
+        )
+    )
+    llm = FakeLLM(
+        [json.dumps({"confirmed_facts": [], "uncertainties": [], "missing_decisions": []})]
+    )
+
+    conclusion = V4EvidenceSynthesizer(llm).synthesize(bundle.goal, bundle)
+
+    fact = conclusion.confirmed_facts[0]
+    assert "/home/lzl/vemu_uestc" in fact.text
+    assert "gitee:uestc-minenet/vemu_uestc.git" in fact.text
+    assert "develop" in fact.text
+    assert fact.evidence_refs == [record.evidence_id]
+
+
 def test_response_fallback_reports_facts_and_uncertainty_without_llm():
     from klonet_agent.ops.privileged.v4.contracts import (
         EvidenceClaim,
