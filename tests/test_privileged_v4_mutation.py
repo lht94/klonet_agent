@@ -505,6 +505,49 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
     assert "Discovery or Binding" in llm.calls[1]["messages"][-1]["content"]
 
 
+def test_change_planner_allows_three_bounded_contract_repairs():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, evidence_id = _bundle_and_conclusion()
+    invalid = json.dumps(
+        {
+            "status": "blocked",
+            "reason": "implementation details missing",
+            "missing_decisions": ["port selection"],
+        }
+    )
+    ready = json.dumps(
+        {
+            "status": "ready",
+            "goal": "restart isolated service",
+            "resources": [],
+            "changes": [
+                {
+                    "step_id": "restart",
+                    "title": "restart isolated service",
+                    "objective": "restart isolated service",
+                    "reason": "requested",
+                    "evidence_refs": [evidence_id],
+                    "depends_on": [],
+                    "risk": "high",
+                    "expected_changes": ["service restarted"],
+                    "postconditions": [
+                        {"checker": "service_active", "args": {"service": "demo"}}
+                    ],
+                }
+            ],
+        }
+    )
+    llm = FakeLLM([invalid, invalid, invalid, ready])
+
+    outcome = V4ChangePlannerAgent(llm).plan(
+        "restart isolated service", bundle, conclusion
+    )
+
+    assert outcome.status == "ready"
+    assert len(llm.calls) == 4
+
+
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

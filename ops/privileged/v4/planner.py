@@ -174,14 +174,15 @@ class V4ChangePlannerAgent:
             )
         last_error: Exception | None = None
         content = ""
-        for attempt in range(2):
+        max_generations = 4
+        for attempt in range(max_generations):
             try:
                 response = self._complete(messages)
                 content = response.choices[0].message.content or ""
                 return self._outcome(parse_json_object(content), goal, bundle)
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
-                if attempt == 0:
+                if attempt < max_generations - 1:
                     messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {
@@ -216,11 +217,13 @@ class V4ChangePlannerAgent:
                         }
                     )
             except Exception as exc:
+                if isinstance(exc, IndexError) and last_error is not None:
+                    break
                 last_error = exc
         return V4PlanningOutcome(
             status="blocked",
             reason=(
-                "Change Planner output invalid after one repair: %s"
+                "Change Planner output invalid after bounded repairs: %s"
                 % str(last_error or "unknown planner failure")
             ),
         )
@@ -901,6 +904,7 @@ class V4ChangePlannerAgent:
                     pending.extend(step_dependencies.get(dependency, set()))
                 return found
 
+            verification_step_ids: set[str] = set()
             for change in indexed_changes:
                 title = str(change.get("title") or "").strip()
                 objective = str(change.get("objective") or "").strip()
@@ -911,6 +915,7 @@ class V4ChangePlannerAgent:
                     primary,
                     re.I,
                 ):
+                    verification_step_ids.add(str(change.get("step_id") or ""))
                     errors.append(
                         "verification-only change is not allowed=%s"
                         % str(change.get("step_id") or "")
@@ -966,9 +971,9 @@ class V4ChangePlannerAgent:
             used_ports_by_step = V4ChangePlannerAgent._used_ports_by_step(data)
             for change in indexed_changes:
                 text = change_text(change)
-                if "nginx" not in text:
-                    continue
                 step_id = str(change.get("step_id") or "")
+                if "nginx" not in text or step_id in verification_step_ids:
+                    continue
                 http_ports: set[int] = set()
                 for check in change.get("postconditions", []):
                     if not isinstance(check, dict) or check.get("checker") != "http_status":
