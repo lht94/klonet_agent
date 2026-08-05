@@ -4,11 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from klonet_agent.ops.privileged.contracts import RISK_LEVELS
+from klonet_agent.ops.privileged.contracts import (
+    ExecutionBinding,
+    ExecutionEvidence,
+    ImplementationPlan,
+    PlanResource,
+    RISK_LEVELS,
+)
 
 
 def _utc_now() -> str:
@@ -161,6 +168,15 @@ class ChangeStepV4:
     risk: str
     expected_changes: list[str]
     postconditions: list[dict[str, Any]]
+    reason: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
+    execution_binding: ExecutionBinding | None = None
+    implementation_plan: ImplementationPlan | None = None
+    status: str = "pending"
+    observation: str = ""
+    execution_attempts: int = 0
+    evidence: ExecutionEvidence | None = None
 
     def __post_init__(self) -> None:
         if self.risk not in RISK_LEVELS:
@@ -171,3 +187,173 @@ class ChangeStepV4:
             raise ValueError("ChangeStepV4 requires expected_changes")
         if not self.postconditions:
             raise ValueError("ChangeStepV4 requires postconditions")
+        if self.execution_binding is not None and self.implementation_plan is not None:
+            raise ValueError(
+                "ChangeStepV4 cannot have both a direct binding and implementation plan"
+            )
+
+    def executable_dict(self) -> dict[str, Any]:
+        return {
+            "step_id": self.step_id,
+            "title": self.title,
+            "objective": self.objective,
+            "reason": self.reason,
+            "evidence_refs": self.evidence_refs,
+            "depends_on": self.depends_on,
+            "risk": self.risk,
+            "expected_changes": self.expected_changes,
+            "postconditions": self.postconditions,
+            "execution_binding": self.execution_binding.executable_dict()
+            if self.execution_binding is not None
+            else None,
+            "implementation_plan": self.implementation_plan.executable_dict()
+            if self.implementation_plan is not None
+            else None,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **self.executable_dict(),
+            "execution_binding": self.execution_binding.to_dict()
+            if self.execution_binding is not None
+            else None,
+            "implementation_plan": self.implementation_plan.to_dict()
+            if self.implementation_plan is not None
+            else None,
+            "status": self.status,
+            "observation": self.observation,
+            "execution_attempts": self.execution_attempts,
+            "evidence": self.evidence.to_dict() if self.evidence is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ChangeStepV4":
+        values = dict(data)
+        values["execution_binding"] = ExecutionBinding.from_dict(
+            values.get("execution_binding")
+        )
+        values["implementation_plan"] = ImplementationPlan.from_dict(
+            values.get("implementation_plan")
+        )
+        values["evidence"] = ExecutionEvidence.from_dict(values.get("evidence"))
+        return cls(**values)
+
+
+V4_PLAN_STATUSES = {
+    "draft",
+    "awaiting_confirmation",
+    "approved",
+    "executing",
+    "verifying",
+    "completed",
+    "paused",
+    "blocked",
+    "failed",
+    "aborted",
+}
+
+
+@dataclass
+class ChangePlanV4:
+    plan_id: str
+    goal: str
+    risk: str
+    steps: list[ChangeStepV4]
+    resources: list[PlanResource] = field(default_factory=list)
+    assumptions: list[str] = field(default_factory=list)
+    schema_version: int = 4
+    status: str = "draft"
+    authorized_hash: str = ""
+    created_at: str = field(default_factory=_utc_now)
+    updated_at: str = field(default_factory=_utc_now)
+
+    def __post_init__(self) -> None:
+        if not self.plan_id.startswith("priv-v4-"):
+            raise ValueError("V4 plan id must start with priv-v4-")
+        if self.schema_version != 4:
+            raise ValueError("V4 plan schema_version must be 4")
+        if self.risk not in RISK_LEVELS or self.risk == "readonly":
+            raise ValueError("V4 change plan requires mutating risk")
+        if not self.steps:
+            raise ValueError("V4 change plan requires steps")
+        if self.status not in V4_PLAN_STATUSES:
+            raise ValueError("invalid V4 plan status: %s" % self.status)
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        goal: str,
+        risk: str,
+        steps: list[ChangeStepV4],
+        resources: list[PlanResource] | None = None,
+        assumptions: list[str] | None = None,
+    ) -> "ChangePlanV4":
+        return cls(
+            plan_id="priv-v4-" + uuid.uuid4().hex[:10],
+            goal=goal,
+            risk=risk,
+            steps=steps,
+            resources=list(resources or []),
+            assumptions=list(assumptions or []),
+        )
+
+    @property
+    def content_hash(self) -> str:
+        payload = {
+            "schema_version": self.schema_version,
+            "goal": self.goal,
+            "risk": self.risk,
+            "resources": [item.to_dict() for item in self.resources],
+            "assumptions": self.assumptions,
+            "steps": [item.executable_dict() for item in self.steps],
+        }
+        return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+    @property
+    def is_authorized(self) -> bool:
+        return bool(self.authorized_hash) and self.authorized_hash == self.content_hash
+
+    def authorize(self) -> None:
+        self.authorized_hash = self.content_hash
+        self.status = "approved"
+        self.updated_at = _utc_now()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "plan_id": self.plan_id,
+            "goal": self.goal,
+            "risk": self.risk,
+            "steps": [item.to_dict() for item in self.steps],
+            "resources": [item.to_dict() for item in self.resources],
+            "assumptions": self.assumptions,
+            "status": self.status,
+            "authorized_hash": self.authorized_hash,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ChangePlanV4":
+        return cls(
+            plan_id=str(data.get("plan_id") or ""),
+            goal=str(data.get("goal") or ""),
+            risk=str(data.get("risk") or ""),
+            steps=[
+                ChangeStepV4.from_dict(item)
+                for item in data.get("steps", [])
+                if isinstance(item, dict)
+            ],
+            resources=[
+                PlanResource.from_dict(item)
+                for item in data.get("resources", [])
+                if isinstance(item, dict)
+            ],
+            assumptions=[str(item) for item in data.get("assumptions", [])],
+            schema_version=int(data.get("schema_version") or 4),
+            status=str(data.get("status") or "draft"),
+            authorized_hash=str(data.get("authorized_hash") or ""),
+            created_at=str(data.get("created_at") or _utc_now()),
+            updated_at=str(data.get("updated_at") or _utc_now()),
+        )

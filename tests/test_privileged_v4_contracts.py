@@ -94,3 +94,22 @@ def test_change_step_requires_observable_postconditions():
             expected_changes=["config changes"],
             postconditions=[],
         )
+
+
+def test_v4_package_exports_mutation_workflow_components():
+    from klonet_agent.ops.privileged.v4 import (
+        V4ChangeBinder,
+        V4ChangePlannerAgent,
+        V4MutationWorkflow,
+        V4PlanStore,
+    )
+
+    assert all(
+        item is not None
+        for item in (
+            V4ChangeBinder,
+            V4ChangePlannerAgent,
+            V4MutationWorkflow,
+            V4PlanStore,
+        )
+    )

@@ -57,6 +57,51 @@ class V4DiscoveryAgent:
         self.budget_factory = budget_factory
         self.on_progress = on_progress
 
+    def collect_requests(
+        self,
+        requests: list[ProbeRequest],
+        bundle: EvidenceBundle,
+    ) -> EvidenceBundle:
+        """Collect a bounded Planner-requested evidence increment."""
+
+        known_keys = {item.request.cache_key for item in bundle.records}
+        fresh: list[ProbeRequest] = []
+        for request in requests:
+            if request.cache_key in known_keys:
+                continue
+            if DEFAULT_READONLY_PROBES.get(request.probe) is None:
+                bundle.add(
+                    EvidenceRecord.from_probe(
+                        request,
+                        "probe refused: probe_not_registered=%s" % request.probe,
+                        status="unavailable",
+                    )
+                )
+                known_keys.add(request.cache_key)
+                continue
+            fresh.append(request)
+            known_keys.add(request.cache_key)
+        if len(fresh) > 4:
+            bundle.budget_exhausted = True
+            fresh = fresh[:4]
+        for request in fresh:
+            if self.on_progress is not None:
+                self.on_progress("collecting read-only evidence: %s" % request.probe)
+            try:
+                output = (
+                    self.probe_runner(
+                        [{"probe": request.probe, "args": request.args, "purpose": request.purpose}]
+                    )
+                    if self.probe_runner is not None
+                    else "probe runner unavailable"
+                )
+                status = "available" if self.probe_runner is not None else "unavailable"
+            except Exception as exc:
+                output = "probe failed: %s" % type(exc).__name__
+                status = "unavailable"
+            bundle.add(EvidenceRecord.from_probe(request, output, status=status))
+        return bundle
+
     def collect(
         self,
         goal: str,

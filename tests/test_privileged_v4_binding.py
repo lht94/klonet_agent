@@ -1,0 +1,155 @@
+from __future__ import annotations
+
+import pytest
+
+
+def _plan():
+    from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
+
+    return ChangePlanV4(
+        plan_id="priv-v4-bind",
+        goal="deploy isolated instance",
+        risk="high",
+        steps=[
+            ChangeStepV4(
+                step_id="deploy",
+                title="deploy instance",
+                objective="deploy an isolated instance",
+                risk="high",
+                expected_changes=["instance is created"],
+                postconditions=[{"checker": "exit_code_zero"}],
+            )
+        ],
+    )
+
+
+class FakeLegacyBinder:
+    def __init__(self, apply):
+        self.apply = apply
+        self.received = None
+
+    def prepare_plan(self, plan, *, grounded_context):
+        self.received = plan
+        self.apply(plan)
+        return plan
+
+
+def test_v4_binder_maps_direct_registered_action_back_to_change_plan():
+    from klonet_agent.ops.privileged.contracts import ExecutionBinding
+    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+
+    def apply(plan):
+        plan.steps[0].execution_binding = ExecutionBinding(
+            kind="registered_action",
+            risk="high",
+            action="service_control",
+            args={"service": "v4e2e", "operation": "start"},
+            postconditions=[{"checker": "exit_code_zero"}],
+        )
+
+    legacy = FakeLegacyBinder(apply)
+    plan = _plan()
+
+    bound = V4ChangeBinder(legacy).bind(plan)
+
+    assert legacy.received.schema_version == 3
+    assert bound is plan
+    assert bound.steps[0].execution_binding.kind == "registered_action"
+    assert bound.steps[0].implementation_plan is None
+    assert bound.status == "awaiting_confirmation"
+
+
+def test_v4_binder_preserves_action_shell_hierarchical_implementation():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ImplementationPlan,
+        PrivilegedStep,
+        ShellArtifact,
+    )
+    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+
+    def apply(plan):
+        action = PrivilegedStep(
+            step_id="deploy-1",
+            title="clone",
+            risk="high",
+            execution_binding=ExecutionBinding(
+                kind="registered_action",
+                risk="high",
+                action="git_operation",
+                args={"operation": "clone"},
+                postconditions=[{"checker": "exit_code_zero"}],
+            ),
+        )
+        artifact = ShellArtifact(
+            artifact_id="script-1",
+            script="true",
+            sha256="x",
+            declared_changes=["config is written"],
+        )
+        shell = PrivilegedStep(
+            step_id="deploy-2",
+            title="configure",
+            risk="high",
+            depends_on=["deploy-1"],
+            execution_binding=ExecutionBinding(
+                kind="shell_artifact",
+                risk="high",
+                shell_artifact=artifact,
+                postconditions=[{"checker": "exit_code_zero"}],
+            ),
+        )
+        plan.steps[0].implementation_plan = ImplementationPlan(
+            implementation_id="impl-deploy",
+            semantic_step_id="deploy",
+            objective="deploy",
+            steps=[action, shell],
+            status="awaiting_confirmation",
+        )
+
+    plan = V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+
+    implementation = plan.steps[0].implementation_plan
+    assert implementation is not None
+    assert [item.execution_binding.kind for item in implementation.steps] == [
+        "registered_action",
+        "shell_artifact",
+    ]
+    restored = type(plan).from_dict(plan.to_dict())
+    assert restored.steps[0].implementation_plan.steps[1].step_id == "deploy-2"
+
+
+@pytest.mark.parametrize("hierarchical", [False, True])
+def test_v4_binder_rejects_verification_only_as_an_execution_step(hierarchical):
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ImplementationPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.v4.binding import V4BindingError, V4ChangeBinder
+
+    def apply(plan):
+        binding = ExecutionBinding(
+            kind="verification_only",
+            risk="readonly",
+            postconditions=[{"checker": "exit_code_zero"}],
+        )
+        if hierarchical:
+            plan.steps[0].implementation_plan = ImplementationPlan(
+                implementation_id="impl-deploy",
+                semantic_step_id="deploy",
+                objective="deploy",
+                steps=[
+                    PrivilegedStep(
+                        step_id="deploy-verify",
+                        title="summarize",
+                        risk="readonly",
+                        execution_binding=binding,
+                    )
+                ],
+            )
+        else:
+            plan.steps[0].execution_binding = binding
+
+    with pytest.raises(V4BindingError, match="verification_only"):
+        V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())

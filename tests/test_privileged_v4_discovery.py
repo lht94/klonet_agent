@@ -112,6 +112,34 @@ def test_discovery_marks_budget_exhaustion_instead_of_replanning_forever():
     assert len(llm.calls) == 2
 
 
+def test_discovery_collect_requests_adds_only_fresh_registered_evidence():
+    from klonet_agent.ops.privileged.v4.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+
+    existing = ProbeRequest("screen", {}, "existing")
+    bundle = EvidenceBundle(goal="deploy")
+    bundle.add(EvidenceRecord.from_probe(existing, "screen evidence"))
+    calls = []
+    agent = V4DiscoveryAgent(
+        FakeLLM([]),
+        probe_runner=lambda requests: calls.append(requests) or "port evidence",
+    )
+
+    returned = agent.collect_requests(
+        [existing, ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
+        bundle,
+    )
+
+    assert returned is bundle
+    assert [item.request.probe for item in bundle.records] == ["screen", "ports"]
+    assert len(calls) == 1
+    assert calls[0][0]["probe"] == "ports"
+
+
 def test_synthesis_repairs_unknown_evidence_reference_once():
     from klonet_agent.ops.privileged.v4.contracts import (
         EvidenceBundle,
