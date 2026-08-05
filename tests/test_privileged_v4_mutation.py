@@ -1034,6 +1034,55 @@ def test_isolated_application_start_must_depend_on_stateful_provisioning():
     ) in errors
 
 
+def test_change_planner_topologically_orders_forward_semantic_dependencies():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {"step_id": "start", "depends_on": ["state"]},
+            {"step_id": "state", "depends_on": ["clone"]},
+            {"step_id": "clone", "depends_on": []},
+        ]
+    }
+
+    V4ChangePlannerAgent._normalize_change_order(data)
+
+    assert [item["step_id"] for item in data["changes"]] == [
+        "clone", "state", "start"
+    ]
+
+
+def test_change_planner_rejects_verification_only_semantic_change():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    changes = [
+        {
+            "step_id": "verify",
+            "title": "Verify the new instance is fully operational",
+            "objective": "Check that MySQL, Redis, and RabbitMQ containers are running",
+            "depends_on": ["start"],
+            "expected_changes": ["Check all service status"],
+            "postconditions": [
+                {"checker": "process_running", "args": {"pattern": "v4e2e"}}
+            ],
+        }
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
+        "deploy a new isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert "verification-only change is not allowed=verify" in errors
+    assert not any(
+        error.endswith(":verify")
+        for error in errors
+        if error.startswith("application start must depend")
+    )
+
+
 def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
@@ -1075,10 +1124,39 @@ def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
         [port],
         _bundle_and_conclusion()[0],
     )
+    shared = V4ChangePlannerAgent._ready_contract_errors(
+        {
+            "goal": "deploy v4e2e",
+            "changes": [
+                {
+                    "step_id": "start-app",
+                    "title": "Start application components",
+                    "objective": "Start the application public service on port 47008",
+                    "depends_on": [],
+                    "expected_changes": ["Listen on port 47008"],
+                    "postconditions": [
+                        {"checker": "port_listening", "args": {"port": 47008}}
+                    ],
+                },
+                {
+                    **change,
+                    "postconditions": [{
+                        "checker": "http_status",
+                        "args": {"url": "http://127.0.0.1:47008/", "expected_status": 200},
+                    }],
+                },
+            ],
+            "assumptions": [],
+        },
+        "deploy a new isolated instance",
+        [port],
+        _bundle_and_conclusion()[0],
+    )
 
     expected = "isolated Nginx requires an explicit frozen dedicated listen port=nginx"
     assert expected in missing
     assert expected not in explicit
+    assert expected in shared
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():

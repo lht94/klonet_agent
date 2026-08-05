@@ -294,6 +294,7 @@ class V4ChangePlannerAgent:
             )
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")
+        self._normalize_change_order(data)
         self._normalize_postcondition_args(data)
         resources = [
             PlanResource.from_dict(item)
@@ -900,6 +901,21 @@ class V4ChangePlannerAgent:
                     pending.extend(step_dependencies.get(dependency, set()))
                 return found
 
+            for change in indexed_changes:
+                title = str(change.get("title") or "").strip()
+                objective = str(change.get("objective") or "").strip()
+                primary = title or objective
+                if re.match(
+                    r"^(?:verify|validate|check|confirm|assert)\b|"
+                    r"^(?:验证|校验|检查|确认|验收)",
+                    primary,
+                    re.I,
+                ):
+                    errors.append(
+                        "verification-only change is not allowed=%s"
+                        % str(change.get("step_id") or "")
+                    )
+
             stateful = [
                 item
                 for item in indexed_changes
@@ -909,7 +925,8 @@ class V4ChangePlannerAgent:
                     re.I,
                 )
                 and re.search(
-                    r"provision|create|start|run|container|部署|创建|启动|容器",
+                    r"provision\b|create\b|start\b|run\b|container\b|"
+                    r"部署|创建|启动|容器",
                     change_text(item),
                     re.I,
                 )
@@ -946,6 +963,7 @@ class V4ChangePlannerAgent:
                 for item in frozen
                 if V4ChangePlannerAgent._requires_host_port_availability(item)
             }
+            used_ports_by_step = V4ChangePlannerAgent._used_ports_by_step(data)
             for change in indexed_changes:
                 text = change_text(change)
                 if "nginx" not in text:
@@ -966,6 +984,11 @@ class V4ChangePlannerAgent:
                         consumer.rsplit(".", 1)[0] == step_id
                         for consumer in frozen_host_ports[port].consumers
                     )
+                    and not any(
+                        port in used_ports
+                        for other_step, used_ports in used_ports_by_step.items()
+                        if other_step != step_id
+                    )
                     for port in http_ports
                 )
                 if not grounded:
@@ -974,6 +997,48 @@ class V4ChangePlannerAgent:
                         "listen port=%s" % step_id
                     )
         return errors
+
+    @staticmethod
+    def _normalize_change_order(data: dict[str, Any]) -> None:
+        """Put model-emitted semantic changes into deterministic DAG order."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        items = [item for item in changes if isinstance(item, dict)]
+        if len(items) != len(changes):
+            return
+        ids = [str(item.get("step_id") or "") for item in items]
+        if any(not step_id for step_id in ids) or len(set(ids)) != len(ids):
+            return
+        known = set(ids)
+        dependencies: dict[str, list[str]] = {}
+        for item, step_id in zip(items, ids):
+            raw = item.get("depends_on", [])
+            if not isinstance(raw, list):
+                return
+            dependencies[step_id] = [str(value) for value in raw]
+        if any(
+            dependency not in known
+            for values in dependencies.values()
+            for dependency in values
+        ):
+            return
+        remaining = list(ids)
+        emitted: list[str] = []
+        while remaining:
+            ready = [
+                step_id
+                for step_id in remaining
+                if all(dep in emitted for dep in dependencies[step_id])
+            ]
+            if not ready:
+                return
+            for step_id in ready:
+                emitted.append(step_id)
+                remaining.remove(step_id)
+        by_id = dict(zip(ids, items))
+        data["changes"] = [by_id[step_id] for step_id in emitted]
 
     @staticmethod
     def _strip_negated_reuse_claims(text: str) -> str:
