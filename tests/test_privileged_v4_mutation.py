@@ -253,7 +253,7 @@ def test_change_planner_builds_only_mutating_change_steps():
     assert outcome.plan.steps[0].evidence_refs == [evidence_id]
 
 
-def test_change_planner_rejects_readonly_or_summary_step():
+def test_change_planner_rejects_readonly_or_summary_step_safely():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
@@ -277,5 +277,39 @@ def test_change_planner_rejects_readonly_or_summary_step():
     }
     llm = FakeLLM([json.dumps(payload), json.dumps(payload)])
 
-    with pytest.raises(ValueError, match="cannot be readonly"):
-        V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+
+    assert outcome.status == "blocked"
+    assert "cannot be readonly" in outcome.reason
+
+
+def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, evidence_id = _bundle_and_conclusion()
+    invalid = json.dumps(
+        {
+            "status": "ready",
+            "goal": "deploy",
+            "resources": [],
+            "changes": [
+                {
+                    "step_id": "clone",
+                    "title": "clone",
+                    "objective": "clone source",
+                    "evidence_refs": [evidence_id],
+                    "risk": "high",
+                    "expected_changes": ["repository created"],
+                }
+            ],
+        }
+    )
+    llm = FakeLLM([invalid, invalid])
+
+    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+
+    assert outcome.status == "blocked"
+    assert "postconditions" in outcome.reason
+    repair_prompt = llm.calls[1]["messages"][-1]["content"]
+    assert '"postconditions"' in repair_prompt
+    assert '"checker"' in repair_prompt

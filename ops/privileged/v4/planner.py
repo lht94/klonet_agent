@@ -30,6 +30,32 @@ For ready return goal, assumptions, frozen/deferred resources and `changes`.
 Every change needs step_id, title, objective, reason, evidence_refs, depends_on,
 risk, non-empty expected_changes, and non-empty structured postconditions.
 Risk cannot be readonly. Evidence references must be supplied evidence IDs.
+
+For status=ready, use this exact shape (repeat the change object as needed):
+{
+  "status": "ready",
+  "goal": "...",
+  "assumptions": [],
+  "resources": [],
+  "changes": [{
+    "step_id": "change-1",
+    "title": "...",
+    "objective": "...",
+    "reason": "...",
+    "evidence_refs": ["ev-..."],
+    "depends_on": [],
+    "risk": "medium",
+    "expected_changes": ["..."],
+    "postconditions": [
+      {"checker": "file_exists", "args": {"path": "/absolute/path"}}
+    ]
+  }]
+}
+postconditions must be a JSON array of checker objects, never prose and never
+omitted. Common checkers include file_exists, file_contains, git_revision,
+service_active, process_running, port_listening, http_status,
+nginx_config_valid, screen_session_exists, and exit_code_zero. Prefer
+independent state checkers; exit_code_zero alone is only a last resort.
 """.strip()
 
 
@@ -82,13 +108,7 @@ class V4ChangePlannerAgent:
         content = ""
         for attempt in range(2):
             try:
-                response = self.llm.complete(
-                    messages=messages,
-                    tools=None,
-                    reasoning_effort="low",
-                    temperature=0,
-                    extra_body={"thinking": {"type": "disabled"}},
-                )
+                response = self._complete(messages)
                 content = response.choices[0].message.content or ""
                 return self._outcome(parse_json_object(content), goal, bundle)
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -98,10 +118,39 @@ class V4ChangePlannerAgent:
                     messages.append(
                         {
                             "role": "user",
-                            "content": "Repair the Change Planner JSON. Error: %s" % exc,
+                            "content": (
+                                "Repair the Change Planner JSON. Error: %s\n"
+                                "Return the complete object again. Every changes[] item "
+                                "must include non-empty expected_changes and a non-empty "
+                                '"postconditions" array of objects shaped as '
+                                '{"checker":"file_exists","args":{"path":"/absolute/path"}}.'
+                                " Do not use readonly or summary steps."
+                            )
+                            % exc,
                         }
                     )
-        raise ValueError(str(last_error or "invalid Change Planner output"))
+            except Exception as exc:
+                last_error = exc
+        return V4PlanningOutcome(
+            status="blocked",
+            reason=(
+                "Change Planner output invalid after one repair: %s"
+                % str(last_error or "unknown planner failure")
+            ),
+        )
+
+    def _complete(self, messages: list[dict[str, str]]) -> Any:
+        try:
+            return self.llm.complete(
+                messages=messages,
+                tools=None,
+                reasoning_effort="medium",
+                temperature=0,
+                response_format={"type": "json_object"},
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+        except TypeError:
+            return self.llm.complete(messages=messages, tools=None)
 
     def _outcome(
         self,
