@@ -559,7 +559,7 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
     ]
     data = {
         "status": "ready",
-        "goal": "deploy instance wrong-name",
+        "goal": "deploy instance wrong-name from /home/lzl/vemu_uestc",
         "resources": [item.to_dict() for item in resources],
         "changes": [
             {
@@ -586,6 +586,7 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
 
     assert "fixed instance identifiers are not frozen=v4e2e" in errors
     assert "fixed Nginx config names are not frozen=klonet-v4-e2e" in errors
+    assert not any("/home/lzl/vemu_uestc" in error for error in errors)
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():

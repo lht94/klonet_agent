@@ -385,7 +385,7 @@ class V4ChangePlannerAgent:
             errors.append("missing frozen resources=%s" % ",".join(missing_roles))
         explicit_paths = set(
             match.rstrip(".,;:，。；：")
-            for match in re.findall(r"/[A-Za-z0-9_./-]+", goal_text)
+            for match in re.findall(r"/[A-Za-z0-9_./-]+", original_goal)
         )
         frozen_paths = {str(item.value) for item in frozen if item.kind == "path"}
         absent_paths = sorted(explicit_paths - frozen_paths)
