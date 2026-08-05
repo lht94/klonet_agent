@@ -56,7 +56,32 @@ omitted. Common checkers include file_exists, file_contains, git_revision,
 service_active, process_running, port_listening, http_status,
 nginx_config_valid, screen_session_exists, and exit_code_zero. Prefer
 independent state checkers; exit_code_zero alone is only a last resort.
+
+Use blocked only for a material user choice that changes the desired outcome.
+Never ask the user to choose implementation details that Discovery or Binding
+can resolve, including free ports, local IPs, generated service/screen names,
+whether to isolate rather than reuse an existing container, Nginx syntax,
+configuration file edits, startup commands, or source layout. For those, use
+need_evidence when state is missing, otherwise choose isolated values, freeze
+them as resources, and emit semantic changes.
 """.strip()
+
+
+DISCOVERABLE_IMPLEMENTATION_MARKERS = (
+    "port",
+    "ip address",
+    "docker container",
+    "nginx",
+    "screen session",
+    "startup command",
+    "configuration file",
+    "source layout",
+    "端口",
+    "ip 地址",
+    "容器",
+    "启动命令",
+    "配置文件",
+)
 
 
 @dataclass
@@ -166,12 +191,24 @@ class V4ChangePlannerAgent:
             )
         if status == "blocked":
             missing = data.get("missing_decisions")
+            missing_items = (
+                [str(item) for item in missing]
+                if isinstance(missing, list)
+                else []
+            )
+            lowered = " ".join(missing_items).lower()
+            if any(
+                marker in lowered
+                for marker in DISCOVERABLE_IMPLEMENTATION_MARKERS
+            ):
+                raise ValueError(
+                    "blocked cannot offload discoverable implementation details; "
+                    "Discovery or Binding must resolve them"
+                )
             return V4PlanningOutcome(
                 status=status,
                 reason=str(data.get("reason") or "planning blocked"),
-                missing_decisions=[str(item) for item in missing]
-                if isinstance(missing, list)
-                else [],
+                missing_decisions=missing_items,
             )
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")

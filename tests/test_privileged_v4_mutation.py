@@ -313,3 +313,54 @@ def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint
     repair_prompt = llm.calls[1]["messages"][-1]["content"]
     assert '"postconditions"' in repair_prompt
     assert '"checker"' in repair_prompt
+
+
+def test_change_planner_repairs_blocked_discoverable_implementation_details():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, evidence_id = _bundle_and_conclusion()
+    invalid_block = json.dumps(
+        {
+            "status": "blocked",
+            "reason": "implementation details missing",
+            "missing_decisions": [
+                "port selection",
+                "IP addresses",
+                "nginx config content",
+                "screen session names",
+                "startup commands",
+            ],
+        }
+    )
+    ready = json.dumps(
+        {
+            "status": "ready",
+            "goal": "deploy",
+            "resources": [],
+            "changes": [
+                {
+                    "step_id": "deploy",
+                    "title": "deploy isolated instance",
+                    "objective": "deploy isolated instance",
+                    "reason": "user requested deployment",
+                    "evidence_refs": [evidence_id],
+                    "depends_on": [],
+                    "risk": "high",
+                    "expected_changes": ["isolated instance is created"],
+                    "postconditions": [
+                        {
+                            "checker": "file_exists",
+                            "args": {"path": "/srv/v4e2e"},
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    llm = FakeLLM([invalid_block, ready])
+
+    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+
+    assert outcome.status == "ready"
+    assert len(llm.calls) == 2
+    assert "Discovery or Binding" in llm.calls[1]["messages"][-1]["content"]
