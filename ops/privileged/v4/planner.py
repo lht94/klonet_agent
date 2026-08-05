@@ -537,6 +537,7 @@ class V4ChangePlannerAgent:
             for item in data.get("resources", [])
             if isinstance(item, dict)
         ]
+        self._normalize_core_resource_consumers(data, resources)
         resources = self._normalize_derived_resources(data, resources)
         self._normalize_nginx_postconditions(data, resources)
         contract_errors = self._ready_contract_errors(
@@ -605,6 +606,7 @@ class V4ChangePlannerAgent:
             "file_contains": {"content": "text"},
             "screen_session_exists": {"name": "session"},
             "process_running": {"name": "pattern"},
+            "container_running": {"name": "container"},
         }
         changes = data.get("changes")
         if not isinstance(changes, list):
@@ -628,6 +630,60 @@ class V4ChangePlannerAgent:
                         args[target] = args[source]
                     if source != target and source in args:
                         del args[source]
+
+    @staticmethod
+    def _normalize_core_resource_consumers(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> None:
+        """Compile authoritative clone slots instead of asking the model to wire them."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        clone_step = next(
+            (
+                item
+                for item in changes
+                if isinstance(item, dict)
+                and str(item.get("step_id") or "")
+                and re.search(
+                    r"\b(?:clone|git|repository)\b|克隆|仓库",
+                    "%s %s"
+                    % (item.get("title") or "", item.get("objective") or ""),
+                    re.I,
+                )
+                and any(
+                    isinstance(check, dict)
+                    and check.get("checker") == "git_revision"
+                    for check in item.get("postconditions", [])
+                )
+            ),
+            None,
+        )
+        if clone_step is None:
+            return
+        step_id = str(clone_step["step_id"])
+        fields = {
+            "instance_root": "repository",
+            "target_root": "repository",
+            "deployment_root": "repository",
+            "source_remote": "url",
+            "source_branch": "ref",
+            "source_revision": "revision",
+        }
+        for resource in resources:
+            field = fields.get(str(resource.role or "").lower())
+            if field is None:
+                continue
+            consumer = "%s.%s" % (step_id, field)
+            resource.consumers = [
+                item
+                for item in resource.consumers
+                if not item.endswith(".%s" % field)
+            ]
+            if consumer not in resource.consumers:
+                resource.consumers.append(consumer)
 
     @staticmethod
     def _normalize_nginx_postconditions(

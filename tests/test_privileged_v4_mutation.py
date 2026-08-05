@@ -606,6 +606,50 @@ def test_change_planner_forces_bounded_function_schema():
     assert properties["changes"]["maxItems"] == 12
 
 
+def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "clone-source",
+                "title": "Clone source repository",
+                "objective": "Clone the authoritative Git repository",
+                "postconditions": [
+                    {
+                        "checker": "container_running",
+                        "args": {"name": "v4e2e-mysql"},
+                    },
+                    {
+                        "checker": "git_revision",
+                        "args": {"path": "/srv/v4e2e", "revision": "abc"},
+                    },
+                ],
+            }
+        ]
+    }
+    resources = [
+        PlanResource("root", "path", "frozen", "instance_root", "/srv/v4e2e"),
+        PlanResource("remote", "identifier", "frozen", "source_remote", "g:x/y"),
+        PlanResource("branch", "identifier", "frozen", "source_branch", "develop"),
+    ]
+
+    V4ChangePlannerAgent._normalize_postcondition_args(data)
+    V4ChangePlannerAgent._normalize_core_resource_consumers(data, resources)
+
+    assert data["changes"][0]["postconditions"][0]["args"] == {
+        "container": "v4e2e-mysql"
+    }
+    assert data["changes"][0]["postconditions"][1]["args"] == {
+        "repository": "/srv/v4e2e",
+        "revision": "abc",
+    }
+    assert resources[0].consumers == ["clone-source.repository"]
+    assert resources[1].consumers == ["clone-source.url"]
+    assert resources[2].consumers == ["clone-source.ref"]
+
+
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 
