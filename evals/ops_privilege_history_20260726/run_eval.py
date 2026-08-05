@@ -11,6 +11,7 @@ from pathlib import Path
 from klonet_agent.llm import LLMClient
 from klonet_agent.ops.privileged.contracts import ExecutionEvidence, utc_now
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
 from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
 from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
@@ -19,6 +20,16 @@ from klonet_agent.ops.privileged.store import PrivilegedPlanStore
 from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
+from klonet_agent.ops.privileged.v4.runtime import ValidatedReadonlyCommandRunner
+from klonet_agent.ops.privileged.v4.store import V4PlanStore
+from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
+from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
 
 
 class CaseTimeout(RuntimeError):
@@ -47,6 +58,9 @@ class SafeEvalExecutor:
             environment_changed=False,
         )
 
+    def execute_readonly(self, step, argv):
+        return self.readonly.execute_readonly(step, argv)
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -55,6 +69,7 @@ def parse_args():
     parser.add_argument("--deterministic-only", action="store_true")
     parser.add_argument("--ids", default="")
     parser.add_argument("--timeout", type=int, default=75)
+    parser.add_argument("--workflow-version", choices=("v3", "v4"), default="v3")
     return parser.parse_args()
 
 
@@ -119,7 +134,67 @@ def _timeout_handler(signum, frame):
     raise CaseTimeout("live case exceeded timeout")
 
 
-def live_result(case, llm, root, timeout):
+def _run_registered_probes(requests):
+    return "\n\n".join(
+        DEFAULT_READONLY_PROBES.run(
+            str(item.get("probe") or ""),
+            item.get("args") if isinstance(item.get("args"), dict) else {},
+        )
+        for item in requests
+    )
+
+
+def build_live_runtime(workflow_version, *, llm, root, executor):
+    version = str(workflow_version or "").strip().lower()
+    if version not in {"v3", "v4"}:
+        raise ValueError("workflow_version must be v3 or v4")
+    if version == "v3":
+        store = PrivilegedPlanStore(
+            root,
+            user_id="history-eval",
+            project_id="shared",
+        )
+        workflow = PrivilegedOpsWorkflow(
+            planner=PrivilegedPlannerAgent(llm),
+            executor=executor,
+            verifier=PrivilegedVerifierAgent(llm),
+            store=store,
+        )
+        return PrivilegedOpsSupervisor(
+            workflow=workflow,
+            classifier=PrivilegedIntentClassifier(llm),
+        )
+    discovery = V4DiscoveryAgent(
+        llm,
+        probe_runner=_run_registered_probes,
+        readonly_command_runner=ValidatedReadonlyCommandRunner(executor),
+    )
+    synthesis = V4EvidenceSynthesizer(llm)
+    workflow = V4MutationWorkflow(
+        planner=V4ChangePlannerAgent(llm),
+        binder=V4ChangeBinder(
+            PrivilegedExecutionAgent(llm, probe_runner=_run_registered_probes)
+        ),
+        store=V4PlanStore(
+            root,
+            user_id="history-eval",
+            project_id="shared",
+        ),
+        executor=executor,
+        verifier=PrivilegedVerifierAgent(llm, probe_runner=_run_registered_probes),
+        discovery=discovery,
+        synthesis=synthesis,
+    )
+    return PrivilegedOpsV4Coordinator(
+        classifier=PrivilegedIntentClassifier(llm),
+        discovery=discovery,
+        synthesis=synthesis,
+        response=V4ResponseAgent(llm),
+        mutation_workflow=workflow,
+    )
+
+
+def live_result(case, llm, root, timeout, workflow_version="v3"):
     result = {
         "live_expected": case["expected_live"],
         "live_kind": "",
@@ -131,23 +206,14 @@ def live_result(case, llm, root, timeout):
         "error": "",
     }
     executor = SafeEvalExecutor()
-    store = PrivilegedPlanStore(
-        root,
-        user_id="history-eval",
-        project_id=case["id"].lower(),
-    )
-    workflow = PrivilegedOpsWorkflow(
-        planner=PrivilegedPlannerAgent(llm),
-        executor=executor,
-        verifier=PrivilegedVerifierAgent(llm),
-        store=store,
-    )
     old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout)
     try:
-        supervisor = PrivilegedOpsSupervisor(
-            workflow=workflow,
-            classifier=PrivilegedIntentClassifier(llm),
+        supervisor = build_live_runtime(
+            workflow_version,
+            llm=llm,
+            root=root / case["id"].lower(),
+            executor=executor,
         )
         supervised = supervisor.handle(case["prompt"], environment_context="")
         result["supervisor_kind"] = supervised.kind
@@ -155,11 +221,12 @@ def live_result(case, llm, root, timeout):
             result["live_kind"] = "conversation"
             result["live_pass"] = case["expected_live"] == "conversation"
             return result
-        if supervised.workflow_result is None:
+        workflow_result = getattr(supervised, "workflow_result", None)
+        if workflow_result is None and not hasattr(supervised, "plan"):
             result["live_kind"] = supervised.kind
             result["live_pass"] = supervised.kind == case["expected_live"]
             return result
-        response = supervised.workflow_result
+        response = workflow_result or supervised
         plan = response.plan
         result["live_kind"] = response.kind
         if plan:
@@ -205,7 +272,15 @@ def main():
     for case in cases:
         row = deterministic_result(case)
         if case.get("live") and not args.deterministic_only:
-            row.update(live_result(case, llm, state_root, args.timeout))
+            row.update(
+                live_result(
+                    case,
+                    llm,
+                    state_root,
+                    args.timeout,
+                    workflow_version=args.workflow_version,
+                )
+            )
         rows.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
 

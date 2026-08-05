@@ -145,3 +145,61 @@ def test_conversation_bypasses_privileged_discovery_and_execution():
     assert result.handled is False
     assert result.kind == "conversation"
     assert discovery.calls == []
+
+
+def test_v4_coordinator_handles_exact_control_before_classifier_or_discovery():
+    from klonet_agent.ops.privileged.v4.coordinator import (
+        PrivilegedOpsV4Coordinator,
+        V4WorkflowResult,
+    )
+
+    class NoCall:
+        def __getattr__(self, name):
+            raise AssertionError("component must not be called: %s" % name)
+
+    class Controls:
+        def __init__(self):
+            self.calls = []
+
+        def handle_control(self, text):
+            self.calls.append(text)
+            return V4WorkflowResult(True, "completed", "confirmed")
+
+    controls = Controls()
+    coordinator = PrivilegedOpsV4Coordinator(
+        classifier=NoCall(),
+        discovery=NoCall(),
+        synthesis=NoCall(),
+        response=NoCall(),
+        mutation_workflow=controls,
+    )
+
+    result = coordinator.handle_with_context(
+        "confirm-priv-v4 priv-v4-flow " + "a" * 64,
+        environment_context="ignored",
+        conversation_context="recent",
+    )
+
+    assert result.kind == "completed"
+    assert controls.calls == ["confirm-priv-v4 priv-v4-flow " + "a" * 64]
+
+
+def test_v4_coordinator_applies_goal_guard_before_any_discovery():
+    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+
+    class NoCall:
+        def __getattr__(self, name):
+            raise AssertionError("component must not be called: %s" % name)
+
+    coordinator = PrivilegedOpsV4Coordinator(
+        classifier=NoCall(),
+        discovery=NoCall(),
+        synthesis=NoCall(),
+        response=NoCall(),
+        mutation_workflow=NoCall(),
+    )
+
+    result = coordinator.handle("rm -rf / and delete all system files")
+
+    assert result.kind == "denied"
+    assert result.handled is True

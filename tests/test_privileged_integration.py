@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from tests.helpers import local_temp_dir
 
 
@@ -98,6 +100,100 @@ class AnswerLLM:
             ],
             usage=SimpleNamespace(total_tokens=7),
         )
+
+
+def test_orchestrator_builds_explicit_v4_runtime_without_v3_fallback():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+
+    with local_temp_dir() as temp_dir:
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops-privilege"),
+            session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+            llm=NoCallLLM(),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
+            privileged_workflow_version="v4",
+        )
+
+    assert orchestrator.privileged_workflow_version == "v4"
+    assert isinstance(orchestrator.privileged_supervisor, PrivilegedOpsV4Coordinator)
+    assert orchestrator.privileged_workflow is orchestrator.privileged_supervisor.mutation_workflow
+
+
+def test_orchestrator_rejects_unknown_privileged_runtime_instead_of_falling_back():
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+
+    with local_temp_dir() as temp_dir, pytest.raises(ValueError, match="v3 or v4"):
+        AgentOrchestrator(
+            profile=get_profile("ops-privilege"),
+            session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+            llm=NoCallLLM(),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
+            privileged_workflow_version="automatic",
+        )
+
+
+def test_explicit_v4_readonly_turn_runs_through_staged_runtime(capsys):
+    import json
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+
+    class QueueLLM:
+        def __init__(self):
+            self.outputs = [
+                json.dumps(
+                    {
+                        "intent": "readonly_action",
+                        "goal_clarity": "clear",
+                        "command": "",
+                        "confidence": 1,
+                        "reason": "inspection",
+                        "clarification_question": "",
+                        "plan_reference": "",
+                    }
+                ),
+                json.dumps({"status": "ready"}),
+                json.dumps(
+                    {
+                        "confirmed_facts": [],
+                        "uncertainties": [],
+                        "missing_decisions": [],
+                    }
+                ),
+                "V4 readonly response",
+            ]
+
+        def complete(self, messages, tools=None, **kwargs):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=self.outputs.pop(0), tool_calls=None)
+                    )
+                ],
+                usage=SimpleNamespace(total_tokens=1),
+            )
+
+    with local_temp_dir() as temp_dir:
+        orchestrator = AgentOrchestrator(
+            profile=get_profile("ops-privilege"),
+            session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+            llm=QueueLLM(),
+            memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
+            privileged_workflow_version="v4",
+        )
+        reply, _, _ = orchestrator.single_chat("inspect platforms", [], 0)
+
+    assert reply == "V4 readonly response"
+    assert "Workflow Coordinator：V4 readonly response" in capsys.readouterr().out
 
 
 def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys):

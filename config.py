@@ -77,6 +77,10 @@ OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS = max(
     1.0,
     float(os.getenv("OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS", "8")),
 )
+OPS_PRIVILEGE_WORKFLOW_VERSION = os.getenv(
+    "OPS_PRIVILEGE_WORKFLOW_VERSION",
+    "v3",
+).strip().lower()
 RAG_RECALL_TOP_K = max(1, int(os.getenv("RAG_RECALL_TOP_K", "30")))
 RAG_FUSION_TOP_K = max(1, int(os.getenv("RAG_FUSION_TOP_K", "20")))
 RAG_RERANK_TOP_N = max(1, int(os.getenv("RAG_RERANK_TOP_N", "10")))

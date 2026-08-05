@@ -251,7 +251,65 @@ class V4MutationWorkflow:
 
     @staticmethod
     def _confirmation_message(plan: ChangePlanV4) -> str:
-        return "Confirm this exact V4 change plan with:\nconfirm-priv-v4 %s %s" % (
-            plan.plan_id,
-            plan.content_hash,
+        lines = [
+            "V4 change plan %s" % plan.plan_id,
+            "Goal: %s" % plan.goal,
+            "Risk: %s" % plan.risk,
+        ]
+        if plan.resources:
+            lines.append("Frozen resources:")
+            for resource in plan.resources:
+                lines.append(
+                    "- %s (%s/%s): %s"
+                    % (resource.name, resource.kind, resource.status, resource.value)
+                )
+        lines.append("Changes:")
+        for change in plan.steps:
+            lines.append(
+                "- %s: %s — %s"
+                % (change.step_id, change.title, change.objective)
+            )
+            lines.append("  expected: %s" % "; ".join(change.expected_changes))
+            lines.append(
+                "  verify: %s"
+                % ", ".join(
+                    str(item.get("checker") or "unknown")
+                    for item in change.postconditions
+                )
+            )
+            for step in V4MutationWorkflow._execution_steps(change):
+                binding = step.execution_binding
+                if binding is None:
+                    lines.append("  binding: missing")
+                    continue
+                if binding.kind == "registered_action":
+                    lines.append(
+                        "  binding: registered_action: %s args=%s"
+                        % (binding.action, binding.args)
+                    )
+                    continue
+                artifact = binding.shell_artifact
+                lines.append(
+                    "  binding: shell_artifact: %s sha256=%s"
+                    % (
+                        artifact.artifact_id if artifact is not None else "missing",
+                        artifact.sha256 if artifact is not None else "missing",
+                    )
+                )
+                if artifact is not None:
+                    lines.extend(
+                        [
+                            "  script:",
+                            "```bash",
+                            artifact.script,
+                            "```",
+                        ]
+                    )
+        lines.extend(
+            [
+                "Exact plan hash: %s" % plan.content_hash,
+                "Confirm this exact V4 change plan with:",
+                "confirm-priv-v4 %s %s" % (plan.plan_id, plan.content_hash),
+            ]
         )
+        return "\n".join(lines)

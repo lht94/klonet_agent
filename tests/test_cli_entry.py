@@ -50,6 +50,7 @@ def test_module_cli_can_run_from_project_root():
     assert "--mode" in result.stdout
     assert "--user-id" in result.stdout
     assert "--project-id" in result.stdout
+    assert "--ops-privilege-workflow" in result.stdout
 
 
 def test_script_cli_can_run_from_project_root():

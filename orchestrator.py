@@ -26,6 +26,7 @@ from klonet_agent.config import (
     OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
     OPS_PRIVILEGE_SUMMARIZER_MODEL,
     OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
+    OPS_PRIVILEGE_WORKFLOW_VERSION,
     RAG_QUERY_PLANNER_MODEL,
     RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
@@ -68,6 +69,15 @@ from klonet_agent.ops.privileged.summarizer import PrivilegedEvidenceSummarizer
 from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
+from klonet_agent.ops.privileged.v4.runtime import ValidatedReadonlyCommandRunner
+from klonet_agent.ops.privileged.v4.store import V4PlanStore
+from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
+from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
 from klonet_agent.ops.routing import OpsRoute, route_ops_request
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
@@ -92,12 +102,21 @@ class AgentOrchestrator:
         memory_store: MemoryStore | None = None,
         intent_analyzer: IntentAnalyzer | None = None,
         journal_maintainer: ProjectJournalMaintainer | None = None,
-        privileged_workflow: PrivilegedOpsWorkflow | None = None,
-        privileged_supervisor: PrivilegedOpsSupervisor | None = None,
+        privileged_workflow: object | None = None,
+        privileged_supervisor: object | None = None,
+        privileged_workflow_version: str | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
+        self.privileged_workflow_version = str(
+            privileged_workflow_version or OPS_PRIVILEGE_WORKFLOW_VERSION
+        ).strip().lower()
+        if (
+            self.profile.name == "ops-privilege"
+            and self.privileged_workflow_version not in {"v3", "v4"}
+        ):
+            raise ValueError("privileged_workflow_version must be v3 or v4")
         supplied_llm = llm
         self.llm = llm or LLMClient()
         self.answer_style = answer_style
@@ -166,7 +185,11 @@ class AgentOrchestrator:
 
             return emit
 
-        if self.profile.name == "ops-privilege" and self.privileged_workflow is None:
+        if (
+            self.profile.name == "ops-privilege"
+            and self.privileged_workflow is None
+            and self.privileged_workflow_version == "v3"
+        ):
             planner_llm = self.llm
             evidence_summarizer = None
             if supplied_llm is None:
@@ -223,7 +246,79 @@ class AgentOrchestrator:
                 on_progress=privileged_progress("Workflow Coordinator"),
             )
         self.privileged_supervisor = privileged_supervisor
-        if self.profile.name == "ops-privilege" and self.privileged_supervisor is None:
+        if (
+            self.profile.name == "ops-privilege"
+            and self.privileged_supervisor is None
+            and self.privileged_workflow_version == "v4"
+        ):
+            planner_llm = self.llm
+            classifier_llm = self.llm
+            if supplied_llm is None:
+                planner_llm = LLMClient(
+                    model=OPS_PRIVILEGE_PLANNER_MODEL,
+                    timeout=OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
+                    max_retries=0,
+                )
+                classifier_llm = LLMClient(
+                    model=OPS_PRIVILEGE_CLASSIFIER_MODEL,
+                    timeout=OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
+                    max_retries=0,
+                )
+            context_builder = PrivilegedPlanContextBuilder(
+                on_progress=privileged_progress("Discovery"),
+            )
+            probe_runner = context_builder.run_recovery_diagnostics
+            executor = PrivilegedCommandExecutor(
+                on_output=lambda channel, chunk: print(chunk, end="", flush=True),
+                environment_fingerprint_provider=(
+                    context_builder.current_environment_fingerprint
+                ),
+            )
+            verifier = PrivilegedVerifierAgent(
+                self.llm,
+                probe_runner=probe_runner,
+            )
+            discovery = V4DiscoveryAgent(
+                planner_llm,
+                probe_runner=probe_runner,
+                readonly_command_runner=ValidatedReadonlyCommandRunner(executor),
+                on_progress=privileged_progress("Discovery"),
+            )
+            synthesis = V4EvidenceSynthesizer(self.llm)
+            mutation_workflow = V4MutationWorkflow(
+                planner=V4ChangePlannerAgent(planner_llm),
+                binder=V4ChangeBinder(
+                    PrivilegedExecutionAgent(
+                        planner_llm,
+                        probe_runner=probe_runner,
+                        on_progress=privileged_progress(
+                            "Implementation Binding Agent"
+                        ),
+                    )
+                ),
+                store=V4PlanStore(
+                    MEMORY_DIR,
+                    user_id=self.session.user_id,
+                    project_id=self.session.project_id,
+                ),
+                executor=executor,
+                verifier=verifier,
+                discovery=discovery,
+                synthesis=synthesis,
+            )
+            self.privileged_workflow = mutation_workflow
+            self.privileged_supervisor = PrivilegedOpsV4Coordinator(
+                classifier=PrivilegedIntentClassifier(classifier_llm),
+                discovery=discovery,
+                synthesis=synthesis,
+                response=V4ResponseAgent(self.llm),
+                mutation_workflow=mutation_workflow,
+            )
+        if (
+            self.profile.name == "ops-privilege"
+            and self.privileged_supervisor is None
+            and self.privileged_workflow_version == "v3"
+        ):
             classifier_llm = self.llm
             if supplied_llm is None:
                 classifier_llm = LLMClient(

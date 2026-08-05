@@ -142,6 +142,9 @@ def test_submit_binds_and_persists_but_never_executes_before_confirmation(tmp_pa
         result.plan.plan_id,
         result.plan.content_hash,
     ) in result.message
+    assert "deploy isolated instance" in result.message
+    assert "registered_action: service_control" in result.message
+    assert "exit_code_zero" in result.message
 
 
 def test_confirmation_rejects_stale_hash_without_execution(tmp_path):
