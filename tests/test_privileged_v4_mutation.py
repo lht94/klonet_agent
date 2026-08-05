@@ -548,6 +548,32 @@ def test_change_planner_allows_three_bounded_contract_repairs():
     assert len(llm.calls) == 4
 
 
+def test_change_planner_bounds_model_output_and_omits_runaway_repair_context():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, _evidence_id = _bundle_and_conclusion()
+    runaway = '{"status":"ready","assumptions":[' + ("x" * 40000)
+    blocked = json.dumps(
+        {
+            "status": "blocked",
+            "reason": "bounded test stop",
+            "missing_decisions": [],
+        }
+    )
+    llm = FakeLLM([runaway, blocked])
+
+    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+
+    assert outcome.status == "blocked"
+    assert len(llm.calls) == 2
+    assert llm.calls[0]["kwargs"]["max_tokens"] == 8000
+    repair_messages = llm.calls[1]["messages"]
+    assistant = next(
+        item["content"] for item in repair_messages if item["role"] == "assistant"
+    )
+    assert assistant == "Previous planner output omitted: contract size exceeded."
+
+
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

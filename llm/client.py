@@ -73,6 +73,7 @@ class LLMClient:
         response_format: dict[str, Any] | None = None,
         extra_body: dict[str, Any] | None = None,
         tool_choice: str | dict[str, Any] | None = None,
+        max_tokens: int | None = None,
     ):
         """发送一次 Chat Completions 请求并返回原始模型响应。
 
@@ -107,6 +108,8 @@ class LLMClient:
             request["temperature"] = temperature
         if response_format is not None:
             request["response_format"] = response_format
+        if max_tokens is not None:
+            request["max_tokens"] = max(1, int(max_tokens))
         if extra_body is not None:
             request["extra_body"] = extra_body
 

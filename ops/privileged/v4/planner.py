@@ -37,6 +37,9 @@ For blocked return reason and missing_decisions.
 For ready return goal, assumptions, frozen/deferred resources and `changes`.
 Every change needs step_id, title, objective, reason, evidence_refs, depends_on,
 risk, non-empty expected_changes, and non-empty structured postconditions.
+Keep assumptions to at most 12 concise items of at most 500 characters each;
+never generate repetitive paraphrases. Return no more than 12 changes and 64
+resources. The entire JSON response must fit within 8000 output tokens.
 Risk cannot be readonly. Evidence references must be supplied evidence IDs.
 
 For status=ready, use this exact shape (repeat the change object as needed):
@@ -199,7 +202,12 @@ class V4ChangePlannerAgent:
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
                 if attempt < max_generations - 1:
-                    messages.append({"role": "assistant", "content": content})
+                    previous = (
+                        content
+                        if len(content) <= 12000
+                        else "Previous planner output omitted: contract size exceeded."
+                    )
+                    messages.append({"role": "assistant", "content": previous})
                     messages.append(
                         {
                             "role": "user",
@@ -254,6 +262,7 @@ class V4ChangePlannerAgent:
                 reasoning_effort="medium",
                 temperature=0,
                 response_format={"type": "json_object"},
+                max_tokens=8000,
                 extra_body={"thinking": {"type": "disabled"}},
             )
         except TypeError:
@@ -265,6 +274,17 @@ class V4ChangePlannerAgent:
         goal: str,
         bundle: EvidenceBundle,
     ) -> V4PlanningOutcome:
+        assumptions = data.get("assumptions", [])
+        if not isinstance(assumptions, list):
+            raise ValueError("planner assumptions must be an array")
+        if len(assumptions) > 12 or any(len(str(item)) > 500 for item in assumptions):
+            raise ValueError("planner assumptions exceed bounded contract")
+        changes = data.get("changes", [])
+        resources = data.get("resources", [])
+        if isinstance(changes, list) and len(changes) > 12:
+            raise ValueError("planner changes exceed bounded contract")
+        if isinstance(resources, list) and len(resources) > 64:
+            raise ValueError("planner resources exceed bounded contract")
         status = str(data.get("status") or "").strip().lower()
         if status == "need_evidence":
             requests = self._probe_requests(data.get("probe_requests"))

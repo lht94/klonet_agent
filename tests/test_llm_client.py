@@ -78,3 +78,29 @@ def test_complete_forwards_named_tool_choice_and_can_disable_reasoning():
     assert captured["tools"] == [tool]
     assert "reasoning_effort" not in captured
     assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+def test_complete_forwards_max_tokens_bound():
+    from klonet_agent.llm.client import LLMClient
+
+    captured = {}
+
+    class Completions:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return "response"
+
+    llm = object.__new__(LLMClient)
+    llm.model = "compatible-model"
+    llm.client = type(
+        "Client",
+        (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    assert llm.complete(
+        messages=[{"role": "user", "content": "bounded"}],
+        max_tokens=8000,
+    ) == "response"
+    assert captured["max_tokens"] == 8000
