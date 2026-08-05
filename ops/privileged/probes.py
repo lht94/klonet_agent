@@ -178,7 +178,59 @@ def _screen(args: dict[str, Any]) -> str:
     session = str(args.get("session") or "").strip()
     if session:
         return inspect_screen_session({"session": session})
-    return "inspect_screen\n" + _run(["screen", "-ls"], timeout=8)
+    listing = _run(["screen", "-ls"], timeout=8)
+    runtime_rows = _screen_runtime_rows(listing)
+    return "inspect_screen\n%s\nscreen_runtime\n%s" % (
+        listing,
+        "\n".join(runtime_rows) or "no runtime cwd mappings",
+    )
+
+
+def _screen_runtime_rows(screen_listing: str) -> list[str]:
+    sessions = [
+        (int(match.group(1)), match.group(2))
+        for match in re.finditer(
+            r"(?m)^\s*(\d+)\.([A-Za-z0-9_.-]{1,128})\s+",
+            str(screen_listing or ""),
+        )
+    ]
+    rows = []
+    for screen_pid, session in sessions[:80]:
+        related = {screen_pid}
+        pending = [screen_pid]
+        while pending:
+            parent = pending.pop()
+            for child in _proc_children(parent):
+                if child not in related:
+                    related.add(child)
+                    pending.append(child)
+        cwd_values = {
+            cwd
+            for pid in related
+            for cwd in [_safe_readlink(Path("/proc") / str(pid) / "cwd")]
+            if cwd and str(cwd).startswith("/") and not str(cwd).startswith("/proc/")
+        }
+        deepest = sorted(
+            cwd
+            for cwd in cwd_values
+            if not any(
+                other != cwd and other.startswith(str(cwd).rstrip("/") + "/")
+                for other in cwd_values
+            )
+        )
+        rows.append(
+            "session=%s screen_pid=%s runtime_cwds=%s"
+            % (session, screen_pid, ",".join(deepest) or "unknown")
+        )
+    return rows
+
+
+def _proc_children(pid: int) -> list[int]:
+    path = Path("/proc") / str(pid) / "task" / str(pid) / "children"
+    try:
+        return [int(item) for item in path.read_text(encoding="utf-8").split()]
+    except (OSError, ValueError):
+        return []
 
 
 def _docker(args: dict[str, Any]) -> str:

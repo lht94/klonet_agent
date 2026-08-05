@@ -67,6 +67,34 @@ def test_project_layout_probe_discovers_nested_klonet_package(tmp_path):
     assert "vemu_uestc" in output
 
 
+def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
+    from klonet_agent.ops.privileged import probes
+
+    def fake_run(argv, **_kwargs):
+        if argv[:2] == ["screen", "-ls"]:
+            return "100.vemu_uestc_m (Detached)"
+        raise AssertionError(argv)
+
+    def fake_readlink(path):
+        if str(path) == "/proc/101/cwd":
+            return "/home/lzl/vemu_uestc/mains"
+        return ""
+
+    monkeypatch.setattr(probes, "_run", fake_run)
+    monkeypatch.setattr(probes, "_safe_readlink", fake_readlink)
+    monkeypatch.setattr(
+        probes,
+        "_proc_children",
+        lambda pid: [101] if pid == 100 else [],
+        raising=False,
+    )
+
+    output = probes.DEFAULT_READONLY_PROBES.run("screen", {})
+
+    assert "session=vemu_uestc_m" in output
+    assert "runtime_cwds=/home/lzl/vemu_uestc/mains" in output
+
+
 def test_file_integrity_distinguishes_existing_directory_from_missing(tmp_path):
     from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 
