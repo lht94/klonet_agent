@@ -1154,6 +1154,49 @@ def test_change_planner_rejects_verification_only_semantic_change():
     )
 
 
+def test_change_planner_moves_leaf_verification_into_predecessor_postconditions():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "resources": [
+            {
+                "name": "listen_port",
+                "kind": "port",
+                "status": "frozen",
+                "role": "nginx_listen_port",
+                "value": 47008,
+                "source": "planner_choice",
+                "consumers": ["verify.url"],
+            }
+        ],
+        "changes": [
+            {
+                "step_id": "nginx",
+                "title": "Create Nginx site",
+                "depends_on": [],
+                "postconditions": [{"checker": "nginx_config_valid", "args": {}}],
+            },
+            {
+                "step_id": "verify",
+                "title": "Verify the HTTP endpoint",
+                "depends_on": ["nginx"],
+                "postconditions": [
+                    {
+                        "checker": "http_status",
+                        "args": {"url": "http://127.0.0.1:47008", "expected_status": 200},
+                    }
+                ],
+            },
+        ],
+    }
+
+    V4ChangePlannerAgent._normalize_verification_changes(data)
+
+    assert [item["step_id"] for item in data["changes"]] == ["nginx"]
+    assert data["changes"][0]["postconditions"][-1]["checker"] == "http_status"
+    assert data["resources"][0]["consumers"] == ["nginx.url"]
+
+
 def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

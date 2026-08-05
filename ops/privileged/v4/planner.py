@@ -298,6 +298,8 @@ class V4ChangePlannerAgent:
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")
         self._normalize_change_order(data)
+        self._normalize_verification_changes(data)
+        self._normalize_change_order(data)
         self._normalize_postcondition_args(data)
         resources = [
             PlanResource.from_dict(item)
@@ -1112,6 +1114,92 @@ class V4ChangePlannerAgent:
                 remaining.remove(step_id)
         by_id = dict(zip(ids, items))
         data["changes"] = [by_id[step_id] for step_id in emitted]
+
+    @staticmethod
+    def _normalize_verification_changes(data: dict[str, Any]) -> None:
+        """Compile attributable verification leaves into the V phase contract."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        items = [item for item in changes if isinstance(item, dict)]
+        by_id = {
+            str(item.get("step_id") or ""): item
+            for item in items
+            if str(item.get("step_id") or "")
+        }
+        removed: dict[str, list[str]] = {}
+        for item in items:
+            step_id = str(item.get("step_id") or "")
+            primary = str(item.get("title") or item.get("objective") or "").strip()
+            if not re.match(
+                r"^(?:verify|validate|check|confirm|assert)\b|"
+                r"^(?:验证|校验|检查|确认|验收)",
+                primary,
+                re.I,
+            ):
+                continue
+            dependencies = item.get("depends_on")
+            if not isinstance(dependencies, list) or not dependencies:
+                continue
+            dependency_ids = [str(value) for value in dependencies]
+            target_id = dependency_ids[-1]
+            target = by_id.get(target_id)
+            if target is None:
+                continue
+            target_checks = target.get("postconditions")
+            if not isinstance(target_checks, list):
+                target_checks = []
+                target["postconditions"] = target_checks
+            existing = {
+                json.dumps(check, ensure_ascii=False, sort_keys=True)
+                for check in target_checks
+                if isinstance(check, dict)
+            }
+            for check in item.get("postconditions", []):
+                if not isinstance(check, dict):
+                    continue
+                fingerprint = json.dumps(check, ensure_ascii=False, sort_keys=True)
+                if fingerprint not in existing:
+                    target_checks.append(check)
+                    existing.add(fingerprint)
+            removed[step_id] = dependency_ids
+        if not removed:
+            return
+        data["changes"] = [
+            item
+            for item in items
+            if str(item.get("step_id") or "") not in removed
+        ]
+        for item in data["changes"]:
+            dependencies = item.get("depends_on")
+            if not isinstance(dependencies, list):
+                continue
+            rewired: list[str] = []
+            for dependency in dependencies:
+                dependency_id = str(dependency)
+                replacements = removed.get(dependency_id, [dependency_id])
+                for replacement in replacements:
+                    if replacement not in rewired:
+                        rewired.append(replacement)
+            item["depends_on"] = rewired
+        resources = data.get("resources")
+        if not isinstance(resources, list):
+            return
+        for resource in resources:
+            consumers = resource.get("consumers") if isinstance(resource, dict) else None
+            if not isinstance(consumers, list):
+                continue
+            rewired_consumers: list[str] = []
+            for consumer in consumers:
+                text = str(consumer)
+                owner, separator, field = text.partition(".")
+                replacements = removed.get(owner, [owner])
+                for replacement in replacements:
+                    rewritten = "%s%s%s" % (replacement, separator, field)
+                    if rewritten not in rewired_consumers:
+                        rewired_consumers.append(rewritten)
+            resource["consumers"] = rewired_consumers
 
     @staticmethod
     def _strip_negated_reuse_claims(text: str) -> str:
