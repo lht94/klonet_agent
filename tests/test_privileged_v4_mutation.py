@@ -594,6 +594,83 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
     assert "change deploy consumes multiple port resources; split it" in errors
 
 
+def test_deployment_contract_rejects_unfrozen_ports_and_bundled_mutations():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, _, _ = _bundle_and_conclusion()
+    resources = [
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root", "/srv/v4e2e",
+            "user_input", consumers=["clone.repository"],
+        ),
+        PlanResource(
+            "source_remote", "identifier", "frozen", "source_remote",
+            "gitee:example/platform.git", "evidence", consumers=["clone.url"],
+        ),
+        PlanResource(
+            "source_branch", "identifier", "frozen", "source_branch", "develop",
+            "evidence", consumers=["clone.ref"],
+        ),
+        PlanResource(
+            "instance_identifier", "identifier", "frozen", "instance_identifier",
+            "v4e2e", "user_input", consumers=["clone.instance_name"],
+        ),
+        PlanResource(
+            "master_port", "port", "frozen", "master_port", 47001,
+            "evidence", consumers=["configure.master_port"],
+        ),
+        PlanResource(
+            "config_path", "path", "frozen", "config_file_path",
+            "/srv/v4e2e/config.py", "derived", consumers=["configure.path"],
+        ),
+    ]
+    data = {
+        "status": "ready",
+        "goal": "deploy v4e2e",
+        "resources": [item.to_dict() for item in resources],
+        "changes": [
+            {
+                "step_id": "clone", "risk": "medium",
+                "expected_changes": ["clone repository"],
+                "postconditions": [
+                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/.git"}}
+                ],
+            },
+            {
+                "step_id": "configure", "risk": "medium",
+                "expected_changes": [
+                    "Set master_port to 47001", "Set worker_port to 47002"
+                ],
+                "postconditions": [
+                    {"checker": "file_contains", "args": {"path": "/srv/v4e2e/config.py", "text": "master_port = 47001"}},
+                    {"checker": "file_contains", "args": {"path": "/srv/v4e2e/config.py", "text": "worker_port = 47002"}},
+                ],
+            },
+            {
+                "step_id": "start", "risk": "high",
+                "expected_changes": ["Create sessions v4e2e_m and v4e2e_w"],
+                "postconditions": [
+                    {"checker": "screen_session_exists", "args": {"session": "v4e2e_m"}},
+                    {"checker": "screen_session_exists", "args": {"session": "v4e2e_w"}},
+                ],
+            },
+        ],
+        "assumptions": [],
+    }
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        data,
+        "deploy isolated instance to /srv/v4e2e; instance name fixed as v4e2e",
+        resources,
+        bundle,
+    )
+
+    assert "change configure uses unfrozen port=47002" in errors
+    assert "change configure bundles multiple configuration assertions; split it" in errors
+    assert "change start verifies multiple screen sessions; split it" in errors
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
@@ -601,7 +678,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     payload = {
         "status": "ready",
-        "goal": "deploy v4e2e to /srv/v4e2e",
+        "goal": "model-rewritten deployment goal",
         "resources": [
             {
                 "name": "instance_root", "kind": "path", "status": "frozen",
@@ -651,6 +728,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
         ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability")
     ]
     assert outcome.candidate_plan is not None
+    assert outcome.candidate_plan.goal == "deploy v4e2e to /srv/v4e2e"
     assert next(
         item for item in outcome.candidate_plan.resources if item.kind == "port"
     ).value == 47002

@@ -274,7 +274,7 @@ class V4ChangePlannerAgent:
             ).risk
             candidate_assumptions = data.get("assumptions")
             candidate_plan = ChangePlanV4.new(
-                goal=str(data.get("goal") or goal),
+                goal=goal,
                 risk=candidate_risk,
                 steps=candidate_steps,
                 resources=resources,
@@ -301,7 +301,7 @@ class V4ChangePlannerAgent:
         return V4PlanningOutcome(
             status="ready",
             plan=ChangePlanV4.new(
-                goal=str(data.get("goal") or goal),
+                goal=goal,
                 risk=risk,
                 steps=steps,
                 resources=resources,
@@ -536,6 +536,54 @@ class V4ChangePlannerAgent:
                 errors.append(
                     "change %s consumes multiple port resources; split it" % step_id
                 )
+        frozen_port_values = {
+            int(resource.value)
+            for resource in frozen
+            if resource.kind == "port"
+        }
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                step_id = str(change.get("step_id") or "")
+                serialized = json.dumps(change, ensure_ascii=False)
+                used_ports = {
+                    int(match)
+                    for match in re.findall(r"(?<![\d.])([1-9]\d{3,4})(?![\d.])", serialized)
+                    if 1024 <= int(match) <= 65535
+                }
+                for port in sorted(used_ports - frozen_port_values):
+                    errors.append(
+                        "change %s uses unfrozen port=%s" % (step_id, port)
+                    )
+                postconditions = change.get("postconditions")
+                if not isinstance(postconditions, list):
+                    continue
+                file_assertions: dict[str, int] = {}
+                screen_sessions: set[str] = set()
+                for check in postconditions:
+                    if not isinstance(check, dict):
+                        continue
+                    args = check.get("args")
+                    if not isinstance(args, dict):
+                        continue
+                    checker = str(check.get("checker") or "")
+                    if checker == "file_contains":
+                        path = str(args.get("path") or "")
+                        file_assertions[path] = file_assertions.get(path, 0) + 1
+                    elif checker == "screen_session_exists":
+                        session = str(args.get("session") or "")
+                        if session:
+                            screen_sessions.add(session)
+                if any(count > 1 for count in file_assertions.values()):
+                    errors.append(
+                        "change %s bundles multiple configuration assertions; split it"
+                        % step_id
+                    )
+                if len(screen_sessions) > 1:
+                    errors.append(
+                        "change %s verifies multiple screen sessions; split it" % step_id
+                    )
         root_resource = next(
             (
                 item
