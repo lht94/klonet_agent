@@ -995,6 +995,92 @@ def test_isolation_contract_distinguishes_negated_and_positive_reuse_claims():
     assert "isolated deployment cannot reuse existing resources" in positive
 
 
+def test_isolated_application_start_must_depend_on_stateful_provisioning():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    changes = [
+        {
+            "step_id": "start-app",
+            "title": "Start application components",
+            "objective": "Launch master, worker, and web terminal in Screen sessions",
+            "depends_on": ["configure"],
+            "expected_changes": ["Create application Screen sessions"],
+            "postconditions": [
+                {"checker": "screen_session_exists", "args": {"session": "v4e2e_m"}}
+            ],
+        },
+        {
+            "step_id": "provision-state",
+            "title": "Provision isolated stateful services",
+            "objective": "Create new MySQL, Redis, and RabbitMQ containers",
+            "depends_on": ["clone"],
+            "expected_changes": ["Create instance-named containers"],
+            "postconditions": [
+                {"checker": "port_listening", "args": {"port": 47004}}
+            ],
+        },
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
+        "deploy a new isolated instance without interfering with existing services",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert (
+        "application start must depend on earlier stateful provisioning="
+        "start-app:provision-state"
+    ) in errors
+
+
+def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    change = {
+        "step_id": "nginx",
+        "title": "Create Nginx configuration",
+        "objective": "Add an isolated Nginx site for v4e2e",
+        "depends_on": ["start-app"],
+        "expected_changes": ["Create and enable klonet-v4-e2e"],
+        "postconditions": [
+            {"checker": "http_status", "args": {"url": "http://127.0.0.1/", "expected_status": 200}}
+        ],
+    }
+    port = PlanResource(
+        "nginx_listen_port", "port", "frozen", "nginx_listen_port", 47008,
+        "planner_choice", consumers=["nginx.listen_port"],
+    )
+
+    missing = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": [change], "assumptions": []},
+        "deploy a new isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+    explicit = V4ChangePlannerAgent._ready_contract_errors(
+        {
+            "goal": "deploy v4e2e",
+            "changes": [{
+                **change,
+                "postconditions": [{
+                    "checker": "http_status",
+                    "args": {"url": "http://127.0.0.1:47008/", "expected_status": 200},
+                }],
+            }],
+            "assumptions": [],
+        },
+        "deploy a new isolated instance",
+        [port],
+        _bundle_and_conclusion()[0],
+    )
+
+    expected = "isolated Nginx requires an explicit frozen dedicated listen port=nginx"
+    assert expected in missing
+    assert expected not in explicit
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

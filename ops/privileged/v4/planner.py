@@ -99,8 +99,12 @@ Mark fixed image/container-side ports with role `container_internal_port`;
 only host/listening ports require availability proof.
 If MySQL, Redis, RabbitMQ, or another stateful dependency is required by an
 isolated deployment, add semantic ChangeSteps that create new instance-named
-containers. Missing image or credential details are resolvable by Discovery
-and Binding and must never justify sharing an existing service.
+containers. Application startup must depend on those provisioning steps and
+must appear after them. An isolated Nginx site must listen on its own explicit,
+availability-verified frozen port; its http_status postcondition must include
+that port instead of implicitly checking an existing port 80 route. Missing
+image or credential details are resolvable by Discovery and Binding and must
+never justify sharing an existing service.
 """.strip()
 
 
@@ -203,7 +207,10 @@ class V4ChangePlannerAgent:
                                 "For isolated stateful dependencies, add semantic changes "
                                 "that create new instance-named containers; never reuse "
                                 "shared services merely because image or credential "
-                                "details still need Binding-time discovery."
+                                "details still need Binding-time discovery. Application "
+                                "startup must depend on and follow stateful provisioning. "
+                                "An isolated Nginx site must use an explicit dedicated "
+                                "frozen listen port, and http_status must check that port."
                             )
                             % exc,
                         }
@@ -858,6 +865,114 @@ class V4ChangePlannerAgent:
             re.I,
         ):
             errors.append("isolated deployment cannot reuse existing resources")
+        if isolation_requested and isinstance(changes, list):
+            indexed_changes = [item for item in changes if isinstance(item, dict)]
+            step_positions = {
+                str(item.get("step_id") or ""): index
+                for index, item in enumerate(indexed_changes)
+            }
+            step_dependencies = {
+                str(item.get("step_id") or ""): {
+                    str(value) for value in item.get("depends_on", [])
+                }
+                for item in indexed_changes
+                if isinstance(item.get("depends_on", []), list)
+            }
+
+            def change_text(item: dict[str, Any]) -> str:
+                return json.dumps(
+                    {
+                        "title": item.get("title", ""),
+                        "objective": item.get("objective", ""),
+                        "expected_changes": item.get("expected_changes", []),
+                    },
+                    ensure_ascii=False,
+                ).lower()
+
+            def ancestors(step_id: str) -> set[str]:
+                found: set[str] = set()
+                pending = list(step_dependencies.get(step_id, set()))
+                while pending:
+                    dependency = pending.pop()
+                    if dependency in found:
+                        continue
+                    found.add(dependency)
+                    pending.extend(step_dependencies.get(dependency, set()))
+                return found
+
+            stateful = [
+                item
+                for item in indexed_changes
+                if re.search(
+                    r"stateful|mysql|redis|rabbitmq|数据库|消息队列|有状态",
+                    change_text(item),
+                    re.I,
+                )
+                and re.search(
+                    r"provision|create|start|run|container|部署|创建|启动|容器",
+                    change_text(item),
+                    re.I,
+                )
+            ]
+            application_starts = [
+                item
+                for item in indexed_changes
+                if re.search(r"start|launch|启动|拉起", change_text(item), re.I)
+                and re.search(
+                    r"application|component|screen|master|worker|web terminal|"
+                    r"应用|组件|会话",
+                    change_text(item),
+                    re.I,
+                )
+                and item not in stateful
+            ]
+            for application in application_starts:
+                application_id = str(application.get("step_id") or "")
+                application_ancestors = ancestors(application_id)
+                for service in stateful:
+                    service_id = str(service.get("step_id") or "")
+                    if (
+                        step_positions.get(service_id, -1)
+                        >= step_positions.get(application_id, -1)
+                        or service_id not in application_ancestors
+                    ):
+                        errors.append(
+                            "application start must depend on earlier stateful "
+                            "provisioning=%s:%s" % (application_id, service_id)
+                        )
+
+            frozen_host_ports = {
+                int(item.value): item
+                for item in frozen
+                if V4ChangePlannerAgent._requires_host_port_availability(item)
+            }
+            for change in indexed_changes:
+                text = change_text(change)
+                if "nginx" not in text:
+                    continue
+                step_id = str(change.get("step_id") or "")
+                http_ports: set[int] = set()
+                for check in change.get("postconditions", []):
+                    if not isinstance(check, dict) or check.get("checker") != "http_status":
+                        continue
+                    args = check.get("args")
+                    url = str(args.get("url") or "") if isinstance(args, dict) else ""
+                    match = re.match(r"https?://[^/:]+:(\d+)(?:/|$)", url, re.I)
+                    if match:
+                        http_ports.add(int(match.group(1)))
+                grounded = any(
+                    port in frozen_host_ports
+                    and any(
+                        consumer.rsplit(".", 1)[0] == step_id
+                        for consumer in frozen_host_ports[port].consumers
+                    )
+                    for port in http_ports
+                )
+                if not grounded:
+                    errors.append(
+                        "isolated Nginx requires an explicit frozen dedicated "
+                        "listen port=%s" % step_id
+                    )
         return errors
 
     @staticmethod

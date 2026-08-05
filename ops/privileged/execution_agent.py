@@ -2478,7 +2478,7 @@ def _implementation_item_is_verification(item: dict[str, Any]) -> bool:
     objective = str(item.get("objective") or "").lower().strip()
     text = title or objective
     verifier = re.search(
-        r"验证|校验|确认|检查|验收|verify|validate|check|confirm|assert",
+        r"验证|校验|确认|检查|验收|verify\b|validate\b|check\b|confirm\b|assert\b",
         text,
         re.IGNORECASE,
     )
@@ -2486,7 +2486,7 @@ def _implementation_item_is_verification(item: dict[str, Any]) -> bool:
         r"创建|新增|写入|修改|修复|设置|切换|启动|停止|重载|重新加载|安装|复制|同步|删除|"
         r"create\b|add\b|write\b|modify\b|insert\b|configure\b|deploy\b|"
         r"set\b|switch\b|start\b|stop\b|reload\b|repair\b|install\b|"
-        r"copy\b|sync\b|remove\b",
+        r"copy\b|sync\b|remove\b|checkout\b|pin\b",
         text,
         re.IGNORECASE,
     )
@@ -2496,7 +2496,7 @@ def _implementation_item_is_verification(item: dict[str, Any]) -> bool:
         r"^(?:请|需要|要|to\s+)?(?:(?:创建|新增|写入|插入|修改|修复|设置|"
         r"切换|启动|停止|重载|安装|复制|同步|删除|准备)|"
         r"(?:create|add|write|insert|modify|repair|configure|deploy|set|"
-        r"switch|start|stop|reload|install|copy|sync|remove|prepare)\b)",
+        r"switch|start|stop|reload|install|copy|sync|remove|prepare|checkout|pin)\b)",
         objective,
         re.IGNORECASE,
     ):
@@ -2516,7 +2516,7 @@ def _semantic_step_is_observational(step: PrivilegedStep) -> bool:
             r"^(?:请|需要|要|to\s+)?(?:(?:创建|新增|写入|插入|修改|修复|设置|"
             r"切换|启动|停止|重载|安装|复制|同步|删除|准备)|"
             r"(?:create|add|write|insert|modify|repair|configure|deploy|set|"
-            r"switch|start|stop|reload|install|copy|sync|remove|prepare)\b)",
+            r"switch|start|stop|reload|install|copy|sync|remove|prepare|checkout|pin)\b)",
             objective,
             re.IGNORECASE,
         ):

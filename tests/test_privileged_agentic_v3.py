@@ -2783,6 +2783,25 @@ def test_verifier_can_observe_services_that_are_already_started():
     )
 
 
+def test_git_checkout_and_pin_is_a_mutation_not_a_check_verifier():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _implementation_item_is_verification,
+    )
+
+    assert not _implementation_item_is_verification(
+        {
+            "title": "Checkout and pin target revision",
+            "objective": "checkout af418698 and pin the repository revision",
+        }
+    )
+    assert _implementation_item_is_verification(
+        {
+            "title": "Check pinned target revision",
+            "objective": "verify the repository is at af418698",
+        }
+    )
+
+
 def test_frozen_port_selection_step_becomes_readonly_verification():
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
