@@ -305,6 +305,7 @@ class V4ChangePlannerAgent:
             if isinstance(item, dict)
         ]
         resources = self._normalize_derived_resources(data, resources)
+        self._normalize_nginx_postconditions(data, resources)
         contract_errors = self._ready_contract_errors(
             data,
             goal,
@@ -394,6 +395,73 @@ class V4ChangePlannerAgent:
                         args[target] = args[source]
                     if source != target and source in args:
                         del args[source]
+
+    @staticmethod
+    def _normalize_nginx_postconditions(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> None:
+        """Materialize the HTTP proof implied by a frozen Nginx listen port."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            step_id = str(change.get("step_id") or "")
+            text = "%s %s" % (
+                str(change.get("title") or ""),
+                str(change.get("objective") or ""),
+            )
+            if not re.search(r"nginx", text, re.I):
+                continue
+            listen_resource = next(
+                (
+                    resource
+                    for resource in resources
+                    if resource.status == "frozen"
+                    and resource.kind == "port"
+                    and V4ChangePlannerAgent._requires_host_port_availability(resource)
+                    and any(
+                        consumer.rsplit(".", 1)[0] == step_id
+                        and (
+                            consumer.endswith(".listen_port")
+                            or "nginx" in str(resource.role or "").lower()
+                            or "nginx" in str(resource.name or "").lower()
+                        )
+                        for consumer in resource.consumers
+                    )
+                ),
+                None,
+            )
+            if listen_resource is None:
+                continue
+            postconditions = change.get("postconditions")
+            if not isinstance(postconditions, list):
+                postconditions = []
+                change["postconditions"] = postconditions
+            port = int(listen_resource.value)
+            if any(
+                isinstance(check, dict)
+                and check.get("checker") == "http_status"
+                and re.search(
+                    r"https?://[^/:]+:%s(?:/|$)" % port,
+                    str((check.get("args") or {}).get("url") or ""),
+                    re.I,
+                )
+                for check in postconditions
+            ):
+                continue
+            postconditions.append(
+                {
+                    "checker": "http_status",
+                    "args": {
+                        "url": "http://127.0.0.1:%s" % port,
+                        "expected_status": 200,
+                    },
+                }
+            )
 
     @staticmethod
     def _authoritative_screen_source_roots(

@@ -1230,6 +1230,37 @@ def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
     assert expected in shared
 
 
+def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "nginx",
+                "title": "Create isolated Nginx site",
+                "objective": "Listen on dedicated port 47008 and proxy to 47001",
+                "postconditions": [
+                    {"checker": "nginx_config_valid", "args": {}}
+                ],
+            }
+        ]
+    }
+    resources = [
+        PlanResource(
+            "nginx_listen_port", "port", "frozen", "nginx_listen_port",
+            47008, "planner_choice", consumers=["nginx.listen_port"],
+        )
+    ]
+
+    V4ChangePlannerAgent._normalize_nginx_postconditions(data, resources)
+
+    assert data["changes"][0]["postconditions"][-1] == {
+        "checker": "http_status",
+        "args": {"url": "http://127.0.0.1:47008", "expected_status": 200},
+    }
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
