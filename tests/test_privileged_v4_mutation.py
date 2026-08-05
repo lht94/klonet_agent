@@ -705,6 +705,11 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
                 "role": "service_port", "value": 47002,
                 "source": "evidence", "consumers": ["deploy.port"],
             },
+            {
+                "name": "redis_container_port", "kind": "port", "status": "frozen",
+                "role": "container_internal_port", "value": 6379,
+                "source": "image_contract", "consumers": ["deploy.container_port"],
+            },
         ],
         "changes": [
             {
@@ -747,3 +752,65 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
 
     assert finalized.status == "ready"
     assert finalized.plan is outcome.candidate_plan
+
+
+def test_planner_normalizes_derived_config_path_and_hidden_selected_port():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, evidence_id = _bundle_and_conclusion()
+    payload = {
+        "status": "ready",
+        "goal": "deploy v4e2e",
+        "resources": [
+            {
+                "name": "instance_root", "kind": "path", "status": "frozen",
+                "role": "instance_root", "value": "/srv/v4e2e",
+                "source": "user_input", "consumers": ["clone.repository"],
+            },
+            {
+                "name": "source_remote", "kind": "identifier", "status": "frozen",
+                "role": "source_remote", "value": "gitee:example/platform.git",
+                "source": "evidence", "consumers": ["clone.url"],
+            },
+            {
+                "name": "source_branch", "kind": "identifier", "status": "frozen",
+                "role": "source_branch", "value": "develop",
+                "source": "evidence", "consumers": ["clone.ref"],
+            },
+            {
+                "name": "instance_identifier", "kind": "identifier", "status": "frozen",
+                "role": "instance_identifier", "value": "v4e2e",
+                "source": "user_input", "consumers": ["clone.instance_name"],
+            },
+        ],
+        "changes": [
+            {
+                "step_id": "clone", "title": "clone", "objective": "clone",
+                "reason": "clone", "evidence_refs": [evidence_id], "depends_on": [],
+                "risk": "medium", "expected_changes": ["clone repository"],
+                "postconditions": [
+                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/.git"}}
+                ],
+            },
+            {
+                "step_id": "configure", "title": "configure ports",
+                "objective": "configure master port", "reason": "isolate",
+                "evidence_refs": [evidence_id], "depends_on": ["clone"],
+                "risk": "medium", "expected_changes": ["Set master_port to 47009"],
+                "postconditions": [
+                    {"checker": "file_contains", "args": {"path": "/srv/v4e2e/config.py", "text": "master_port = 47009"}}
+                ],
+            },
+        ],
+        "assumptions": [],
+    }
+
+    outcome = V4ChangePlannerAgent(FakeLLM([json.dumps(payload)])).plan(
+        "deploy isolated v4e2e to /srv/v4e2e", bundle, conclusion
+    )
+
+    assert outcome.status == "need_evidence"
+    assert outcome.probe_requests[0].args == {"ports": [47009]}
+    resources = outcome.candidate_plan.resources
+    assert any(item.kind == "port" and item.value == 47009 for item in resources)
+    assert any(item.kind == "path" and item.value == "/srv/v4e2e/config.py" for item in resources)

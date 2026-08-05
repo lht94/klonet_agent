@@ -91,7 +91,9 @@ ChangeStep may contain multiple related attributes or components; the Binding
 stage will decompose it into atomic Action/Shell implementation steps. For an
 isolated deployment, explicitly plan new uniquely named containers and
 sessions; never assume reuse of an existing resource. Every numeric port used
-anywhere in changes or postconditions must have its own frozen port resource.
+in host configuration or postconditions must have its own frozen port resource.
+Mark fixed image/container-side ports with role `container_internal_port`;
+only host/listening ports require availability proof.
 """.strip()
 
 
@@ -189,7 +191,8 @@ class V4ChangePlannerAgent:
                                 "Do not reuse or modify existing instance resources. "
                                 "Keep semantic changes cohesive and let Binding split "
                                 "them into atomic implementation steps. Freeze every "
-                                "numeric port used anywhere in the plan."
+                                "host/listening port used anywhere in the plan; mark "
+                                "fixed container-side ports as container_internal_port."
                             )
                             % exc,
                         }
@@ -257,6 +260,7 @@ class V4ChangePlannerAgent:
             for item in data.get("resources", [])
             if isinstance(item, dict)
         ]
+        resources = self._normalize_derived_resources(data, resources)
         contract_errors = self._ready_contract_errors(
             data,
             goal,
@@ -337,7 +341,7 @@ class V4ChangePlannerAgent:
             )
         occupied = []
         for resource in candidate.resources:
-            if resource.status != "frozen" or resource.kind != "port":
+            if not V4ChangePlannerAgent._requires_host_port_availability(resource):
                 continue
             port = int(resource.value)
             relevant = [
@@ -449,7 +453,10 @@ class V4ChangePlannerAgent:
                 }
                 for role in roles
             ),
-            "port": any(item.kind == "port" for item in frozen),
+            "port": any(
+                V4ChangePlannerAgent._requires_host_port_availability(item)
+                for item in frozen
+            ),
         }
         missing_roles = [name for name, present in required_roles.items() if not present]
         if missing_roles:
@@ -537,12 +544,10 @@ class V4ChangePlannerAgent:
                 if not isinstance(change, dict):
                     continue
                 step_id = str(change.get("step_id") or "")
-                serialized = json.dumps(change, ensure_ascii=False)
-                used_ports = {
-                    int(match)
-                    for match in re.findall(r"(?<![\d.])([1-9]\d{3,4})(?![\d.])", serialized)
-                    if 1024 <= int(match) <= 65535
-                }
+                used_ports = V4ChangePlannerAgent._used_ports_by_step(data).get(
+                    step_id,
+                    set(),
+                )
                 for port in sorted(used_ports - frozen_port_values):
                     errors.append(
                         "change %s uses unfrozen port=%s" % (step_id, port)
@@ -644,7 +649,11 @@ class V4ChangePlannerAgent:
             errors.append(
                 "port resource lacks availability evidence=%s" % port_resource.name
             )
-        for port_resource in (item for item in frozen if item.kind == "port"):
+        for port_resource in (
+            item
+            for item in frozen
+            if V4ChangePlannerAgent._requires_host_port_availability(item)
+        ):
             port = int(port_resource.value)
             relevant = [
                 record
@@ -673,13 +682,151 @@ class V4ChangePlannerAgent:
         return errors
 
     @staticmethod
+    def _normalize_derived_resources(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> list[PlanResource]:
+        normalized = list(resources)
+        by_port = {
+            int(item.value): item
+            for item in normalized
+            if V4ChangePlannerAgent._requires_host_port_availability(item)
+        }
+        for step_id, ports in V4ChangePlannerAgent._used_ports_by_step(data).items():
+            for port in sorted(ports):
+                consumer = "%s.port_%s" % (step_id, port)
+                existing = by_port.get(port)
+                if existing is not None:
+                    if consumer not in existing.consumers:
+                        existing.consumers.append(consumer)
+                    continue
+                resource = PlanResource(
+                    name="derived_host_port_%s" % port,
+                    kind="port",
+                    status="frozen",
+                    role="selected_host_port",
+                    value=port,
+                    source="derived_from_change_contract",
+                    consumers=[consumer],
+                )
+                normalized.append(resource)
+                by_port[port] = resource
+
+        root = next(
+            (
+                item
+                for item in normalized
+                if item.status == "frozen"
+                and item.kind == "path"
+                and str(item.role or "").lower()
+                in {"instance_root", "target_root", "deployment_root"}
+            ),
+            None,
+        )
+        if root is None:
+            return normalized
+        root_text = str(root.value).rstrip("/")
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return normalized
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            step_id = str(change.get("step_id") or "")
+            postconditions = change.get("postconditions")
+            if not isinstance(postconditions, list):
+                continue
+            for check in postconditions:
+                args = check.get("args") if isinstance(check, dict) else None
+                path = str(args.get("path") or "") if isinstance(args, dict) else ""
+                if not path.startswith(root_text + "/") or path == root_text + "/.git":
+                    continue
+                consumer = "%s.path" % step_id
+                existing = next(
+                    (
+                        item
+                        for item in normalized
+                        if item.status == "frozen"
+                        and item.kind == "path"
+                        and str(item.value) == path
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if consumer not in existing.consumers:
+                        existing.consumers.append(consumer)
+                    continue
+                normalized.append(
+                    PlanResource(
+                        name="derived_path_%s" % (len(normalized) + 1),
+                        kind="path",
+                        status="frozen",
+                        role="derived_configuration_path",
+                        value=path,
+                        source="derived_from_instance_root",
+                        consumers=[consumer],
+                    )
+                )
+        return normalized
+
+    @staticmethod
+    def _used_ports_by_step(data: dict[str, Any]) -> dict[str, set[int]]:
+        result: dict[str, set[int]] = {}
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return result
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            step_id = str(change.get("step_id") or "")
+            ports: set[int] = set()
+            text_parts = [
+                str(change.get("title") or ""),
+                str(change.get("objective") or ""),
+            ]
+            expected = change.get("expected_changes")
+            if isinstance(expected, list):
+                text_parts.extend(str(item) for item in expected)
+            text = "\n".join(text_parts)
+            for match in re.findall(
+                r"(?:\bport\b|_port|\u7aef\u53e3).{0,20}?([1-9]\d{1,4})(?![\d.])",
+                text,
+                re.I,
+            ):
+                port = int(match)
+                if 1 <= port <= 65535:
+                    ports.add(port)
+            postconditions = change.get("postconditions")
+            if isinstance(postconditions, list):
+                for check in postconditions:
+                    args = check.get("args") if isinstance(check, dict) else None
+                    if not isinstance(args, dict):
+                        continue
+                    if str(check.get("checker") or "") == "port_listening":
+                        try:
+                            port = int(args.get("port"))
+                        except (TypeError, ValueError):
+                            port = 0
+                        if 1 <= port <= 65535:
+                            ports.add(port)
+                    for value in args.values():
+                        if not isinstance(value, str):
+                            continue
+                        for match in re.findall(r"https?://[^\s/:]+:(\d{1,5})", value):
+                            port = int(match)
+                            if 1 <= port <= 65535:
+                                ports.add(port)
+            result[step_id] = ports
+        return result
+
+    @staticmethod
     def _unproven_port_resources(
         resources: list[PlanResource],
         bundle: EvidenceBundle,
     ) -> list[PlanResource]:
         unproven = []
         for resource in resources:
-            if resource.status != "frozen" or resource.kind != "port":
+            if not V4ChangePlannerAgent._requires_host_port_availability(resource):
                 continue
             port = int(resource.value)
             if not any(
@@ -689,6 +836,18 @@ class V4ChangePlannerAgent:
             ):
                 unproven.append(resource)
         return unproven
+
+    @staticmethod
+    def _requires_host_port_availability(resource: PlanResource) -> bool:
+        if resource.status != "frozen" or resource.kind != "port":
+            return False
+        role_and_name = "%s %s" % (resource.role or "", resource.name or "")
+        lowered = role_and_name.lower()
+        return not (
+            "internal" in lowered
+            or "container_port" in lowered
+            or "image_port" in lowered
+        )
 
     @staticmethod
     def _steps(value: Any, bundle: EvidenceBundle) -> list[ChangeStepV4]:
