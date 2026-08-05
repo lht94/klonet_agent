@@ -349,6 +349,7 @@ class V4ChangePlannerAgent:
     ) -> set[str]:
         goal_text = str(goal or "").lower()
         roots: set[str] = set()
+        all_grounded_roots: set[str] = set()
         for record in bundle.records:
             if record.status != "available" or record.request.probe != "screen":
                 continue
@@ -364,8 +365,6 @@ class V4ChangePlannerAgent:
                     session,
                     flags=re.I,
                 )
-                if prefix.lower() not in goal_text:
-                    continue
                 for root in match.group(2).split(","):
                     if root == "unknown" or not root:
                         continue
@@ -375,8 +374,14 @@ class V4ChangePlannerAgent:
                         and re.search(r"status=##\s+[^\s]+", output) is not None
                     )
                     if grounded:
-                        roots.add(root)
-        return roots
+                        all_grounded_roots.add(root)
+                        if prefix.lower() in goal_text:
+                            roots.add(root)
+        if roots:
+            return roots
+        if "screen" in goal_text and len(all_grounded_roots) == 1:
+            return all_grounded_roots
+        return set()
 
     @staticmethod
     def _is_redundant_source_request(

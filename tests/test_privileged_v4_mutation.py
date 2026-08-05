@@ -227,6 +227,10 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             ),
         )
     )
+    assert V4ChangePlannerAgent._authoritative_screen_source_roots(
+        "use the selected Screen source",
+        bundle,
+    ) == {"/home/lzl/vemu_uestc"}
 
     with pytest.raises(ValueError, match="authoritative Screen source evidence"):
         V4ChangePlannerAgent(None)._outcome(
