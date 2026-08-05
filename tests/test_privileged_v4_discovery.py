@@ -112,6 +112,37 @@ def test_discovery_marks_budget_exhaustion_instead_of_replanning_forever():
     assert len(llm.calls) == 2
 
 
+def test_discovery_normalizes_screen_evidence_section_aliases_to_registered_probe():
+    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "need_evidence",
+                    "probe_requests": [
+                        {"probe": "screen", "args": {}, "purpose": "sessions"},
+                        {
+                            "probe": "screen_git_repositories",
+                            "args": {},
+                            "purpose": "mistaken section alias",
+                        },
+                    ],
+                }
+            ),
+            json.dumps({"status": "ready"}),
+        ]
+    )
+    calls = []
+    bundle = V4DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: calls.append(requests) or "screen evidence",
+    ).collect("inspect Screen source")
+
+    assert [item.request.probe for item in bundle.records] == ["screen"]
+    assert len(calls) == 1
+
+
 def test_discovery_collect_requests_adds_only_fresh_registered_evidence():
     from klonet_agent.ops.privileged.v4.contracts import (
         EvidenceBundle,

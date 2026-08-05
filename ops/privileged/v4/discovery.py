@@ -257,14 +257,22 @@ class V4DiscoveryAgent:
         if not isinstance(value, list):
             return []
         requests = []
+        known_keys: set[str] = set()
+        aliases = {
+            "screen_runtime": "screen",
+            "screen_git_repositories": "screen",
+        }
         for item in value:
             if not isinstance(item, dict):
                 continue
-            requests.append(
-                ProbeRequest(
-                    probe=str(item.get("probe") or ""),
-                    args=item.get("args") if isinstance(item.get("args"), dict) else {},
-                    purpose=str(item.get("purpose") or "collect required fact"),
-                )
+            requested_probe = str(item.get("probe") or "").strip()
+            request = ProbeRequest(
+                probe=aliases.get(requested_probe, requested_probe),
+                args=item.get("args") if isinstance(item.get("args"), dict) else {},
+                purpose=str(item.get("purpose") or "collect required fact"),
             )
+            if request.cache_key in known_keys:
+                continue
+            known_keys.add(request.cache_key)
+            requests.append(request)
         return requests
