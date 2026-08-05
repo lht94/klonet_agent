@@ -171,6 +171,44 @@ def test_discovery_collect_requests_adds_only_fresh_registered_evidence():
     assert calls[0][0]["probe"] == "ports"
 
 
+def test_discovery_derives_structured_git_record_from_unique_screen_source():
+    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "need_evidence",
+                    "probe_requests": [
+                        {"probe": "screen", "args": {}, "purpose": "source"}
+                    ],
+                }
+            ),
+            json.dumps({"status": "ready"}),
+        ]
+    )
+    output = (
+        "session=vemu_uestc_m git_roots=/home/lzl/vemu_uestc\n"
+        "path=/home/lzl/vemu_uestc inside_work_tree=true revision=abc\n"
+        "status=## develop...origin/develop\n"
+        "remotes=origin\tgitee:example/vemu.git (fetch)"
+    )
+    calls = []
+    bundle = V4DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: calls.append(requests) or output,
+    ).collect("use Screen prefix vemu_uestc as source")
+
+    assert [item.request.probe for item in bundle.records] == [
+        "screen",
+        "git_repository",
+    ]
+    derived = bundle.records[1]
+    assert derived.request.args == {"repository": "/home/lzl/vemu_uestc"}
+    assert "derived authoritative Screen source" in derived.request.purpose
+    assert len(calls) == 1
+
+
 def test_synthesis_repairs_unknown_evidence_reference_once():
     from klonet_agent.ops.privileged.v4.contracts import (
         EvidenceBundle,

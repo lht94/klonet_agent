@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
@@ -108,7 +109,10 @@ class V4DiscoveryAgent:
             except Exception as exc:
                 output = "probe failed: %s" % type(exc).__name__
                 status = "unavailable"
-            bundle.add(EvidenceRecord.from_probe(request, output, status=status))
+            record = bundle.add(
+                EvidenceRecord.from_probe(request, output, status=status)
+            )
+            self._add_derived_screen_source(bundle, record)
         return bundle
 
     def collect(
@@ -226,6 +230,7 @@ class V4DiscoveryAgent:
                         status=status_value,
                     )
                 )
+                self._add_derived_screen_source(bundle, record)
                 evidence_sections.append(
                     "%s (%s):\n%s"
                     % (record.evidence_id, request.probe, record.output[:7000])
@@ -241,6 +246,43 @@ class V4DiscoveryAgent:
                     % ("\n\n".join(evidence_sections) or "No new evidence; duplicates were reused."),
                 }
             )
+
+    @staticmethod
+    def _add_derived_screen_source(
+        bundle: EvidenceBundle,
+        record: EvidenceRecord,
+    ) -> None:
+        if (
+            record.status != "available"
+            or record.request.probe != "screen"
+            or "screen" not in str(bundle.goal or "").lower()
+            or "remotes=origin" not in record.output
+        ):
+            return
+        roots = {
+            match.group(1)
+            for match in re.finditer(
+                r"\bpath=(/[^\s]+)\s+inside_work_tree=true",
+                record.output,
+            )
+        }
+        if len(roots) != 1:
+            return
+        root = next(iter(roots))
+        request = ProbeRequest(
+            "git_repository",
+            {"repository": root},
+            "derived authoritative Screen source Git repository",
+        )
+        if any(item.request.cache_key == request.cache_key for item in bundle.records):
+            return
+        bundle.add(
+            EvidenceRecord.from_probe(
+                request,
+                record.output,
+                status="available",
+            )
+        )
 
     def _complete(self, messages: list[dict[str, str]]) -> str:
         response = self.llm.complete(
