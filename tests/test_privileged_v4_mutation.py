@@ -986,6 +986,120 @@ def test_change_planner_derives_frozen_source_revision_for_clone_binding():
     assert revision.consumers == ["clone.revision"]
 
 
+def test_complete_klonet_deployment_contract_requires_all_runtime_components_and_ports():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    resources = [
+        PlanResource(
+            "instance_identifier", "identifier", "frozen", "instance_identifier",
+            "v4e2e", "user_input", consumers=["start.instance_name"],
+        ),
+        PlanResource(
+            "web_port", "port", "frozen", "service_port", 47001,
+            "evidence", consumers=["start.web_port"],
+        ),
+        PlanResource(
+            "master_port", "port", "frozen", "master_port", 47002,
+            "evidence", consumers=["start.master_port"],
+        ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 47003,
+            "evidence", consumers=["start.worker_port"],
+        ),
+    ]
+    data = {
+        "goal": "deploy a complete isolated Klonet platform instance",
+        "assumptions": [],
+        "changes": [
+            {
+                "step_id": "start",
+                "title": "Start application services",
+                "objective": "Start web, master and worker Screen sessions",
+                "depends_on": [],
+                "risk": "high",
+                "expected_changes": [
+                    "Create v4e2e_web", "Create v4e2e_master", "Create v4e2e_worker"
+                ],
+                "postconditions": [
+                    {"checker": "screen_session_exists", "args": {"session": "v4e2e_web"}},
+                    {"checker": "screen_session_exists", "args": {"session": "v4e2e_master"}},
+                    {"checker": "screen_session_exists", "args": {"session": "v4e2e_worker"}},
+                ],
+            }
+        ],
+    }
+
+    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+        data, resources
+    )
+
+    assert "complete Klonet runtime missing components=celery" in errors
+    assert "complete Klonet runtime missing port resources=web_terminal_port" in errors
+    assert "complete Klonet runtime missing Screen sessions=v4e2e_c,v4e2e_m,v4e2e_w" in errors
+
+
+def test_complete_klonet_deployment_contract_requires_config_fields_and_master_nginx_upstream():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    resources = [
+        PlanResource(
+            "instance_identifier", "identifier", "frozen", "instance_identifier",
+            "v4e2e", "user_input", consumers=["start.instance_name"],
+        ),
+        PlanResource(
+            "master_port", "port", "frozen", "master_port", 47001,
+            "evidence", consumers=["config.master_port"],
+        ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 47002,
+            "evidence", consumers=["config.worker_port"],
+        ),
+        PlanResource(
+            "web_terminal_port", "port", "frozen", "web_terminal_port", 47003,
+            "evidence", consumers=["config.web_terminal_port"],
+        ),
+    ]
+    data = {
+        "goal": "deploy a complete isolated Klonet platform instance",
+        "changes": [
+            {
+                "step_id": "config",
+                "title": "Configure isolated services",
+                "objective": "Set application and MySQL, Redis, RabbitMQ ports",
+                "expected_changes": ["configure all ports"],
+                "postconditions": [],
+            },
+            {
+                "step_id": "start",
+                "title": "Start master, celery, web terminal and worker",
+                "objective": "Start complete application runtime",
+                "expected_changes": ["v4e2e_m v4e2e_c v4e2e_web v4e2e_w"],
+                "postconditions": [
+                    {"checker": "screen_session_exists", "args": {"session": name}}
+                    for name in ("v4e2e_m", "v4e2e_c", "v4e2e_web", "v4e2e_w")
+                ],
+            },
+            {
+                "step_id": "nginx",
+                "title": "Install Nginx site",
+                "objective": "Proxy the Nginx entry point to web terminal 47003",
+                "expected_changes": ["Nginx proxies to 47003"],
+                "postconditions": [],
+            },
+        ],
+    }
+
+    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
+
+    assert (
+        "complete Klonet configuration missing attributes="
+        "master_port,worker_port,web_terminal_port,mysql_port,redis_port,rabbitmq_port"
+    ) in errors
+    assert "complete Klonet Nginx must proxy to frozen master_port=47001" in errors
+
+
 def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

@@ -107,6 +107,17 @@ availability-verified frozen port; its http_status postcondition must include
 that port instead of implicitly checking an existing port 80 route. Missing
 image or credential details are resolvable by Discovery and Binding and must
 never justify sharing an existing service.
+
+A complete Klonet platform runtime has exactly four Screen components:
+master (`<instance>_m`), celery (`<instance>_c`), web terminal
+(`<instance>_web`), and worker (`<instance>_w`). It has distinct frozen
+`master_port`, `worker_port`, and `web_terminal_port` host resources; celery
+does not listen on a fourth application port. Configuration changes must name
+those exact Python attributes as well as mysql_port, redis_port and
+rabbitmq_port when isolated stateful containers are planned. The Nginx site
+fronts the master application port; web-terminal and worker liveness are
+proved independently. Do not rename the web-terminal port to a generic
+`web_port`, and do not spell Screen suffixes as `_master` or `_worker`.
 """.strip()
 
 
@@ -1110,6 +1121,137 @@ class V4ChangePlannerAgent:
                         "isolated Nginx requires an explicit frozen dedicated "
                         "listen port=%s" % step_id
                     )
+        errors.extend(
+            V4ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
+        )
+        return errors
+
+    @staticmethod
+    def _complete_klonet_contract_errors(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> list[str]:
+        """Keep a requested complete platform from degrading into a partial start."""
+
+        goal = str(data.get("goal") or "")
+        if not (
+            re.search(r"(?:complete|full|fully operational|完整|全量)", goal, re.I)
+            and re.search(r"(?:klonet|platform|instance|平台|实例)", goal, re.I)
+        ):
+            return []
+        payload = json.dumps(data.get("changes", []), ensure_ascii=False).lower()
+        component_patterns = {
+            "master": r"\bmaster\b",
+            "worker": r"\bworker\b",
+            "celery": r"\bcelery\b",
+            "web_terminal": r"web[_ -]?terminal|_web\b",
+        }
+        missing_components = [
+            name
+            for name, pattern in component_patterns.items()
+            if not re.search(pattern, payload, re.I)
+        ]
+        errors = []
+        if missing_components:
+            errors.append(
+                "complete Klonet runtime missing components=%s"
+                % ",".join(missing_components)
+            )
+        role_texts = {
+            re.sub(
+                r"[^a-z0-9_]+",
+                "_",
+                "%s %s" % (resource.name, resource.role),
+            ).strip("_")
+            for resource in resources
+            if resource.status == "frozen" and resource.kind == "port"
+        }
+        missing_ports = [
+            name
+            for name in ("master_port", "worker_port", "web_terminal_port")
+            if not any(name in text for text in role_texts)
+        ]
+        if missing_ports:
+            errors.append(
+                "complete Klonet runtime missing port resources=%s"
+                % ",".join(missing_ports)
+            )
+        instance = next(
+            (
+                str(resource.value)
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.role in {
+                    "instance_identifier", "instance_name", "platform_instance_name"
+                }
+            ),
+            "",
+        )
+        if instance:
+            sessions = {
+                str((check.get("args") or {}).get("session") or "")
+                for change in data.get("changes", [])
+                if isinstance(change, dict)
+                for check in change.get("postconditions", [])
+                if isinstance(check, dict)
+                and check.get("checker") == "screen_session_exists"
+            }
+            expected = {"%s_%s" % (instance, suffix) for suffix in ("m", "c", "web", "w")}
+            missing_sessions = sorted(expected - sessions)
+            if missing_sessions:
+                errors.append(
+                    "complete Klonet runtime missing Screen sessions=%s"
+                    % ",".join(missing_sessions)
+                )
+        changes = [
+            change for change in data.get("changes", []) if isinstance(change, dict)
+        ]
+        config_payload = "\n".join(
+            json.dumps(change, ensure_ascii=False).lower()
+            for change in changes
+            if re.search(
+                r"config|配置",
+                "%s %s" % (change.get("title", ""), change.get("objective", "")),
+                re.I,
+            )
+        )
+        required_attributes = (
+            "master_port", "worker_port", "web_terminal_port",
+            "mysql_port", "redis_port", "rabbitmq_port",
+        )
+        missing_attributes = [
+            attribute
+            for attribute in required_attributes
+            if attribute not in config_payload
+        ]
+        if missing_attributes:
+            errors.append(
+                "complete Klonet configuration missing attributes=%s"
+                % ",".join(missing_attributes)
+            )
+        master_port = next(
+            (
+                int(resource.value)
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.kind == "port"
+                and "master_port" in "%s %s" % (resource.name, resource.role)
+            ),
+            None,
+        )
+        nginx_payload = "\n".join(
+            json.dumps(change, ensure_ascii=False).lower()
+            for change in changes
+            if "nginx" in json.dumps(change, ensure_ascii=False).lower()
+        )
+        if master_port is not None and (
+            not re.search(r"\bmaster\b", nginx_payload, re.I)
+            or str(master_port) not in nginx_payload
+        ):
+            errors.append(
+                "complete Klonet Nginx must proxy to frozen master_port=%s"
+                % master_port
+            )
         return errors
 
     @staticmethod

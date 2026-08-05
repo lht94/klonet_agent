@@ -9,6 +9,7 @@ from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
 from klonet_agent.ops.privileged.v4.coordinator import V4WorkflowResult
 from klonet_agent.ops.privileged.v4.binding import V4BindingError
 from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
+from klonet_agent.tools.environment import redact_sensitive_text
 
 
 class V4MutationWorkflow:
@@ -374,7 +375,7 @@ class V4MutationWorkflow:
                 if binding.kind == "registered_action":
                     lines.append(
                         "  binding: registered_action: %s args=%s"
-                        % (binding.action, binding.args)
+                        % (binding.action, _redacted_binding_args(binding.args))
                     )
                     continue
                 artifact = binding.shell_artifact
@@ -402,3 +403,34 @@ class V4MutationWorkflow:
             ]
         )
         return "\n".join(lines)
+
+
+def _redacted_binding_args(args: dict[str, Any]) -> str:
+    """Render a reviewable contract without disclosing credential values."""
+
+    safe: dict[str, Any] = {}
+    sensitive = re.compile(r"password|passwd|pwd|secret|token|credential", re.I)
+    for key, value in args.items():
+        if sensitive.search(str(key)):
+            safe[key] = "[REDACTED]"
+            continue
+        if key == "environment" and isinstance(value, list):
+            rendered = []
+            for item in value:
+                name, separator, _content = str(item).partition("=")
+                rendered.append(
+                    "%s=[REDACTED]" % name
+                    if separator and sensitive.search(name)
+                    else str(item)
+                )
+            safe[key] = rendered
+            continue
+        if key == "command" and isinstance(value, list):
+            rendered = list(value)
+            for index, item in enumerate(rendered[:-1]):
+                if str(item).lower() in {"--requirepass", "--password", "--passwd"}:
+                    rendered[index + 1] = "[REDACTED]"
+            safe[key] = rendered
+            continue
+        safe[key] = value
+    return redact_sensitive_text(str(safe))

@@ -619,6 +619,53 @@ def test_direct_runner_creates_new_container_with_bounded_docker_argv(monkeypatc
     assert "private-value" not in result.output
 
 
+def test_direct_runner_allows_only_bounded_redis_password_command(monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    calls = []
+    monkeypatch.setattr(module.shutil, "which", lambda program: "/usr/bin/docker")
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+
+    def command_runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1:3] == ["container", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, "", "No such object")
+        return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
+
+    runner = DirectPrivilegedActionRunner(command_runner=command_runner)
+    completed = runner(
+        _step(
+            "create_docker_container",
+            {
+                "name": "v4e2e-redis",
+                "image": "redis:7",
+                "port_bindings": ["127.0.0.1:47005:6379"],
+                "command": ["redis-server", "--requirepass", "local-secret"],
+            },
+            risk="high",
+        )
+    )
+    blocked = runner(
+        _step(
+            "create_docker_container",
+            {
+                "name": "v4e2e-redis-unsafe",
+                "image": "redis:7",
+                "port_bindings": ["127.0.0.1:47015:6379"],
+                "command": ["sh", "-c", "touch /tmp/unsafe"],
+            },
+            risk="high",
+        )
+    )
+
+    assert completed.status == "completed"
+    assert calls[2][-4:] == ["redis:7", "redis-server", "--requirepass", "local-secret"]
+    assert "local-secret" not in completed.output
+    assert blocked.status == "blocked"
+    assert "invalid_container_command" in blocked.output
+
+
 def test_direct_runner_refuses_to_replace_existing_container(monkeypatch):
     from klonet_agent.ops.privileged import action_runner as module
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner

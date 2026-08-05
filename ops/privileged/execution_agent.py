@@ -2325,6 +2325,7 @@ def _action_arg_json_schema(name: str) -> dict[str, Any]:
         "entries",
         "port_bindings",
         "environment",
+        "command",
     }:
         return {"type": "array", "items": {"type": "string"}}
     if name in {"patch"}:
@@ -2341,7 +2342,7 @@ def _optional_action_args(action: str) -> list[str]:
         "upsert_python_class": ["base_class"],
         "set_python_config_assignment": ["assignment_name"],
         "set_python_class_attribute": ["class_name"],
-        "create_docker_container": ["environment", "restart_policy"],
+        "create_docker_container": ["environment", "restart_policy", "command"],
         "git_operation": [
             "url", "remote", "ref", "revision", "path", "tag", "create",
             "force_with_lease",

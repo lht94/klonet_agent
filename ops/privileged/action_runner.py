@@ -1930,6 +1930,7 @@ class DirectPrivilegedActionRunner:
         image = str(step.args.get("image") or "").strip()
         port_bindings = _string_list(step.args.get("port_bindings"))
         environment = _string_list(step.args.get("environment"))
+        command = _string_list(step.args.get("command"))
         restart_policy = str(
             step.args.get("restart_policy") or "unless-stopped"
         ).strip()
@@ -1943,6 +1944,8 @@ class DirectPrivilegedActionRunner:
             return self._blocked("invalid_container_port_bindings")
         if any(not _valid_container_environment(item) for item in environment):
             return self._blocked("invalid_container_environment")
+        if command and not _valid_container_command(name, image, command):
+            return self._blocked("invalid_container_command")
         if restart_policy not in {"no", "always", "unless-stopped", "on-failure"}:
             return self._blocked("invalid_container_restart_policy")
         docker = shutil.which("docker")
@@ -1977,6 +1980,7 @@ class DirectPrivilegedActionRunner:
         for variable in environment:
             argv.extend(["-e", variable])
         argv.append(image)
+        argv.extend(command)
         result = self._command(_sudo_if_needed(argv), timeout=step.timeout)
         if result.returncode != 0:
             return DirectActionResult(
@@ -3566,6 +3570,21 @@ def _valid_container_environment(value: str) -> bool:
         and _SAFE_ENV_KEY.fullmatch(key)
         and len(content) <= 2048
         and not any(character in content for character in ("\x00", "\n", "\r"))
+    )
+
+
+def _valid_container_command(name: str, image: str, command: list[str]) -> bool:
+    """Allow only the one service override required by the typed Redis contract."""
+
+    if not ("redis" in name.lower() and "redis" in image.lower()):
+        return False
+    if len(command) != 3 or command[:2] != ["redis-server", "--requirepass"]:
+        return False
+    password = command[2]
+    return bool(
+        8 <= len(password) <= 128
+        and not any(character.isspace() for character in password)
+        and not any(character in password for character in ("\x00", "\n", "\r"))
     )
 
 

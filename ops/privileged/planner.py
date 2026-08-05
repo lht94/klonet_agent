@@ -1489,6 +1489,21 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
             "no", "always", "unless-stopped", "on-failure",
         }:
             return "action=manage_container restart_policy_required"
+    if action == "create_docker_container" and args.get("command"):
+        command = args.get("command")
+        name = str(args.get("name") or "").lower()
+        image = str(args.get("image") or "").lower()
+        if not (
+            isinstance(command, list)
+            and len(command) == 3
+            and command[:2] == ["redis-server", "--requirepass"]
+            and isinstance(command[2], str)
+            and 8 <= len(command[2]) <= 128
+            and not any(character.isspace() for character in command[2])
+            and "redis" in name
+            and "redis" in image
+        ):
+            return "action=create_docker_container invalid_container_command"
     if action == "manage_docker_network":
         if operation in {"connect", "disconnect"} and not args.get("container"):
             return "action=manage_docker_network container_required"

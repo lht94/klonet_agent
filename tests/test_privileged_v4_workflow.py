@@ -5,6 +5,40 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_v4_confirmation_redacts_registered_action_credentials():
+    from klonet_agent.ops.privileged.contracts import ExecutionBinding
+    from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    step = ChangeStepV4(
+        step_id="redis",
+        title="create Redis",
+        objective="create isolated Redis",
+        risk="high",
+        expected_changes=["Redis container is created"],
+        postconditions=[{"checker": "exit_code_zero"}],
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="create_docker_container",
+            args={
+                "name": "v4e2e-redis",
+                "image": "redis:7",
+                "port_bindings": ["127.0.0.1:47005:6379"],
+                "command": ["redis-server", "--requirepass", "local-secret"],
+                "environment": ["REDIS_PASSWORD=local-secret"],
+            },
+            risk="high",
+            postconditions=[{"checker": "exit_code_zero"}],
+        ),
+    )
+    plan = ChangePlanV4.new(goal="deploy", risk="high", steps=[step])
+
+    message = V4MutationWorkflow._confirmation_message(plan)
+
+    assert "local-secret" not in message
+    assert "[REDACTED]" in message
+
+
 def _change_plan(*, hierarchical=False):
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
