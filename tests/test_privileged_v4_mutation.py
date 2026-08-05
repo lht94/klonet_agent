@@ -35,6 +35,12 @@ def _bundle_and_conclusion():
             "origin=gitee:example/platform.git branch=develop",
         )
     )
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("ports", {"ports": [47001]}, "freeze port"),
+            "inspect_ports\nno matching listeners",
+        )
+    )
     conclusion = EvidenceConclusion(
         confirmed_facts=[EvidenceClaim("source repository identified", [record.evidence_id])]
     )
@@ -220,7 +226,43 @@ def test_change_planner_builds_only_mutating_change_steps():
                             "value": "/srv/v4e2e",
                             "source": "user_input",
                             "consumers": ["clone.repository"],
-                        }
+                        },
+                        {
+                            "name": "source_remote",
+                            "kind": "identifier",
+                            "status": "frozen",
+                            "role": "source_remote",
+                            "value": "gitee:example/platform.git",
+                            "source": "evidence",
+                            "consumers": ["clone.url"],
+                        },
+                        {
+                            "name": "source_branch",
+                            "kind": "identifier",
+                            "status": "frozen",
+                            "role": "source_branch",
+                            "value": "develop",
+                            "source": "evidence",
+                            "consumers": ["clone.ref"],
+                        },
+                        {
+                            "name": "instance_identifier",
+                            "kind": "identifier",
+                            "status": "frozen",
+                            "role": "instance_identifier",
+                            "value": "v4e2e",
+                            "source": "user_input",
+                            "consumers": ["clone.instance_name"],
+                        },
+                        {
+                            "name": "master_port",
+                            "kind": "port",
+                            "status": "frozen",
+                            "role": "master_port",
+                            "value": 47001,
+                            "source": "evidence",
+                            "consumers": ["clone.port"],
+                        },
                     ],
                     "changes": [
                         {
@@ -290,7 +332,7 @@ def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint
     invalid = json.dumps(
         {
             "status": "ready",
-            "goal": "deploy",
+            "goal": "restart isolated service",
             "resources": [],
             "changes": [
                 {
@@ -306,7 +348,9 @@ def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint
     )
     llm = FakeLLM([invalid, invalid])
 
-    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = V4ChangePlannerAgent(llm).plan(
+        "restart isolated service", bundle, conclusion
+    )
 
     assert outcome.status == "blocked"
     assert "postconditions" in outcome.reason
@@ -335,7 +379,7 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
     ready = json.dumps(
         {
             "status": "ready",
-            "goal": "deploy",
+            "goal": "restart isolated service",
             "resources": [],
             "changes": [
                 {
@@ -359,8 +403,176 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
     )
     llm = FakeLLM([invalid_block, ready])
 
-    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = V4ChangePlannerAgent(llm).plan(
+        "restart isolated service", bundle, conclusion
+    )
 
     assert outcome.status == "ready"
     assert len(llm.calls) == 2
     assert "Discovery or Binding" in llm.calls[1]["messages"][-1]["content"]
+
+
+def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, evidence_id = _bundle_and_conclusion()
+    invalid = {
+        "status": "ready",
+        "goal": "deploy isolated instance to /srv/v4e2e",
+        "resources": [],
+        "changes": [
+            {
+                "step_id": "deploy",
+                "title": "deploy",
+                "objective": "clone into /srv/v4e2e",
+                "reason": "deploy",
+                "evidence_refs": [evidence_id],
+                "depends_on": [],
+                "risk": "high",
+                "expected_changes": ["/srv/v4e2e is created"],
+                "postconditions": [
+                    {
+                        "checker": "file_contains",
+                        "args": {"path": "/srv/v4e2e/config.py", "content": "x"},
+                    }
+                ],
+            }
+        ],
+    }
+    valid = {
+        **invalid,
+        "resources": [
+            {
+                "name": "instance_root",
+                "kind": "path",
+                "status": "frozen",
+                "role": "instance_root",
+                "value": "/srv/v4e2e",
+                "source": "user_input",
+                "consumers": ["deploy.repository"],
+            },
+            {
+                "name": "source_remote",
+                "kind": "identifier",
+                "status": "frozen",
+                "role": "source_remote",
+                "value": "gitee:example/platform.git",
+                "source": "evidence",
+                "consumers": ["deploy.url"],
+            },
+            {
+                "name": "source_branch",
+                "kind": "identifier",
+                "status": "frozen",
+                "role": "source_branch",
+                "value": "develop",
+                "source": "evidence",
+                "consumers": ["deploy.ref"],
+            },
+            {
+                "name": "instance_identifier",
+                "kind": "identifier",
+                "status": "frozen",
+                "role": "instance_identifier",
+                "value": "v4e2e",
+                "source": "user_input",
+                "consumers": ["deploy.instance_name"],
+            },
+            {
+                "name": "master_port",
+                "kind": "port",
+                "status": "frozen",
+                "role": "master_port",
+                "value": 47001,
+                "source": "evidence",
+                "consumers": ["deploy.port"],
+            },
+        ],
+        "changes": [
+            {
+                **invalid["changes"][0],
+                "postconditions": [
+                    {
+                        "checker": "file_contains",
+                        "args": {"path": "/srv/v4e2e/config.py", "text": "x"},
+                    }
+                ],
+            }
+        ],
+    }
+    llm = FakeLLM([json.dumps(invalid), json.dumps(valid)])
+
+    outcome = V4ChangePlannerAgent(llm).plan(
+        "deploy isolated instance to /srv/v4e2e",
+        bundle,
+        conclusion,
+    )
+
+    assert outcome.status == "ready"
+    assert {item.role for item in outcome.plan.resources} >= {
+        "instance_root",
+        "source_remote",
+        "source_branch",
+        "master_port",
+    }
+    repair = llm.calls[1]["messages"][-1]["content"]
+    assert "frozen resources" in repair
+    assert "missing_required_args=text" in repair
+
+
+def test_deployment_contract_preserves_fixed_names_from_original_goal():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, _, _ = _bundle_and_conclusion()
+    resources = [
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root", "/srv/v4e2e",
+            "user_input", consumers=["deploy.repository"],
+        ),
+        PlanResource(
+            "source_remote", "identifier", "frozen", "source_remote",
+            "gitee:example/platform.git", "evidence", consumers=["deploy.url"],
+        ),
+        PlanResource(
+            "source_branch", "identifier", "frozen", "source_branch", "develop",
+            "evidence", consumers=["deploy.ref"],
+        ),
+        PlanResource(
+            "instance_identifier", "identifier", "frozen", "instance_identifier",
+            "wrong-name", "user_input", consumers=["deploy.instance_name"],
+        ),
+        PlanResource(
+            "master_port", "port", "frozen", "master_port", 47001,
+            "evidence", consumers=["deploy.port"],
+        ),
+    ]
+    data = {
+        "status": "ready",
+        "goal": "deploy instance wrong-name",
+        "resources": [item.to_dict() for item in resources],
+        "changes": [
+            {
+                "step_id": "deploy",
+                "risk": "high",
+                "expected_changes": ["created"],
+                "postconditions": [
+                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e"}}
+                ],
+            }
+        ],
+        "assumptions": [],
+    }
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        data,
+        (
+            "deploy isolated instance to /srv/v4e2e; "
+            "实例名固定为 v4e2e，Nginx 配置名固定为 klonet-v4-e2e"
+        ),
+        resources,
+        bundle,
+    )
+
+    assert "fixed instance identifiers are not frozen=v4e2e" in errors
+    assert "fixed Nginx config names are not frozen=klonet-v4-e2e" in errors

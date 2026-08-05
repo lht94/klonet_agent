@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from klonet_agent.ops.privileged.contracts import PlanResource, RISK_LEVELS
+from klonet_agent.ops.privileged.checkers import (
+    CHECKER_REQUIRED_ARGS,
+    DefaultCheckerRegistry,
+)
 from klonet_agent.ops.privileged.v4.contracts import (
     ChangePlanV4,
     ChangeStepV4,
@@ -36,7 +41,23 @@ For status=ready, use this exact shape (repeat the change object as needed):
   "status": "ready",
   "goal": "...",
   "assumptions": [],
-  "resources": [],
+  "resources": [
+    {"name":"instance_root","kind":"path","status":"frozen",
+     "role":"instance_root","value":"/absolute/new/root",
+     "source":"user_input","consumers":["change-1.repository"]},
+    {"name":"source_remote","kind":"identifier","status":"frozen",
+     "role":"source_remote","value":"git@example/repository.git",
+     "source":"evidence","consumers":["change-1.url"]},
+    {"name":"source_branch","kind":"identifier","status":"frozen",
+     "role":"source_branch","value":"develop","source":"evidence",
+     "consumers":["change-1.ref"]},
+    {"name":"instance_identifier","kind":"identifier","status":"frozen",
+     "role":"instance_identifier","value":"new-instance",
+     "source":"user_input","consumers":["change-1.instance_name"]},
+    {"name":"service_port","kind":"port","status":"frozen",
+     "role":"service_port","value":47001,"source":"evidence",
+     "consumers":["change-1.port"]}
+  ],
   "changes": [{
     "step_id": "change-1",
     "title": "...",
@@ -149,7 +170,12 @@ class V4ChangePlannerAgent:
                                 "must include non-empty expected_changes and a non-empty "
                                 '"postconditions" array of objects shaped as '
                                 '{"checker":"file_exists","args":{"path":"/absolute/path"}}.'
-                                " Do not use readonly or summary steps."
+                                " Do not use readonly or summary steps. Deployment plans "
+                                "must include frozen resources for instance_root, "
+                                "source_remote, source_branch, instance identifiers, and "
+                                "every selected port, with semantic-step consumers such "
+                                "as change-1.repository, change-1.url, and change-1.ref. "
+                                "Do not reuse or modify existing instance resources."
                             )
                             % exc,
                         }
@@ -217,6 +243,14 @@ class V4ChangePlannerAgent:
             for item in data.get("resources", [])
             if isinstance(item, dict)
         ]
+        contract_errors = self._ready_contract_errors(
+            data,
+            goal,
+            resources,
+            bundle,
+        )
+        if contract_errors:
+            raise ValueError("; ".join(contract_errors))
         steps = self._steps(data.get("changes"), bundle)
         risk = max(steps, key=lambda item: RISK_LEVELS.index(item.risk)).risk
         assumptions = data.get("assumptions")
@@ -232,6 +266,259 @@ class V4ChangePlannerAgent:
                 else [],
             ),
         )
+
+    @staticmethod
+    def _ready_contract_errors(
+        data: dict[str, Any],
+        goal: str,
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+    ) -> list[str]:
+        errors: list[str] = []
+        known_checkers = set(DefaultCheckerRegistry().names)
+        changes = data.get("changes")
+        if isinstance(changes, list):
+            for step_index, change in enumerate(changes):
+                if not isinstance(change, dict):
+                    continue
+                if str(change.get("risk") or "").strip() == "readonly":
+                    errors.append("ChangeStepV4 cannot be readonly")
+                if not change.get("expected_changes"):
+                    errors.append(
+                        "change[%s] requires expected_changes" % step_index
+                    )
+                postconditions = change.get("postconditions")
+                if not isinstance(postconditions, list):
+                    errors.append(
+                        "change[%s] requires postconditions" % step_index
+                    )
+                    continue
+                if not postconditions:
+                    errors.append(
+                        "change[%s] requires postconditions" % step_index
+                    )
+                for check_index, check in enumerate(postconditions):
+                    if not isinstance(check, dict):
+                        errors.append(
+                            "change[%s].postcondition[%s] must be an object"
+                            % (step_index, check_index)
+                        )
+                        continue
+                    name = str(check.get("checker") or "").strip()
+                    args = check.get("args")
+                    if name not in known_checkers:
+                        errors.append(
+                            "change[%s].postcondition[%s] checker_not_registered=%s"
+                            % (step_index, check_index, name or "missing")
+                        )
+                        continue
+                    if not isinstance(args, dict):
+                        errors.append(
+                            "change[%s].postcondition[%s] args must be an object"
+                            % (step_index, check_index)
+                        )
+                        continue
+                    missing = [
+                        key
+                        for key in CHECKER_REQUIRED_ARGS.get(name, ())
+                        if key not in args or args[key] in (None, "")
+                    ]
+                    if missing:
+                        errors.append(
+                            "change[%s].postcondition[%s] checker=%s "
+                            "missing_required_args=%s"
+                            % (step_index, check_index, name, ",".join(missing))
+                        )
+        original_goal = str(goal or "")
+        planned_goal = str(data.get("goal") or "")
+        goal_text = "%s\n%s" % (original_goal, planned_goal)
+        deployment = bool(
+            re.search(r"\b(?:deploy|deployment|clone)\b|部署|克隆", goal_text, re.I)
+        )
+        if not deployment:
+            return errors
+        frozen = [item for item in resources if item.status == "frozen"]
+        roles = {str(item.role or "").lower(): item for item in frozen}
+        required_roles = {
+            "instance_root": any(
+                role in {"instance_root", "target_root", "deployment_root"}
+                for role in roles
+            ),
+            "source_remote": any(
+                "source" in role and ("remote" in role or "url" in role)
+                for role in roles
+            ),
+            "source_branch": any(
+                "source" in role and "branch" in role for role in roles
+            ),
+            "instance_identifier": any(
+                role in {
+                    "instance_identifier",
+                    "instance_name",
+                    "platform_instance_name",
+                }
+                for role in roles
+            ),
+            "port": any(item.kind == "port" for item in frozen),
+        }
+        missing_roles = [name for name, present in required_roles.items() if not present]
+        if missing_roles:
+            errors.append("missing frozen resources=%s" % ",".join(missing_roles))
+        explicit_paths = set(
+            match.rstrip(".,;:，。；：")
+            for match in re.findall(r"/[A-Za-z0-9_./-]+", goal_text)
+        )
+        frozen_paths = {str(item.value) for item in frozen if item.kind == "path"}
+        absent_paths = sorted(explicit_paths - frozen_paths)
+        if absent_paths:
+            errors.append("goal paths are not frozen=%s" % ",".join(absent_paths))
+        fixed_identifiers = [
+            value
+            for value in re.findall(
+                r"(?:实例名|instance name)\s*(?:固定)?\s*(?:为|is|=)\s*([A-Za-z0-9_.-]+)",
+                goal_text,
+                re.I,
+            )
+            if value
+        ]
+        frozen_identifiers = {
+            str(item.value)
+            for item in frozen
+            if str(item.role or "").lower()
+            in {
+                "instance_identifier",
+                "instance_name",
+                "platform_instance_name",
+            }
+        }
+        absent_identifiers = sorted(set(fixed_identifiers) - frozen_identifiers)
+        if absent_identifiers:
+            errors.append(
+                "fixed instance identifiers are not frozen=%s"
+                % ",".join(absent_identifiers)
+            )
+        fixed_nginx_names = [
+            value
+            for value in re.findall(
+                r"Nginx\s*配置名\s*(?:固定)?\s*(?:为|is|=)\s*([A-Za-z0-9_.-]+)",
+                original_goal,
+                re.I,
+            )
+            if value
+        ]
+        frozen_nginx_names = {
+            str(item.value)
+            for item in frozen
+            if str(item.role or "").lower()
+            in {"nginx_config_name", "nginx_site_name"}
+        }
+        absent_nginx_names = sorted(set(fixed_nginx_names) - frozen_nginx_names)
+        if absent_nginx_names:
+            errors.append(
+                "fixed Nginx config names are not frozen=%s"
+                % ",".join(absent_nginx_names)
+            )
+        step_ids = {
+            str(item.get("step_id") or "")
+            for item in changes or []
+            if isinstance(item, dict)
+        }
+        for resource in frozen:
+            if not resource.consumers:
+                errors.append("frozen resource has no consumers=%s" % resource.name)
+                continue
+            unknown = [
+                consumer
+                for consumer in resource.consumers
+                if consumer.rsplit(".", 1)[0] not in step_ids
+            ]
+            if unknown:
+                errors.append(
+                    "resource consumers reference unknown steps=%s"
+                    % ",".join(unknown)
+                )
+        root_resource = next(
+            (
+                item
+                for item in frozen
+                if str(item.role or "").lower()
+                in {"instance_root", "target_root", "deployment_root"}
+            ),
+            None,
+        )
+        if root_resource is not None and not any(
+            consumer.endswith(".repository") for consumer in root_resource.consumers
+        ):
+            errors.append("instance_root requires a .repository consumer")
+        source_remote = next(
+            (
+                item
+                for item in frozen
+                if "source" in str(item.role or "").lower()
+                and (
+                    "remote" in str(item.role or "").lower()
+                    or "url" in str(item.role or "").lower()
+                )
+            ),
+            None,
+        )
+        if source_remote is not None and not any(
+            consumer.endswith(".url") for consumer in source_remote.consumers
+        ):
+            errors.append("source_remote requires a .url consumer")
+        if source_remote is not None:
+            remote_value = str(source_remote.value)
+            if remote_value.startswith("/") or not any(
+                marker in remote_value for marker in (".git", ":", "https://", "ssh://")
+            ):
+                errors.append("source_remote must be a discovered Git remote")
+            elif not any(
+                remote_value in record.output for record in bundle.records
+            ):
+                errors.append("source_remote is not grounded in evidence")
+        source_branch = next(
+            (
+                item
+                for item in frozen
+                if "source" in str(item.role or "").lower()
+                and "branch" in str(item.role or "").lower()
+            ),
+            None,
+        )
+        if source_branch is not None and not any(
+            consumer.endswith(".ref") for consumer in source_branch.consumers
+        ):
+            errors.append("source_branch requires a .ref consumer")
+        if source_branch is not None and not any(
+            str(source_branch.value) in record.output for record in bundle.records
+        ):
+            errors.append("source_branch is not grounded in evidence")
+        for port_resource in (item for item in frozen if item.kind == "port"):
+            port = int(port_resource.value)
+            relevant = [
+                record
+                for record in bundle.records
+                if record.request.probe == "ports"
+                and port in record.request.args.get("ports", [])
+            ]
+            if not relevant:
+                errors.append(
+                    "port resource lacks availability evidence=%s" % port_resource.name
+                )
+                continue
+            if any(re.search(r":%s\b" % port, record.output) for record in relevant):
+                errors.append("port resource is already listening=%s" % port)
+        isolation_requested = bool(re.search(r"isolat|隔离|不干扰", goal_text, re.I))
+        assumptions = " ".join(
+            str(item) for item in data.get("assumptions", [])
+        ).lower()
+        if isolation_requested and re.search(
+            r"(?:reuse|share|复用|共享).{0,40}(?:existing|container|现有|容器)",
+            assumptions,
+            re.I,
+        ):
+            errors.append("isolated deployment cannot reuse existing resources")
+        return errors
 
     @staticmethod
     def _steps(value: Any, bundle: EvidenceBundle) -> list[ChangeStepV4]:
