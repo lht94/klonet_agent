@@ -30,6 +30,7 @@ STEP_STATUSES = {
     "approved",
     "running",
     "executed",
+    "applied_unverified",
     "verifying",
     "completed",
     "paused",
@@ -61,7 +62,7 @@ SHELL_ARTIFACT_STATUSES = {
     "failed",
     "expired",
 }
-PLAN_RESOURCE_STATUSES = {"frozen", "deferred"}
+PLAN_RESOURCE_STATUSES = {"frozen", "deferred", "disputed"}
 PLAN_RESOURCE_KINDS = {"path", "port", "url", "identifier", "string"}
 
 
@@ -76,6 +77,7 @@ class PlanResource:
     name: str
     kind: str
     status: str
+    role: str = ""
     value: Any = None
     source: str = ""
     reason: str = ""
@@ -107,6 +109,11 @@ class PlanResource:
                     "deferred plan resource requires reason and resolve_before"
                 )
             return
+        if self.status == "disputed":
+            if not self.reason:
+                raise ValueError("disputed plan resource requires reason")
+            if self.value in (None, ""):
+                raise ValueError("disputed plan resource keeps its previous value")
         if self.value in (None, ""):
             raise ValueError("frozen plan resource requires a value")
         if self.kind == "path":
@@ -147,6 +154,7 @@ class ExecutionEvidence:
     finished_at: str = ""
     timed_out: bool = False
     environment_changed: bool = False
+    mutation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -373,6 +381,9 @@ class FailurePacket:
     environment_changes: list[str] = field(default_factory=list)
     completed_steps: list[dict[str, Any]] = field(default_factory=list)
     remaining_steps: list[dict[str, Any]] = field(default_factory=list)
+    plan_resources: list[dict[str, Any]] = field(default_factory=list)
+    causal_steps: list[dict[str, Any]] = field(default_factory=list)
+    rollback: dict[str, Any] = field(default_factory=dict)
     reflection: str = ""
     environment_fingerprint: str = ""
     failure_fingerprint: str = ""
@@ -629,11 +640,27 @@ class PrivilegedPlan:
             name=resource.name,
             kind=resource.kind,
             status="frozen",
+            role=resource.role,
             value=value,
             source=source,
             consumers=list(resource.consumers),
         )
         self.resources[self.resources.index(resource)] = replacement
+        self.authorized_hash = ""
+        self.status = "awaiting_confirmation"
+        self.updated_at = utc_now()
+
+    def dispute_resource(self, name: str, *, reason: str) -> None:
+        """Mark a frozen value as contradicted without silently replacing it."""
+
+        resource = next(
+            (item for item in self.resources if item.name == name),
+            None,
+        )
+        if resource is None:
+            raise KeyError("unknown plan resource: %s" % name)
+        resource.status = "disputed"
+        resource.reason = str(reason or "deterministic evidence contradicted value")
         self.authorized_hash = ""
         self.status = "awaiting_confirmation"
         self.updated_at = utc_now()

@@ -1324,14 +1324,25 @@ def _validate_python_package_entries(site_packages_dir: str, package: str, entri
 
 def _allowed_site_packages_root(path: Path) -> bool:
     text = str(path).replace("\\", "/").rstrip("/")
-    if re.fullmatch(r"/home/klonet-agent/\.local/lib/python\d+(?:\.\d+)?/site-packages", text):
-        return True
-    return bool(
-        re.fullmatch(
-            r"/home/klonet-agent/(?:platforms|workspace|workspaces)/[^/]+/(?:\.venv|venv)/lib/python\d+(?:\.\d+)?/site-packages",
+    allowed_homes = {"/home/klonet-agent"}
+    current_home = str(Path.home()).replace("\\", "/").rstrip("/")
+    if re.fullmatch(r"/home/[A-Za-z0-9_.-]+", current_home):
+        allowed_homes.add(current_home)
+    for home in allowed_homes:
+        escaped = re.escape(home)
+        if re.fullmatch(
+            escaped + r"/\.local/lib/python\d+(?:\.\d+)?/site-packages",
             text,
-        )
-    )
+        ):
+            return True
+        if re.fullmatch(
+            escaped
+            + r"/(?:platforms|workspace|workspaces)/[^/]+/"
+            + r"(?:\.venv|venv)/lib/python\d+(?:\.\d+)?/site-packages",
+            text,
+        ):
+            return True
+    return False
 
 
 def _looks_unsafe_path(value: str) -> bool:

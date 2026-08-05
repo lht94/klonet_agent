@@ -96,9 +96,14 @@ def test_binding_agent_builds_and_binds_atomic_implementation_plan(tmp_path):
                             "objective": "verify the lht instance root directory exists",
                             "reason": "the created state must be observed",
                             "depends_on": ["create-root"],
-                            "expected_changes": [],
+                            "expected_changes": [
+                                "the directory state is confirmed"
+                            ],
                             "success_criteria": ["the directory exists"],
-                            "risk_suggestion": "readonly",
+                            # The model may accidentally inherit the outer
+                            # mutation risk. No expected state transition
+                            # still makes this a deterministic verifier.
+                            "risk_suggestion": "medium",
                         },
                     ],
                 }
@@ -164,6 +169,7 @@ def test_binding_agent_builds_and_binds_atomic_implementation_plan(tmp_path):
         "verification_only",
     ]
     assert micro_steps[1].depends_on == ["inspect__create-root"]
+    assert micro_steps[1].risk == "readonly"
     assert "planned predecessor inspect__create-root" in (
         micro_steps[1].evidence_refs[0]
     )
@@ -172,6 +178,539 @@ def test_binding_agent_builds_and_binds_atomic_implementation_plan(tmp_path):
     assert restored.steps[0].implementation_plan.steps[0].step_id == (
         "inspect__create-root"
     )
+
+
+def test_structural_class_binding_extracts_a_single_full_class_wrapper():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    compiled = _infer_structural_action_args(
+        "upsert_python_class",
+        {
+            "path": "/future/config.py",
+            "class_name": "LhtConfig",
+            "body": (
+                "class LhtConfig(CommonConfig):\n"
+                "    master_port = 46001\n"
+                "    worker_port = 46002\n"
+            ),
+        },
+        [],
+    )
+
+    assert compiled["base_class"] == "CommonConfig"
+    assert compiled["body"] == (
+        "master_port = 46001\nworker_port = 46002"
+    )
+
+
+def test_config_assignment_action_cannot_masquerade_as_port_field_edit():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_objective_fit,
+    )
+
+    edit_ports = PrivilegedStep(
+        step_id="ports",
+        title="写入四个端口字段",
+        objective="在 LhtConfig 类中设置 master 和 worker 端口",
+        expected_changes=["类字段变更"],
+        risk="medium",
+    )
+    activate = PrivilegedStep(
+        step_id="activate",
+        title="切换活动配置",
+        objective="将 PROJ_CONFIG 切换为 LhtConfig",
+        expected_changes=["活动配置变更"],
+        risk="medium",
+    )
+
+    assert "objective_is_not_config_activation" in (
+        _validate_action_objective_fit(
+            "set_python_config_assignment",
+            edit_ports,
+        )
+    )
+    assert not _validate_action_objective_fit(
+        "set_python_config_assignment",
+        activate,
+    )
+
+
+def test_micro_predecessor_can_produce_frozen_instance_root_for_validation():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _host_fact_is_planned_future,
+    )
+
+    step = PrivilegedStep(
+        step_id="copy__verify",
+        title="校验复制目录",
+        objective="验证项目结构",
+        evidence_refs=[
+            "planned semantic predecessor copy executes first; "
+            "objective=copy source tree; expected_changes=instance tree exists"
+        ],
+        depends_on=["copy__sync"],
+        risk="readonly",
+    )
+    resource = PlanResource(
+        name="instance_root",
+        kind="path",
+        status="frozen",
+        role="instance_root",
+        value="/home/lzl/lht",
+        source="derived",
+    )
+
+    assert _host_fact_is_planned_future(
+        "validate_project_files",
+        {"project_root": "/home/lzl/lht/vemu_uestc"},
+        step,
+        "grounding_failed=project_root_missing_entries:gun.py",
+        [resource],
+    )
+
+
+def test_manual_checkpoint_cannot_replace_automatic_start_action():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_objective_fit,
+    )
+
+    start = PrivilegedStep(
+        step_id="start",
+        title="启动 master 组件",
+        objective="启动 lht master screen 会话",
+        expected_changes=["master 会话运行"],
+        risk="high",
+    )
+
+    assert "cannot_produce_automatic_state_change" in (
+        _validate_action_objective_fit("manual_checkpoint", start)
+    )
+
+
+def test_readonly_verification_reselects_instead_of_starting_a_service(tmp_path):
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    plan = PrivilegedPlannerAgent(
+        FakeLLM([_semantic_payload(objective="confirm Redis is reachable")])
+    ).plan("确认 Redis 可用")
+    plan.steps[0].risk = "medium"
+    plan.steps[0].expected_changes = ["Redis state is confirmed"]
+    binder = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "ensure_klonet_redis_instance",
+                    "selection_reason": "incorrectly tries to repair it",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "verification_only",
+                    "selection_reason": "only observe service reachability",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "binding_reason": "TCP reachability proves the criterion",
+                    "postconditions": [
+                        {
+                                "checker": "port_listening",
+                            "args": {"host": "127.0.0.1", "port": 8368},
+                        }
+                    ],
+                }
+            ),
+        ]
+    )
+
+    bound = PrivilegedExecutionAgent(
+        binder,
+        enable_implementation_plans=False,
+    ).prepare_plan(plan, grounded_context=None)
+
+    assert bound.steps[0].execution_binding.kind == "verification_only"
+
+
+def test_micro_plan_inherits_outer_semantic_future_outputs():
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    prepare = PrivilegedStep(
+        step_id="prepare",
+        title="prepare runtime",
+        objective="create the lht runtime directory",
+        expected_changes=["/home/lzl/lht exists and contains copied source"],
+        risk="medium",
+    )
+    start = PrivilegedStep(
+        step_id="start",
+        title="start runtime",
+        objective="start lht from /home/lzl/lht",
+        depends_on=["prepare"],
+        risk="medium",
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-future-output",
+        goal="deploy lht",
+        risk="medium",
+        steps=[prepare, start],
+    )
+    llm = FakeLLM([
+        json.dumps(
+            {
+                "status": "ready",
+                "reason": "verify the predecessor output before launch",
+                "implementation_steps": [
+                    {
+                        "id": "verify-runtime",
+                        "title": "验证运行目录",
+                        "objective": "verify /home/lzl/lht is runnable",
+                        "reason": "launch requires the copied source",
+                        "depends_on": [],
+                        "expected_changes": [],
+                        "success_criteria": ["runtime directory exists"],
+                        "risk_suggestion": "readonly",
+                    }
+                ],
+            }
+        )
+    ])
+
+    steps = PrivilegedExecutionAgent(llm)._decompose_semantic_step(
+        plan,
+        start,
+        grounded_context=None,
+    )
+
+    assert any(
+        "planned semantic predecessor prepare executes first" in item
+        and "/home/lzl/lht exists" in item
+        for item in steps[0].evidence_refs
+    )
+
+
+def test_structural_python_action_rejects_nested_duplicate_class_contract():
+    from klonet_agent.ops.privileged.planner import _validate_action_semantics
+
+    problem = _validate_action_semantics(
+        "upsert_python_class",
+        {
+            "path": "/tmp/config.py",
+            "class_name": "LhtConfig",
+            "base_class": "CommonConfig",
+            "body": "class LhtConfig(CommonConfig):\n    master_port = 46001",
+        },
+    )
+
+    assert problem == (
+        "action=upsert_python_class body_must_not_include_class_header"
+    )
+
+
+def test_single_component_action_rejects_aggregate_or_mismatched_contract():
+    from klonet_agent.ops.privileged.planner import _validate_action_semantics
+
+    aggregate = _validate_action_semantics(
+        "start_screen_component",
+        {
+            "platform": "lht",
+            "component": "undefined",
+            "screen_session": "lht",
+            "project_root": "/home/lzl",
+        },
+    )
+    mismatch = _validate_action_semantics(
+        "start_screen_component",
+        {
+            "platform": "lht",
+            "component": "master",
+            "screen_session": "lht_w",
+            "project_root": "/home/lzl",
+        },
+    )
+
+    assert "invalid_component" in aggregate
+    assert mismatch.endswith("screen_session_mismatch")
+
+
+def test_binding_keeps_full_structural_python_body():
+    from klonet_agent.ops.privileged.execution_agent import _clean_binding_args
+
+    body = "\n".join("field_%s = %s" % (index, index) for index in range(200))
+
+    cleaned = _clean_binding_args({"body": body})
+
+    assert cleaned["body"] == body
+
+
+def test_duplicate_http_checks_compile_to_one_alternative_contract():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _merge_alternative_checker_contracts,
+    )
+
+    checks = _merge_alternative_checker_contracts(
+        [
+            {
+                "checker": "http_status",
+                "args": {"url": "http://127.0.0.1/lht/", "status": 200},
+            },
+            {
+                "checker": "http_status",
+                "args": {"url": "http://127.0.0.1/lht/", "status": 302},
+            },
+        ]
+    )
+
+    assert checks == [
+        {
+            "checker": "http_status",
+            "args": {
+                "url": "http://127.0.0.1/lht/",
+                "statuses": [200, 302],
+            },
+        }
+    ]
+
+
+def test_future_dependency_output_can_ground_nginx_install_source():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _host_fact_is_planned_future,
+    )
+
+    step = PrivilegedStep(
+        step_id="install-nginx",
+        title="install nginx config",
+        objective="install generated config",
+        evidence_refs=[
+            "planned predecessor copy-template executes first; "
+            "expected_changes=/home/lzl/lht/nginx/lht.conf exists"
+        ],
+        depends_on=["copy-template"],
+        risk="medium",
+    )
+
+    assert _host_fact_is_planned_future(
+        "install_nginx_config",
+        {"source_path": "/home/lzl/lht/nginx/lht.conf"},
+        step,
+        "grounding_failed=nginx_source_not_file",
+    )
+    assert not _host_fact_is_planned_future(
+        "install_nginx_config",
+        {"source_path": "/etc/shadow"},
+        step,
+        "grounding_failed=nginx_source_not_file",
+    )
+
+
+def test_frozen_instance_root_is_valid_future_runtime_after_prepare_step():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _host_fact_is_planned_future,
+    )
+
+    step = PrivilegedStep(
+        step_id="start__master",
+        title="start master",
+        objective="start copied instance",
+        evidence_refs=[
+            "planned semantic predecessor prepare executes first; "
+            "expected_changes=isolated source tree exists"
+        ],
+        depends_on=["prepare"],
+    )
+    resource = PlanResource(
+        name="instance_root",
+        kind="path",
+        status="frozen",
+        role="instance_root",
+        value="/home/lzl/lht",
+        source="derived",
+    )
+
+    assert _host_fact_is_planned_future(
+        "start_screen_component",
+        {"project_root": "/home/lzl/lht"},
+        step,
+        "grounding_failed=project_root_missing_entries:gun.py",
+        [resource],
+    )
+
+
+def test_micro_plan_cannot_add_http_health_before_backend_start():
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        _validate_micro_plan_dependency_shape,
+    )
+
+    route = PrivilegedStep(
+        step_id="route",
+        title="configure route",
+        objective="write nginx config",
+        risk="medium",
+    )
+    start = PrivilegedStep(
+        step_id="start",
+        title="启动平台组件",
+        objective="start platform services",
+        depends_on=["route"],
+        risk="high",
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-order",
+        goal="deploy",
+        risk="high",
+        steps=[route, start],
+    )
+    premature = PrivilegedStep(
+        step_id="route__http",
+        title="验证路由可访问",
+        objective="check HTTP route response",
+        success_criteria=["HTTP 200"],
+        risk="readonly",
+    )
+    author_only = PrivilegedStep(
+        step_id="route__write",
+        title="编写 Nginx 配置",
+        objective="write proxy_pass http://127.0.0.1:45661",
+        success_criteria=["配置包含 proxy_pass http://127.0.0.1:45661"],
+        risk="medium",
+    )
+
+    _validate_micro_plan_dependency_shape(plan, route, [author_only])
+
+    with pytest.raises(ExecutionBindingError, match="requires_backend_start"):
+        _validate_micro_plan_dependency_shape(plan, route, [premature])
+
+
+def test_frozen_resource_consumers_override_model_guessed_action_args():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _inject_frozen_resource_args,
+    )
+
+    step = PrivilegedStep(
+        step_id="prepare__sync",
+        title="sync source",
+        objective="copy source into isolated instance",
+    )
+    resources = [
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value="/home/lzl/vemu_uestc",
+            source="evidence",
+            consumers=["prepare.source"],
+        ),
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value="/home/lzl/lht",
+            source="derived",
+            consumers=["prepare.destination"],
+        ),
+    ]
+
+    compiled = _inject_frozen_resource_args(
+        step,
+        {
+            "source": "/wrong/source",
+            "destination": "/home/lzl/lht/vemu_uestc",
+        },
+        resources,
+    )
+
+    assert compiled == {
+        "source": "/home/lzl/vemu_uestc",
+        "destination": "/home/lzl/lht",
+    }
+
+
+def test_generated_file_action_cannot_escape_frozen_plan_paths(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_mutating_action_paths,
+    )
+
+    instance = tmp_path / "lht"
+    resource = PlanResource(
+        name="instance_root",
+        kind="path",
+        status="frozen",
+        role="instance_root",
+        value=str(instance),
+        source="derived",
+    )
+
+    assert not _validate_mutating_action_paths(
+        "write_ops_file",
+        {"path": str(instance / "nginx" / "lht.conf")},
+        [resource],
+    )
+    assert "outside_frozen_resources" in _validate_mutating_action_paths(
+        "write_ops_file",
+        {"path": "/root/legacy/nginx.conf"},
+        [resource],
+    )
+
+
+def test_structural_binding_infers_base_from_future_copied_source(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    source = tmp_path / "source"
+    target = tmp_path / "lht"
+    (source / "vemu_config").mkdir(parents=True)
+    (source / "vemu_config" / "config.py").write_text(
+        "class CommonConfig:\n    pass\n",
+        encoding="utf-8",
+    )
+    resources = [
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value=str(source),
+            source="evidence",
+        ),
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value=str(target),
+            source="derived",
+        ),
+    ]
+
+    compiled = _infer_structural_action_args(
+        "upsert_python_class",
+        {
+            "path": str(target / "vemu_config" / "config.py"),
+            "class_name": "LhtConfig",
+            "body": "master_port = 46001",
+        },
+        resources,
+    )
+
+    assert compiled["base_class"] == "CommonConfig"
 
 
 def test_planner_can_probe_then_returns_semantic_plan_without_actions():
@@ -755,6 +1294,48 @@ def test_plan_resources_freeze_paths_ports_and_keep_git_remote_deferred(
     assert "git_remote（待补全" in preview
 
 
+def test_same_value_resource_aliases_may_share_one_consumer(tmp_path):
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    payload = json.loads(
+        _semantic_payload(objective="deploy a new lht platform instance")
+    )
+    payload["goal"] = "deploy lht"
+    payload["steps"][0]["risk_suggestion"] = "medium"
+    payload["resources"] = [
+        {
+            "name": "instance_root",
+            "kind": "path",
+            "status": "frozen",
+            "role": "instance_root",
+            "value": str(tmp_path / "lht"),
+            "source": "derived",
+            "reason": "",
+            "resolve_before": "",
+            "consumers": ["inspect.destination"],
+        },
+        {
+            "name": "copy_destination",
+            "kind": "path",
+            "status": "frozen",
+            "role": "copy_destination",
+            "value": str(tmp_path / "lht"),
+            "source": "derived",
+            "reason": "",
+            "resolve_before": "",
+            "consumers": ["inspect.destination"],
+        },
+    ]
+
+    plan = PrivilegedPlannerAgent(FakeLLM([json.dumps(payload)])).plan(
+        "deploy lht"
+    )
+
+    assert len(plan.resources) == 2
+    assert "inspect.destination" in plan.resources[0].consumers
+    assert "inspect.destination" not in plan.resources[1].consumers
+
+
 def test_mutating_deployment_plan_cannot_omit_resource_manifest(tmp_path):
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
@@ -787,7 +1368,7 @@ def test_mutating_deployment_plan_cannot_omit_resource_manifest(tmp_path):
     assert plan.resources[0].name == "instance_root"
 
 
-def test_frozen_instance_root_rejects_binding_to_existing_old_instance(
+def test_frozen_instance_root_compiles_over_model_selected_old_instance(
     tmp_path,
 ):
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
@@ -818,15 +1399,6 @@ def test_frozen_instance_root_rejects_binding_to_existing_old_instance(
         "args": {"platform": "lht", "project_root": str(old_root)},
     }
 
-    with pytest.raises(ValueError, match="resource_binding_violation"):
-        agent._registered_binding(
-            contract,
-            step,
-            grounded_context=None,
-            plan_resources=[resource],
-        )
-
-    contract["args"]["project_root"] = str(new_root)
     binding = agent._registered_binding(
         contract,
         step,
@@ -1778,6 +2350,465 @@ def test_execution_agent_binds_verification_only_without_command(tmp_path):
     assert evidence.return_code == 0
     assert evidence.environment_changed is False
     assert decision.status == "passed"
+
+
+def test_observational_semantic_step_rejects_mutating_micro_step():
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        PrivilegedExecutionAgent,
+    )
+
+    verify = PrivilegedStep(
+        step_id="verify-health",
+        title="验证 lht 实例端到端健康",
+        objective="verify the deployed instance is healthy",
+        expected_changes=["the public endpoint is reachable"],
+        risk="medium",
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-verifier-pollution",
+        goal="deploy lht",
+        risk="medium",
+        steps=[verify],
+    )
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "ready",
+                    "implementation_steps": [
+                        {
+                            "id": "reload-nginx",
+                            "title": "Reload Nginx",
+                            "objective": "reload nginx to pick up the site",
+                            "depends_on": [],
+                            "expected_changes": ["nginx configuration reloaded"],
+                            "success_criteria": ["nginx is active"],
+                            "risk_suggestion": "medium",
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(
+        ExecutionBindingError,
+        match="observational_semantic_step_contains_mutation",
+    ):
+        PrivilegedExecutionAgent(llm)._decompose_semantic_step(
+            plan,
+            verify,
+            grounded_context=None,
+        )
+
+
+def test_generic_file_write_cannot_claim_to_enable_nginx_site():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_objective_fit,
+    )
+
+    step = PrivilegedStep(
+        step_id="nginx",
+        title="安装并启用 lht Nginx 站点",
+        objective="write the site config and enable it",
+        expected_changes=[
+            "/etc/nginx/sites-available/lht exists",
+            "/etc/nginx/sites-enabled/lht points to it",
+        ],
+        risk="medium",
+    )
+
+    assert "cannot_enable_nginx_site" in _validate_action_objective_fit(
+        "write_ops_file",
+        step,
+    )
+
+
+def test_nginx_mutating_actions_declare_effects():
+    from klonet_agent.ops.actions import configured_ops_action_registry
+
+    registry = configured_ops_action_registry()
+
+    assert registry.get("install_nginx_config").effects
+    assert registry.get("reload_nginx").effects
+
+
+def test_nginx_install_contract_allows_inline_content_without_source_file():
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    tool = PrivilegedExecutionAgent(FakeLLM([]))._action_contract_function_tool(
+        "install_nginx_config"
+    )
+    args_schema = tool["function"]["parameters"]["properties"]["args"]
+
+    assert args_schema["required"] == ["config_name"]
+    assert "content" in args_schema["properties"]
+    assert "source_path" in args_schema["properties"]
+
+
+def test_invalid_implementation_json_triggers_local_rebuild(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    target = tmp_path / "lht"
+    step = PrivilegedStep(
+        step_id="prepare",
+        title="创建实例目录",
+        objective="create the lht instance directory",
+        expected_changes=["the directory exists"],
+        risk="medium",
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-invalid-implementation-json",
+        goal="prepare lht",
+        risk="medium",
+        steps=[step],
+    )
+    llm = FakeLLM(
+        [
+            "{invalid-json",
+            json.dumps(
+                {
+                    "status": "ready",
+                    "implementation_steps": [
+                        {
+                            "id": "create",
+                            "title": "创建实例目录",
+                            "objective": "create the lht instance directory",
+                            "depends_on": [],
+                            "expected_changes": ["the directory exists"],
+                            "success_criteria": ["the directory exists"],
+                            "risk_suggestion": "medium",
+                        }
+                    ],
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "create_directory",
+                    "selection_reason": "the action is atomic",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "",
+                    "args": {"path": str(target)},
+                    "binding_reason": "create the frozen target",
+                    "resolved_from_evidence": [],
+                    "preconditions": [],
+                    "postconditions": [
+                        {"checker": "file_exists", "args": {"path": str(target)}}
+                    ],
+                }
+            ),
+        ]
+    )
+    progress = []
+
+    bound = PrivilegedExecutionAgent(
+        llm,
+        on_progress=progress.append,
+    ).prepare_plan(plan, grounded_context=None)
+
+    assert bound.status == "awaiting_confirmation"
+    assert len(llm.calls) == 4
+    assert any("局部重建" in message for message in progress)
+
+
+def test_screen_session_is_derived_from_platform_and_component():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    compiled = _infer_structural_action_args(
+        "start_screen_component",
+        {
+            "platform": "klonet",
+            "component": "master",
+            "screen_session": "klonet_master",
+            "project_root": "/home/lzl/lht",
+        },
+        [
+            PlanResource(
+                name="screen_name_prefix",
+                kind="string",
+                status="frozen",
+                role="screen_session_name_prefix",
+                value="lht",
+                source="planner",
+            )
+        ],
+    )
+
+    assert compiled["platform"] == "lht"
+    assert compiled["screen_session"] == "lht_m"
+
+
+def test_nginx_install_source_must_prove_declared_content(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    source = tmp_path / "default"
+    source.write_text("server { listen 80; }\n", encoding="utf-8")
+    step = PrivilegedStep(
+        step_id="nginx",
+        title="安装并启用 lht Nginx 站点",
+        objective="install the lht nginx site",
+        expected_changes=["the site listens on 45556"],
+        risk="medium",
+    )
+
+    with pytest.raises(ValueError, match="nginx_source_missing_declared_content"):
+        PrivilegedExecutionAgent(FakeLLM([]))._registered_binding(
+            {
+                "action": "install_nginx_config",
+                "args": {
+                    "source_path": str(source),
+                    "content": "",
+                    "config_name": "lht",
+                },
+                "postconditions": [
+                    {
+                        "checker": "file_contains",
+                        "args": {
+                            "path": "/etc/nginx/sites-available/lht",
+                            "text": "45556",
+                        },
+                    }
+                ],
+            },
+            step,
+            grounded_context=None,
+        )
+
+
+def test_backend_configuration_requires_frozen_public_port_assignment():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        _validate_semantic_resource_coverage,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="configure",
+        title="配置 lht 后端独立端口与地址",
+        objective="configure the copied backend ports",
+        risk="medium",
+    )
+    micro_steps = [
+        PrivilegedStep(
+            step_id=f"configure__{attribute}",
+            title=f"set {attribute}",
+            action="set_python_class_attribute",
+            args={"attribute": attribute},
+            risk="medium",
+        )
+        for attribute in ("master_port", "worker_port", "web_terminal_port")
+    ]
+    resources = [
+        PlanResource(
+            name="public_port",
+            kind="port",
+            status="frozen",
+            role="public_port",
+            value=45556,
+            source="planner",
+        )
+    ]
+
+    with pytest.raises(ExecutionBindingError, match="missing_public_port_assignment"):
+        _validate_semantic_resource_coverage(semantic, micro_steps, resources)
+
+
+def test_verifier_cannot_assert_unscoped_legacy_port_state():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_checker_resource_scope,
+    )
+
+    step = PrivilegedStep(
+        step_id="ready",
+        title="验证 lht 后端全部就绪",
+        objective="verify the new backend ports are listening",
+        risk="readonly",
+    )
+    resources = [
+        PlanResource(
+            name="master_port",
+            kind="port",
+            status="frozen",
+            role="master_port",
+            value=45554,
+            source="planner",
+        )
+    ]
+
+    assert "unscoped_port_check=45551" in _validate_checker_resource_scope(
+        step,
+        [{"checker": "port_not_listening", "args": {"port": 45551}}],
+        resources,
+    )
+
+
+def test_verifier_can_observe_services_that_are_already_started():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _implementation_item_is_verification,
+    )
+
+    assert _implementation_item_is_verification(
+        {
+            "title": "验证 lht 四个后端端口均处于监听",
+            "objective": "verify all backend services are started and listening",
+        }
+    )
+    assert not _implementation_item_is_verification(
+        {
+            "title": "验证并启动 lht 后端",
+            "objective": "verify and start the backend services",
+        }
+    )
+
+
+def test_frozen_port_selection_step_becomes_readonly_verification():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _normalize_resolved_resource_semantic_step,
+    )
+
+    step = PrivilegedStep(
+        step_id="select-ports",
+        title="自动选择 lht 空闲端口",
+        objective="scan listeners and choose available backend ports",
+        expected_changes=["port values are selected"],
+        risk="medium",
+    )
+    resources = [
+        PlanResource(
+            name="master_port",
+            kind="port",
+            status="frozen",
+            role="master_port",
+            value=45661,
+            source="planner",
+        )
+    ]
+
+    _normalize_resolved_resource_semantic_step(step, resources)
+
+    assert step.title == "验证已冻结端口仍可用"
+    assert step.risk == "readonly"
+    assert step.expected_changes == []
+    assert "45661" in step.objective
+
+
+def test_reload_step_cannot_degrade_to_verification_only():
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    step = PrivilegedStep(
+        step_id="reload",
+        title="校验并重新加载 Nginx 配置",
+        objective="validate and reload nginx",
+        risk="readonly",
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-reload-no-degrade",
+        goal="enable nginx site",
+        risk="medium",
+        steps=[step],
+    )
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "verification_only",
+                    "selection_reason": "syntax can be checked",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "registered_action",
+                    "action": "reload_nginx",
+                    "selection_reason": "reload is required",
+                }
+            ),
+            json.dumps(
+                {
+                    "status": "ready",
+                    "reason": "",
+                    "args": {},
+                    "binding_reason": "validate then reload",
+                    "resolved_from_evidence": [],
+                    "preconditions": [],
+                    "postconditions": [
+                        {"checker": "nginx_config_valid", "args": {}},
+                        {"checker": "service_active", "args": {"service": "nginx"}},
+                    ],
+                }
+            ),
+        ]
+    )
+
+    binding = PrivilegedExecutionAgent(llm).prepare_step(
+        plan,
+        step,
+        grounded_context=None,
+    )
+
+    assert binding.action == "reload_nginx"
+
+
+def test_sync_binding_rejects_existing_nonempty_destination(tmp_path):
+    from klonet_agent.ops.privileged.planner import _validate_host_facts
+
+    source = tmp_path / "source"
+    destination = tmp_path / "existing"
+    source.mkdir()
+    destination.mkdir()
+    (destination / "legacy.txt").write_text("keep", encoding="utf-8")
+
+    assert "destination_not_empty" in _validate_host_facts(
+        "sync_directory",
+        {"source": str(source), "destination": str(destination)},
+    )
+
+
+def test_copy_semantic_rejects_nonempty_frozen_instance_root(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        _validate_semantic_destination_availability,
+    )
+
+    destination = tmp_path / "lht"
+    destination.mkdir()
+    (destination / "legacy.txt").write_text("keep", encoding="utf-8")
+    step = PrivilegedStep(
+        step_id="copy",
+        title="复制源码到新实例目录",
+        objective="copy the source repository into the lht instance root",
+        expected_changes=["the instance tree exists"],
+        risk="medium",
+    )
+    resources = [
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value=str(destination),
+            source="planner",
+        )
+    ]
+
+    with pytest.raises(ExecutionBindingError, match="instance_root_not_empty"):
+        _validate_semantic_destination_availability(step, resources)
 
 
 def test_execution_agent_reselects_after_action_contract_is_not_grounded(

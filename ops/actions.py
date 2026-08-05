@@ -266,12 +266,91 @@ DEFAULT_OPS_ACTIONS = (
         backends=("ops-privilege",),
     ),
     OpsActionSpec(
+        "upsert_python_class",
+        "_upsert_python_class",
+        "controlled",
+        True,
+        ("path",),
+        category="filesystem",
+        description=(
+            "按顶层类名新增、替换或移动 Python 类；自动定位完整类边界，"
+            "保证目标类位于其本地父类之后，并在备份及写入前执行 AST 编译校验"
+        ),
+        preconditions=(
+            "target_python_file_exists",
+            "base_class_exists_when_local",
+            "class_body_is_valid_python",
+        ),
+        effects=("python_class_upserted", "backup_created"),
+        postconditions=("python_module_compiles", "class_definition_is_unique"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
+        "set_python_config_assignment",
+        "_set_python_config_assignment",
+        "controlled",
+        True,
+        ("path",),
+        category="filesystem",
+        description=(
+            "按 AST 将一个已有的顶层配置对象赋值切换为指定配置类实例；"
+            "要求目标类和唯一赋值均存在，自动备份并在写入前编译校验"
+        ),
+        preconditions=(
+            "target_python_file_exists",
+            "config_class_exists",
+            "assignment_exists_exactly_once",
+        ),
+        effects=("active_python_config_changed", "backup_created"),
+        postconditions=("python_module_compiles", "assignment_targets_class"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
+        "set_python_class_attribute",
+        "_set_python_class_attribute",
+        "controlled",
+        True,
+        ("path",),
+        category="filesystem",
+        description=(
+            "按 AST 设置顶层 Python 配置类的一个标量属性；class_name 可省略并"
+            "由 PROJ_CONFIG 活动配置自动识别，自动备份并在写入前编译校验"
+        ),
+        preconditions=(
+            "target_python_file_exists",
+            "target_config_class_exists",
+            "attribute_name_is_safe",
+        ),
+        effects=("python_class_attribute_changed", "backup_created"),
+        postconditions=("python_module_compiles", "attribute_has_expected_value"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
         "install_nginx_config",
         "_install_nginx_config",
         "privileged",
         True,
+        ("source_path",),
+        category="service",
+        description=(
+            "从 source_path 或内联 content 安装 Nginx 站点配置到 "
+            "sites-available，并创建同名的 sites-enabled 符号链接"
+        ),
+        preconditions=("source_or_content_present", "site_name_is_safe"),
+        effects=("nginx_site_installed", "nginx_site_enabled"),
+        postconditions=("site_config_installed", "site_symlink_enabled"),
     ),
-    OpsActionSpec("reload_nginx", "_reload_nginx", "privileged", True),
+    OpsActionSpec(
+        "reload_nginx",
+        "_reload_nginx",
+        "privileged",
+        True,
+        category="service",
+        description="先运行 nginx -t，再重新加载 Nginx 配置",
+        preconditions=("nginx_config_valid",),
+        effects=("nginx_reloaded",),
+        postconditions=("nginx_active",),
+    ),
     OpsActionSpec(
         "start_docker_container",
         "_start_docker_container",

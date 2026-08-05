@@ -5,6 +5,7 @@ import io
 import json
 import subprocess
 import tarfile
+from pathlib import Path
 
 
 ENTRY_FILES = (
@@ -50,6 +51,104 @@ def _step(action, args, *, risk="medium"):
         args=args,
         risk=risk,
     )
+
+
+def test_install_nginx_config_also_enables_site(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    source = tmp_path / "lht.conf"
+    source.write_text("server { listen 45563; }\n", encoding="utf-8")
+    calls = []
+
+    def command_runner(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "install_nginx_config",
+            {"source_path": str(source), "config_name": "lht"},
+        )
+    )
+
+    assert result.status == "completed"
+    commands = [argv[1:] if argv and argv[0] == "sudo" else argv for argv, _ in calls]
+    assert [
+        "install",
+        "-o",
+        "root",
+        "-g",
+        "root",
+        "-m",
+        "0644",
+        str(source.resolve()),
+        "/etc/nginx/sites-available/lht",
+    ] in commands
+    assert [
+        "ln",
+        "-sfn",
+        "/etc/nginx/sites-available/lht",
+        "/etc/nginx/sites-enabled/lht",
+    ] in commands
+    assert "enabled=/etc/nginx/sites-enabled/lht" in result.output
+
+
+def test_install_nginx_config_accepts_inline_content():
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    calls = []
+    installed_content = []
+
+    def command_runner(argv, **kwargs):
+        command = list(argv[1:] if argv and argv[0] == "sudo" else argv)
+        calls.append(command)
+        if command and command[0] == "install":
+            installed_content.append(
+                Path(command[-2]).read_text(encoding="utf-8")
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    content = "server { listen 45563; }\n"
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "install_nginx_config",
+            {"content": content, "config_name": "lht"},
+        )
+    )
+
+    assert result.status == "completed"
+    assert installed_content == [content]
+    assert any(command[0] == "ln" for command in calls)
+
+
+def test_sync_directory_refuses_nonempty_destination(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    source = tmp_path / "source"
+    destination = tmp_path / "existing"
+    source.mkdir()
+    destination.mkdir()
+    (source / "new.txt").write_text("new", encoding="utf-8")
+    legacy = destination / "legacy.txt"
+    legacy.write_text("keep", encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "sync_directory",
+            {"source": str(source), "destination": str(destination)},
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "destination_not_empty" in result.output
+    assert legacy.read_text(encoding="utf-8") == "keep"
+    assert not (destination / "new.txt").exists()
 
 
 def test_direct_runner_prepares_nested_entries_without_ops_helper(tmp_path):
@@ -858,6 +957,250 @@ def test_direct_runner_generic_text_edit_rejects_invalid_python_result(tmp_path)
 
     assert result.status == "blocked"
     assert "text_edit_result_invalid_SyntaxError" in result.output
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_python_candidate_compiler_rejects_subclass_before_local_base(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    original = (
+        "class CommonConfig:\n"
+        "    pass\n\n"
+        "class ExistingConfig(CommonConfig):\n"
+        "    pass\n"
+    )
+    config.write_text(original, encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "insert_text_before_anchor",
+            {
+                "path": str(config),
+                "anchor": "class CommonConfig:",
+                "content": "class LhtConfig(CommonConfig):\n    master_port = 46001\n",
+            },
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "candidate_python_base_defined_after_subclass=LhtConfig:CommonConfig" in result.output
+    assert config.read_text(encoding="utf-8") == original
+    assert not list(tmp_path.glob("config.py.klonet-agent.bak.*"))
+
+
+def test_upsert_python_class_moves_existing_subclass_after_base(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text(
+        "class LhtConfig(CommonConfig):\n"
+        "    master_port = 1\n\n"
+        "class CommonConfig:\n"
+        "    inherited = True\n\n"
+        "class ExistingConfig(CommonConfig):\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "upsert_python_class",
+            {
+                "path": str(config),
+                "class_name": "LhtConfig",
+                "base_class": "CommonConfig",
+                "body": (
+                    "master_ip = '192.128.122.101'\n"
+                    "master_port = 46001\n"
+                    "worker_port = 46002\n"
+                    "web_terminal_port = 46003"
+                ),
+            },
+        )
+    )
+
+    updated = config.read_text(encoding="utf-8")
+    assert result.status == "completed"
+    assert updated.count("class LhtConfig(CommonConfig):") == 1
+    assert updated.index("class CommonConfig:") < updated.index(
+        "class LhtConfig(CommonConfig):"
+    )
+    compile(updated, str(config), "exec")
+    assert result.metadata["state"] == "applied_unverified"
+
+
+def test_upsert_python_class_does_not_write_when_local_base_is_missing(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    original = "class ExistingConfig:\n    pass\n"
+    config.write_text(original, encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "upsert_python_class",
+            {
+                "path": str(config),
+                "class_name": "LhtConfig",
+                "base_class": "CommonConfig",
+                "body": "master_port = 46001",
+            },
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "python_class_local_base_missing=CommonConfig" in result.output
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_upsert_python_config_class_infers_common_config_base(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text("class CommonConfig:\n    pass\n", encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "upsert_python_class",
+            {
+                "path": str(config),
+                "class_name": "LhtConfig",
+                "body": "master_port = 46001",
+            },
+        )
+    )
+
+    assert result.status == "completed"
+    assert "class LhtConfig(CommonConfig):" in config.read_text(encoding="utf-8")
+
+
+def test_set_python_config_assignment_uses_ast_and_validates_candidate(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text(
+        "class CommonConfig:\n"
+        "    pass\n\n"
+        "class OldConfig(CommonConfig):\n"
+        "    pass\n\n"
+        "class LhtConfig(CommonConfig):\n"
+        "    master_port = 46001\n\n"
+        "PROJ_CONFIG = OldConfig()\n",
+        encoding="utf-8",
+    )
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "set_python_config_assignment",
+            {
+                "path": str(config),
+                "class_name": "LhtConfig",
+            },
+        )
+    )
+
+    updated = config.read_text(encoding="utf-8")
+    assert result.status == "completed"
+    assert "PROJ_CONFIG = LhtConfig()" in updated
+    assert "PROJ_CONFIG = OldConfig()" not in updated
+    compile(updated, str(config), "exec")
+    assert result.metadata["state"] == "applied_unverified"
+
+
+def test_set_python_config_assignment_rejects_missing_class_without_writing(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    original = "class OldConfig:\n    pass\n\nPROJ_CONFIG = OldConfig()\n"
+    config.write_text(original, encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "set_python_config_assignment",
+            {
+                "path": str(config),
+                "assignment_name": "PROJ_CONFIG",
+                "class_name": "LhtConfig",
+            },
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "python_config_class_count=0 expected=1" in result.output
+    assert config.read_text(encoding="utf-8") == original
+
+
+def test_set_python_class_attribute_infers_active_config_and_preserves_type(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    config = tmp_path / "config.py"
+    config.write_text(
+        "class CommonConfig:\n"
+        "    master_port = 10000\n\n"
+        "class WtxConfig(CommonConfig):\n"
+        "    worker_port = 10001\n\n"
+        "PROJ_CONFIG = WtxConfig()\n",
+        encoding="utf-8",
+    )
+    runner = DirectPrivilegedActionRunner()
+
+    changed = runner(
+        _step(
+            "set_python_class_attribute",
+            {
+                "path": str(config),
+                "attribute": "worker_port",
+                "value": "45562",
+            },
+        )
+    )
+    appended = runner(
+        _step(
+            "set_python_class_attribute",
+            {
+                "path": str(config),
+                "attribute": "master_ip",
+                "value": "192.168.1.33",
+            },
+        )
+    )
+
+    updated = config.read_text(encoding="utf-8")
+    assert changed.status == appended.status == "completed"
+    assert "worker_port = 45562" in updated
+    assert "master_ip = '192.168.1.33'" in updated
+    compile(updated, str(config), "exec")
+
+
+def test_text_mutation_records_backup_and_can_be_rolled_back(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+    from klonet_agent.ops.privileged.contracts import ExecutionEvidence
+
+    config = tmp_path / "config.py"
+    original = "class CommonConfig:\n    pass\n"
+    config.write_text(original, encoding="utf-8")
+    runner = DirectPrivilegedActionRunner()
+
+    result = runner(
+        _step(
+            "edit_text_file",
+            {
+                "path": str(config),
+                "operation": "append",
+                "anchor": "",
+                "content": "class LhtConfig(CommonConfig):\n    master_port = 46001\n",
+            },
+        )
+    )
+
+    assert result.status == "completed"
+    assert result.metadata["state"] == "applied_unverified"
+    assert Path(result.metadata["backup"]).is_file()
+    rollback = runner.rollback(
+        ExecutionEvidence(environment_changed=True, mutation=result.metadata)
+    )
+    assert rollback.status == "completed"
     assert config.read_text(encoding="utf-8") == original
 
 

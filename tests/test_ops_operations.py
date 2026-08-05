@@ -3165,7 +3165,7 @@ def test_remove_python_package_entries_requires_step_confirmation_and_removes_en
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
 
-    root = Path("/home/klonet-agent/workspaces/test_remove_python_package_entries")
+    root = Path.home() / "workspaces" / "test_remove_python_package_entries"
     site_packages = root / ".venv" / "lib" / "python3.8" / "site-packages"
     package_dir = site_packages / "werkzeug"
     stale_dir = package_dir / "datastructures"
@@ -3258,7 +3258,7 @@ def test_remove_python_package_entries_accepts_stringified_entry_list():
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
 
-    root = Path("/home/klonet-agent/workspaces/test_remove_python_package_entries_string")
+    root = Path.home() / "workspaces" / "test_remove_python_package_entries_string"
     site_packages = root / ".venv" / "lib" / "python3.8" / "site-packages"
     package_dir = site_packages / "werkzeug"
     stale_dir = package_dir / "wrappers"

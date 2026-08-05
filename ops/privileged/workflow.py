@@ -6,11 +6,13 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.checkers import ensure_postconditions
 from klonet_agent.ops.privileged.contracts import (
     FailurePacket,
+    PlanResource,
     PrivilegedPlan,
     PrivilegedStep,
     VerificationDecision,
@@ -27,6 +29,7 @@ COMMAND_PATTERN = re.compile(
     r"^(?:list-priv|"
     r"(?:show-priv|audit-priv|confirm-priv|resume-priv|abort-priv|continue-priv|"
     r"retry-priv|replan-priv)\s+\S+|"
+    r"resolve-priv-resource\s+\S+\s+\S+\s+\S+|"
     r"confirm-priv-step\s+\S+\s+\S+)$"
 )
 MAX_INITIAL_BINDING_REPLAN_ATTEMPTS = 2
@@ -217,6 +220,16 @@ class PrivilegedOpsWorkflow:
             except ExecutionBindingError as exc:
                 failure = redact_sensitive_text(_short_error(exc))
                 failures.append(failure)
+                disputed = _dispute_contradicted_resource(plan, failure)
+                if disputed:
+                    terminal = ExecutionBindingError(
+                        "冻结资源与确定性环境证据冲突：%s；旧授权已失效，"
+                        "需要用户确认修正后的资源值" % disputed,
+                        replan_recommended=False,
+                        category="resource_disputed",
+                    )
+                    self._attach_paused_binding_plan(terminal, plan)
+                    raise terminal from exc
                 if not getattr(exc, "replan_recommended", True):
                     if self.on_progress is not None:
                         self.on_progress(
@@ -294,6 +307,7 @@ class PrivilegedOpsWorkflow:
                 retry_kwargs["planning_feedback"] = feedback
                 retry_kwargs["prior_probe_history"] = previous_probe_history
                 replacement = self.planner.plan(goal, **retry_kwargs)
+                replacement.resources = _inherit_replan_resources(plan, replacement)
                 replacement.plan_id = workflow_plan_id
                 replacement.probe_history = (
                     previous_probe_history
@@ -330,18 +344,30 @@ class PrivilegedOpsWorkflow:
                 "无法生成可确认的安全计划：%s。当前没有执行任何操作。"
                 % _short_error(exc),
             )
+        disputed = next(
+            (item for item in paused_plan.resources if item.status == "disputed"),
+            None,
+        )
+        correction = ""
+        if disputed is not None:
+            correction = (
+                "- 明确修正冲突资源：resolve-priv-resource %s %s <新值>\n"
+                % (paused_plan.plan_id, disputed.name)
+            )
         return WorkflowResult(
             "paused",
             "Implementation Binding Agent 无法形成完整实现，所有自动"
             "重选与 Planner replan 已停止；没有执行任何服务器变更。\n"
             "原因：%s\n\n请由你决定：\n"
             "- 查看当前证据：audit-priv %s\n"
+            "%s"
             "- 再次要求 Planner 重规划：replan-priv %s\n"
             "- 放弃该计划：abort-priv %s\n"
             "- 或直接补充目标/约束，提交一条新的请求"
             % (
                 _short_error(exc),
                 paused_plan.plan_id,
+                correction,
                 paused_plan.plan_id,
                 paused_plan.plan_id,
             ),
@@ -416,6 +442,10 @@ class PrivilegedOpsWorkflow:
                 return self.replan(
                     parts[1],
                     reason="用户要求根据现有执行证据重新规划",
+                )
+            if command == "resolve-priv-resource" and len(parts) == 4:
+                return self.resolve_disputed_resource(
+                    parts[1], parts[2], parts[3]
                 )
             if command == "abort-priv" and len(parts) == 2:
                 return self.abort(parts[1])
@@ -651,6 +681,25 @@ class PrivilegedOpsWorkflow:
                 plan.status = "paused"
                 self.store.save(plan)
                 self._event("privileged_plan_paused", plan, {"reason": decision.reason})
+                semantic_parent = next(
+                    (
+                        item for item in plan.steps
+                        if item is step
+                        or (
+                            item.implementation_plan is not None
+                            and step in item.implementation_plan.steps
+                        )
+                    ),
+                    step,
+                )
+                causal_repair = self._automatic_causal_repair(
+                    plan,
+                    semantic_parent,
+                    step,
+                    persist=True,
+                )
+                if causal_repair is not None:
+                    return causal_repair
                 rebound = self._automatic_implementation_rebind(
                     plan,
                     step,
@@ -671,11 +720,17 @@ class PrivilegedOpsWorkflow:
                     plan,
                 )
             step.status = "completed"
+            if step.evidence is not None and step.evidence.mutation:
+                # Keep it provisional until the enclosing semantic plan commits.
+                step.evidence.mutation.setdefault("state", "applied_unverified")
             self.store.save(plan)
         if plan.steps and all(
             step.status in {"completed", "skipped"}
             for step in _execution_steps(plan)
         ):
+            for step in _execution_steps(plan):
+                if step.evidence is not None and step.evidence.mutation:
+                    step.evidence.mutation["state"] = "committed"
             for semantic_step in plan.steps:
                 if semantic_step.implementation_plan is not None:
                     semantic_step.implementation_plan.status = "completed"
@@ -685,6 +740,13 @@ class PrivilegedOpsWorkflow:
             self._event("privileged_plan_completed", plan, {"recovered": True})
             return WorkflowResult("completed", render_plan(plan), plan)
         if unknown_steps:
+            plan.status = "approved"
+            self.store.save(plan)
+            return self._execute_plan(plan)
+        if any(
+            step.status == "applied_unverified"
+            for step in _execution_steps(plan)
+        ):
             plan.status = "approved"
             self.store.save(plan)
             return self._execute_plan(plan)
@@ -702,6 +764,28 @@ class PrivilegedOpsWorkflow:
         plan = self.store.load(plan_id)
         if plan.status == "completed":
             return WorkflowResult("blocked", "Completed plan cannot be aborted.", plan)
+        rollback_failures = []
+        for step in reversed(_execution_steps(plan)):
+            if not _is_uncommitted_mutation(step):
+                continue
+            evidence = self.executor.rollback(step)
+            if evidence.return_code == 0:
+                step.status = "skipped"
+                step.observation = _append_observation(
+                    step.observation,
+                    "用户终止计划，未提交修改已自动回滚",
+                )
+            else:
+                rollback_failures.append(step.step_id)
+        if rollback_failures:
+            plan.status = "paused"
+            self.store.save(plan)
+            return WorkflowResult(
+                "paused",
+                "终止计划前的自动回滚失败：%s。计划保持暂停，请查看 audit-priv %s。"
+                % ("、".join(rollback_failures), plan.plan_id),
+                plan,
+            )
         plan.status = "aborted"
         for step in _all_plan_steps(plan):
             if step.status in {
@@ -714,6 +798,50 @@ class PrivilegedOpsWorkflow:
         self.store.save(plan)
         self._event("privileged_plan_blocked", plan, {"reason": "aborted"})
         return WorkflowResult("aborted", render_plan(plan), plan)
+
+    def resolve_disputed_resource(
+        self,
+        plan_id: str,
+        name: str,
+        value: str,
+    ) -> WorkflowResult:
+        """Apply one explicit human correction, then require a fresh replan."""
+
+        plan = self.store.load(plan_id)
+        resource = next(
+            (item for item in plan.resources if item.name == name),
+            None,
+        )
+        if resource is None:
+            return WorkflowResult("blocked", "计划中不存在资源：%s" % name, plan)
+        if resource.status != "disputed":
+            return WorkflowResult(
+                "blocked",
+                "资源 %s 当前没有证据冲突，拒绝绕过原计划直接改值。" % name,
+                plan,
+            )
+        try:
+            plan.resolve_resource(name, value, source="explicit_user_correction")
+        except ValueError as exc:
+            return WorkflowResult(
+                "blocked",
+                "资源值不符合 %s 合同：%s" % (resource.kind, _short_error(exc)),
+                plan,
+            )
+        plan.status = "paused"
+        self.store.save(plan)
+        self._event(
+            "privileged_resource_corrected",
+            plan,
+            {"resource": name, "source": "explicit_user_correction"},
+        )
+        return WorkflowResult(
+            "paused",
+            "资源 %s 已按你的决定修正；旧实现参数和授权均已失效。\n"
+            "请重新规划：replan-priv %s\n查看计划：show-priv %s"
+            % (name, plan.plan_id, plan.plan_id),
+            plan,
+        )
 
     def continue_plan(self, plan_id: str) -> WorkflowResult:
         """Skip the paused step only after an explicit user decision."""
@@ -784,6 +912,25 @@ class PrivilegedOpsWorkflow:
             None,
         )
         if failed_step is not None and self.context_builder is not None:
+            semantic_step = next(
+                (
+                    item for item in plan.steps
+                    if item is failed_step
+                    or (
+                        item.implementation_plan is not None
+                        and failed_step in item.implementation_plan.steps
+                    )
+                ),
+                failed_step,
+            )
+            repaired = self._automatic_causal_repair(
+                plan,
+                semantic_step,
+                failed_step,
+                persist=True,
+            )
+            if repaired is not None:
+                return repaired
             recovered = self._automatic_recovery_plan(
                 plan,
                 failed_step,
@@ -814,6 +961,7 @@ class PrivilegedOpsWorkflow:
             planner_kwargs["grounded_context"] = grounded_context
         try:
             replacement = self.planner.plan(plan.goal, **planner_kwargs)
+            replacement.resources = _inherit_replan_resources(plan, replacement)
             replacement.plan_id = plan.plan_id
             if self.execution_agent is None:
                 raise RuntimeError("Implementation Binding Agent is unavailable")
@@ -1076,6 +1224,8 @@ class PrivilegedOpsWorkflow:
             )
             if decision.status == "passed":
                 step.status = "completed"
+                if step.evidence is not None and step.evidence.mutation:
+                    step.evidence.mutation["state"] = "committed"
                 step.observation = self._summarize_step(
                     step,
                     "completed",
@@ -1131,6 +1281,14 @@ class PrivilegedOpsWorkflow:
                     "verification_status": decision.status,
                 },
             )
+            causal_repair = self._automatic_causal_repair(
+                plan,
+                step,
+                step,
+                persist=persist,
+            )
+            if causal_repair is not None:
+                return causal_repair
             rebound = self._automatic_implementation_rebind(
                 plan,
                 step,
@@ -1169,7 +1327,7 @@ class PrivilegedOpsWorkflow:
         execution_steps = _execution_steps(plan)
         total_micro_steps = len(execution_steps)
         completed_micro_steps = sum(
-            step.status in {"completed", "skipped"}
+            step.status in {"completed", "applied_unverified", "skipped"}
             for step in execution_steps
         )
         for semantic_step in plan.steps:
@@ -1211,7 +1369,9 @@ class PrivilegedOpsWorkflow:
             semantic_step.status = "running"
             implementation.status = "executing"
             for micro_step in implementation.steps:
-                if micro_step.status in {"completed", "skipped"}:
+                if micro_step.status in {
+                    "completed", "applied_unverified", "skipped"
+                }:
                     continue
                 if micro_step.status == "execution_unknown":
                     semantic_step.status = "paused"
@@ -1227,7 +1387,8 @@ class PrivilegedOpsWorkflow:
                 incomplete_dependencies = [
                     dependency
                     for dependency in micro_step.depends_on
-                    if _find_step(plan, dependency).status != "completed"
+                    if _find_step(plan, dependency).status
+                    not in {"completed", "applied_unverified"}
                 ]
                 if incomplete_dependencies:
                     micro_step.status = "paused"
@@ -1337,7 +1498,12 @@ class PrivilegedOpsWorkflow:
                         )
                     )
                 if decision.status == "passed":
-                    micro_step.status = "completed"
+                    micro_step.status = (
+                        "applied_unverified"
+                        if micro_step.evidence is not None
+                        and micro_step.evidence.environment_changed
+                        else "completed"
+                    )
                     micro_step.observation = self._summarize_step(
                         micro_step,
                         "completed",
@@ -1375,6 +1541,14 @@ class PrivilegedOpsWorkflow:
                 plan.status = "paused"
                 if persist:
                     self.store.save(plan)
+                causal_repair = self._automatic_causal_repair(
+                    plan,
+                    semantic_step,
+                    micro_step,
+                    persist=persist,
+                )
+                if causal_repair is not None:
+                    return causal_repair
                 rebound = self._automatic_implementation_rebind(
                     plan,
                     micro_step,
@@ -1399,6 +1573,11 @@ class PrivilegedOpsWorkflow:
                     plan,
                 )
 
+            for micro_step in implementation.steps:
+                if micro_step.status == "applied_unverified":
+                    micro_step.status = "completed"
+                if micro_step.evidence is not None and micro_step.evidence.mutation:
+                    micro_step.evidence.mutation["state"] = "committed"
             implementation.status = "completed"
             semantic_step.status = "completed"
             semantic_step.observation = (
@@ -1602,6 +1781,210 @@ class PrivilegedOpsWorkflow:
             plan,
         )
 
+    def _automatic_causal_repair(
+        self,
+        plan: PrivilegedPlan,
+        semantic_step: PrivilegedStep,
+        failed_step: PrivilegedStep,
+        *,
+        persist: bool,
+    ) -> WorkflowResult | None:
+        """Rollback and rebind the uncommitted producer of failed evidence."""
+
+        if (
+            not persist
+            or not hasattr(self.executor, "rollback")
+        ):
+            return None
+        producer = _causal_mutation_step(plan, semantic_step, failed_step)
+        if producer is None or producer.implementation_rebind_attempts >= 2:
+            return None
+        failure_feedback = redact_sensitive_text(
+            json.dumps(
+                {
+                    "failure_class": "predecessor_implementation_error",
+                    "failed_verification_step": {
+                        "step_id": failed_step.step_id,
+                        "objective": failed_step.objective,
+                        "checks": [item.to_dict() for item in failed_step.checks],
+                        "verification": (
+                            plan.verification.to_dict()
+                            if plan.verification is not None else {}
+                        ),
+                    },
+                    "causal_producer": {
+                        "step_id": producer.step_id,
+                        "objective": producer.objective,
+                        "binding": (
+                            producer.execution_binding.to_dict()
+                            if producer.execution_binding is not None else {}
+                        ),
+                        "mutation": (
+                            dict(producer.evidence.mutation)
+                            if producer.evidence is not None else {}
+                        ),
+                    },
+                    "instruction": (
+                        "The verifier is correct. Repair the causal producer while "
+                        "preserving its semantic objective. Select a materially "
+                        "different Action argument contract or implementation."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        )[:16000]
+        implementation = semantic_step.implementation_plan
+        implementation_steps = (
+            implementation.steps if implementation is not None else [producer]
+        )
+        producer_index = implementation_steps.index(producer)
+        rollback_records = []
+        for candidate in reversed(implementation_steps[producer_index:]):
+            if not _is_uncommitted_mutation(candidate):
+                continue
+            rollback_evidence = self.executor.rollback(candidate)
+            rollback_records.append(
+                {
+                    "step_id": candidate.step_id,
+                    "evidence": rollback_evidence.to_dict(),
+                }
+            )
+            if rollback_evidence.return_code != 0:
+                plan.status = "paused"
+                candidate.status = "paused"
+                candidate.observation = _append_observation(
+                    candidate.observation,
+                    "自动回滚失败：%s" % (
+                        rollback_evidence.stderr or "unknown rollback error"
+                    ),
+                )
+                plan.recovery_history.append(
+                    {"kind": "causal_rollback_failed", "records": rollback_records}
+                )
+                self.store.save(plan)
+                return WorkflowResult(
+                    "paused",
+                    "Verifier 已定位到前驱实现“%s”，但自动回滚失败，"
+                    "系统没有继续执行。\n"
+                    "请查看证据：audit-priv %s\n"
+                    "或终止计划：abort-priv %s"
+                    % (producer.title, plan.plan_id, plan.plan_id),
+                    plan,
+                )
+            candidate.status = "pending"
+            if candidate.evidence is not None:
+                candidate.evidence.mutation["state"] = "rolled_back"
+
+        try:
+            if (
+                self.execution_agent is None
+                or self.context_builder is None
+                or not hasattr(self.execution_agent, "prepare_step")
+            ):
+                raise RecoveryPlanUnavailable(
+                    "causal rebind services are unavailable after rollback"
+                )
+            grounded_context = self.context_builder.build(
+                producer.objective or producer.title,
+                supplemental_environment_context=failure_feedback,
+            )
+            candidate = PrivilegedStep.from_dict(producer.to_dict())
+            old_binding = producer.execution_binding
+            candidate.execution_binding = None
+            candidate.evidence = None
+            candidate.checks = []
+            candidate.status = "pending"
+            replacement = self.execution_agent.prepare_step(
+                plan,
+                candidate,
+                grounded_context=grounded_context,
+                implementation_feedback=failure_feedback,
+            )
+            if _binding_execution_signature(replacement) == _binding_execution_signature(
+                old_binding
+            ):
+                raise RecoveryPlanUnavailable(
+                    "Binding Agent repeated the rejected causal implementation"
+                )
+        except Exception as exc:
+            plan.recovery_history.append(
+                {
+                    "kind": "causal_rollback_completed_rebind_failed",
+                    "producer_step_id": producer.step_id,
+                    "records": rollback_records,
+                    "reason": _short_error(exc),
+                }
+            )
+            producer.status = "paused"
+            producer.observation = _append_observation(
+                producer.observation,
+                "致因修改已回滚，但局部重绑失败：%s" % _short_error(exc),
+            )
+            if persist:
+                self.store.save(plan)
+            recovery = self._automatic_recovery_plan(
+                plan,
+                failed_step,
+                persist=persist,
+            )
+            if recovery is not None:
+                return recovery
+            return WorkflowResult(
+                "paused",
+                "Verifier 已定位并回滚致因步骤“%s”，但 Binding Agent 无法"
+                "生成不同实现，Planner 也未形成可靠新路线。\n"
+                "请查看证据：audit-priv %s\n"
+                "补充实现约束后重新请求，或终止计划：abort-priv %s"
+                % (producer.title, plan.plan_id, plan.plan_id),
+                plan,
+            )
+
+        producer.execution_binding = replacement
+        producer.risk = replacement.risk
+        producer.approval_scope = replacement.approval_scope
+        producer.preconditions = list(replacement.preconditions)
+        producer.postconditions = list(replacement.postconditions)
+        producer.evidence = None
+        producer.checks = []
+        producer.status = "pending"
+        producer.implementation_rebind_attempts += 1
+        for candidate in implementation_steps[producer_index + 1:]:
+            if candidate.status not in {"completed", "skipped"}:
+                candidate.status = "pending"
+                candidate.evidence = None
+                candidate.checks = []
+        semantic_step.status = "awaiting_confirmation"
+        if implementation is not None:
+            implementation.status = "awaiting_confirmation"
+        plan.authorized_hash = ""
+        plan.status = "awaiting_confirmation"
+        plan.verification = None
+        plan.recovery_history.append(
+            {
+                "kind": "causal_implementation_rebound",
+                "producer_step_id": producer.step_id,
+                "failed_step_id": failed_step.step_id,
+                "records": rollback_records,
+            }
+        )
+        if persist:
+            self.store.save(plan)
+        return WorkflowResult(
+            "awaiting_confirmation",
+            "Verifier 已确认失败来自前驱实现“%s”；该未提交修改已回滚，"
+            "Binding Agent 已生成不同实现。旧授权失效，请重新确认。\n\n%s\n\n"
+            "确认修复：confirm-priv %s\n查看差异与证据：audit-priv %s\n"
+            "终止计划：abort-priv %s"
+            % (
+                producer.title,
+                render_plan(plan),
+                plan.plan_id,
+                plan.plan_id,
+                plan.plan_id,
+            ),
+            plan,
+        )
+
     def _summarize_step(
         self,
         step: PrivilegedStep,
@@ -1729,7 +2112,10 @@ class PrivilegedOpsWorkflow:
         recovery_goal = (
             "原始目标：%s\n"
             "上一执行步骤失败。请根据 Failure Packet 自主反思并重新规划"
-            "剩余路线；保留已完成步骤作为不可更改事实，不得原样重复失败方案。"
+            "剩余路线；仅已提交完成的语义步骤是不可更改事实。当前失败语义"
+            "步骤内的 applied_unverified 修改允许被回滚和替换。Failure Packet"
+            " 中的 plan_resources 是权威资源清单，必须保持其值和角色，不得"
+            "原样重复失败方案。"
             % plan.goal
         )
         try:
@@ -1748,6 +2134,7 @@ class PrivilegedOpsWorkflow:
                 recovery_goal,
                 **recovery_planner_kwargs,
             )
+            replacement.resources = _inherit_replan_resources(plan, replacement)
             replacement = self._bind_with_replanning(
                 recovery_goal,
                 replacement,
@@ -1833,11 +2220,23 @@ class PrivilegedOpsWorkflow:
                 "failure_fingerprint": packet.failure_fingerprint,
             },
         )
+        causal = packet.causal_steps[0] if packet.causal_steps else {}
+        causal_hint = (
+            "\n程序定位的致因步骤：%s\n自动回滚：%s\n"
+            % (
+                causal.get("objective") or "未能确定",
+                (
+                    "可用，目标=%s" % packet.rollback.get("path", "")
+                    if packet.rollback.get("available")
+                    else "不可用或已耗尽"
+                ),
+            )
+        )
         return WorkflowResult(
             "paused",
             "当前步骤失败，后续操作已停止。\n"
             "失败与反思：%s\n"
-            "未继续自动规划：%s\n\n"
+            "未继续自动规划：%s\n%s\n"
             "请由你决定下一步：\n"
             "- 查看证据：audit-priv %s\n"
             "- 重试当前步骤：retry-priv %s\n"
@@ -1847,6 +2246,7 @@ class PrivilegedOpsWorkflow:
             % (
                 failure_summary,
                 reason,
+                causal_hint,
                 plan.plan_id,
                 plan.plan_id,
                 plan.plan_id,
@@ -1944,6 +2344,7 @@ def render_plan(plan: PrivilegedPlan) -> str:
         "pending": "待执行",
         "running": "执行中",
         "executed": "已执行",
+        "applied_unverified": "已应用，待语义验收",
         "executing": "执行中",
         "verifying": "验证中",
         "completed": "已完成",
@@ -1969,7 +2370,18 @@ def render_plan(plan: PrivilegedPlan) -> str:
         for resource in plan.resources[:12]:
             if resource.status == "frozen":
                 value = redact_sensitive_text(str(resource.value))[:240]
-                lines.append("- %s=%s（已冻结）" % (resource.name, value))
+                role = " [角色=%s]" % resource.role if resource.role else ""
+                lines.append("- %s=%s（已冻结）%s" % (resource.name, value, role))
+            elif resource.status == "disputed":
+                lines.append(
+                    "- %s=%s（存在证据冲突，角色=%s）：%s"
+                    % (
+                        resource.name,
+                        redact_sensitive_text(str(resource.value))[:240],
+                        resource.role or resource.name,
+                        resource.reason,
+                    )
+                )
             else:
                 lines.append(
                     "- %s（待补全，最晚在 %s 前确定）：%s"
@@ -1996,7 +2408,7 @@ def render_plan(plan: PrivilegedPlan) -> str:
         implementation = step.implementation_plan
         if implementation is not None:
             completed = sum(
-                item.status in {"completed", "skipped"}
+                item.status in {"completed", "applied_unverified", "skipped"}
                 for item in implementation.steps
             )
             lines.append(
@@ -2025,6 +2437,7 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
         "awaiting_confirmation": "等待确认",
         "approved": "已确认",
         "completed": "已完成",
+        "applied_unverified": "已应用，待语义验收",
         "paused": "已暂停",
         "pending": "待执行",
         "skipped": "已跳过",
@@ -2043,11 +2456,22 @@ def render_plan_details(plan: PrivilegedPlan) -> str:
         for resource in plan.resources:
             if resource.status == "frozen":
                 lines.append(
-                    "- %s：%s（已冻结，来源：%s）"
+                    "- %s：%s（已冻结，角色：%s，来源：%s）"
                     % (
                         resource.name,
                         redact_sensitive_text(str(resource.value))[:500],
+                        resource.role or resource.name,
                         resource.source or "计划证据",
+                    )
+                )
+            elif resource.status == "disputed":
+                lines.append(
+                    "- %s：%s（证据冲突，角色：%s；%s）"
+                    % (
+                        resource.name,
+                        redact_sensitive_text(str(resource.value))[:500],
+                        resource.role or resource.name,
+                        resource.reason,
                     )
                 )
             else:
@@ -2316,6 +2740,7 @@ def _build_failure_packet(
         "binding": binding,
         "evidence": evidence,
         "verification": verification,
+        "plan_resources": [item.to_dict() for item in plan.resources],
         "environment_fingerprint": environment_fingerprint,
     }
     fingerprint = hashlib.sha256(
@@ -2364,7 +2789,7 @@ def _build_failure_packet(
                 "result": item.observation,
             }
             for item in atomic_steps
-            if item.status == "completed"
+            if item.status == "completed" and _step_is_committed(plan, item)
         ],
         remaining_steps=[
             {
@@ -2374,8 +2799,14 @@ def _build_failure_packet(
             }
             for item in atomic_steps
             if item.step_id != failed_step.step_id
-            and item.status not in {"completed", "skipped"}
+            and (
+                item.status not in {"completed", "skipped"}
+                or not _step_is_committed(plan, item)
+            )
         ],
+        plan_resources=[item.to_dict() for item in plan.resources],
+        causal_steps=_failure_causal_steps(plan, failed_step),
+        rollback=_failure_rollback_contract(plan, failed_step),
         reflection=(
             plan.verification.reflection
             if plan.verification is not None
@@ -2384,6 +2815,266 @@ def _build_failure_packet(
         environment_fingerprint=environment_fingerprint,
         failure_fingerprint=fingerprint,
     )
+
+
+def _step_is_committed(plan: PrivilegedPlan, step: PrivilegedStep) -> bool:
+    parent = next(
+        (
+            item for item in plan.steps
+            if item is step
+            or (
+                item.implementation_plan is not None
+                and step in item.implementation_plan.steps
+            )
+        ),
+        step,
+    )
+    return parent.status == "completed"
+
+
+def _causal_mutation_step(
+    plan: PrivilegedPlan,
+    semantic_step: PrivilegedStep,
+    failed_step: PrivilegedStep,
+) -> PrivilegedStep | None:
+    """Find the nearest uncommitted mutation that produced failed evidence."""
+
+    if _is_uncommitted_mutation(failed_step):
+        return failed_step
+    implementation = semantic_step.implementation_plan
+    if implementation is None or failed_step not in implementation.steps:
+        return None
+    by_id = {item.step_id: item for item in implementation.steps}
+    queue = list(reversed(failed_step.depends_on))
+    visited: set[str] = set()
+    while queue:
+        step_id = queue.pop(0)
+        if step_id in visited:
+            continue
+        visited.add(step_id)
+        candidate = by_id.get(step_id)
+        if candidate is None:
+            continue
+        if _is_uncommitted_mutation(candidate):
+            return candidate
+        queue.extend(reversed(candidate.depends_on))
+
+    failed_index = implementation.steps.index(failed_step)
+    failed_paths = _step_contract_paths(failed_step)
+    for candidate in reversed(implementation.steps[:failed_index]):
+        if not _is_uncommitted_mutation(candidate):
+            continue
+        produced_path = str(candidate.evidence.mutation.get("path") or "")
+        if not failed_paths or produced_path in failed_paths:
+            return candidate
+    return None
+
+
+def _is_uncommitted_mutation(step: PrivilegedStep) -> bool:
+    _restore_legacy_mutation_metadata(step)
+    return bool(
+        step.evidence is not None
+        and step.evidence.environment_changed
+        and step.evidence.mutation
+        and step.evidence.mutation.get("state") != "committed"
+        and step.evidence.mutation.get("state") != "rolled_back"
+    )
+
+
+def _restore_legacy_mutation_metadata(step: PrivilegedStep) -> None:
+    """Recover rollback data written by pre-transaction action runners."""
+
+    evidence = step.evidence
+    binding = step.execution_binding
+    if (
+        evidence is None
+        or evidence.mutation
+        or not evidence.environment_changed
+        or binding is None
+        or binding.kind != "registered_action"
+        or binding.action not in {
+            "write_ops_file",
+            "replace_text_in_file",
+            "insert_text_before_anchor",
+            "edit_text_file",
+            "upsert_python_class",
+        }
+    ):
+        return
+    output = "%s %s" % (evidence.stdout or "", evidence.stderr or "")
+    path_match = re.search(r"(?:^|\s)path=([^\s]+)", output)
+    backup_match = re.search(r"(?:^|\s)backup=([^\s]+)", output)
+    if path_match is None or backup_match is None:
+        return
+    path = Path(path_match.group(1)).expanduser()
+    backup = Path(backup_match.group(1)).expanduser()
+    expected_prefix = "%s.klonet-agent.bak." % path.name
+    if (
+        not path.is_absolute()
+        or not backup.is_absolute()
+        or backup.parent != path.parent
+        or not backup.name.startswith(expected_prefix)
+        or not backup.is_file()
+    ):
+        return
+    evidence.mutation.update(
+        {
+            "kind": "text_file",
+            "path": str(path),
+            "backup": str(backup),
+            "created": "false",
+            "state": "applied_unverified",
+            "recovered_from": "legacy_action_output",
+        }
+    )
+
+
+def _step_contract_paths(step: PrivilegedStep) -> set[str]:
+    paths = set()
+    binding = step.execution_binding
+    specifications = [*step.preconditions, *step.postconditions]
+    if binding is not None:
+        specifications.extend(binding.preconditions)
+        specifications.extend(binding.postconditions)
+        for name, value in binding.args.items():
+            if "path" in name and isinstance(value, str) and value.startswith("/"):
+                paths.add(value)
+    for specification in specifications:
+        args = specification.get("args", {}) if isinstance(specification, dict) else {}
+        for name, value in args.items():
+            if "path" in name and isinstance(value, str) and value.startswith("/"):
+                paths.add(value)
+    return paths
+
+
+def _failure_causal_steps(
+    plan: PrivilegedPlan,
+    failed_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    semantic = next(
+        (
+            item for item in plan.steps
+            if item is failed_step
+            or (
+                item.implementation_plan is not None
+                and failed_step in item.implementation_plan.steps
+            )
+        ),
+        failed_step,
+    )
+    producer = _causal_mutation_step(plan, semantic, failed_step)
+    if producer is None:
+        return []
+    return [{
+        "step_id": producer.step_id,
+        "objective": producer.objective or producer.title,
+        "relationship": "produced_artifact_checked_by_failed_step",
+        "mutation": dict(producer.evidence.mutation) if producer.evidence else {},
+    }]
+
+
+def _failure_rollback_contract(
+    plan: PrivilegedPlan,
+    failed_step: PrivilegedStep,
+) -> dict[str, Any]:
+    causal = _failure_causal_steps(plan, failed_step)
+    if not causal:
+        return {"available": False, "reason": "no_uncommitted_causal_mutation"}
+    mutation = dict(causal[0].get("mutation") or {})
+    return {
+        "available": bool(
+            mutation.get("backup") or mutation.get("created") == "true"
+        ),
+        "producer_step_id": causal[0]["step_id"],
+        "path": mutation.get("path", ""),
+        "backup": mutation.get("backup", ""),
+    }
+
+
+def _dispute_contradicted_resource(
+    plan: PrivilegedPlan,
+    failure: str,
+) -> str:
+    match = re.search(
+        r"project_root_is_source_repo:use_platform_root=([^\s；,]+)",
+        str(failure or ""),
+    )
+    if match is None:
+        return ""
+    recommended = match.group(1)
+    resource = next(
+        (item for item in plan.resources if item.name == "project_root"),
+        None,
+    )
+    if (
+        resource is None
+        or resource.status != "frozen"
+        or str(resource.value) == recommended
+    ):
+        return ""
+    plan.dispute_resource(
+        "project_root",
+        reason=(
+            "deterministic layout identifies %s as platform_runtime_root"
+            % recommended
+        ),
+    )
+    return "project_root=%s, suggested=%s" % (resource.value, recommended)
+
+
+def _inherit_replan_resources(
+    original: PrivilegedPlan,
+    replacement: PrivilegedPlan,
+) -> list[PlanResource]:
+    """Preserve frozen values and roles while accepting new step consumers."""
+
+    old_by_name = {item.name: item for item in original.resources}
+    merged: list[PlanResource] = []
+    used = set()
+    for proposed in replacement.resources:
+        previous = old_by_name.get(proposed.name)
+        if previous is None:
+            merged.append(proposed)
+            continue
+        used.add(previous.name)
+        # A replan may describe the same frozen value with a broader JSON
+        # label (most commonly path -> string).  The original manifest is the
+        # authority: preserve its kind/value/role instead of turning harmless
+        # schema drift into a terminal recovery failure.
+        merged.append(
+            PlanResource(
+                name=previous.name,
+                kind=previous.kind,
+                status=previous.status,
+                role=previous.role or proposed.role or previous.name,
+                value=previous.value,
+                source=previous.source,
+                reason=previous.reason,
+                resolve_before=(
+                    proposed.resolve_before
+                    if previous.status == "deferred"
+                    else previous.resolve_before
+                ),
+                consumers=list(proposed.consumers),
+            )
+        )
+    for previous in original.resources:
+        if previous.name in used:
+            continue
+        merged.append(
+            PlanResource(
+                name=previous.name,
+                kind=previous.kind,
+                status=previous.status,
+                role=previous.role or previous.name,
+                value=previous.value,
+                source=previous.source,
+                reason=previous.reason,
+                resolve_before=previous.resolve_before,
+                consumers=[],
+            )
+        )
+    return merged
 
 
 def _semantic_plan_signature(steps: list[PrivilegedStep]) -> str:

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import textwrap
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -77,10 +79,25 @@ reason to return blocked: select shell_artifact when a bounded, reviewable
 one-time shell implementation is possible. Never invent Action names. All
 implementation parameters will be generated and validated by a separate
 stage 2 call.
+For adding, replacing, or moving a top-level Python class, prefer the
+structural upsert_python_class Action over generic text anchors or Shell. For
+switching a top-level assignment such as PROJ_CONFIG to an already declared
+configuration class, prefer set_python_config_assignment; it does not require
+guessing the old source text. For
+setting a scalar field such as master_ip, master_port, worker_port,
+public_port, or web_terminal_port on a Python configuration class, prefer
+set_python_class_attribute over text replacement; class_name may be omitted
+when PROJ_CONFIG identifies the active class. For
+checking a Python class/module attribute value, prefer verification_only with
+python_attribute_equals over run_ops_command or Shell.
 Plan resources are immutable shared inputs. Never replace a frozen resource
 with a currently existing value from another instance. A deferred resource is
 unknown, not permission to guess; choose an implementation that does not need
 it or return blocked with the missing resource name.
+Planned predecessor effects are valid future-state grounding. When an earlier
+semantic or implementation step creates a path/resource, bind its consumer to
+that frozen future value and verify it after the dependency runs. Do not probe
+or reject the future target merely because it does not exist during binding.
 """.strip()
 
 MAX_BINDING_PROBE_ROUNDS = 2
@@ -129,6 +146,8 @@ Return exactly one JSON object with status:
 
 Do not return an Action, command, shell script, precondition, or probe request.
 exit_code_zero is not valid evidence for a verification-only step.
+If a declared predecessor creates the checked target, bind the checker to that
+future target; its absence during plan compilation is expected, not a blocker.
 """.strip()
 
 
@@ -149,6 +168,17 @@ ports, or other concrete arguments at this stage. Later binding calls will
 ground those details.
 The supplied plan resource manifest is already frozen. Implementation steps
 must preserve it; a deferred value remains unknown until its declared boundary.
+An earlier semantic dependency's expected changes are valid future facts. Bind
+later actions and checks to those declared outputs instead of probing for them
+before their producing step has executed.
+Use the registered Action catalog as capability boundaries. Do not split an
+indivisible Action into fake preparation effects (for example, do not create
+empty screen sessions separately from starting their components), and do not
+describe one atomic step as changing multiple components when only a singular
+component Action can cover it. Do not emit Action names in the micro-plan.
+Do not create a mutation step merely to "preserve" state already carried by a
+copy/predecessor. If preservation matters, express it as a readonly final
+verification with no expected_changes.
 
 Return status=ready with 1-12 implementation_steps. Each step needs id, title,
 objective, reason, depends_on, expected_changes, success_criteria, and
@@ -360,6 +390,14 @@ class PrivilegedExecutionAgent:
     ) -> PrivilegedPlan:
         bound_micro_steps: list[PrivilegedStep] = []
         for index, semantic_step in enumerate(plan.steps, start=1):
+            _validate_semantic_destination_availability(
+                semantic_step,
+                plan.resources,
+            )
+            _normalize_resolved_resource_semantic_step(
+                semantic_step,
+                plan.resources,
+            )
             self._progress(
                 "语义步骤 %s/%s：正在把“%s”展开为原子 Implementation Plan…"
                 % (
@@ -379,6 +417,11 @@ class PrivilegedExecutionAgent:
                         semantic_step,
                         grounded_context=grounded_context,
                         feedback=feedback,
+                    )
+                    _validate_micro_plan_dependency_shape(
+                        plan,
+                        semantic_step,
+                        micro_steps,
                     )
                     for micro_index, micro_step in enumerate(
                         micro_steps,
@@ -400,6 +443,11 @@ class PrivilegedExecutionAgent:
                             grounded_context=grounded_context,
                         )
                         _apply_binding_to_step(micro_step, binding)
+                    _validate_semantic_resource_coverage(
+                        semantic_step,
+                        micro_steps,
+                        plan.resources,
+                    )
                 except ExecutionBindingError as exc:
                     last_error = str(exc)
                     if attempt + 1 >= MAX_IMPLEMENTATION_PLAN_REBUILDS:
@@ -523,21 +571,29 @@ class PrivilegedExecutionAgent:
                 grounded_context
             ),
             "registered_checker_catalog": self.checkers.render_catalog(),
+            "registered_action_capability_catalog": self._action_catalog(),
             "frozen_plan_resources": _resource_manifest_payload(
                 plan.resources
             ),
             "previous_attempt_feedback": feedback,
         }
-        result = self._call_function(
-            [
-                {"role": "system", "content": IMPLEMENTATION_PLANNING_PROMPT},
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            self._implementation_plan_function_tool(),
-        )
+        try:
+            result = self._call_function(
+                [
+                    {"role": "system", "content": IMPLEMENTATION_PLANNING_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    },
+                ],
+                self._implementation_plan_function_tool(),
+            )
+        except ValueError as exc:
+            raise ExecutionBindingError(
+                "invalid implementation function response: %s" % exc,
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            ) from exc
         status = str(result.get("status") or "").strip().lower()
         if status == "blocked":
             raise ExecutionBindingError(
@@ -559,6 +615,9 @@ class PrivilegedExecutionAgent:
                 replan_recommended=False,
                 category="implementation_contract_invalid",
             )
+        semantic_is_observational = _semantic_step_is_observational(
+            semantic_step
+        )
         raw_ids: list[str] = []
         for index, item in enumerate(items, start=1):
             if not isinstance(item, dict):
@@ -577,11 +636,38 @@ class PrivilegedExecutionAgent:
                     replan_recommended=False,
                     category="implementation_contract_invalid",
                 )
+            if (
+                semantic_is_observational
+                and not _implementation_item_is_verification(item)
+            ):
+                raise ExecutionBindingError(
+                    "observational_semantic_step_contains_mutation=%s"
+                    % str(item.get("title") or item.get("objective") or raw_id),
+                    replan_recommended=False,
+                    category="implementation_contract_invalid",
+                )
             raw_ids.append(raw_id)
         id_map = {
             raw_id: "%s__%s" % (semantic_step.step_id, raw_id)
             for raw_id in raw_ids
         }
+        semantic_dependency_evidence = []
+        for dependency_id in semantic_step.depends_on:
+            predecessor = next(
+                (item for item in plan.steps if item.step_id == dependency_id),
+                None,
+            )
+            if predecessor is None:
+                continue
+            semantic_dependency_evidence.append(
+                "planned semantic predecessor %s executes first; objective=%s; "
+                "expected_changes=%s"
+                % (
+                    predecessor.step_id,
+                    predecessor.objective or predecessor.title,
+                    " | ".join(predecessor.expected_changes) or "not declared",
+                )
+            )
         steps = []
         for index, item in enumerate(items):
             raw_id = raw_ids[index]
@@ -595,6 +681,9 @@ class PrivilegedExecutionAgent:
                     replan_recommended=False,
                     category="implementation_contract_invalid",
                 )
+            expected_changes = _strings(item.get("expected_changes"), 20)
+            if _implementation_item_is_verification(item):
+                expected_changes = []
             risk = str(item.get("risk_suggestion") or semantic_step.risk).lower()
             risk = {
                 "normal": "readonly",
@@ -604,6 +693,11 @@ class PrivilegedExecutionAgent:
             }.get(risk, risk)
             if risk not in RISK_LEVELS:
                 risk = semantic_step.risk
+            # A micro-step with no declared state transition is a verifier.
+            # Do not let an inherited outer risk turn it into a fake mutation
+            # and force the binder away from verification_only.
+            if not expected_changes:
+                risk = "readonly"
             if _is_discovery_only_implementation_step(item, risk=risk):
                 raise ExecutionBindingError(
                     "standalone discovery step is not executable: %s"
@@ -630,12 +724,12 @@ class PrivilegedExecutionAgent:
                         item.get("objective") or item.get("title") or raw_id
                     ).strip()[:1000],
                     reason=str(item.get("reason") or "").strip()[:1000],
-                    evidence_refs=dependency_evidence,
+                    evidence_refs=[
+                        *semantic_dependency_evidence,
+                        *dependency_evidence,
+                    ],
                     depends_on=[id_map[dep] for dep in dependencies],
-                    expected_changes=_strings(
-                        item.get("expected_changes"),
-                        20,
-                    ),
+                    expected_changes=expected_changes,
                     success_criteria=_strings(
                         item.get("success_criteria"),
                         20,
@@ -693,6 +787,11 @@ class PrivilegedExecutionAgent:
                     )
                 )
                 status = str(data.get("status") or "").strip().lower()
+                if _implementation_item_is_verification(
+                    {"title": step.title, "objective": step.objective}
+                ):
+                    step.expected_changes = []
+                    step.risk = "readonly"
                 if status == "need_evidence":
                     if (
                         self.probe_runner is None
@@ -734,13 +833,22 @@ class PrivilegedExecutionAgent:
                     continue
                 if status == "registered_action":
                     action = str(data.get("action") or "").strip()
+                    selected_spec = self.action_registry.get(action)
                     if (
-                        self.action_registry.get(action) is None
+                        selected_spec is None
                         or action not in DIRECT_PRIVILEGED_ACTIONS
                     ):
                         raise ValueError(
                             "action_not_directly_registered=%s"
                             % (action or "<missing>")
+                        )
+                    if (
+                        _step_is_verification(step)
+                        and selected_spec.effects
+                    ):
+                        raise ImplementationRejected(
+                            "registered_action:%s" % action,
+                            "readonly verification cannot bind a mutating Action",
                         )
                     self._progress(
                         "选择结论：步骤“%s”选用注册 Action：%s；"
@@ -817,6 +925,15 @@ class PrivilegedExecutionAgent:
                     )
                     return binding
                 if status == "verification_only":
+                    if (
+                        not _step_is_verification(step)
+                        or step.risk != "readonly"
+                        or step.expected_changes
+                    ):
+                        raise ImplementationRejected(
+                            "verification_only",
+                            "verification_only cannot replace a mutation-shaped objective",
+                        )
                     try:
                         binding = self._complete_verification_only_contract(
                             selection=data,
@@ -1101,12 +1218,30 @@ class PrivilegedExecutionAgent:
                 "action_not_directly_registered=%s"
                 % (action or "<missing>")
             )
+        if (
+            _step_is_verification(semantic_step)
+            and spec.effects
+        ):
+            raise ValueError(
+                "readonly_verification_cannot_bind_mutating_action=%s"
+                % action
+            )
         args = _json_object_value(data.get("args"))
         if args is None:
             raise ValueError(
                 "action=%s args must be an object, got=%s"
                 % (action, type(data.get("args")).__name__)
             )
+        args = _inject_frozen_resource_args(
+            semantic_step,
+            args,
+            plan_resources or [],
+        )
+        args = _infer_structural_action_args(
+            action,
+            args,
+            plan_resources or [],
+        )
         missing = [
             key
             for key in REQUIRED_ACTION_ARGS.get(action, ())
@@ -1120,12 +1255,28 @@ class PrivilegedExecutionAgent:
         problem = self.action_registry.validate_args(spec, args)
         if problem:
             raise ValueError(problem)
+        problem = _validate_mutating_action_paths(
+            action,
+            args,
+            plan_resources or [],
+        )
+        if problem:
+            raise ValueError(problem)
+        problem = _validate_action_objective_fit(action, semantic_step)
+        if problem:
+            raise ValueError(problem)
         problem = _validate_action_semantics(action, args)
         if problem:
             raise ValueError(problem)
         if grounded_context is not None:
             problem = _validate_host_facts(action, args)
-            if problem:
+            if problem and not _host_fact_is_planned_future(
+                action,
+                args,
+                semantic_step,
+                problem,
+                plan_resources or [],
+            ):
                 raise ValueError(problem)
         _validate_action_resource_bindings(
             semantic_step,
@@ -1164,6 +1315,9 @@ class PrivilegedExecutionAgent:
         checks = checks or _default_action_postconditions(action, args)
         if not checks:
             checks = [{"checker": "exit_code_zero", "args": {}}]
+        problem = _validate_action_postcondition_fit(action, args, checks)
+        if problem:
+            raise ValueError(problem)
         binding = ExecutionBinding(
             kind="registered_action",
             action=action,
@@ -1200,7 +1354,25 @@ class PrivilegedExecutionAgent:
             "frozen_action": action,
             "required_args": list(REQUIRED_ACTION_ARGS.get(action, ())),
             "optional_args": (
-                ["anchor"] if action == "edit_text_file" else []
+                ["source_path", "content"]
+                if action == "install_nginx_config"
+                else (
+                    ["anchor"]
+                    if action == "edit_text_file"
+                    else (
+                        ["base_class"]
+                        if action == "upsert_python_class"
+                        else (
+                            ["assignment_name"]
+                            if action == "set_python_config_assignment"
+                            else (
+                                ["class_name"]
+                                if action == "set_python_class_attribute"
+                                else []
+                            )
+                        )
+                    )
+                )
             ),
             "action_description": (
                 self.action_registry.get(action).description
@@ -1274,13 +1446,13 @@ class PrivilegedExecutionAgent:
                     % _progress_text(action)
                 )
                 return binding
-            except (KeyError, TypeError, ValueError) as exc:
+            except (KeyError, TypeError, ValueError, OSError) as exc:
                 last_error = str(exc)
                 if attempt >= MAX_ACTION_CONTRACT_REPAIRS:
                     break
                 self._progress(
-                    "实现节点：Action 参数合同无效，正在请求第 %s 次定向修复…"
-                    % attempt
+                    "实现节点：Action 参数合同无效（%s），正在请求第 %s 次定向修复…"
+                    % (_progress_text(last_error, 240), attempt)
                 )
                 messages.append(
                     {
@@ -1540,6 +1712,13 @@ class PrivilegedExecutionAgent:
                     raise ValueError(
                         "verification_only_requires_observable_postconditions"
                     )
+                problem = _validate_checker_resource_scope(
+                    semantic_step,
+                    checks,
+                    plan_resources or [],
+                )
+                if problem:
+                    raise ValueError(problem)
                 return ExecutionBinding(
                     kind="verification_only",
                     risk="readonly",
@@ -1723,7 +1902,7 @@ class PrivilegedExecutionAgent:
                 )
                 continue
             result.append({"checker": name, "args": args})
-        return result, errors
+        return _merge_alternative_checker_contracts(result), errors
 
     @staticmethod
     def _probe_requests(value: Any) -> list[dict[str, Any]]:
@@ -1908,7 +2087,11 @@ class PrivilegedExecutionAgent:
         action: str,
     ) -> dict[str, Any]:
         required = list(REQUIRED_ACTION_ARGS.get(action, ()))
-        optional = ["anchor"] if action == "edit_text_file" else []
+        optional = (
+            ["source_path", "content"]
+            if action == "install_nginx_config"
+            else (["anchor"] if action == "edit_text_file" else [])
+        )
         return _function_tool(
             "bind_action_%s" % action,
             "Bind grounded arguments for frozen registered Action %s." % action,
@@ -2215,11 +2398,11 @@ def _is_discovery_only_implementation_step(
 ) -> bool:
     """Reject internal argument discovery accidentally emitted as execution."""
 
-    if risk != "readonly" or _strings(item.get("expected_changes"), 20):
+    if risk != "readonly":
         return False
     text = " ".join(
         str(item.get(key) or "").lower()
-        for key in ("title", "objective", "reason")
+        for key in ("title", "objective")
     )
     discovery_markers = (
         "定位",
@@ -2239,6 +2422,72 @@ def _is_discovery_only_implementation_step(
     return any(marker in text for marker in discovery_markers)
 
 
+def _implementation_item_is_verification(item: dict[str, Any]) -> bool:
+    """Normalize verifier-shaped micro steps despite inherited effect text."""
+
+    title = str(item.get("title") or "").lower().strip()
+    objective = str(item.get("objective") or "").lower().strip()
+    text = title or objective
+    verifier = re.search(
+        r"验证|校验|确认|检查|验收|verify|validate|check|confirm|assert",
+        text,
+        re.IGNORECASE,
+    )
+    mutation = re.search(
+        r"创建|新增|写入|修改|修复|设置|切换|启动|停止|重载|重新加载|安装|复制|同步|删除|"
+        r"create\b|add\b|write\b|modify\b|insert\b|configure\b|deploy\b|"
+        r"set\b|switch\b|start\b|stop\b|reload\b|repair\b|install\b|"
+        r"copy\b|sync\b|remove\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not verifier or mutation:
+        return False
+    if title and re.search(
+        r"^(?:请|需要|要|to\s+)?(?:(?:创建|新增|写入|插入|修改|修复|设置|"
+        r"切换|启动|停止|重载|安装|复制|同步|删除|准备)|"
+        r"(?:create|add|write|insert|modify|repair|configure|deploy|set|"
+        r"switch|start|stop|reload|install|copy|sync|remove|prepare)\b)",
+        objective,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
+def _semantic_step_is_observational(step: PrivilegedStep) -> bool:
+    """Classify the semantic goal by its primary verb, not prerequisite prose."""
+
+    title = str(step.title or "").strip()
+    if title:
+        if not _implementation_item_is_verification({"title": title}):
+            return False
+        objective = str(step.objective or "").strip()
+        if re.search(
+            r"^(?:请|需要|要|to\s+)?(?:(?:创建|新增|写入|插入|修改|修复|设置|"
+            r"切换|启动|停止|重载|安装|复制|同步|删除|准备)|"
+            r"(?:create|add|write|insert|modify|repair|configure|deploy|set|"
+            r"switch|start|stop|reload|install|copy|sync|remove|prepare)\b)",
+            objective,
+            re.IGNORECASE,
+        ):
+            return False
+        return True
+    return _implementation_item_is_verification(
+        {"objective": step.objective}
+    )
+
+
+def _step_is_verification(step: PrivilegedStep) -> bool:
+    """Require both a readonly contract and an observational objective."""
+
+    if step.risk != "readonly" or step.expected_changes:
+        return False
+    return _implementation_item_is_verification(
+        {"title": step.title, "objective": step.objective}
+    )
+
+
 def _planned_output_paths(step: PrivilegedStep) -> tuple[Any, ...]:
     """Extract dependency-produced absolute paths for compile-time cwd checks."""
 
@@ -2249,6 +2498,112 @@ def _planned_output_paths(step: PrivilegedStep) -> tuple[Any, ...]:
             if cleaned and cleaned not in paths:
                 paths.append(cleaned)
     return tuple(paths)
+
+
+def _host_fact_is_planned_future(
+    action: str,
+    args: dict[str, Any],
+    step: PrivilegedStep,
+    problem: str,
+    resources: list[PlanResource] | None = None,
+) -> bool:
+    """Allow compile-time absent paths explicitly produced by dependencies."""
+
+    problem_to_arg = {
+        "grounding_failed=nginx_source_not_file": "source_path",
+        "grounding_failed=archive_not_found": "archive_path",
+    }
+    arg_name = problem_to_arg.get(problem)
+    if arg_name is None:
+        if problem.startswith("grounding_failed=install_script_not_found"):
+            arg_name = "script_dir"
+        elif problem.startswith("grounding_failed=project_root_missing_entries"):
+            arg_name = "project_root"
+    if arg_name is None:
+        return False
+    candidate_text = str(args.get(arg_name) or "").strip()
+    if not candidate_text.startswith("/"):
+        return False
+    candidate = Path(candidate_text)
+    for raw in _planned_output_paths(step):
+        root_text = str(raw or "").strip()
+        if not root_text.startswith("/"):
+            continue
+        root = Path(root_text)
+        try:
+            candidate.relative_to(root)
+            if candidate == root or root in candidate.parents:
+                return True
+        except (OSError, ValueError):
+            continue
+    if any(
+        re.search(r"planned (?:semantic )?predecessor", item)
+        for item in step.evidence_refs
+    ):
+        for resource in resources or []:
+            if (
+                resource.status == "frozen"
+                and (resource.role == "instance_root" or resource.name == "instance_root")
+            ):
+                root = Path(str(resource.value))
+                try:
+                    candidate.relative_to(root)
+                    return True
+                except (OSError, ValueError):
+                    continue
+    return False
+
+
+def _validate_micro_plan_dependency_shape(
+    plan: PrivilegedPlan,
+    semantic_step: PrivilegedStep,
+    micro_steps: list[PrivilegedStep],
+) -> None:
+    """Prevent local decomposition from violating outer semantic ordering."""
+
+    step_by_id = {item.step_id: item for item in plan.steps}
+    pending = list(semantic_step.depends_on)
+    ancestors: set[str] = set()
+    while pending:
+        step_id = pending.pop()
+        if step_id in ancestors:
+            continue
+        ancestors.add(step_id)
+        predecessor = step_by_id.get(step_id)
+        if predecessor is not None:
+            pending.extend(predecessor.depends_on)
+    backend_start_ids = {
+        item.step_id for item in plan.steps
+        if re.search(
+            r"启动.{0,16}(?:平台|组件|服务)|"
+            r"\bstart.{0,20}(?:platform|component|service)",
+            "%s %s" % (item.title, item.objective),
+            re.IGNORECASE,
+        )
+    }
+    if not backend_start_ids:
+        return
+    if backend_start_ids.intersection(ancestors):
+        return
+    for micro_step in micro_steps:
+        text = "%s %s %s" % (
+            micro_step.title,
+            micro_step.objective,
+            " ".join(micro_step.success_criteria),
+        )
+        if re.search(
+            r"curl|路由.{0,8}(?:可达|访问|响应)|"
+            r"http.{0,16}(?:status|response|200|2\d\d|3\d\d)",
+            text,
+            re.IGNORECASE,
+        ):
+            raise ExecutionBindingError(
+                "implementation_dependency_order_invalid=%s_http_health_"
+                "requires_backend_start_semantic_predecessor"
+                % micro_step.step_id,
+                replan_recommended=True,
+                category="implementation_plan_unavailable",
+            )
 
 
 def _apply_binding_to_step(
@@ -2330,6 +2685,434 @@ def _validate_action_resource_bindings(
                     "resource_binding_violation=%s.%s must use ${%s}"
                     % (semantic_id, arg_name, resource.name)
                 )
+
+
+def _inject_frozen_resource_args(
+    step: PrivilegedStep,
+    args: dict[str, Any],
+    resources: list[PlanResource],
+) -> dict[str, Any]:
+    """Compile authoritative resource consumers into Action arguments."""
+
+    compiled = dict(args)
+    for resource in resources:
+        if resource.status != "frozen":
+            continue
+        for consumer in resource.consumers:
+            semantic_id, arg_name = consumer.rsplit(".", 1)
+            if step.step_id == semantic_id or step.step_id.startswith(
+                semantic_id + "__"
+            ):
+                compiled[arg_name] = resource.value
+    return compiled
+
+
+def _validate_mutating_action_paths(
+    action: str,
+    args: dict[str, Any],
+    resources: list[PlanResource],
+) -> str:
+    """Keep generated file mutations inside the plan's frozen path scope."""
+
+    arg_name = {
+        "write_ops_file": "path",
+        "replace_text_in_file": "path",
+        "insert_text_before_anchor": "path",
+        "edit_text_file": "path",
+        "upsert_python_class": "path",
+        "set_python_config_assignment": "path",
+        "set_python_class_attribute": "path",
+        "install_nginx_config": "source_path",
+    }.get(action)
+    if arg_name is None:
+        return ""
+    if action == "install_nginx_config" and not str(
+        args.get("source_path") or ""
+    ).strip():
+        return ""
+    candidate_text = str(args.get(arg_name) or "").strip()
+    if not candidate_text.startswith("/"):
+        return "action_path_not_absolute=%s" % arg_name
+    candidate = Path(candidate_text)
+    frozen_roots = [
+        Path(str(resource.value))
+        for resource in resources
+        if resource.status == "frozen"
+        and resource.kind == "path"
+        and str(resource.value).startswith("/")
+    ]
+    if not frozen_roots:
+        return ""
+    for root in frozen_roots:
+        try:
+            candidate.relative_to(root)
+            return ""
+        except ValueError:
+            continue
+    return "action_path_outside_frozen_resources=%s:%s" % (
+        arg_name,
+        candidate,
+    )
+
+
+def _validate_action_objective_fit(
+    action: str,
+    step: PrivilegedStep,
+) -> str:
+    """Reject structurally valid Actions that cannot cause the stated effect."""
+
+    text = " ".join(
+        [step.title, step.objective, step.reason, *step.expected_changes]
+    ).lower()
+    if action == "manual_checkpoint":
+        if step.risk == "readonly" and not step.expected_changes:
+            return ""
+        if re.search(
+            r"人工|手动|用户.{0,8}(?:决定|确认)|manual|checkpoint|"
+            r"human.{0,8}(?:decision|approval)",
+            text,
+            re.IGNORECASE,
+        ):
+            return ""
+        return "action=manual_checkpoint cannot_produce_automatic_state_change"
+    if action == "write_ops_file" and re.search(
+        r"sites-enabled|符号链接|软链接|\bsymlink\b|"
+        r"(?:nginx|站点).{0,20}(?:启用|enable)|"
+        r"(?:启用|enable).{0,20}(?:nginx|site|站点)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "action=write_ops_file cannot_enable_nginx_site"
+    if action != "set_python_config_assignment":
+        return ""
+    if re.search(
+        r"激活|切换.{0,12}(?:配置|config)|活动配置|"
+        r"(?:active|default).{0,12}config|"
+        r"config.{0,12}(?:assignment|activate|switch|point)",
+        text,
+        re.IGNORECASE,
+    ):
+        return ""
+    return "action=set_python_config_assignment objective_is_not_config_activation"
+
+
+def _validate_action_postcondition_fit(
+    action: str,
+    args: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> str:
+    """Require generated artifacts to contain every claimed literal."""
+
+    if action != "install_nginx_config":
+        return ""
+    content = str(args.get("content") or "")
+    if not content.strip():
+        source = Path(str(args.get("source_path") or "")).expanduser()
+        try:
+            content = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return "nginx_source_or_content_unreadable"
+    destination = "/etc/nginx/sites-available/%s" % str(
+        args.get("config_name") or ""
+    ).strip()
+    for check in checks:
+        check_args = check.get("args") if isinstance(check, dict) else None
+        if (
+            check.get("checker") == "file_contains"
+            and isinstance(check_args, dict)
+            and str(check_args.get("path") or "") == destination
+        ):
+            expected = str(check_args.get("text") or "")
+            if expected and expected not in content:
+                return "nginx_source_missing_declared_content=%s" % expected
+    return ""
+
+
+def _normalize_resolved_resource_semantic_step(
+    step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> None:
+    """Turn planning-time port selection into execution-time verification."""
+
+    text = "%s %s" % (step.title, step.objective)
+    if not re.search(
+        r"自动.{0,8}选择.{0,8}(?:空闲)?端口|选择.{0,8}空闲端口|"
+        r"(?:select|choose).{0,20}(?:available|free).{0,12}ports?|"
+        r"scan.{0,20}(?:and|to).{0,12}(?:select|choose).{0,12}ports?",
+        text,
+        re.IGNORECASE,
+    ):
+        return
+    frozen_ports = [
+        (str(resource.role or resource.name), int(resource.value))
+        for resource in resources
+        if resource.status == "frozen"
+        and (
+            resource.kind == "port"
+            or str(resource.role or resource.name).endswith("_port")
+        )
+        and str(resource.value).isdigit()
+    ]
+    if not frozen_ports:
+        return
+    manifest = "、".join(
+        "%s=%s" % item for item in sorted(frozen_ports)
+    )
+    step.title = "验证已冻结端口仍可用"
+    step.objective = "验证计划阶段已冻结的端口仍未被占用：%s" % manifest
+    step.expected_changes = []
+    step.risk = "readonly"
+    step.success_criteria = ["所有已冻结端口在执行前仍未被监听"]
+
+
+def _validate_semantic_destination_availability(
+    step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> None:
+    """Block every implementation route when a new-instance target has data."""
+
+    text = "%s %s" % (step.title, step.objective)
+    if not re.search(
+        r"复制|同步|克隆|copy|sync|clone|materialize",
+        text,
+        re.IGNORECASE,
+    ):
+        return
+    target = next(
+        (
+            Path(str(resource.value)).expanduser()
+            for resource in resources
+            if resource.status == "frozen"
+            and (resource.role == "instance_root" or resource.name == "instance_root")
+            and str(resource.value).startswith("/")
+        ),
+        None,
+    )
+    if target is None or not target.is_dir():
+        return
+    try:
+        occupied = next(target.iterdir(), None) is not None
+    except OSError as exc:
+        raise ExecutionBindingError(
+            "instance_root_not_inspectable=%s" % target,
+            replan_recommended=True,
+            category="external_state_conflict",
+        ) from exc
+    if occupied:
+        raise ExecutionBindingError(
+            "instance_root_not_empty=%s" % target,
+            replan_recommended=True,
+            category="external_state_conflict",
+        )
+
+
+def _validate_semantic_resource_coverage(
+    semantic_step: PrivilegedStep,
+    micro_steps: list[PrivilegedStep],
+    resources: list[PlanResource],
+) -> None:
+    """Ensure a backend port configuration consumes every frozen port field."""
+
+    text = "%s %s" % (semantic_step.title, semantic_step.objective)
+    if not re.search(r"配置|端口|config|port", text, re.IGNORECASE):
+        return
+    has_public_port = any(
+        resource.status == "frozen"
+        and (resource.role == "public_port" or resource.name == "public_port")
+        for resource in resources
+    )
+    if not has_public_port:
+        return
+    attributes = set()
+    for step in micro_steps:
+        binding = step.execution_binding
+        action = step.action or (binding.action if binding is not None else "")
+        args = step.args or (binding.args if binding is not None else {})
+        if action == "set_python_class_attribute":
+            attributes.add(str(args.get("attribute") or "").strip())
+    backend_fields = {"master_port", "worker_port", "web_terminal_port"}
+    if len(attributes.intersection(backend_fields)) >= 2 and "public_port" not in attributes:
+        raise ExecutionBindingError(
+            "missing_public_port_assignment",
+            replan_recommended=False,
+            category="implementation_contract_invalid",
+        )
+
+
+def _validate_checker_resource_scope(
+    step: PrivilegedStep,
+    checks: list[dict[str, Any]],
+    resources: list[PlanResource],
+) -> str:
+    """Reject port assertions unrelated to the frozen plan or stated objective."""
+
+    frozen_ports = {
+        int(resource.value)
+        for resource in resources
+        if resource.status == "frozen"
+        and (
+            resource.kind == "port"
+            or str(resource.role or resource.name).endswith("_port")
+        )
+        and str(resource.value).isdigit()
+    }
+    if not frozen_ports:
+        return ""
+    text = " ".join(
+        [
+            step.title,
+            step.objective,
+            step.reason,
+            *step.evidence_refs,
+            *step.success_criteria,
+        ]
+    ).lower()
+    shared_service_check = bool(
+        re.search(r"redis|mysql|rabbitmq|共享服务|shared service", text)
+    )
+    for check in checks:
+        if not isinstance(check, dict) or not str(
+            check.get("checker") or ""
+        ).startswith("port_"):
+            continue
+        args = check.get("args")
+        raw_port = args.get("port") if isinstance(args, dict) else None
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            continue
+        if port in frozen_ports or str(port) in text:
+            continue
+        if shared_service_check and port in {3307, 5672, 8368}:
+            continue
+        return "unscoped_port_check=%s" % port
+    return ""
+
+
+def _infer_structural_action_args(
+    action: str,
+    args: dict[str, Any],
+    resources: list[PlanResource],
+) -> dict[str, Any]:
+    """Infer stable AST facts from the current or predecessor source tree."""
+
+    compiled = dict(args)
+    if action in {
+        "start_screen_component",
+        "restart_screen_component",
+        "stop_screen_component",
+    }:
+        suffix = {
+            "master": "m",
+            "celery": "c",
+            "web_terminal": "web",
+            "worker": "w",
+        }.get(str(compiled.get("component") or "").strip())
+        platform = str(
+            compiled.get("session_prefix")
+            or compiled.get("platform")
+            or ""
+        ).strip()
+        resource_platform = next(
+            (
+                str(resource.value).strip()
+                for resource in resources
+                if resource.status == "frozen"
+                and (
+                    resource.role in {
+                        "instance_identifier",
+                        "platform_instance_name",
+                        "screen_session_prefix",
+                        "screen_session_name_prefix",
+                    }
+                    or (
+                        "screen" in str(resource.role or "")
+                        and "prefix" in str(resource.role or "")
+                    )
+                )
+                and str(resource.value).strip()
+            ),
+            "",
+        )
+        if resource_platform:
+            platform = resource_platform
+        if suffix and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", platform):
+            compiled["platform"] = platform
+            compiled["screen_session"] = "%s_%s" % (platform, suffix)
+    if action != "upsert_python_class":
+        return compiled
+    raw_body = textwrap.dedent(str(compiled.get("body") or "")).strip()
+    class_name = str(compiled.get("class_name") or "").strip()
+    if raw_body.startswith("class ") and class_name:
+        try:
+            wrapper = ast.parse(raw_body)
+        except SyntaxError:
+            wrapper = None
+        if (
+            wrapper is not None
+            and len(wrapper.body) == 1
+            and isinstance(wrapper.body[0], ast.ClassDef)
+            and wrapper.body[0].name == class_name
+            and wrapper.body[0].body
+        ):
+            class_node = wrapper.body[0]
+            body_lines = raw_body.splitlines()
+            first = class_node.body[0]
+            last = class_node.body[-1]
+            extracted = "\n".join(
+                body_lines[
+                    int(first.lineno) - 1:int(last.end_lineno or last.lineno)
+                ]
+            )
+            compiled["body"] = textwrap.dedent(extracted).strip()
+            if not compiled.get("base_class") and class_node.bases:
+                base = class_node.bases[0]
+                if isinstance(base, ast.Name):
+                    compiled["base_class"] = base.id
+                elif isinstance(base, ast.Attribute):
+                    try:
+                        compiled["base_class"] = ast.unparse(base)
+                    except (AttributeError, ValueError):
+                        pass
+    if compiled.get("base_class"):
+        return compiled
+    target_text = str(compiled.get("path") or "").strip()
+    if not target_text.startswith("/") or not class_name.endswith("Config"):
+        return compiled
+    target = Path(target_text)
+    candidates = [target]
+    instance_root = next(
+        (
+            Path(str(item.value)) for item in resources
+            if item.status == "frozen"
+            and (item.role == "instance_root" or item.name == "instance_root")
+        ),
+        None,
+    )
+    source_root = next(
+        (
+            Path(str(item.value)) for item in resources
+            if item.status == "frozen" and item.role == "source_repo_root"
+        ),
+        None,
+    )
+    if instance_root is not None and source_root is not None:
+        try:
+            candidates.append(source_root / target.relative_to(instance_root))
+        except ValueError:
+            pass
+    for candidate in candidates:
+        try:
+            tree = ast.parse(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, SyntaxError):
+            continue
+        if any(
+            isinstance(node, ast.ClassDef) and node.name == "CommonConfig"
+            for node in tree.body
+        ):
+            compiled["base_class"] = "CommonConfig"
+            break
+    return compiled
 
 
 def _validate_shell_resource_bindings(
@@ -2420,9 +3203,44 @@ def _clean_binding_args(value: dict[str, Any]) -> dict[str, Any]:
             }
         else:
             result[normalized] = str(item)[
-                :20000 if normalized in {"content", "anchor"} else 500
+                :20000 if normalized in {"content", "anchor", "body"} else 500
             ]
     return result
+
+
+def _merge_alternative_checker_contracts(
+    checks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Represent alternative HTTP outcomes as one deterministic OR check."""
+
+    merged: list[dict[str, Any]] = []
+    http_by_url: dict[str, dict[str, Any]] = {}
+    for check in checks:
+        args = check.get("args", {})
+        if check.get("checker") != "http_status" or not isinstance(args, dict):
+            merged.append(check)
+            continue
+        url = str(args.get("url") or "")
+        existing = http_by_url.get(url)
+        if existing is None:
+            copied = {"checker": "http_status", "args": dict(args)}
+            http_by_url[url] = copied
+            merged.append(copied)
+            continue
+        statuses = []
+        for candidate in (existing["args"], args):
+            raw = candidate.get("statuses")
+            if isinstance(raw, list):
+                statuses.extend(raw)
+            elif candidate.get("status") is not None:
+                statuses.append(candidate.get("status"))
+            else:
+                statuses.append(200)
+        existing["args"].pop("status", None)
+        existing["args"]["statuses"] = sorted(
+            {int(item) for item in statuses}
+        )
+    return merged
 
 
 def _json_object_value(value: Any) -> dict[str, Any] | None:

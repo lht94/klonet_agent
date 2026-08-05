@@ -45,7 +45,7 @@ CHECKER_ARGUMENT_HINTS = {
     "network_link_state": "name,state",
     "libvirt_domain_state": "domain,state",
     "ovs_resource_state": "resource_type,name; optional present",
-    "http_status": "url; optional status",
+    "http_status": "url; optional status or statuses",
     "git_revision": "repository,revision",
     "user_in_group": "user,group",
     "file_mode": "path,mode",
@@ -53,6 +53,9 @@ CHECKER_ARGUMENT_HINTS = {
     "python_package_state": "python_executable,package; optional present",
     "command_available": "command",
     "python_import_succeeds": "module; optional python_executable,cwd",
+    "python_attribute_equals": (
+        "module,attribute,expected; optional python_executable,cwd"
+    ),
     "package_version": "package; optional version",
     "nginx_config_valid": "optional binary",
     "log_has_no_fatal_error": "path; optional tail_chars,pattern",
@@ -95,6 +98,7 @@ CHECKER_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "python_package_state": ("python_executable", "package"),
     "command_available": ("command",),
     "python_import_succeeds": ("module",),
+    "python_attribute_equals": ("module", "attribute", "expected"),
     "package_version": ("package",),
     "nginx_config_valid": (),
     "log_has_no_fatal_error": ("path",),
@@ -138,6 +142,7 @@ class DefaultCheckerRegistry:
             "python_package_state": self._python_package_state,
             "command_available": self._command_available,
             "python_import_succeeds": self._python_import_succeeds,
+            "python_attribute_equals": self._python_attribute_equals,
             "package_version": self._package_version,
             "nginx_config_valid": self._nginx_config_valid,
             "log_has_no_fatal_error": self._log_has_no_fatal_error,
@@ -546,7 +551,11 @@ class DefaultCheckerRegistry:
     def _http_status(self, args, evidence):
         del evidence
         url = str(args["url"])
-        expected = int(args.get("status", 200))
+        raw_statuses = args.get("statuses")
+        if isinstance(raw_statuses, list) and raw_statuses:
+            expected = sorted({int(item) for item in raw_statuses})
+        else:
+            expected = [int(args.get("status", 200))]
         try:
             with urllib.request.urlopen(url, timeout=5) as response:
                 observed = int(response.status)
@@ -559,7 +568,7 @@ class DefaultCheckerRegistry:
             )
         return CheckResult(
             "http_status",
-            "passed" if observed == expected else "failed",
+            "passed" if observed in expected else "failed",
             expected=str(expected),
             observed=str(observed),
         )
@@ -681,6 +690,45 @@ class DefaultCheckerRegistry:
             [python, "-c", script, target],
             cwd=cwd,
             expected="import %s" % target,
+        )
+
+    def _python_attribute_equals(self, args, evidence):
+        """Read one public Python attribute and compare its JSON value."""
+
+        del evidence
+        module = str(args["module"]).strip()
+        attribute = str(args["attribute"]).strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module):
+            raise ValueError("invalid Python module target")
+        if not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", attribute):
+            raise ValueError("invalid Python attribute target")
+        python = str(args.get("python_executable") or sys.executable).strip()
+        cwd_value = str(args.get("cwd") or "").strip()
+        cwd = None
+        if cwd_value:
+            cwd_path = Path(cwd_value).expanduser()
+            if not cwd_path.is_dir():
+                raise ValueError(
+                    "python attribute cwd is not a directory: %s" % cwd_path
+                )
+            cwd = str(cwd_path)
+        expected_json = json.dumps(
+            args["expected"], ensure_ascii=False, sort_keys=True
+        )
+        script = (
+            "import importlib,json,sys\n"
+            "obj=importlib.import_module(sys.argv[1])\n"
+            "for name in sys.argv[2].split('.'):\n"
+            " obj=getattr(obj,name)\n"
+            "expected=json.loads(sys.argv[3])\n"
+            "print(json.dumps(obj,ensure_ascii=False,sort_keys=True))\n"
+            "raise SystemExit(0 if obj==expected else 1)\n"
+        )
+        return self._command_check(
+            "python_attribute_equals",
+            [python, "-c", script, module, attribute, expected_json],
+            cwd=cwd,
+            expected="%s.%s == %s" % (module, attribute, expected_json),
         )
 
     def _package_version(self, args, evidence):

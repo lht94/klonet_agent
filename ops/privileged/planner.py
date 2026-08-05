@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
+import textwrap
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +23,9 @@ from klonet_agent.ops.privileged.planner_schema import (
     normalize_semantic_risk,
 )
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+
+
+MAX_PLANNER_INVALID_REPAIRS = 3
 
 
 PLANNER_SYSTEM_PROMPT = """
@@ -54,6 +59,7 @@ When ready, return:
    "name":"stable_name such as instance_root or master_port",
    "kind":"path|port|url|identifier|string",
    "status":"frozen|deferred",
+   "role":"semantic role such as platform_runtime_root or source_repo_root",
    "value":"exact value for frozen; null for deferred",
    "source":"user_input|environment_evidence|derived",
    "reason":"why this value is deferred, otherwise empty",
@@ -87,6 +93,16 @@ instance's value for a deferred resource. consumers lock a resource to an
 argument in the later implementation, for example copy.destination and
 start.project_root. Do not add consumers for parameters that do not directly
 carry that exact value.
+Every path resource must have an unambiguous role. In particular,
+platform_runtime_root, source_repo_root, config_file and runtime_cwd are
+different roles even when two values happen to share a parent directory.
+For a new Klonet instance beside an existing one, freeze a distinct
+instance_root (for example platform_runtime_root/instance_name), prepare/copy
+the source into it before configuration or startup, and bind runtime startup
+through the platform root plus instance name. Do not mutate the existing
+source_repo_root's active config as the new instance's isolated config.
+Nginx syntax may be configured before startup, but HTTP/proxy health must only
+be verified after the backend-start semantic step on which it depends.
 
 Never include passwords. You have no mutation tools. An independent Execution
 Agent will map semantic steps to registered Actions or frozen one-time shell
@@ -302,6 +318,12 @@ class PrivilegedPlannerAgent:
                         raise ValueError(
                             "deployment plan that assigns ports requires frozen port resources"
                         )
+                    _validate_deployment_plan_shape(
+                        str(data.get("goal") or goal),
+                        steps,
+                        resources,
+                        grounded_context=grounded_context,
+                    )
                 self._progress(
                     "规划结论：已形成 %s 个语义步骤，开始匹配安全执行能力。"
                     % len(steps)
@@ -309,14 +331,15 @@ class PrivilegedPlannerAgent:
                 break
             except (KeyError, TypeError, ValueError) as exc:
                 last_error = str(exc)
-                if invalid_repairs >= 1:
+                if invalid_repairs >= MAX_PLANNER_INVALID_REPAIRS:
                     raise ValueError(
                         "Planner did not return a valid semantic plan: %s"
                         % last_error
                     )
                 invalid_repairs += 1
                 self._progress(
-                    "规划节点：Planner 返回格式不完整，正在请求结构化修复…"
+                    "规划节点：Planner 返回格式不完整（%s），正在请求结构化修复…"
+                    % str(last_error)[:240]
                 )
                 messages.append({"role": "assistant", "content": content})
                 messages.append(
@@ -384,6 +407,7 @@ class PrivilegedPlannerAgent:
                 name=str(item.get("name") or "").strip(),
                 kind=str(item.get("kind") or "string").strip().lower(),
                 status=str(item.get("status") or "").strip().lower(),
+                role=_resource_role(item),
                 value=item.get("value"),
                 source=str(item.get("source") or "").strip()[:200],
                 reason=str(item.get("reason") or "").strip()[:1000],
@@ -407,15 +431,19 @@ class PrivilegedPlannerAgent:
                     )
                 )
                 implicit_args: tuple[str, ...] = ()
-                if resource.name == "instance_name":
+                resource_role = resource.role or resource.name
+                if resource.name == "instance_name" or resource_role == "instance_name":
                     implicit_args = ("platform",)
-                elif resource.name == "instance_root":
+                elif resource.name == "instance_root" or resource_role == "instance_root":
                     implicit_args = ("project_root",)
                     if copy_like:
                         implicit_args += ("destination", "repository")
                     if create_like:
                         implicit_args += ("path",)
-                elif resource.name == "source_root" and copy_like:
+                elif (
+                    resource.name == "source_root"
+                    or resource_role == "source_repo_root"
+                ) and copy_like:
                     implicit_args = ("source",)
                 elif (
                     resource.name in {"git_remote", "repository_url"}
@@ -429,7 +457,7 @@ class PrivilegedPlannerAgent:
                     consumer = "%s.%s" % (step_id, arg_name)
                     if consumer not in resource.consumers:
                         resource.consumers.append(consumer)
-            if resource.name == "instance_root":
+            if resource.name == "instance_root" or resource.role == "instance_root":
                 for step in steps:
                     text = "%s %s" % (step.title, step.objective)
                     if re.search(
@@ -460,15 +488,86 @@ class PrivilegedPlannerAgent:
         names = [item.name for item in resources]
         if len(set(names)) != len(names):
             raise ValueError("duplicate plan resource name")
-        owners: dict[str, str] = {}
+        # destination is a semantic role, not an LLM naming choice. Prefer the
+        # frozen instance root and discard aliases that incorrectly claim the
+        # same destination consumer.
+        instance_consumers = {
+            consumer
+            for resource in resources
+            for consumer in resource.consumers
+            if consumer.endswith((".destination", ".project_root"))
+        }
+        for consumer in instance_consumers:
+            claimants = [
+                resource for resource in resources
+                if consumer in resource.consumers
+            ]
+            preferred = next(
+                (
+                    resource for resource in claimants
+                    if resource.role == "instance_root"
+                    or resource.name == "instance_root"
+                ),
+                None,
+            )
+            if preferred is not None:
+                for resource in claimants:
+                    if resource is not preferred:
+                        resource.consumers.remove(consumer)
+        owners: dict[str, PlanResource] = {}
         for resource in resources:
+            retained_consumers = []
             for consumer in resource.consumers:
-                previous = owners.setdefault(consumer, resource.name)
-                if previous != resource.name:
+                previous = owners.setdefault(consumer, resource)
+                if previous.name == resource.name:
+                    retained_consumers.append(consumer)
+                    continue
+                same_value = (
+                    str(Path(str(previous.value)).expanduser())
+                    == str(Path(str(resource.value)).expanduser())
+                    if previous.kind == resource.kind == "path"
+                    else previous.value == resource.value
+                )
+                if not same_value:
+                    if (
+                        consumer.endswith(".source")
+                        and previous.kind == resource.kind == "path"
+                    ):
+                        try:
+                            previous_exists = Path(
+                                str(previous.value)
+                            ).is_dir()
+                        except OSError:
+                            previous_exists = False
+                        try:
+                            current_exists = Path(str(resource.value)).is_dir()
+                        except OSError:
+                            current_exists = False
+                        if previous_exists != current_exists:
+                            if current_exists:
+                                previous.consumers = [
+                                    item for item in previous.consumers
+                                    if item != consumer
+                                ]
+                                owners[consumer] = resource
+                                retained_consumers.append(consumer)
+                            continue
                     raise ValueError(
-                        "plan resource consumer has multiple owners: %s"
-                        % consumer
+                        "plan resource consumer has conflicting owners: %s "
+                        "%s=%s vs %s=%s"
+                        % (
+                            consumer,
+                            previous.name,
+                            previous.value,
+                            resource.name,
+                            resource.value,
+                        )
                     )
+                # Equal-value aliases are harmless, but the persisted contract
+                # keeps a single canonical owner for deterministic injection.
+                if previous is resource:
+                    retained_consumers.append(consumer)
+            resource.consumers = retained_consumers
         return resources
 
     def _progress(self, message: str) -> None:
@@ -583,6 +682,22 @@ class PrivilegedPlannerAgent:
         except TypeError:
             return self.llm.complete(messages=messages, tools=None)
 
+def _resource_role(item: dict[str, Any]) -> str:
+    explicit = str(item.get("role") or "").strip()
+    if explicit:
+        return explicit[:100]
+    name = str(item.get("name") or "").strip()
+    known = {
+        "project_root": "platform_runtime_root",
+        "runtime_cwd": "runtime_cwd",
+        "source_repo_root": "source_repo_root",
+        "config_path": "config_file",
+        "nginx_config_path": "nginx_config_file",
+        "instance_root": "platform_instance_root",
+    }
+    return known.get(name, name)[:100]
+
+
 def _default_action_postconditions(
     action: str,
     args: dict[str, Any],
@@ -624,6 +739,16 @@ def _default_action_postconditions(
                 "args": {
                     "path": args.get("path"),
                     "text": args.get("content"),
+                },
+            }
+        ]
+    if action == "upsert_python_class":
+        return [
+            {
+                "checker": "file_contains",
+                "args": {
+                    "path": args.get("path"),
+                    "text": "class %s(" % args.get("class_name"),
                 },
             }
         ]
@@ -1014,6 +1139,189 @@ def _requires_plan_resource_manifest(
     return deployment and mutating
 
 
+def _validate_deployment_plan_shape(
+    goal: str,
+    steps: list[PrivilegedStep],
+    resources: list[PlanResource],
+    *,
+    grounded_context: GroundedPlanContext | None = None,
+) -> None:
+    """Reject confirmable new-instance routes that cannot be isolated."""
+
+    text = " ".join(
+        [goal]
+        + ["%s %s" % (step.title, step.objective) for step in steps]
+    ).lower()
+    if not re.search(
+        r"新增.{0,12}(?:实例|平台)|新.{0,8}(?:实例|平台)|"
+        r"\bnew\s+(?:instance|platform)\b|\bdeploy.{0,20}\binstance\b",
+        text,
+    ):
+        return
+    by_role = {
+        (item.role or item.name): item
+        for item in resources
+        if item.status == "frozen"
+    }
+    instance_root = by_role.get("instance_root") or next(
+        (
+            item for item in resources
+            if item.status == "frozen" and item.name == "instance_root"
+        ),
+        None,
+    )
+    source_root = by_role.get("source_repo_root")
+    if instance_root is None:
+        raise ValueError(
+            "new_instance_isolation_missing=freeze_distinct_instance_root"
+        )
+    if source_root is not None and str(instance_root.value) == str(source_root.value):
+        raise ValueError(
+            "new_instance_isolation_invalid=instance_root_equals_source_repo_root"
+        )
+
+    preparation = [
+        step for step in steps
+        if re.search(
+            r"复制|克隆|准备.{0,8}源码|"
+            r"\bcopy\b|\bclone\b|\bprepare.{0,12}source",
+            "%s %s %s" % (
+                step.title,
+                step.objective,
+                " ".join(step.expected_changes),
+            ),
+            flags=re.IGNORECASE,
+        )
+    ]
+    start_steps = [
+        step for step in steps
+        if re.search(
+            r"启动.{0,16}(?:平台|组件|服务)|\bstart.{0,20}(?:platform|component|service)",
+            "%s %s" % (step.title, step.objective),
+            flags=re.IGNORECASE,
+        )
+    ]
+    if start_steps and not preparation:
+        raise ValueError(
+            "new_instance_isolation_missing=prepare_or_copy_instance_source"
+        )
+    preparation_ids = {step.step_id for step in preparation}
+    step_by_id = {step.step_id: step for step in steps}
+
+    def dependency_closure(step: PrivilegedStep) -> set[str]:
+        pending = list(step.depends_on)
+        found: set[str] = set()
+        while pending:
+            dependency_id = pending.pop()
+            if dependency_id in found:
+                continue
+            found.add(dependency_id)
+            dependency = step_by_id.get(dependency_id)
+            if dependency is not None:
+                pending.extend(dependency.depends_on)
+        return found
+
+    for start in start_steps:
+        if preparation_ids and not preparation_ids.intersection(
+            dependency_closure(start)
+        ):
+            raise ValueError(
+                "new_instance_dependency_missing=%s_requires_instance_preparation"
+                % start.step_id
+            )
+
+    for prepare in preparation:
+        source = next(
+            (
+                resource for resource in resources
+                if "%s.source" % prepare.step_id in resource.consumers
+            ),
+            None,
+        )
+        destination = next(
+            (
+                resource for resource in resources
+                if "%s.destination" % prepare.step_id in resource.consumers
+            ),
+            None,
+        )
+        if source is None:
+            raise ValueError(
+                "new_instance_copy_source_missing=%s.source" % prepare.step_id
+            )
+        source_path = Path(str(source.value))
+        try:
+            source_exists = source_path.is_dir()
+        except OSError:
+            source_exists = False
+        if source.status != "frozen" or not source_exists:
+            raise ValueError(
+                "new_instance_copy_source_not_existing=%s:%s"
+                % (source.name, source.value)
+            )
+        if grounded_context is not None and source.source != "user_input":
+            environment = grounded_context.facts.get("environment_model")
+            projects = (
+                environment.get("projects", [])
+                if isinstance(environment, dict)
+                else []
+            )
+            grounded_paths = set()
+            for project in projects:
+                if not isinstance(project, dict):
+                    continue
+                for key in (
+                    "candidate_root",
+                    "source_repo_root",
+                    "platform_root",
+                    "backend_package_root",
+                ):
+                    value = str(project.get(key) or "").strip()
+                    if value.startswith("/"):
+                        grounded_paths.add(Path(value))
+            if grounded_paths and not any(
+                source_path == root or root in source_path.parents
+                for root in grounded_paths
+            ):
+                raise ValueError(
+                    "new_instance_copy_source_not_grounded_in_environment=%s:%s"
+                    % (source.name, source.value)
+                )
+        if source.source == "user_input" and str(source.value) not in goal:
+            raise ValueError(
+                "new_instance_copy_source_not_present_in_user_input=%s:%s"
+                % (source.name, source.value)
+            )
+        if destination is None or str(destination.value) != str(instance_root.value):
+            raise ValueError(
+                "new_instance_copy_destination_must_equal_instance_root=%s"
+                % prepare.step_id
+            )
+
+    start_ids = {step.step_id for step in start_steps}
+    for step in steps:
+        step_text = "%s %s %s" % (
+            step.title,
+            step.objective,
+            " ".join(step.success_criteria),
+        )
+        if (
+            re.search(r"nginx|反向代理|路由|proxy", step_text, re.IGNORECASE)
+            and re.search(
+                r"响应|可达|accessible|responsive|curl|"
+                r"http.{0,16}(?:status|response|200|2\d\d|3\d\d)",
+                step_text,
+                re.IGNORECASE,
+            )
+            and start_ids
+            and not start_ids.intersection(step.depends_on)
+        ):
+            raise ValueError(
+                "semantic_dependency_order_invalid=%s_http_health_requires_backend_start"
+                % step.step_id
+            )
+
+
 def _effective_declared_risk(
     deterministic_floor: str,
     declared: Any,
@@ -1076,9 +1384,19 @@ def _validate_host_facts(action: str, args: dict[str, Any]) -> str:
         if not script_dir.is_dir() or not (script_dir / script_name).is_file():
             return "grounding_failed=install_script_not_found:%s" % script_name
     if action == "install_nginx_config":
+        if str(args.get("content") or "").strip():
+            return ""
         source = Path(str(args.get("source_path") or "")).expanduser()
         if not source.is_file():
-            return "grounding_failed=nginx_source_not_file"
+            return "grounding_failed=nginx_source_or_content_required"
+    if action == "sync_directory":
+        destination = Path(str(args.get("destination") or "")).expanduser()
+        if destination.is_dir():
+            try:
+                if next(destination.iterdir(), None) is not None:
+                    return "grounding_failed=sync_destination_not_empty"
+            except OSError:
+                return "grounding_failed=sync_destination_not_inspectable"
     if action == "extract_archive":
         archive = Path(str(args.get("archive_path") or "")).expanduser()
         if not archive.is_file():
@@ -1129,6 +1447,43 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
                 return "action=edit_text_file anchor_required"
         elif anchor:
             return "action=edit_text_file anchor_must_be_empty"
+    if action == "upsert_python_class":
+        class_name = str(args.get("class_name") or "").strip()
+        base_class = str(args.get("base_class") or "").strip()
+        body = textwrap.dedent(str(args.get("body") or "")).strip("\n")
+        if not re.fullmatch(r"[A-Za-z_]\w*", class_name):
+            return "action=upsert_python_class invalid_class_name"
+        if base_class and not re.fullmatch(
+            r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", base_class
+        ):
+            return "action=upsert_python_class invalid_base_class"
+        try:
+            wrapped = ast.parse(
+                "class %s(%s):\n%s\n"
+                % (class_name, base_class or "object", textwrap.indent(body, "    "))
+            )
+        except SyntaxError:
+            return "action=upsert_python_class invalid_body"
+        target = wrapped.body[0]
+        if any(isinstance(node, ast.ClassDef) for node in target.body):
+            return "action=upsert_python_class body_must_not_include_class_header"
+    if action in {"start_screen_component", "restart_screen_component"}:
+        component = str(args.get("component") or "").strip()
+        platform = str(args.get("platform") or "").strip()
+        session = str(args.get("screen_session") or "").strip()
+        suffixes = {
+            "master": "m",
+            "celery": "c",
+            "web_terminal": "web",
+            "worker": "w",
+        }
+        if component not in suffixes:
+            return "action=%s invalid_component=%s" % (
+                action,
+                component or "missing",
+            )
+        if platform and session != "%s_%s" % (platform, suffixes[component]):
+            return "action=%s screen_session_mismatch" % action
     if action == "manage_container" and operation == "set_restart_policy":
         if str(args.get("restart_policy") or "") not in {
             "no", "always", "unless-stopped", "on-failure",

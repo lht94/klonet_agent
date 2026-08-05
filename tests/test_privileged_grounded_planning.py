@@ -226,7 +226,7 @@ def test_planner_rejects_model_authored_shell_even_after_repair():
             ]
         }
     )
-    llm = FakeLLM([shell_payload, shell_payload])
+    llm = FakeLLM([shell_payload] * 4)
 
     try:
         PrivilegedPlannerAgent(llm).plan("帮我部署平台")
@@ -432,8 +432,7 @@ def test_standard_deploy_has_no_deterministic_resolver_when_llm_plan_is_invalid(
     )
     llm = FakeLLM(
         [
-            json.dumps({"status": "ready", "steps": []}),
-            json.dumps({"status": "ready", "steps": []}),
+            *[json.dumps({"status": "ready", "steps": []})] * 4,
         ]
     )
 
@@ -467,8 +466,7 @@ def test_recovery_never_falls_back_to_repeating_standard_deploy(tmp_path):
     )
     llm = FakeLLM(
         [
-            json.dumps({"status": "ready", "steps": []}),
-            json.dumps({"status": "ready", "steps": []}),
+            *[json.dumps({"status": "ready", "steps": []})] * 4,
         ]
     )
 

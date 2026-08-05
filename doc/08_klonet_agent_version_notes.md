@@ -1064,10 +1064,25 @@ Ops-Privilege 入口把“请求类型”和“目标明确性”分开判断：
 
 Ops-Privilege 的交互输出与延迟也遵循以下边界：
 
-- 分类器与 Planner 默认都使用 `deepseek-v4-pro`，显式关闭 thinking；强模型负责理解
+- 分类器与 Planner 默认都使用 `deepseek-v4-flash`，显式关闭 thinking；统一使用低延迟模型负责理解
   和规划，但不消耗不必要的隐藏推理 Token。
 - 默认不设置业务层硬超时，避免正常的模型延迟波动被误报为失败；仍关闭 SDK 自动
   重试，网络或服务错误不会暗中重复请求。
+
+源码修改与失败恢复采用事务式 Implementation 流程：
+
+- `write_ops_file`、`replace_text_in_file`、`insert_text_before_anchor` 与
+  `edit_text_file` 先在内存中生成候选内容；Python 候选必须通过 AST、编译、重复类
+  和本地父类定义顺序检查，JSON 候选必须可解析，然后才备份并原子写入。
+- 修改类步骤通过自身检查后先进入 `applied_unverified`，只有所属语义步骤的全部
+  Implementation 都通过 Verifier 才提交为 `completed`。验证失败或用户终止时，
+  Coordinator 根据持久化的 mutation/backup 证据逆序回滚未提交修改。
+- Failure Packet 包含冻结资源及角色、因果前驱和回滚合同。Verifier 失败时优先重绑
+  产生错误产物的前驱 Implementation；局部实现耗尽后才进入 Planner replan。
+- replan 继承原计划冻结值和资源角色，不允许把 `source_repo_root` 与
+  `platform_runtime_root` 静默互换。确定性证据与冻结值冲突时资源进入 `disputed`，
+  必须由用户执行 `resolve-priv-resource <plan_id> <name> <value>` 明确修正，随后重新
+  replan 和确认。
 - 分类前立即显示“正在分析请求并规划下一步…”，进入 Planner 后显示“正在生成高权限
   操作计划…”，等待期间不再保持空白。
 - Planner 通常生成 3–6 步、最多 8 步；相关只读探测必须合并，标准超时和校验器由

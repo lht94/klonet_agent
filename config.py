@@ -21,7 +21,7 @@ if load_dotenv is not None:
     # systemd service start from different directories in production.
     load_dotenv(PACKAGE_ROOT / ".env")
 
-DEFAULT_MODEL = "deepseek-v4-pro"
+DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_EMBEDDING_MODEL = os.getenv(
     "DEFAULT_EMBEDDING_MODEL",
@@ -51,7 +51,7 @@ RAG_QUERY_PLANNER_TIMEOUT_SECONDS = max(
 )
 OPS_PRIVILEGE_CLASSIFIER_MODEL = os.getenv(
     "OPS_PRIVILEGE_CLASSIFIER_MODEL",
-    "deepseek-v4-pro",
+    "deepseek-v4-flash",
 ).strip()
 _ops_classifier_timeout = float(
     os.getenv("OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS", "0")
@@ -61,7 +61,7 @@ OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS = (
 )
 OPS_PRIVILEGE_PLANNER_MODEL = os.getenv(
     "OPS_PRIVILEGE_PLANNER_MODEL",
-    "deepseek-v4-pro",
+    "deepseek-v4-flash",
 ).strip()
 _ops_planner_timeout = float(
     os.getenv("OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS", "0")

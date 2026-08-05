@@ -104,13 +104,17 @@ def test_context_renders_structured_environment_model(tmp_path):
             return [str(backend)]
 
     context = Builder(
-        knowledge_search=lambda *args, **kwargs: "knowledge",
+        knowledge_search=lambda *args, **kwargs: (
+            "knowledge example /root/obsolete/platform"
+        ),
         environment_inspector=lambda args: "environment",
     ).build("部署平台")
 
     prompt = context.render()
     model = context.facts["environment_model"]
     assert "Structured environment facts" in prompt
+    assert "/root/obsolete/platform" not in prompt
+    assert "knowledge-path omitted" in prompt
     assert model["projects"][0]["platform_root"] == str(backend.parent)
     assert context.audit_summary()["environment_schema_version"] == 1
 
@@ -252,7 +256,7 @@ def test_invalid_planner_output_has_no_deterministic_workflow_fallback(tmp_path)
     import pytest
 
     with pytest.raises(ValueError, match="valid semantic plan"):
-        PrivilegedPlannerAgent(FakeLLM([invalid, invalid])).plan(
+        PrivilegedPlannerAgent(FakeLLM([invalid] * 4)).plan(
             "部署平台",
             grounded_context=context,
         )
@@ -393,6 +397,17 @@ def test_new_platform_deployment_replay_compiles_to_confirmable_plan(tmp_path):
             "goal": "deploy codexsim",
             "resources": [
                 {
+                    "name": "source_root",
+                    "kind": "path",
+                    "status": "frozen",
+                    "role": "source_repo_root",
+                    "value": str(source_root),
+                    "source": "environment_evidence",
+                    "reason": "",
+                    "resolve_before": "",
+                    "consumers": ["copy.source"],
+                },
+                {
                     "name": "instance_root",
                     "kind": "path",
                     "status": "frozen",
@@ -414,6 +429,17 @@ def test_new_platform_deployment_replay_compiles_to_confirmable_plan(tmp_path):
                     "reason": "",
                     "resolve_before": "",
                     "consumers": ["configure.content", "route.content"],
+                },
+                {
+                    "name": "nginx_config",
+                    "kind": "path",
+                    "status": "frozen",
+                    "role": "nginx_config_path",
+                    "value": str(nginx_config),
+                    "source": "environment_evidence",
+                    "reason": "",
+                    "resolve_before": "",
+                    "consumers": ["route.path"],
                 },
             ],
             "steps": [

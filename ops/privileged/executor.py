@@ -271,6 +271,46 @@ class PrivilegedCommandExecutor:
             finished_at=utc_now(),
             timed_out=False,
             environment_changed=changed,
+            mutation=dict(getattr(result, "metadata", {}) or {}),
+        )
+
+    def rollback(self, step: PrivilegedStep) -> ExecutionEvidence:
+        """Compensate an uncommitted registered-action mutation exactly once."""
+
+        started_at = utc_now()
+        evidence = step.evidence
+        rollback = getattr(self.action_runner, "rollback", None)
+        if evidence is None or rollback is None:
+            return ExecutionEvidence(
+                return_code=2,
+                stderr="automatic_rollback_unavailable",
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        try:
+            result = rollback(evidence)
+        except Exception as exc:
+            return ExecutionEvidence(
+                return_code=1,
+                stderr="automatic_rollback_failed=%s" % exc.__class__.__name__,
+                started_at=started_at,
+                finished_at=utc_now(),
+                environment_changed=False,
+            )
+        output = self._bounded(str(result.output or ""))
+        return_code = 0 if result.status == "completed" else (
+            2 if result.status == "blocked" else 1
+        )
+        return ExecutionEvidence(
+            return_code=return_code,
+            stdout=output if return_code == 0 else "",
+            stderr=output if return_code != 0 else "",
+            started_at=started_at,
+            finished_at=utc_now(),
+            environment_changed=(
+                "environment_changed=true" in output.lower()
+            ),
         )
 
     def execute_readonly(

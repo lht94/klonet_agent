@@ -277,6 +277,347 @@ def test_hierarchical_verifier_exception_pauses_instead_of_crashing_cli(
     assert any("不会终止进程" in item for item in progress)
 
 
+def test_failed_verifier_rolls_back_and_rebinds_causal_producer(tmp_path):
+    from types import SimpleNamespace
+
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ExecutionEvidence,
+        ImplementationPlan,
+        PrivilegedPlan,
+        PrivilegedStep,
+        VerificationDecision,
+    )
+    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
+    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
+
+    config = tmp_path / "config.py"
+    backup = tmp_path / "config.py.klonet-agent.bak.1"
+    config.write_text("ORIGINAL\n", encoding="utf-8")
+
+    class Executor:
+        def execute(self, step):
+            if step.step_id == "semantic__write":
+                backup.write_text(config.read_text(encoding="utf-8"), encoding="utf-8")
+                config.write_text("BROKEN\n", encoding="utf-8")
+                return ExecutionEvidence(
+                    return_code=0,
+                    environment_changed=True,
+                    mutation={
+                        "kind": "text_file",
+                        "path": str(config),
+                        "backup": str(backup),
+                        "created": "false",
+                        "state": "applied_unverified",
+                    },
+                )
+            return ExecutionEvidence(return_code=0, environment_changed=False)
+
+        def rollback(self, step):
+            assert step.step_id == "semantic__write"
+            config.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+            return ExecutionEvidence(return_code=0, environment_changed=True)
+
+    class Verifier:
+        def verify_step(self, plan, step):
+            del plan
+            return VerificationDecision(
+                status="passed" if step.step_id == "semantic__write" else "failed",
+                reason="import NameError" if step.step_id != "semantic__write" else "written",
+            )
+
+    class Context:
+        def build(self, goal, supplemental_environment_context=""):
+            del goal
+            assert "predecessor_implementation_error" in supplemental_environment_context
+            return SimpleNamespace(planning_blocker=lambda: "")
+
+    class Binder:
+        def prepare_step(
+            self,
+            plan,
+            step,
+            *,
+            grounded_context,
+            implementation_feedback="",
+        ):
+            del plan, grounded_context
+            assert step.step_id == "semantic__write"
+            assert "import NameError" in implementation_feedback
+            return ExecutionBinding(
+                kind="registered_action",
+                action="edit_text_file",
+                args={
+                    "path": str(config),
+                    "operation": "append",
+                    "content": "FIXED",
+                },
+                risk="medium",
+                postconditions=[
+                    {"checker": "file_contains", "args": {"path": str(config), "text": "FIXED"}}
+                ],
+                binding_reason="repair the causal producer",
+            )
+
+    write = PrivilegedStep(
+        step_id="semantic__write",
+        title="write config",
+        objective="write valid config",
+        risk="medium",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="insert_text_before_anchor",
+            args={"path": str(config), "anchor": "ORIGINAL", "content": "BROKEN"},
+            risk="medium",
+            postconditions=[{"checker": "file_contains", "args": {"path": str(config), "text": "BROKEN"}}],
+        ),
+    )
+    verify = PrivilegedStep(
+        step_id="semantic__verify",
+        title="verify import",
+        objective="verify generated config import",
+        risk="readonly",
+        depends_on=[write.step_id],
+        execution_binding=ExecutionBinding(
+            kind="verification_only",
+            risk="readonly",
+            postconditions=[{"checker": "file_contains", "args": {"path": str(config), "text": "VALID"}}],
+        ),
+    )
+    parent = PrivilegedStep(
+        step_id="semantic",
+        title="configure instance",
+        objective="configure instance",
+        risk="medium",
+        implementation_plan=ImplementationPlan(
+            implementation_id="impl-semantic",
+            semantic_step_id="semantic",
+            objective="configure instance",
+            steps=[write, verify],
+            status="awaiting_confirmation",
+        ),
+    )
+    plan = PrivilegedPlan(
+        plan_id="priv-causal-repair",
+        goal="configure instance",
+        risk="medium",
+        steps=[parent],
+        status="awaiting_confirmation",
+    )
+    store = PrivilegedPlanStore(tmp_path / "memory", user_id="u", project_id="p")
+    store.save(plan)
+    workflow = PrivilegedOpsWorkflow(
+        planner=object(),
+        execution_agent=Binder(),
+        executor=Executor(),
+        verifier=Verifier(),
+        store=store,
+        context_builder=Context(),
+    )
+
+    result = workflow.approve_plan(plan.plan_id)
+
+    assert result.kind == "awaiting_confirmation"
+    assert config.read_text(encoding="utf-8") == "ORIGINAL\n"
+    rebound = result.plan.steps[0].implementation_plan.steps[0]
+    assert rebound.status == "pending"
+    assert rebound.execution_binding.action == "edit_text_file"
+    assert result.plan.recovery_history[-1]["kind"] == "causal_implementation_rebound"
+
+
+def test_replan_preserves_frozen_resource_value_and_role():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedPlan
+    from klonet_agent.ops.privileged.workflow import _inherit_replan_resources
+
+    original = PrivilegedPlan(
+        plan_id="priv-old",
+        goal="deploy",
+        risk="medium",
+        steps=[_step("start")],
+        resources=[
+            PlanResource(
+                name="project_root",
+                kind="path",
+                status="frozen",
+                role="platform_runtime_root",
+                value="/home/lzl",
+                source="environment_evidence",
+                consumers=["start.project_root"],
+            )
+        ],
+    )
+    replacement = PrivilegedPlan(
+        plan_id="priv-new",
+        goal="deploy",
+        risk="medium",
+        steps=[_step("restart")],
+        resources=[
+            PlanResource(
+                name="project_root",
+                kind="path",
+                status="frozen",
+                role="source_repo_root",
+                value="/home/lzl/vemu_uestc",
+                source="llm_replan",
+                consumers=["restart.project_root"],
+            )
+        ],
+    )
+
+    merged = _inherit_replan_resources(original, replacement)
+
+    assert merged[0].value == "/home/lzl"
+    assert merged[0].role == "platform_runtime_root"
+    assert merged[0].consumers == ["restart.project_root"]
+
+
+def test_replan_ignores_kind_label_drift_for_frozen_resource():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedPlan
+    from klonet_agent.ops.privileged.workflow import _inherit_replan_resources
+
+    original = PrivilegedPlan(
+        plan_id="priv-old-kind",
+        goal="deploy",
+        risk="medium",
+        steps=[_step("verify")],
+        resources=[
+            PlanResource(
+                name="python_executable",
+                kind="path",
+                status="frozen",
+                role="runtime_python_executable",
+                value="/opt/conda/envs/klonet/bin/python",
+                source="environment_evidence",
+                consumers=["verify.python_executable"],
+            )
+        ],
+    )
+    replacement = PrivilegedPlan(
+        plan_id="priv-new-kind",
+        goal="deploy",
+        risk="medium",
+        steps=[_step("verify_again")],
+        resources=[
+            PlanResource(
+                name="python_executable",
+                kind="string",
+                status="frozen",
+                value="python",
+                source="llm_replan",
+                consumers=["verify_again.python_executable"],
+            )
+        ],
+    )
+
+    merged = _inherit_replan_resources(original, replacement)
+
+    assert merged[0].kind == "path"
+    assert merged[0].value == "/opt/conda/envs/klonet/bin/python"
+    assert merged[0].role == "runtime_python_executable"
+    assert merged[0].consumers == ["verify_again.python_executable"]
+
+
+def test_legacy_text_action_output_restores_rollback_metadata(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ExecutionEvidence,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.workflow import _is_uncommitted_mutation
+
+    target = tmp_path / "config.py"
+    backup = tmp_path / "config.py.klonet-agent.bak.123"
+    target.write_text("BROKEN\n", encoding="utf-8")
+    backup.write_text("ORIGINAL\n", encoding="utf-8")
+    step = PrivilegedStep(
+        step_id="legacy-write",
+        title="legacy write",
+        objective="write config",
+        risk="medium",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="insert_text_before_anchor",
+            args={"path": str(target), "anchor": "x", "content": "y"},
+            risk="medium",
+        ),
+        evidence=ExecutionEvidence(
+            return_code=0,
+            stdout=(
+                "action=insert_text_before_anchor path=%s backup=%s "
+                "environment_changed=true" % (target, backup)
+            ),
+            environment_changed=True,
+        ),
+    )
+
+    assert _is_uncommitted_mutation(step) is True
+    assert step.evidence.mutation == {
+        "kind": "text_file",
+        "path": str(target),
+        "backup": str(backup),
+        "created": "false",
+        "state": "applied_unverified",
+        "recovered_from": "legacy_action_output",
+    }
+
+
+def test_disputed_resource_invalidates_authorization():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedPlan
+
+    plan = PrivilegedPlan(
+        plan_id="priv-disputed",
+        goal="deploy",
+        risk="medium",
+        steps=[_step("start")],
+        resources=[
+            PlanResource(
+                name="project_root",
+                kind="path",
+                status="frozen",
+                role="platform_runtime_root",
+                value="/home/lzl",
+                source="environment_evidence",
+            )
+        ],
+    )
+    plan.authorize()
+
+    plan.dispute_resource("project_root", reason="runtime probe contradicted path role")
+
+    assert plan.resources[0].status == "disputed"
+    assert plan.status == "awaiting_confirmation"
+    assert not plan.is_authorized
+
+
+def test_user_can_resolve_disputed_resource_before_replan(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource
+
+    plan = _plan(status="paused")
+    plan.resources = [
+        PlanResource(
+            name="project_root",
+            kind="path",
+            status="disputed",
+            role="platform_runtime_root",
+            value="/wrong/source",
+            source="old_plan",
+            reason="layout probe recommends /home/lzl",
+        )
+    ]
+    workflow = _workflow(tmp_path, plan)
+    workflow.store.save(plan)
+
+    result = workflow.handle_command(
+        "resolve-priv-resource priv-test project_root /home/lzl"
+    )
+
+    assert result.kind == "paused"
+    assert result.plan.resources[0].status == "frozen"
+    assert result.plan.resources[0].value == "/home/lzl"
+    assert result.plan.resources[0].source == "explicit_user_correction"
+    assert "replan-priv priv-test" in result.message
+
+
 def test_nested_implementation_change_invalidates_plan_authorization():
     from klonet_agent.ops.privileged.contracts import (
         ImplementationPlan,

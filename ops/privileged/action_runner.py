@@ -20,9 +20,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -53,6 +54,9 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "replace_text_in_file",
         "insert_text_before_anchor",
         "edit_text_file",
+        "upsert_python_class",
+        "set_python_config_assignment",
+        "set_python_class_attribute",
         "install_nginx_config",
         "reload_nginx",
         "start_docker_container",
@@ -151,6 +155,7 @@ class DirectActionResult:
     status: str
     output: str
     next_required_action: str = ""
+    metadata: dict[str, str] = field(default_factory=dict)
 
 
 class DirectPrivilegedActionRunner:
@@ -214,6 +219,56 @@ class DirectPrivilegedActionRunner:
                 % _one_line(exc),
                 "inspect_runtime",
             )
+
+    def rollback(self, evidence) -> DirectActionResult:
+        """Restore one exact text mutation recorded by this runner."""
+
+        mutation = dict(getattr(evidence, "mutation", {}) or {})
+        path = _absolute_path(mutation.get("path"))
+        backup = _absolute_path(mutation.get("backup"))
+        created = str(mutation.get("created") or "").lower() == "true"
+        if path is None or mutation.get("kind") != "text_file":
+            return self._blocked("rollback_metadata_missing")
+        if created:
+            if not path.exists():
+                return DirectActionResult(
+                    "completed",
+                    "rollback path=%s already_absent=true environment_changed=false"
+                    % path,
+                )
+            try:
+                path.unlink()
+            except OSError as exc:
+                return DirectActionResult(
+                    "failed",
+                    "rollback_remove_failed path=%s error=%s environment_changed=unknown"
+                    % (path, exc.__class__.__name__),
+                    "inspect_path_permissions",
+                )
+            return DirectActionResult(
+                "completed",
+                "rollback path=%s created_file_removed=true environment_changed=true"
+                % path,
+            )
+        expected_prefix = "%s.klonet-agent.bak." % path.name
+        if (
+            backup is None
+            or backup.parent != path.parent
+            or not backup.name.startswith(expected_prefix)
+            or not backup.is_file()
+        ):
+            return self._blocked("rollback_backup_missing_or_untrusted")
+        try:
+            original = backup.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return self._blocked("rollback_backup_not_readable")
+        result = self._write_file(path, original, 120)
+        if result:
+            return result
+        return DirectActionResult(
+            "completed",
+            "rollback path=%s backup=%s environment_changed=true" % (path, backup),
+        )
 
     def _action_manual_checkpoint(
         self,
@@ -754,13 +809,28 @@ class DirectPrivilegedActionRunner:
                 "direct_incremental_write_not_implemented",
                 next_action="replan_with_replace_or_run_ops_command",
             )
-        result = self._write_file(path, content, step.timeout)
+        original = None
+        if path.exists():
+            if not path.is_file():
+                return self._blocked("invalid_write_path")
+            try:
+                original = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return self._blocked("write_target_not_readable_text")
+        result, backup, created = self._commit_text_candidate(
+            path,
+            original,
+            content,
+            step.timeout,
+        )
         if result:
             return result
         return DirectActionResult(
             "completed",
-            "action=write_ops_file path=%s bytes=%s environment_changed=true"
-            % (path, len(content.encode("utf-8"))),
+            "action=write_ops_file path=%s backup=%s bytes=%s "
+            "candidate_validation=passed environment_changed=true"
+            % (path, backup or "none", len(content.encode("utf-8"))),
+            metadata=_mutation_metadata(path, backup, created),
         )
 
     def _action_replace_text_in_file(
@@ -798,32 +868,12 @@ class DirectPrivilegedActionRunner:
                 "replacement_match_count=%s expected=1" % matches
             )
         updated = content.replace(old_text, new_text, 1)
-        backup = path.with_name(
-            "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+        result, backup, created = self._commit_text_candidate(
+            path,
+            content,
+            updated,
+            step.timeout,
         )
-        try:
-            if os.access(path.parent, os.W_OK):
-                shutil.copy2(path, backup)
-            else:
-                copied = self._command(
-                    _sudo_if_needed(["cp", "-p", str(path), str(backup)]),
-                    timeout=step.timeout,
-                )
-                if copied.returncode != 0:
-                    return DirectActionResult(
-                        "failed",
-                        "replacement_backup_failed path=%s stderr=%s environment_changed=false"
-                        % (path, _one_line(copied.stderr)),
-                        "inspect_path_permissions",
-                    )
-            result = self._write_file(path, updated, step.timeout)
-        except OSError as exc:
-            return DirectActionResult(
-                "failed",
-                "replacement_failed path=%s error=%s environment_changed=unknown"
-                % (path, exc.__class__.__name__),
-                "inspect_path_permissions",
-            )
         if result:
             return result
         return DirectActionResult(
@@ -833,6 +883,7 @@ class DirectPrivilegedActionRunner:
                 "matches=1 environment_changed=true"
             )
             % (path, backup),
+            metadata=_mutation_metadata(path, backup, created),
         )
 
     def _action_insert_text_before_anchor(
@@ -879,39 +930,19 @@ class DirectPrivilegedActionRunner:
             )
         separator = "" if insertion.endswith("\n") else "\n"
         updated = original.replace(anchor, insertion + separator + anchor, 1)
-        backup = path.with_name(
-            "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+        result, backup, created = self._commit_text_candidate(
+            path,
+            original,
+            updated,
+            step.timeout,
         )
-        try:
-            if os.access(path.parent, os.W_OK):
-                shutil.copy2(path, backup)
-            else:
-                copied = self._command(
-                    _sudo_if_needed(["cp", "-p", str(path), str(backup)]),
-                    timeout=step.timeout,
-                )
-                if copied.returncode != 0:
-                    return DirectActionResult(
-                        "failed",
-                        "insertion_backup_failed path=%s stderr=%s "
-                        "environment_changed=false"
-                        % (path, _one_line(copied.stderr)),
-                        "inspect_path_permissions",
-                    )
-            result = self._write_file(path, updated, step.timeout)
-        except OSError as exc:
-            return DirectActionResult(
-                "failed",
-                "insertion_failed path=%s error=%s environment_changed=unknown"
-                % (path, exc.__class__.__name__),
-                "inspect_path_permissions",
-            )
         if result:
             return result
         return DirectActionResult(
             "completed",
             "action=insert_text_before_anchor path=%s backup=%s matches=1 "
             "environment_changed=true" % (path, backup),
+            metadata=_mutation_metadata(path, backup, created),
         )
 
     def _action_edit_text_file(
@@ -996,79 +1027,410 @@ class DirectPrivilegedActionRunner:
                 "action=edit_text_file operation=%s path=%s unchanged=true "
                 "environment_changed=false" % (operation, path),
             )
-        try:
-            if path.suffix.lower() == ".py":
-                ast.parse(updated, filename=str(path))
-            elif path.suffix.lower() == ".json":
-                json.loads(updated)
-        except (SyntaxError, ValueError, json.JSONDecodeError) as exc:
-            return self._blocked(
-                "text_edit_result_invalid_%s" % exc.__class__.__name__
-            )
-
-        backup = path.with_name(
-            "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+        result, backup, created = self._commit_text_candidate(
+            path,
+            original,
+            updated,
+            step.timeout,
         )
-        try:
-            if os.access(path.parent, os.W_OK):
-                shutil.copy2(path, backup)
-            else:
-                copied = self._command(
-                    _sudo_if_needed(["cp", "-p", str(path), str(backup)]),
-                    timeout=step.timeout,
-                )
-                if copied.returncode != 0:
-                    return DirectActionResult(
-                        "failed",
-                        "text_edit_backup_failed path=%s stderr=%s "
-                        "environment_changed=false"
-                        % (path, _one_line(copied.stderr)),
-                        "inspect_path_permissions",
-                    )
-            result = self._write_file(path, updated, step.timeout)
-        except OSError as exc:
-            return DirectActionResult(
-                "failed",
-                "text_edit_failed path=%s error=%s environment_changed=unknown"
-                % (path, exc.__class__.__name__),
-                "inspect_path_permissions",
-            )
         if result:
             return result
         return DirectActionResult(
             "completed",
             "action=edit_text_file operation=%s path=%s backup=%s "
             "environment_changed=true" % (operation, path, backup),
+            metadata=_mutation_metadata(path, backup, created),
+        )
+
+    def _action_upsert_python_class(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Upsert a top-level class without asking an LLM for text spans."""
+
+        path = _absolute_path(step.args.get("path"))
+        class_name = str(step.args.get("class_name") or "").strip()
+        base_class = str(step.args.get("base_class") or "").strip()
+        body = textwrap.dedent(str(step.args.get("body") or "")).strip("\n")
+        if (
+            path is None
+            or not path.is_file()
+            or path.suffix.lower() != ".py"
+            or _SENSITIVE_NAME.search(path.name)
+            or not re.fullmatch(r"[A-Za-z_]\w*", class_name)
+            or (base_class and not re.fullmatch(
+                r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", base_class
+            ))
+            or (base_class and class_name == base_class)
+            or not body
+            or len(body) > 24000
+            or _SENSITIVE_CONTENT.search(body)
+        ):
+            return self._blocked("invalid_python_class_contract")
+        try:
+            original = path.read_text(encoding="utf-8")
+            tree = ast.parse(original, filename=str(path))
+        except (OSError, UnicodeError, SyntaxError):
+            return self._blocked("python_class_target_not_parseable")
+
+        if not base_class:
+            base_class = (
+                "CommonConfig"
+                if class_name.endswith("Config")
+                and any(
+                    isinstance(node, ast.ClassDef)
+                    and node.name == "CommonConfig"
+                    for node in tree.body
+                )
+                else "object"
+            )
+
+        # Validate the body independently before editing the target.
+        class_source = "class %s(%s):\n%s\n" % (
+            class_name,
+            base_class,
+            textwrap.indent(body, "    "),
+        )
+        try:
+            wrapped = ast.parse(class_source)
+        except SyntaxError:
+            return self._blocked("python_class_body_invalid")
+        if any(
+            isinstance(node, ast.ClassDef)
+            for node in wrapped.body[0].body
+        ):
+            return self._blocked(
+                "python_class_body_must_not_include_class_header"
+            )
+
+        lines = original.splitlines(keepends=True)
+        target = next(
+            (
+                node for node in tree.body
+                if isinstance(node, ast.ClassDef) and node.name == class_name
+            ),
+            None,
+        )
+        if target is not None:
+            start = min(
+                [target.lineno]
+                + [item.lineno for item in target.decorator_list]
+            ) - 1
+            end = int(target.end_lineno or target.lineno)
+            del lines[start:end]
+
+        without_target = "".join(lines)
+        try:
+            remaining_tree = ast.parse(without_target, filename=str(path))
+        except SyntaxError:
+            return self._blocked("python_class_intermediate_not_parseable")
+        local_base_name = base_class.split(".")[-1]
+        base = next(
+            (
+                node for node in remaining_tree.body
+                if isinstance(node, ast.ClassDef) and node.name == local_base_name
+            ),
+            None,
+        )
+        if "." not in base_class and base_class != "object" and base is None:
+            return self._blocked("python_class_local_base_missing=%s" % base_class)
+        insert_at = int(base.end_lineno or base.lineno) if base is not None else len(lines)
+        insertion = "\n\n" + class_source.rstrip() + "\n"
+        lines.insert(insert_at, insertion)
+        updated = "".join(lines)
+        result, backup, created = self._commit_text_candidate(
+            path,
+            original,
+            updated,
+            step.timeout,
+        )
+        if result:
+            return result
+        return DirectActionResult(
+            "completed",
+            "action=upsert_python_class path=%s class=%s base=%s backup=%s "
+            "candidate_validation=passed environment_changed=true"
+            % (path, class_name, base_class, backup),
+            metadata=_mutation_metadata(path, backup, created),
+        )
+
+    def _action_set_python_config_assignment(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Switch one top-level config assignment using Python structure."""
+
+        path = _absolute_path(step.args.get("path"))
+        assignment_name = str(
+            step.args.get("assignment_name") or "PROJ_CONFIG"
+        ).strip()
+        class_name = str(step.args.get("class_name") or "").strip()
+        if (
+            path is None
+            or not path.is_file()
+            or path.suffix.lower() != ".py"
+            or _SENSITIVE_NAME.search(path.name)
+            or not re.fullmatch(r"[A-Za-z_]\w*", assignment_name)
+            or not re.fullmatch(r"[A-Za-z_]\w*", class_name)
+        ):
+            return self._blocked("invalid_python_config_assignment_contract")
+        try:
+            original = path.read_text(encoding="utf-8")
+            tree = ast.parse(original, filename=str(path))
+        except (OSError, UnicodeError, SyntaxError):
+            return self._blocked("python_config_assignment_target_not_parseable")
+
+        classes = [
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        ]
+        assignments = []
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == assignment_name
+                for target in node.targets
+            ):
+                assignments.append(node)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == assignment_name
+            ):
+                assignments.append(node)
+        if len(classes) != 1:
+            return self._blocked(
+                "python_config_class_count=%s expected=1" % len(classes)
+            )
+        if len(assignments) != 1:
+            return self._blocked(
+                "python_config_assignment_count=%s expected=1"
+                % len(assignments)
+            )
+        assignment = assignments[0]
+        if int(classes[0].lineno) >= int(assignment.lineno):
+            return self._blocked("python_config_class_must_precede_assignment")
+
+        lines = original.splitlines(keepends=True)
+        start = int(assignment.lineno) - 1
+        end = int(assignment.end_lineno or assignment.lineno)
+        replacement = "%s = %s()\n" % (assignment_name, class_name)
+        updated = "".join([*lines[:start], replacement, *lines[end:]])
+        if updated == original:
+            return DirectActionResult(
+                "completed",
+                "action=set_python_config_assignment path=%s unchanged=true "
+                "environment_changed=false" % path,
+            )
+        result, backup, created = self._commit_text_candidate(
+            path,
+            original,
+            updated,
+            step.timeout,
+        )
+        if result:
+            return result
+        return DirectActionResult(
+            "completed",
+            "action=set_python_config_assignment path=%s assignment=%s "
+            "class=%s backup=%s candidate_validation=passed "
+            "environment_changed=true"
+            % (path, assignment_name, class_name, backup),
+            metadata=_mutation_metadata(path, backup, created),
+        )
+
+    def _action_set_python_class_attribute(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Set one scalar class attribute without text anchors or line guesses."""
+
+        path = _absolute_path(step.args.get("path"))
+        class_name = str(step.args.get("class_name") or "").strip()
+        attribute = str(step.args.get("attribute") or "").strip()
+        raw_value = step.args.get("value")
+        if (
+            path is None
+            or not path.is_file()
+            or path.suffix.lower() != ".py"
+            or _SENSITIVE_NAME.search(path.name)
+            or (class_name and not re.fullmatch(r"[A-Za-z_]\w*", class_name))
+            or not re.fullmatch(r"[A-Za-z_]\w*", attribute)
+            or raw_value is None
+        ):
+            return self._blocked("invalid_python_class_attribute_contract")
+        try:
+            original = path.read_text(encoding="utf-8")
+            tree = ast.parse(original, filename=str(path))
+        except (OSError, UnicodeError, SyntaxError):
+            return self._blocked("python_class_attribute_target_not_parseable")
+
+        if not class_name:
+            active_classes = []
+            for node in tree.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not any(
+                    isinstance(target, ast.Name) and target.id == "PROJ_CONFIG"
+                    for target in node.targets
+                ):
+                    continue
+                if (
+                    isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and not node.value.args
+                    and not node.value.keywords
+                ):
+                    active_classes.append(node.value.func.id)
+            if len(active_classes) != 1:
+                return self._blocked(
+                    "active_python_config_class_count=%s expected=1"
+                    % len(active_classes)
+                )
+            class_name = active_classes[0]
+
+        classes = [
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        ]
+        if len(classes) != 1:
+            return self._blocked(
+                "python_attribute_class_count=%s expected=1" % len(classes)
+            )
+        target_class = classes[0]
+        assignments = []
+        for node in target_class.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == attribute
+                for target in node.targets
+            ):
+                assignments.append(node)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == attribute
+            ):
+                assignments.append(node)
+        if len(assignments) > 1:
+            return self._blocked(
+                "python_attribute_assignment_count=%s expected_at_most=1"
+                % len(assignments)
+            )
+
+        value = raw_value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if re.fullmatch(r"-?(?:0|[1-9]\d*)", stripped):
+                value = int(stripped)
+            elif stripped.lower() in {"true", "false"}:
+                value = stripped.lower() == "true"
+            elif stripped.lower() in {"none", "null"}:
+                value = None
+            else:
+                value = stripped
+        if not isinstance(value, (str, int, float, bool, type(None))):
+            return self._blocked("python_attribute_value_must_be_scalar")
+        replacement = "    %s = %r\n" % (attribute, value)
+        lines = original.splitlines(keepends=True)
+        if assignments:
+            assignment = assignments[0]
+            start = int(assignment.lineno) - 1
+            end = int(assignment.end_lineno or assignment.lineno)
+            updated = "".join([*lines[:start], replacement, *lines[end:]])
+        else:
+            insert_at = int(target_class.end_lineno or target_class.lineno)
+            lines.insert(insert_at, replacement)
+            updated = "".join(lines)
+        if updated == original:
+            return DirectActionResult(
+                "completed",
+                "action=set_python_class_attribute path=%s class=%s "
+                "attribute=%s unchanged=true environment_changed=false"
+                % (path, class_name, attribute),
+            )
+        result, backup, created = self._commit_text_candidate(
+            path,
+            original,
+            updated,
+            step.timeout,
+        )
+        if result:
+            return result
+        return DirectActionResult(
+            "completed",
+            "action=set_python_class_attribute path=%s class=%s attribute=%s "
+            "backup=%s candidate_validation=passed environment_changed=true"
+            % (path, class_name, attribute, backup),
+            metadata=_mutation_metadata(path, backup, created),
         )
 
     def _action_install_nginx_config(
         self,
         step: PrivilegedStep,
     ) -> DirectActionResult:
-        source = _absolute_path(step.args.get("source_path"))
+        temporary_source = None
+        inline_content = step.args.get("content")
+        if str(inline_content or "").strip():
+            content = str(inline_content)
+            if _SENSITIVE_CONTENT.search(content):
+                return self._blocked("invalid_nginx_inline_content")
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="klonet-nginx-",
+                suffix=".conf",
+                delete=False,
+            ) as handle:
+                handle.write(content)
+                temporary_source = Path(handle.name)
+            source = temporary_source
+        else:
+            source = _absolute_path(step.args.get("source_path"))
         name = str(step.args.get("config_name") or "").strip()
         if source is None or not source.is_file():
             return self._blocked("nginx_source_not_found")
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,120}\.conf", name):
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", name)
+            or ".." in name
+        ):
             return self._blocked("invalid_nginx_config_name")
         destination = Path("/etc/nginx/sites-available") / name
-        command = _sudo_if_needed(
-            ["install", "-o", "root", "-g", "root", "-m", "0644",
-             str(source), str(destination)]
-        )
-        result = self._command(command, timeout=step.timeout)
-        if result.returncode != 0:
-            return DirectActionResult(
-                "failed",
-                "nginx_config_install_failed stderr=%s environment_changed=unknown"
-                % _one_line(result.stderr),
-                "inspect_nginx_routes",
+        enabled = Path("/etc/nginx/sites-enabled") / name
+        try:
+            command = _sudo_if_needed(
+                ["install", "-o", "root", "-g", "root", "-m", "0644",
+                 str(source), str(destination)]
             )
-        return DirectActionResult(
-            "completed",
-            "action=install_nginx_config destination=%s environment_changed=true"
-            % destination,
-        )
+            result = self._command(command, timeout=step.timeout)
+            if result.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "nginx_config_install_failed stderr=%s environment_changed=unknown"
+                    % _one_line(result.stderr),
+                    "inspect_nginx_routes",
+                )
+            link_result = self._command(
+                _sudo_if_needed(
+                    ["ln", "-sfn", str(destination), str(enabled)]
+                ),
+                timeout=step.timeout,
+            )
+            if link_result.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "nginx_config_enable_failed destination=%s stderr=%s "
+                    "environment_changed=true"
+                    % (destination, _one_line(link_result.stderr)),
+                    "inspect_nginx_routes",
+                )
+            return DirectActionResult(
+                "completed",
+                "action=install_nginx_config destination=%s enabled=%s "
+                "environment_changed=true"
+                % (destination, enabled),
+            )
+        finally:
+            if temporary_source is not None:
+                temporary_source.unlink(missing_ok=True)
 
     def _action_reload_nginx(
         self,
@@ -1817,6 +2179,12 @@ class DirectPrivilegedActionRunner:
             or source in destination.parents
         ):
             return self._blocked("invalid_directory_sync_scope")
+        if destination.is_dir():
+            try:
+                if next(destination.iterdir(), None) is not None:
+                    return self._blocked("directory_sync_destination_not_empty")
+            except OSError:
+                return self._blocked("directory_sync_destination_not_inspectable")
         symlink = next(
             (item for item in source.rglob("*") if item.is_symlink()),
             None,
@@ -2435,6 +2803,59 @@ class DirectPrivilegedActionRunner:
             shutil.rmtree(temp_dir, ignore_errors=True)
         return None
 
+    def _commit_text_candidate(
+        self,
+        path: Path,
+        original: str | None,
+        updated: str,
+        timeout: int,
+    ) -> tuple[DirectActionResult | None, Path | None, bool]:
+        """Validate a candidate, retain a backup, then atomically publish it."""
+
+        problem = _candidate_validation_problem(path, updated)
+        if problem:
+            return self._blocked(problem), None, False
+        created = original is None
+        backup = None
+        try:
+            if not created:
+                backup = path.with_name(
+                    "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+                )
+                if os.access(path.parent, os.W_OK):
+                    shutil.copy2(path, backup)
+                else:
+                    copied = self._command(
+                        _sudo_if_needed(["cp", "-p", str(path), str(backup)]),
+                        timeout=timeout,
+                    )
+                    if copied.returncode != 0:
+                        return (
+                            DirectActionResult(
+                                "failed",
+                                "candidate_backup_failed path=%s stderr=%s "
+                                "environment_changed=false"
+                                % (path, _one_line(copied.stderr)),
+                                "inspect_path_permissions",
+                            ),
+                            None,
+                            False,
+                        )
+            result = self._write_file(path, updated, timeout)
+        except OSError as exc:
+            return (
+                DirectActionResult(
+                    "failed",
+                    "candidate_commit_failed path=%s error=%s "
+                    "environment_changed=unknown"
+                    % (path, exc.__class__.__name__),
+                    "inspect_path_permissions",
+                ),
+                backup,
+                created,
+            )
+        return result, backup, created
+
     def _command(
         self,
         argv: list[str],
@@ -2494,6 +2915,67 @@ class DirectPrivilegedActionRunner:
             "%s environment_changed=false" % _one_line(reason),
             next_action,
         )
+
+
+def _candidate_validation_problem(path: Path, content: str) -> str:
+    """Return a deterministic compiler error for a staged text mutation."""
+
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        try:
+            json.loads(content)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return "candidate_json_invalid=%s" % exc.__class__.__name__
+        return ""
+    if suffix != ".py":
+        return ""
+    try:
+        tree = ast.parse(content, filename=str(path))
+        compile(tree, str(path), "exec")
+    except (SyntaxError, ValueError, TypeError) as exc:
+        return (
+            "candidate_python_compile_failed=%s "
+            "text_edit_result_invalid_%s"
+            % (exc.__class__.__name__, exc.__class__.__name__)
+        )
+
+    definitions: dict[str, int] = {}
+    duplicates: set[str] = set()
+    classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+    for index, node in enumerate(classes):
+        if node.name in definitions:
+            duplicates.add(node.name)
+        definitions.setdefault(node.name, index)
+    if duplicates:
+        return "candidate_python_duplicate_class=%s" % ",".join(
+            sorted(duplicates)
+        )
+    for index, node in enumerate(classes):
+        for base in node.bases:
+            if (
+                isinstance(base, ast.Name)
+                and base.id in definitions
+                and definitions[base.id] >= index
+            ):
+                return "candidate_python_base_defined_after_subclass=%s:%s" % (
+                    node.name,
+                    base.id,
+                )
+    return ""
+
+
+def _mutation_metadata(
+    path: Path,
+    backup: Path | None,
+    created: bool,
+) -> dict[str, str]:
+    return {
+        "kind": "text_file",
+        "path": str(path),
+        "backup": str(backup or ""),
+        "created": "true" if created else "false",
+        "state": "applied_unverified",
+    }
 
 
 def _project_root(step: PrivilegedStep) -> tuple[Path, str]:

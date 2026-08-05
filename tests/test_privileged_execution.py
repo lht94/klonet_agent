@@ -202,6 +202,33 @@ def test_checker_registry_reports_unknown_or_missing_dependency_as_unavailable()
     assert unavailable.status == "failed"
 
 
+def test_http_status_checker_accepts_one_of_multiple_expected_codes(monkeypatch):
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    class Response:
+        status = 302
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.checkers.urllib.request.urlopen",
+        lambda *args, **kwargs: Response(),
+    )
+
+    result = DefaultCheckerRegistry().run(
+        {
+            "checker": "http_status",
+            "args": {"url": "http://127.0.0.1/lht/", "statuses": [200, 302]},
+        }
+    )
+
+    assert result.status == "passed"
+
+
 def test_python_import_checker_uses_requested_interpreter_and_cwd(tmp_path):
     import sys
 
@@ -239,6 +266,35 @@ def test_python_import_checker_uses_requested_interpreter_and_cwd(tmp_path):
 
     assert found.status == "passed"
     assert missing.status == "failed"
+
+
+def test_python_attribute_checker_compares_grounded_class_value(tmp_path):
+    import sys
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    package = tmp_path / "demo_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "config.py").write_text(
+        "class DemoConfig:\n    master_port = 46001\n",
+        encoding="utf-8",
+    )
+    registry = DefaultCheckerRegistry()
+    contract = {
+        "checker": "python_attribute_equals",
+        "args": {
+            "module": "demo_pkg.config",
+            "attribute": "DemoConfig.master_port",
+            "expected": 46001,
+            "python_executable": sys.executable,
+            "cwd": str(tmp_path),
+        },
+    }
+
+    assert registry.run(contract).status == "passed"
+    contract["args"]["expected"] = 46002
+    assert registry.run(contract).status == "failed"
 
 
 def test_checker_bug_is_reported_unavailable_instead_of_escaping():

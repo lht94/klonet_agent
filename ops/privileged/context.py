@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -46,6 +47,16 @@ _RECOVERY_PROBES = {
 }
 
 
+def _omit_knowledge_absolute_paths(value: str) -> str:
+    """Prevent documentation paths from becoming frozen server resources."""
+
+    return re.sub(
+        r"(?<![A-Za-z0-9_])/(?:[A-Za-z0-9._~+@-]+/)*[A-Za-z0-9._~+@-]+/?",
+        "[knowledge-path omitted; resolve from server evidence]",
+        str(value or ""),
+    )
+
+
 @dataclass(frozen=True)
 class GroundedPlanContext:
     knowledge_evidence: str
@@ -64,8 +75,9 @@ class GroundedPlanContext:
                 f"{json.dumps(environment_model, ensure_ascii=False, sort_keys=True, indent=2)}\n\n"
             )
         return (
-            "## Klonet knowledge evidence\n"
-            f"{self.knowledge_evidence}\n\n"
+            "## Klonet knowledge evidence (procedural only; absolute paths are"
+            " not host facts)\n"
+            f"{_omit_knowledge_absolute_paths(self.knowledge_evidence)}\n\n"
             f"{model_section}"
             "## Registered read-only probes\n"
             f"{DEFAULT_READONLY_PROBES.render()}\n\n"
@@ -76,7 +88,6 @@ class GroundedPlanContext:
             " not select implementation names.\n"
             f"{self.action_catalog}"
         )
-
     def audit_summary(self) -> dict[str, Any]:
         summary = {
             "knowledge_status": self.knowledge_status,

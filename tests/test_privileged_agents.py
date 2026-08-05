@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
 
 class FakeLLM:
     def __init__(self, contents):
@@ -111,10 +113,10 @@ def test_planner_repairs_invalid_json_once():
     assert "repair" in llm.calls[1]["messages"][-1]["content"].lower()
 
 
-def test_planner_fails_safe_after_invalid_repair():
+def test_planner_fails_safe_after_invalid_repairs_are_exhausted():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
-    llm = FakeLLM(["not json", "still not json"])
+    llm = FakeLLM(["not json"] * 4)
 
     try:
         PrivilegedPlannerAgent(llm).plan("restart nginx")
@@ -122,6 +124,358 @@ def test_planner_fails_safe_after_invalid_repair():
         assert "valid semantic plan" in str(exc)
     else:
         raise AssertionError("planner must fail safe")
+
+
+def test_planner_can_repair_two_independent_contract_errors():
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    llm = FakeLLM(["not json", "still not json", _planner_payload()])
+
+    plan = PrivilegedPlannerAgent(llm).plan("restart nginx")
+
+    assert plan.goal == "restart nginx"
+    assert len(llm.calls) == 3
+
+
+def test_new_instance_plan_requires_isolated_prepared_instance_root():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.planner import _validate_deployment_plan_shape
+
+    steps = [
+        PrivilegedStep(
+            step_id="start",
+            title="启动 lht 平台组件",
+            objective="启动一个新的 lht 平台实例",
+            risk="medium",
+        ),
+    ]
+    resources = [
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value="/home/lzl/vemu_uestc",
+            source="evidence",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="isolation_missing"):
+        _validate_deployment_plan_shape("新增 lht 平台实例", steps, resources)
+
+
+def test_new_instance_http_health_must_depend_on_backend_start():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.planner import _validate_deployment_plan_shape
+
+    prepare = PrivilegedStep(
+        step_id="prepare",
+        title="复制源码目录",
+        objective="复制源码到独立 lht 目录",
+        risk="medium",
+    )
+    start = PrivilegedStep(
+        step_id="start",
+        title="启动 lht 平台组件",
+        objective="启动新平台服务",
+        depends_on=["prepare"],
+        risk="medium",
+    )
+    nginx = PrivilegedStep(
+        step_id="nginx",
+        title="配置 Nginx 路由",
+        objective="配置 /lht/ 反向代理",
+        success_criteria=["HTTP 路由响应 200"],
+        risk="medium",
+    )
+    resources = [
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value="/home/lzl/lht",
+            source="derived",
+            consumers=["prepare.destination"],
+        ),
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value="/home/lzl/vemu_uestc",
+            source="evidence",
+            consumers=["prepare.source"],
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="http_health_requires_backend_start"):
+        _validate_deployment_plan_shape(
+            "新增 lht 平台实例",
+            [prepare, nginx, start],
+            resources,
+        )
+
+
+def test_new_instance_copy_source_must_come_from_grounded_environment(tmp_path):
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.planner import _validate_deployment_plan_shape
+
+    grounded = tmp_path / "grounded-source"
+    stale = tmp_path / "stale-knowledge-source"
+    destination = tmp_path / "lht"
+    grounded.mkdir()
+    stale.mkdir()
+    steps = [
+        PrivilegedStep(
+            step_id="copy",
+            title="复制源码目录",
+            objective="复制源码到独立 lht 目录",
+            expected_changes=[str(destination)],
+            success_criteria=["目标目录存在"],
+            risk="medium",
+        )
+    ]
+    resources = [
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value=str(destination),
+            source="derived",
+            consumers=["copy.destination"],
+        ),
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value=str(stale),
+            source="environment_evidence",
+            consumers=["copy.source"],
+        ),
+    ]
+    context = GroundedPlanContext(
+        knowledge_evidence="old documentation mentions the stale path",
+        environment_evidence="current source was inspected",
+        action_catalog="",
+        facts={
+            "environment_model": {
+                "projects": [
+                    {
+                        "candidate_root": str(grounded),
+                        "source_repo_root": str(grounded),
+                        "platform_root": str(grounded),
+                        "backend_package_root": str(grounded),
+                    }
+                ]
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="not_grounded_in_environment"):
+        _validate_deployment_plan_shape(
+            "新增 lht 平台实例",
+            steps,
+            resources,
+            grounded_context=context,
+        )
+
+
+def test_authoring_nginx_http_proxy_text_is_not_a_health_check(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.planner import _validate_deployment_plan_shape
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "lht"
+    prepare = PrivilegedStep(
+        step_id="copy",
+        title="复制源码",
+        objective="复制源码到新实例",
+        success_criteria=["目标目录存在"],
+        risk="medium",
+    )
+    author = PrivilegedStep(
+        step_id="author_nginx",
+        title="编写 Nginx 配置",
+        objective="写入 proxy_pass http://127.0.0.1:46001",
+        depends_on=["copy"],
+        success_criteria=["配置含 proxy_pass http://127.0.0.1:46001"],
+        risk="medium",
+    )
+    start = PrivilegedStep(
+        step_id="start",
+        title="启动平台组件",
+        objective="启动新平台服务",
+        depends_on=["copy"],
+        success_criteria=["screen 会话存在"],
+        risk="high",
+    )
+    resources = [
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value=str(destination),
+            source="derived",
+            consumers=["copy.destination"],
+        ),
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value=str(source),
+            source="environment_evidence",
+            consumers=["copy.source"],
+        ),
+    ]
+
+    _validate_deployment_plan_shape(
+        "新增 lht 平台实例",
+        [prepare, author, start],
+        resources,
+    )
+
+
+def test_instance_directory_preparation_does_not_require_a_copy_source(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.planner import _validate_deployment_plan_shape
+
+    source = tmp_path / "source"
+    source.mkdir()
+    destination = tmp_path / "lht"
+    create = PrivilegedStep(
+        step_id="prepare_root",
+        title="准备实例根目录",
+        objective="创建 lht 实例目录",
+        success_criteria=["目录存在"],
+        risk="low",
+    )
+    copy = PrivilegedStep(
+        step_id="copy_source",
+        title="复制源码",
+        objective="复制源码到 lht",
+        depends_on=["prepare_root"],
+        success_criteria=["源码存在"],
+        risk="medium",
+    )
+    start = PrivilegedStep(
+        step_id="start",
+        title="启动平台组件",
+        objective="启动新平台服务",
+        depends_on=["copy_source"],
+        success_criteria=["会话存在"],
+        risk="high",
+    )
+    resources = [
+        PlanResource(
+            name="instance_root",
+            kind="path",
+            status="frozen",
+            role="instance_root",
+            value=str(destination),
+            source="derived",
+            consumers=[
+                "prepare_root.path",
+                "copy_source.destination",
+            ],
+        ),
+        PlanResource(
+            name="source_root",
+            kind="path",
+            status="frozen",
+            role="source_repo_root",
+            value=str(source),
+            source="environment_evidence",
+            consumers=["copy_source.source"],
+        ),
+    ]
+
+    _validate_deployment_plan_shape(
+        "新增 lht 平台实例",
+        [create, copy, start],
+        resources,
+    )
+
+
+def test_copy_source_conflict_prefers_existing_directory(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
+
+    existing = tmp_path / "source"
+    existing.mkdir()
+    future = tmp_path / "lht" / "source"
+    steps = [
+        PrivilegedStep(
+            step_id="copy",
+            title="复制源码",
+            objective="复制源码到新实例",
+            success_criteria=["目标存在"],
+            risk="medium",
+        ),
+        PrivilegedStep(
+            step_id="configure",
+            title="配置新实例",
+            objective="配置 lht 项目",
+            depends_on=["copy"],
+            success_criteria=["配置完成"],
+            risk="medium",
+        ),
+    ]
+    resources = PrivilegedPlannerAgent._build_plan_resources(
+        {
+            "resources": [
+                {
+                    "name": "existing_source",
+                    "kind": "path",
+                    "status": "frozen",
+                    "role": "source_repo_root",
+                    "value": str(existing),
+                    "source": "environment_evidence",
+                    "consumers": [
+                        "copy.source",
+                        "configure.project_root",
+                    ],
+                },
+                {
+                    "name": "future_source",
+                    "kind": "path",
+                    "status": "frozen",
+                    "role": "copied_source_root",
+                    "value": str(future),
+                    "source": "derived",
+                    "consumers": ["copy.source"],
+                },
+                {
+                    "name": "instance_root",
+                    "kind": "path",
+                    "status": "frozen",
+                    "role": "instance_root",
+                    "value": str(tmp_path / "lht"),
+                    "source": "derived",
+                    "consumers": ["configure.project_root"],
+                },
+            ]
+        },
+        steps,
+    )
+
+    owners = [
+        item for item in resources if "copy.source" in item.consumers
+    ]
+    assert [(item.name, item.value) for item in owners] == [
+        ("existing_source", str(existing))
+    ]
+    project_roots = [
+        item for item in resources
+        if "configure.project_root" in item.consumers
+    ]
+    assert [item.name for item in project_roots] == ["instance_root"]
 
 
 def test_planner_rejects_oversized_internal_plan_and_requests_compaction():
@@ -167,7 +521,7 @@ def test_planner_rejects_hard_denied_command_even_if_model_calls_it_low_risk():
                     }
                 ],
             )
-    llm = FakeLLM([denied, denied])
+    llm = FakeLLM([denied] * 4)
 
     try:
         PrivilegedPlannerAgent(llm).plan("wipe host")
