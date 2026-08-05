@@ -2608,6 +2608,24 @@ def test_implementation_items_are_topologically_ordered_before_binding():
     assert [item["id"] for item in ordered] == ["create", "start", "verify"]
 
 
+def test_outer_semantic_dependencies_are_not_micro_plan_dependencies():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _remove_outer_semantic_dependencies,
+    )
+
+    items = [
+        {"id": "create", "depends_on": ["change-1"]},
+        {"id": "verify", "depends_on": ["create", "change-1"]},
+    ]
+
+    _remove_outer_semantic_dependencies(items, ["change-1"])
+
+    assert items == [
+        {"id": "create", "depends_on": []},
+        {"id": "verify", "depends_on": ["create"]},
+    ]
+
+
 def test_screen_session_is_derived_from_platform_and_component():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.execution_agent import (

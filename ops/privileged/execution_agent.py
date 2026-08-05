@@ -647,6 +647,7 @@ class PrivilegedExecutionAgent:
                     category="implementation_contract_invalid",
                 )
             raw_ids.append(raw_id)
+        _remove_outer_semantic_dependencies(items, semantic_step.depends_on)
         items = _topologically_order_implementation_items(items)
         raw_ids = [
             _safe_implementation_step_id(
@@ -2391,6 +2392,24 @@ def _safe_implementation_step_id(value: Any, *, fallback: str) -> str:
         str(value or "").strip(),
     ).strip("-_")
     return (text or fallback)[:80]
+
+
+def _remove_outer_semantic_dependencies(
+    items: list[dict[str, Any]],
+    semantic_dependencies: list[str],
+) -> None:
+    """Keep the outer DAG edge out of the implementation-local namespace."""
+
+    outer = {str(value) for value in semantic_dependencies}
+    if not outer:
+        return
+    for item in items:
+        dependencies = item.get("depends_on")
+        if not isinstance(dependencies, list):
+            continue
+        item["depends_on"] = [
+            value for value in dependencies if str(value) not in outer
+        ]
 
 
 def _topologically_order_implementation_items(

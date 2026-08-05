@@ -983,6 +983,34 @@ def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     assert len([item for item in normalized if item.value == 6379]) == 1
 
 
+def test_change_planner_freezes_standard_stateful_container_internal_ports():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "stateful",
+                "title": "Provision isolated MySQL, Redis, and RabbitMQ containers",
+                "objective": "Create v4e2e-mysql, v4e2e-redis, and v4e2e-rabbitmq",
+                "expected_changes": ["Start all three new containers"],
+                "postconditions": [],
+            }
+        ]
+    }
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [])
+    internal = {
+        item.value: item
+        for item in normalized
+        if item.role == "container_internal_port"
+    }
+
+    assert set(internal) == {3306, 6379, 5672}
+    assert internal[3306].consumers == ["stateful.mysql_internal_port"]
+    assert internal[6379].consumers == ["stateful.redis_internal_port"]
+    assert internal[5672].consumers == ["stateful.rabbitmq_internal_port"]
+
+
 def test_change_planner_freezes_multiple_future_paths_with_unique_consumers():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

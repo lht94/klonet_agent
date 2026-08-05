@@ -1074,6 +1074,58 @@ class V4ChangePlannerAgent:
             and item.kind == "port"
             and not V4ChangePlannerAgent._requires_host_port_availability(item)
         }
+        changes = data.get("changes")
+        if isinstance(changes, list):
+            standard_internal_ports = {
+                "mysql": 3306,
+                "redis": 6379,
+                "rabbitmq": 5672,
+            }
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                step_id = str(change.get("step_id") or "")
+                text = json.dumps(
+                    {
+                        "title": change.get("title", ""),
+                        "objective": change.get("objective", ""),
+                        "expected_changes": change.get("expected_changes", []),
+                    },
+                    ensure_ascii=False,
+                ).lower()
+                if not re.search(r"container|容器", text, re.I):
+                    continue
+                for service, port in standard_internal_ports.items():
+                    if service not in text:
+                        continue
+                    consumer = "%s.%s_internal_port" % (step_id, service)
+                    existing = next(
+                        (
+                            item
+                            for item in normalized
+                            if item.status == "frozen"
+                            and item.kind == "port"
+                            and int(item.value) == port
+                            and not V4ChangePlannerAgent._requires_host_port_availability(item)
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        if consumer not in existing.consumers:
+                            existing.consumers.append(consumer)
+                        continue
+                    normalized.append(
+                        PlanResource(
+                            name="%s_container_internal_port" % service,
+                            kind="port",
+                            status="frozen",
+                            role="container_internal_port",
+                            value=port,
+                            source="standard_service_contract",
+                            consumers=[consumer],
+                        )
+                    )
+                    explicit_internal_ports.add(port)
         for step_id, ports in V4ChangePlannerAgent._used_ports_by_step(data).items():
             for port in sorted(ports):
                 consumer = "%s.port_%s" % (step_id, port)
