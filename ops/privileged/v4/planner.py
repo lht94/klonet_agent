@@ -249,6 +249,23 @@ class V4ChangePlannerAgent:
             resources,
             bundle,
         )
+        unproven_ports = self._unproven_port_resources(resources, bundle)
+        non_port_errors = [
+            error
+            for error in contract_errors
+            if not error.startswith("port resource lacks availability evidence=")
+        ]
+        if unproven_ports and not non_port_errors:
+            return V4PlanningOutcome(
+                status="need_evidence",
+                probe_requests=[
+                    ProbeRequest(
+                        "ports",
+                        {"ports": sorted({int(item.value) for item in unproven_ports})},
+                        "verify frozen port availability",
+                    )
+                ],
+            )
         if contract_errors:
             raise ValueError("; ".join(contract_errors))
         steps = self._steps(data.get("changes"), bundle)
@@ -493,6 +510,13 @@ class V4ChangePlannerAgent:
             str(source_branch.value) in record.output for record in bundle.records
         ):
             errors.append("source_branch is not grounded in evidence")
+        for port_resource in V4ChangePlannerAgent._unproven_port_resources(
+            frozen,
+            bundle,
+        ):
+            errors.append(
+                "port resource lacks availability evidence=%s" % port_resource.name
+            )
         for port_resource in (item for item in frozen if item.kind == "port"):
             port = int(port_resource.value)
             relevant = [
@@ -502,9 +526,6 @@ class V4ChangePlannerAgent:
                 and port in record.request.args.get("ports", [])
             ]
             if not relevant:
-                errors.append(
-                    "port resource lacks availability evidence=%s" % port_resource.name
-                )
                 continue
             if any(re.search(r":%s\b" % port, record.output) for record in relevant):
                 errors.append("port resource is already listening=%s" % port)
@@ -519,6 +540,24 @@ class V4ChangePlannerAgent:
         ):
             errors.append("isolated deployment cannot reuse existing resources")
         return errors
+
+    @staticmethod
+    def _unproven_port_resources(
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+    ) -> list[PlanResource]:
+        unproven = []
+        for resource in resources:
+            if resource.status != "frozen" or resource.kind != "port":
+                continue
+            port = int(resource.value)
+            if not any(
+                record.request.probe == "ports"
+                and port in record.request.args.get("ports", [])
+                for record in bundle.records
+            ):
+                unproven.append(resource)
+        return unproven
 
     @staticmethod
     def _steps(value: Any, bundle: EvidenceBundle) -> list[ChangeStepV4]:

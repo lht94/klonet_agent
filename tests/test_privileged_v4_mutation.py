@@ -576,3 +576,62 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
 
     assert "fixed instance identifiers are not frozen=v4e2e" in errors
     assert "fixed Nginx config names are not frozen=klonet-v4-e2e" in errors
+
+
+def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
+    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, evidence_id = _bundle_and_conclusion()
+    payload = {
+        "status": "ready",
+        "goal": "deploy v4e2e to /srv/v4e2e",
+        "resources": [
+            {
+                "name": "instance_root", "kind": "path", "status": "frozen",
+                "role": "instance_root", "value": "/srv/v4e2e",
+                "source": "user_input", "consumers": ["deploy.repository"],
+            },
+            {
+                "name": "source_remote", "kind": "identifier", "status": "frozen",
+                "role": "source_remote", "value": "gitee:example/platform.git",
+                "source": "evidence", "consumers": ["deploy.url"],
+            },
+            {
+                "name": "source_branch", "kind": "identifier", "status": "frozen",
+                "role": "source_branch", "value": "develop",
+                "source": "evidence", "consumers": ["deploy.ref"],
+            },
+            {
+                "name": "instance_identifier", "kind": "identifier",
+                "status": "frozen", "role": "instance_identifier", "value": "v4e2e",
+                "source": "user_input", "consumers": ["deploy.instance_name"],
+            },
+            {
+                "name": "service_port", "kind": "port", "status": "frozen",
+                "role": "service_port", "value": 47002,
+                "source": "evidence", "consumers": ["deploy.port"],
+            },
+        ],
+        "changes": [
+            {
+                "step_id": "deploy", "title": "deploy", "objective": "deploy",
+                "reason": "deploy", "evidence_refs": [evidence_id], "depends_on": [],
+                "risk": "high", "expected_changes": ["created"],
+                "postconditions": [
+                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e"}}
+                ],
+            }
+        ],
+    }
+    llm = FakeLLM([json.dumps(payload)])
+
+    outcome = V4ChangePlannerAgent(llm).plan(
+        "deploy v4e2e to /srv/v4e2e", bundle, conclusion
+    )
+
+    assert outcome.status == "need_evidence"
+    assert outcome.probe_requests == [
+        ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability")
+    ]
+    assert len(llm.calls) == 1
