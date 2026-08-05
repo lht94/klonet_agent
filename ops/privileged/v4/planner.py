@@ -351,6 +351,17 @@ class V4ChangePlannerAgent:
         roots: set[str] = set()
         all_grounded_roots: set[str] = set()
         for record in bundle.records:
+            if (
+                record.status == "available"
+                and record.request.probe == "git_repository"
+                and "derived authoritative Screen source"
+                in str(record.request.purpose or "")
+            ):
+                repository = str(record.request.args.get("repository") or "")
+                if repository:
+                    all_grounded_roots.add(repository)
+                    roots.add(repository)
+                continue
             if record.status != "available" or record.request.probe != "screen":
                 continue
             output = record.output
