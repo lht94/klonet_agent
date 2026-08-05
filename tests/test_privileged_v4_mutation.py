@@ -625,6 +625,10 @@ def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
                         "checker": "git_revision",
                         "args": {"path": "/srv/v4e2e", "revision": "abc"},
                     },
+                    {
+                        "checker": "file_contains",
+                        "args": {"path": "/srv/v4e2e/config.py", "pattern": "x"},
+                    },
                 ],
             }
         ]
@@ -644,6 +648,10 @@ def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
     assert data["changes"][0]["postconditions"][1]["args"] == {
         "repository": "/srv/v4e2e",
         "revision": "abc",
+    }
+    assert data["changes"][0]["postconditions"][2]["args"] == {
+        "path": "/srv/v4e2e/config.py",
+        "text": "x",
     }
     assert resources[0].consumers == ["clone-source.repository"]
     assert resources[1].consumers == ["clone-source.url"]

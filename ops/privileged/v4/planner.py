@@ -603,7 +603,7 @@ class V4ChangePlannerAgent:
 
         aliases = {
             "git_revision": {"path": "repository"},
-            "file_contains": {"content": "text"},
+            "file_contains": {"content": "text", "pattern": "text"},
             "screen_session_exists": {"name": "session"},
             "process_running": {"name": "pattern"},
             "container_running": {"name": "container"},
