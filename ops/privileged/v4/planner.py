@@ -97,6 +97,10 @@ sessions; never assume reuse of an existing resource. Every numeric port used
 in host configuration or postconditions must have its own frozen port resource.
 Mark fixed image/container-side ports with role `container_internal_port`;
 only host/listening ports require availability proof.
+If MySQL, Redis, RabbitMQ, or another stateful dependency is required by an
+isolated deployment, add semantic ChangeSteps that create new instance-named
+containers. Missing image or credential details are resolvable by Discovery
+and Binding and must never justify sharing an existing service.
 """.strip()
 
 
@@ -195,7 +199,11 @@ class V4ChangePlannerAgent:
                                 "Keep semantic changes cohesive and let Binding split "
                                 "them into atomic implementation steps. Freeze every "
                                 "host/listening port used anywhere in the plan; mark "
-                                "fixed container-side ports as container_internal_port."
+                                "fixed container-side ports as container_internal_port. "
+                                "For isolated stateful dependencies, add semantic changes "
+                                "that create new instance-named containers; never reuse "
+                                "shared services merely because image or credential "
+                                "details still need Binding-time discovery."
                             )
                             % exc,
                         }
@@ -755,8 +763,11 @@ class V4ChangePlannerAgent:
                     ]
                     if not any(
                         consumer.rsplit(".", 1)[0] == step_id
-                        and consumer.rsplit(".", 1)[1]
-                        in {"path", "source_path", "repository"}
+                        and (
+                            consumer.rsplit(".", 1)[1]
+                            in {"path", "source_path", "repository"}
+                            or consumer.rsplit(".", 1)[1].startswith("path_")
+                        )
                         for resource in matching
                         for consumer in resource.consumers
                     ):
@@ -838,6 +849,9 @@ class V4ChangePlannerAgent:
             },
             ensure_ascii=False,
         ).lower()
+        isolation_payload = V4ChangePlannerAgent._strip_negated_reuse_claims(
+            isolation_payload
+        )
         if isolation_requested and re.search(
             r"(?:reuse|share|复用|共享).{0,40}(?:existing|container|现有|容器)",
             isolation_payload,
@@ -845,6 +859,17 @@ class V4ChangePlannerAgent:
         ):
             errors.append("isolated deployment cannot reuse existing resources")
         return errors
+
+    @staticmethod
+    def _strip_negated_reuse_claims(text: str) -> str:
+        return re.sub(
+            r"(?:never|no|not|without|do\s+not|must\s+not|禁止|不要|不得|不应|不复用)"
+            r"[^.!?。！？]{0,30}(?:reuse|share|复用|共享)"
+            r"[^.!?。！？]{0,40}(?:existing|container|现有|容器)",
+            "",
+            text,
+            flags=re.I,
+        )
 
     @staticmethod
     def _normalize_derived_resources(
@@ -910,12 +935,18 @@ class V4ChangePlannerAgent:
             postconditions = change.get("postconditions")
             if not isinstance(postconditions, list):
                 continue
+            future_paths = []
             for check in postconditions:
                 args = check.get("args") if isinstance(check, dict) else None
                 path = str(args.get("path") or "") if isinstance(args, dict) else ""
-                if not path.startswith(root_text + "/") or path == root_text + "/.git":
-                    continue
-                consumer = "%s.path" % step_id
+                if path.startswith(root_text + "/") and path != root_text + "/.git":
+                    if path not in future_paths:
+                        future_paths.append(path)
+            for path_index, path in enumerate(future_paths, start=1):
+                consumer = "%s.path%s" % (
+                    step_id,
+                    "_%s" % path_index if len(future_paths) > 1 else "",
+                )
                 existing = next(
                     (
                         item

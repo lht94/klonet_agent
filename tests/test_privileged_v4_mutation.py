@@ -940,6 +940,61 @@ def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     assert len([item for item in normalized if item.value == 6379]) == 1
 
 
+def test_change_planner_freezes_multiple_future_paths_with_unique_consumers():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    root = PlanResource(
+        "instance_root",
+        "path",
+        "frozen",
+        "instance_root",
+        "/srv/v4e2e",
+        "user_input",
+        consumers=["change-1.repository"],
+    )
+    data = {
+        "changes": [
+            {
+                "step_id": "change-2",
+                "postconditions": [
+                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/a.py"}},
+                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/b.py"}},
+                ],
+            }
+        ]
+    }
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [root])
+    derived = [item for item in normalized if item.value in {"/srv/v4e2e/a.py", "/srv/v4e2e/b.py"}]
+
+    assert len(derived) == 2
+    assert {item.consumers[0] for item in derived} == {
+        "change-2.path_1",
+        "change-2.path_2",
+    }
+
+
+def test_isolation_contract_distinguishes_negated_and_positive_reuse_claims():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    negative = V4ChangePlannerAgent._ready_contract_errors(
+        {"changes": [], "assumptions": ["Never reuse or share existing containers."]},
+        "deploy an isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+    positive = V4ChangePlannerAgent._ready_contract_errors(
+        {"changes": [], "assumptions": ["Use the existing shared Redis container."]},
+        "deploy an isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert "isolated deployment cannot reuse existing resources" not in negative
+    assert "isolated deployment cannot reuse existing resources" in positive
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
