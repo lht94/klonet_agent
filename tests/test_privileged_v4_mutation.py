@@ -1012,6 +1012,38 @@ def test_change_planner_derives_frozen_source_revision_for_clone_binding():
     assert revision.consumers == ["clone.revision"]
 
 
+def test_change_planner_derives_fixed_nginx_name_from_site_path():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(
+        {
+            "changes": [
+                {
+                    "step_id": "nginx",
+                    "title": "Create Nginx site",
+                    "objective": "Install /etc/nginx/sites-available/klonet-v4-e2e",
+                    "expected_changes": [
+                        "Enable /etc/nginx/sites-enabled/klonet-v4-e2e"
+                    ],
+                    "postconditions": [
+                        {
+                            "checker": "file_exists",
+                            "args": {
+                                "path": "/etc/nginx/sites-available/klonet-v4-e2e"
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        [],
+    )
+
+    resource = next(item for item in normalized if item.role == "nginx_config_name")
+    assert resource.value == "klonet-v4-e2e"
+    assert resource.consumers == ["nginx.config_name"]
+
+
 def test_complete_klonet_deployment_contract_requires_all_runtime_components_and_ports():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

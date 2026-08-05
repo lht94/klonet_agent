@@ -1597,6 +1597,38 @@ class V4ChangePlannerAgent:
                 normalized.append(resource)
                 by_port[port] = resource
 
+        has_nginx_name = any(
+            item.status == "frozen"
+            and item.role in {"nginx_config_name", "nginx_site_name"}
+            for item in normalized
+        )
+        if not has_nginx_name and isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                step_id = str(change.get("step_id") or "")
+                text = json.dumps(change, ensure_ascii=False)
+                if "nginx" not in text.lower():
+                    continue
+                match = re.search(
+                    r"/etc/nginx/sites-available/([A-Za-z0-9_.-]+)",
+                    text,
+                )
+                if match is None:
+                    continue
+                normalized.append(
+                    PlanResource(
+                        name="nginx_config_name",
+                        kind="identifier",
+                        status="frozen",
+                        role="nginx_config_name",
+                        value=match.group(1),
+                        source="derived_from_nginx_site_path",
+                        consumers=["%s.config_name" % step_id],
+                    )
+                )
+                break
+
         root = next(
             (
                 item
