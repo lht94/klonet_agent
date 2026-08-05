@@ -257,6 +257,58 @@ def test_planner_evidence_gap_returns_to_discovery_then_replans(tmp_path):
     assert discovery.calls == synthesis.calls == 1
 
 
+def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path):
+    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    candidate = _change_plan()
+
+    class CandidatePlanner:
+        def __init__(self):
+            self.calls = 0
+            self.finalize_calls = 0
+
+        def plan(self, *args, **kwargs):
+            self.calls += 1
+            return V4PlanningOutcome(
+                status="need_evidence",
+                candidate_plan=candidate,
+                probe_requests=[
+                    ProbeRequest("ports", {"ports": [47001]}, "verify port")
+                ],
+            )
+
+        def finalize_candidate(self, plan, bundle):
+            self.finalize_calls += 1
+            assert plan is candidate
+            return V4PlanningOutcome(status="ready", plan=plan)
+
+    planner = CandidatePlanner()
+    discovery = SimpleNamespace(
+        collect_requests=lambda requests, evidence_bundle: evidence_bundle
+    )
+    synthesis = SimpleNamespace(
+        synthesize=lambda goal, evidence_bundle: SimpleNamespace()
+    )
+    workflow = V4MutationWorkflow(
+        planner=planner,
+        binder=FakeBinder(),
+        store=MemoryStore(),
+        executor=FakeExecutor(),
+        verifier=FakeVerifier(),
+        discovery=discovery,
+        synthesis=synthesis,
+    )
+
+    result = workflow.submit(
+        "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
+    )
+
+    assert result.kind == "awaiting_confirmation"
+    assert planner.calls == planner.finalize_calls == 1
+
+
 def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
     from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome

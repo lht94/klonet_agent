@@ -590,7 +590,7 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
-    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
@@ -645,4 +645,22 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     assert outcome.probe_requests == [
         ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability")
     ]
+    assert outcome.candidate_plan is not None
+    assert next(
+        item for item in outcome.candidate_plan.resources if item.kind == "port"
+    ).value == 47002
     assert len(llm.calls) == 1
+
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability"),
+            "inspect_ports\nno matching listeners",
+        )
+    )
+    finalized = V4ChangePlannerAgent.finalize_candidate(
+        outcome.candidate_plan,
+        bundle,
+    )
+
+    assert finalized.status == "ready"
+    assert finalized.plan is outcome.candidate_plan

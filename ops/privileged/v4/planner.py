@@ -109,6 +109,7 @@ DISCOVERABLE_IMPLEMENTATION_MARKERS = (
 class V4PlanningOutcome:
     status: str
     plan: ChangePlanV4 | None = None
+    candidate_plan: ChangePlanV4 | None = None
     probe_requests: list[ProbeRequest] = field(default_factory=list)
     reason: str = ""
     missing_decisions: list[str] = field(default_factory=list)
@@ -258,8 +259,24 @@ class V4ChangePlannerAgent:
             if not error.startswith("port resource lacks availability evidence=")
         ]
         if unproven_ports and not non_port_errors:
+            candidate_steps = self._steps(data.get("changes"), bundle)
+            candidate_risk = max(
+                candidate_steps,
+                key=lambda item: RISK_LEVELS.index(item.risk),
+            ).risk
+            candidate_assumptions = data.get("assumptions")
+            candidate_plan = ChangePlanV4.new(
+                goal=str(data.get("goal") or goal),
+                risk=candidate_risk,
+                steps=candidate_steps,
+                resources=resources,
+                assumptions=[str(item) for item in candidate_assumptions]
+                if isinstance(candidate_assumptions, list)
+                else [],
+            )
             return V4PlanningOutcome(
                 status="need_evidence",
+                candidate_plan=candidate_plan,
                 probe_requests=[
                     ProbeRequest(
                         "ports",
@@ -285,6 +302,49 @@ class V4ChangePlannerAgent:
                 else [],
             ),
         )
+
+    @staticmethod
+    def finalize_candidate(
+        candidate: ChangePlanV4,
+        bundle: EvidenceBundle,
+    ) -> V4PlanningOutcome:
+        unproven = V4ChangePlannerAgent._unproven_port_resources(
+            candidate.resources,
+            bundle,
+        )
+        if unproven:
+            return V4PlanningOutcome(
+                status="need_evidence",
+                candidate_plan=candidate,
+                probe_requests=[
+                    ProbeRequest(
+                        "ports",
+                        {"ports": sorted({int(item.value) for item in unproven})},
+                        "verify frozen port availability",
+                    )
+                ],
+            )
+        occupied = []
+        for resource in candidate.resources:
+            if resource.status != "frozen" or resource.kind != "port":
+                continue
+            port = int(resource.value)
+            relevant = [
+                record
+                for record in bundle.records
+                if record.request.probe == "ports"
+                and port in record.request.args.get("ports", [])
+            ]
+            if any(re.search(r":%s\b" % port, record.output) for record in relevant):
+                occupied.append(port)
+        if occupied:
+            return V4PlanningOutcome(
+                status="blocked",
+                candidate_plan=candidate,
+                reason="candidate ports became occupied: %s"
+                % ",".join(str(item) for item in occupied),
+            )
+        return V4PlanningOutcome(status="ready", plan=candidate)
 
     @staticmethod
     def _ready_contract_errors(

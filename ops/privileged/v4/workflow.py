@@ -64,7 +64,20 @@ class V4MutationWorkflow:
             )
             evidence_conclusion = self.synthesis.synthesize(goal, evidence_bundle)
             replanning_rounds += 1
-            outcome = self.planner.plan(goal, evidence_bundle, evidence_conclusion)
+            candidate_plan = getattr(outcome, "candidate_plan", None)
+            finalize_candidate = getattr(
+                self.planner,
+                "finalize_candidate",
+                None,
+            )
+            if candidate_plan is not None and finalize_candidate is not None:
+                outcome = finalize_candidate(candidate_plan, evidence_bundle)
+            else:
+                outcome = self.planner.plan(
+                    goal,
+                    evidence_bundle,
+                    evidence_conclusion,
+                )
         if outcome.status != "ready" or outcome.plan is None:
             return V4WorkflowResult(
                 True,
