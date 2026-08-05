@@ -85,6 +85,12 @@ whether to isolate rather than reuse an existing container, Nginx syntax,
 configuration file edits, startup commands, or source layout. For those, use
 need_evidence when state is missing, otherwise choose isolated values, freeze
 them as resources, and emit semantic changes.
+
+Keep every ChangeStep atomic: one configuration attribute, one container, one
+screen component, or one Nginx site mutation per step. Never bundle multiple
+ports, multiple IP attributes, or multiple containers into one ChangeStep.
+For an isolated deployment, explicitly plan new uniquely named containers and
+sessions; never assume reuse of an existing resource.
 """.strip()
 
 
@@ -178,7 +184,9 @@ class V4ChangePlannerAgent:
                                 "as change-1.repository, change-1.url, and change-1.ref. "
                                 "Freeze every future configuration file path derived "
                                 "from instance_root and bind it as change-N.path. "
-                                "Do not reuse or modify existing instance resources."
+                                "Do not reuse or modify existing instance resources. "
+                                "Keep every change atomic: one configuration attribute, "
+                                "one container, one screen component, or one Nginx site."
                             )
                             % exc,
                         }
@@ -516,6 +524,18 @@ class V4ChangePlannerAgent:
                     "resource consumers reference unknown steps=%s"
                     % ",".join(unknown)
                 )
+        ports_by_step: dict[str, set[str]] = {}
+        for resource in frozen:
+            if resource.kind != "port":
+                continue
+            for consumer in resource.consumers:
+                step_id = consumer.rsplit(".", 1)[0]
+                ports_by_step.setdefault(step_id, set()).add(resource.name)
+        for step_id, port_names in ports_by_step.items():
+            if len(port_names) > 1:
+                errors.append(
+                    "change %s consumes multiple port resources; split it" % step_id
+                )
         root_resource = next(
             (
                 item
@@ -626,12 +646,16 @@ class V4ChangePlannerAgent:
             if any(re.search(r":%s\b" % port, record.output) for record in relevant):
                 errors.append("port resource is already listening=%s" % port)
         isolation_requested = bool(re.search(r"isolat|隔离|不干扰", goal_text, re.I))
-        assumptions = " ".join(
-            str(item) for item in data.get("assumptions", [])
+        isolation_payload = json.dumps(
+            {
+                "assumptions": data.get("assumptions", []),
+                "changes": data.get("changes", []),
+            },
+            ensure_ascii=False,
         ).lower()
         if isolation_requested and re.search(
             r"(?:reuse|share|复用|共享).{0,40}(?:existing|container|现有|容器)",
-            assumptions,
+            isolation_payload,
             re.I,
         ):
             errors.append("isolated deployment cannot reuse existing resources")

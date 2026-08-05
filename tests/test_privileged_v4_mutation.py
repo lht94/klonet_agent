@@ -556,6 +556,10 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
             "master_port", "port", "frozen", "master_port", 47001,
             "evidence", consumers=["deploy.port"],
         ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 47002,
+            "evidence", consumers=["deploy.worker_port"],
+        ),
     ]
     data = {
         "status": "ready",
@@ -587,6 +591,7 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
     assert "fixed instance identifiers are not frozen=v4e2e" in errors
     assert "fixed Nginx config names are not frozen=klonet-v4-e2e" in errors
     assert not any("/home/lzl/vemu_uestc" in error for error in errors)
+    assert "change deploy consumes multiple port resources; split it" in errors
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
