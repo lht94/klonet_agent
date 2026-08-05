@@ -100,6 +100,11 @@ def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
         lambda pid: [101] if pid == 100 else [],
         raising=False,
     )
+    monkeypatch.setattr(
+        probes,
+        "inspect_screen_session",
+        lambda args: "inspect_screen_session\nsession=%s scrollback" % args["session"],
+    )
 
     output = probes.DEFAULT_READONLY_PROBES.run("screen", {})
 
@@ -108,6 +113,13 @@ def test_screen_probe_maps_session_to_descendant_runtime_cwd(monkeypatch):
     assert "git_roots=/home/lzl/vemu_uestc" in output
     assert "inside_work_tree=true" in output
     assert "origin=gitee:example/vemu.git" in output
+    filtered = probes.DEFAULT_READONLY_PROBES.run(
+        "screen",
+        {"session": "vemu_uestc"},
+    )
+    assert "runtime_cwds=/home/lzl/vemu_uestc/mains" in filtered
+    assert "origin=gitee:example/vemu.git" in filtered
+    assert "session=vemu_uestc scrollback" in filtered
 
 
 def test_file_integrity_distinguishes_existing_directory_from_missing(tmp_path):

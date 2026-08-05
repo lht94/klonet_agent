@@ -176,8 +176,6 @@ def _service(args: dict[str, Any]) -> str:
 
 def _screen(args: dict[str, Any]) -> str:
     session = str(args.get("session") or "").strip()
-    if session:
-        return inspect_screen_session({"session": session})
     listing = _run(["screen", "-ls"], timeout=8)
     runtime_rows = _screen_runtime_rows(listing)
     git_roots = sorted(
@@ -193,10 +191,19 @@ def _screen(args: dict[str, Any]) -> str:
         _git_repository({"repository": root})
         for root in git_roots[:20]
     ]
-    return "inspect_screen\n%s\nscreen_runtime\n%s\nscreen_git_repositories\n%s" % (
+    session_section = (
+        inspect_screen_session({"session": session})
+        if session
+        else "not requested"
+    )
+    return (
+        "inspect_screen\n%s\nscreen_runtime\n%s\n"
+        "screen_git_repositories\n%s\nrequested_screen_session\n%s"
+    ) % (
         listing,
         "\n".join(runtime_rows) or "no runtime cwd mappings",
         "\n\n".join(git_sections) or "no mapped Git repositories",
+        session_section,
     )
 
 
