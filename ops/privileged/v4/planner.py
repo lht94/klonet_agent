@@ -203,8 +203,12 @@ class V4ChangePlannerAgent:
         for attempt in range(max_generations):
             try:
                 response = self._complete(messages)
-                content = response.choices[0].message.content or ""
-                return self._outcome(parse_json_object(content), goal, bundle)
+                choices = getattr(response, "choices", None)
+                message = getattr(choices[0], "message", None) if choices else None
+                content = getattr(message, "content", None) or ""
+                data, normalized_content = self._planner_payload(response)
+                content = normalized_content or content
+                return self._outcome(data, goal, bundle)
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
                 if attempt < max_generations - 1:
@@ -261,18 +265,201 @@ class V4ChangePlannerAgent:
         )
 
     def _complete(self, messages: list[dict[str, str]]) -> Any:
+        tool = self._planner_tool()
+        choice = {
+            "type": "function",
+            "function": {"name": "submit_v4_change_plan"},
+        }
         try:
             return self.llm.complete(
                 messages=messages,
-                tools=None,
+                tools=[tool],
+                tool_choice=choice,
                 reasoning_effort="medium",
                 temperature=0,
-                response_format={"type": "json_object"},
                 max_tokens=8000,
                 extra_body={"thinking": {"type": "disabled"}},
             )
         except TypeError:
-            return self.llm.complete(messages=messages, tools=None)
+            return self.llm.complete(messages=messages, tools=[tool])
+
+    @staticmethod
+    def _planner_tool() -> dict[str, Any]:
+        text = {"type": "string", "maxLength": 500}
+        checker_args = {
+            "type": "object",
+            "description": "Arguments for the named registered checker.",
+            "additionalProperties": True,
+        }
+        return {
+            "type": "function",
+            "function": {
+                "name": "submit_v4_change_plan",
+                "description": (
+                    "Submit one bounded semantic V4 planning outcome. This is the "
+                    "only accepted Change Planner response channel."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["need_evidence", "ready", "blocked"],
+                        },
+                        "goal": {"type": "string", "maxLength": 1000},
+                        "reason": {"type": "string", "maxLength": 1000},
+                        "missing_decisions": {
+                            "type": "array",
+                            "maxItems": 8,
+                            "items": text,
+                        },
+                        "probe_requests": {
+                            "type": "array",
+                            "maxItems": 4,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "probe": {"type": "string", "maxLength": 100},
+                                    "args": {
+                                        "type": "object",
+                                        "additionalProperties": True,
+                                    },
+                                    "purpose": text,
+                                },
+                                "required": ["probe", "args", "purpose"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "assumptions": {
+                            "type": "array",
+                            "maxItems": 12,
+                            "items": text,
+                        },
+                        "resources": {
+                            "type": "array",
+                            "maxItems": 64,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string", "maxLength": 100},
+                                    "kind": {"type": "string", "maxLength": 50},
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["frozen", "deferred"],
+                                    },
+                                    "role": {"type": "string", "maxLength": 100},
+                                    "value": {},
+                                    "source": {"type": "string", "maxLength": 200},
+                                    "consumers": {
+                                        "type": "array",
+                                        "maxItems": 24,
+                                        "items": {
+                                            "type": "string",
+                                            "maxLength": 150,
+                                        },
+                                    },
+                                },
+                                "required": [
+                                    "name", "kind", "status", "role", "source",
+                                    "consumers",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "changes": {
+                            "type": "array",
+                            "maxItems": 12,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step_id": {"type": "string", "maxLength": 100},
+                                    "title": text,
+                                    "objective": {"type": "string", "maxLength": 1000},
+                                    "reason": {"type": "string", "maxLength": 1000},
+                                    "evidence_refs": {
+                                        "type": "array",
+                                        "maxItems": 24,
+                                        "items": {"type": "string", "maxLength": 100},
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "maxItems": 12,
+                                        "items": {"type": "string", "maxLength": 100},
+                                    },
+                                    "risk": {
+                                        "type": "string",
+                                        "enum": ["low", "medium", "high", "critical"],
+                                    },
+                                    "expected_changes": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 24,
+                                        "items": text,
+                                    },
+                                    "postconditions": {
+                                        "type": "array",
+                                        "minItems": 1,
+                                        "maxItems": 24,
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "checker": {
+                                                    "type": "string",
+                                                    "enum": list(
+                                                        DefaultCheckerRegistry().names
+                                                    ),
+                                                },
+                                                "args": checker_args,
+                                            },
+                                            "required": ["checker", "args"],
+                                            "additionalProperties": False,
+                                        },
+                                    },
+                                },
+                                "required": [
+                                    "step_id", "title", "objective", "reason",
+                                    "evidence_refs", "depends_on", "risk",
+                                    "expected_changes", "postconditions",
+                                ],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["status"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    @staticmethod
+    def _planner_payload(response: Any) -> tuple[dict[str, Any], str]:
+        choices = getattr(response, "choices", None)
+        if not choices:
+            raise ValueError("planner response missing choices")
+        message = getattr(choices[0], "message", None)
+        if message is None:
+            raise ValueError("planner response missing message")
+        calls = getattr(message, "tool_calls", None)
+        if calls:
+            if len(calls) != 1:
+                raise ValueError("planner must emit exactly one function call")
+            function = getattr(calls[0], "function", None)
+            name = getattr(function, "name", None)
+            arguments = getattr(function, "arguments", None)
+            if str(name or "") != "submit_v4_change_plan":
+                raise ValueError("unexpected planner function call")
+            if isinstance(arguments, dict):
+                data = arguments
+            else:
+                data = json.loads(str(arguments or ""))
+            if not isinstance(data, dict):
+                raise ValueError("planner function arguments must be an object")
+            return data, json.dumps(data, ensure_ascii=False)
+
+        # Compatibility for lightweight test doubles which predate tool calls.
+        # The production request above always forces submit_v4_change_plan.
+        content = getattr(message, "content", None) or ""
+        return parse_json_object(content), content
 
     def _outcome(
         self,

@@ -574,6 +574,38 @@ def test_change_planner_bounds_model_output_and_omits_runaway_repair_context():
     assert assistant == "Previous planner output omitted: contract size exceeded."
 
 
+def test_change_planner_forces_bounded_function_schema():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, conclusion, _evidence_id = _bundle_and_conclusion()
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "test stop",
+                    "missing_decisions": [],
+                }
+            )
+        ]
+    )
+
+    V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+
+    call = llm.calls[0]
+    assert call["kwargs"]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_v4_change_plan"},
+    }
+    function = call["tools"][0]["function"]
+    assert function["name"] == "submit_v4_change_plan"
+    properties = function["parameters"]["properties"]
+    assert properties["assumptions"]["maxItems"] == 12
+    assert properties["assumptions"]["items"]["maxLength"] == 500
+    assert properties["resources"]["maxItems"] == 64
+    assert properties["changes"]["maxItems"] == 12
+
+
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 
