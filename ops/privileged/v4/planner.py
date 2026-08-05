@@ -118,6 +118,9 @@ rabbitmq_port when isolated stateful containers are planned. The Nginx site
 fronts the master application port; web-terminal and worker liveness are
 proved independently. Do not rename the web-terminal port to a generic
 `web_port`, and do not spell Screen suffixes as `_master` or `_worker`.
+The currently registered complete-runtime capability does not start a separate
+data-server component, so do not add `data_server_port`, a data-server Screen,
+or a fifth application component to this V4 deployment contract.
 """.strip()
 
 
@@ -1152,6 +1155,13 @@ class V4ChangePlannerAgent:
             if not re.search(pattern, payload, re.I)
         ]
         errors = []
+        if "data_server" in payload or any(
+            "data_server" in "%s %s" % (resource.name, resource.role)
+            for resource in resources
+        ):
+            errors.append(
+                "complete Klonet runtime includes unsupported data_server component"
+            )
         if missing_components:
             errors.append(
                 "complete Klonet runtime missing components=%s"

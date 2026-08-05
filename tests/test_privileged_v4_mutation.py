@@ -1100,6 +1100,33 @@ def test_complete_klonet_deployment_contract_requires_config_fields_and_master_n
     assert "complete Klonet Nginx must proxy to frozen master_port=47001" in errors
 
 
+def test_complete_klonet_deployment_contract_rejects_unsupported_data_server_component():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    resource = PlanResource(
+        "data_server_port", "port", "frozen", "data_server_port", 47004,
+        "planner_choice", consumers=["config.data_server_port"],
+    )
+    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+        {
+            "goal": "deploy a complete isolated Klonet platform instance",
+            "changes": [
+                {
+                    "step_id": "config",
+                    "title": "Configure data server",
+                    "objective": "Set data_server_port = 47004",
+                    "expected_changes": ["data server is configured"],
+                    "postconditions": [],
+                }
+            ],
+        },
+        [resource],
+    )
+
+    assert "complete Klonet runtime includes unsupported data_server component" in errors
+
+
 def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
