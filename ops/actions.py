@@ -514,6 +514,23 @@ DEFAULT_OPS_ACTIONS = (
         backends=("ops-privilege",),
     ),
     OpsActionSpec(
+        "create_docker_container",
+        "_create_docker_container",
+        "dangerous",
+        True,
+        confirmation_scope="step",
+        category="container",
+        description="从已发现镜像创建一个全新且名称唯一的 Docker 容器",
+        preconditions=(
+            "container_name_absent",
+            "container_image_observed",
+            "host_ports_frozen_and_available",
+        ),
+        effects=("new_container_created_and_started",),
+        postconditions=("container_running", "published_ports_listening"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
         "manage_container",
         "_manage_container",
         "privileged",

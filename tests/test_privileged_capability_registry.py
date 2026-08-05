@@ -29,6 +29,7 @@ def test_direct_action_specs_publish_machine_readable_contracts():
         "manage_service",
         "manage_process",
         "manage_container",
+        "create_docker_container",
         "install_system_packages",
         "install_python_packages",
         "manage_file_permissions",

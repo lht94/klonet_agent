@@ -576,6 +576,80 @@ def test_direct_runner_service_container_and_package_actions_use_bounded_argv(
     ] in calls
 
 
+def test_direct_runner_creates_new_container_with_bounded_docker_argv(monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    calls = []
+    monkeypatch.setattr(module.shutil, "which", lambda program: "/usr/bin/docker")
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+
+    def command_runner(argv, **kwargs):
+        calls.append(list(argv))
+        if argv[1:3] == ["container", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, "", "No such object")
+        return subprocess.CompletedProcess(argv, 0, "container-id\n", "")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "create_docker_container",
+            {
+                "name": "v4e2e-mysql",
+                "image": "mysql:latest",
+                "port_bindings": ["127.0.0.1:47005:3306"],
+                "environment": ["MYSQL_ROOT_PASSWORD=private-value"],
+                "restart_policy": "unless-stopped",
+            },
+            risk="high",
+        )
+    )
+
+    assert result.status == "completed"
+    assert calls == [
+        ["/usr/bin/docker", "container", "inspect", "v4e2e-mysql"],
+        ["/usr/bin/docker", "image", "inspect", "mysql:latest"],
+        [
+            "/usr/bin/docker", "run", "-d", "--name", "v4e2e-mysql",
+            "--restart", "unless-stopped",
+            "-p", "127.0.0.1:47005:3306",
+            "-e", "MYSQL_ROOT_PASSWORD=private-value",
+            "mysql:latest",
+        ],
+    ]
+    assert "private-value" not in result.output
+
+
+def test_direct_runner_refuses_to_replace_existing_container(monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    calls = []
+    monkeypatch.setattr(module.shutil, "which", lambda program: "/usr/bin/docker")
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+
+    def command_runner(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0, "existing-id\n", "")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "create_docker_container",
+            {
+                "name": "v4e2e-mysql",
+                "image": "mysql:latest",
+                "port_bindings": ["127.0.0.1:47005:3306"],
+            },
+            risk="high",
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "container_already_exists" in result.output
+    assert calls == [
+        ["/usr/bin/docker", "container", "inspect", "v4e2e-mysql"]
+    ]
+
+
 def test_direct_runner_python_packages_permissions_and_git_use_structured_argv(
     tmp_path,
     monkeypatch,

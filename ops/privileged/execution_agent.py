@@ -647,6 +647,14 @@ class PrivilegedExecutionAgent:
                     category="implementation_contract_invalid",
                 )
             raw_ids.append(raw_id)
+        items = _topologically_order_implementation_items(items)
+        raw_ids = [
+            _safe_implementation_step_id(
+                item.get("id"),
+                fallback="step-%s" % index,
+            )
+            for index, item in enumerate(items, start=1)
+        ]
         id_map = {
             raw_id: "%s__%s" % (semantic_step.step_id, raw_id)
             for raw_id in raw_ids
@@ -1353,27 +1361,7 @@ class PrivilegedExecutionAgent:
         payload = {
             "frozen_action": action,
             "required_args": list(REQUIRED_ACTION_ARGS.get(action, ())),
-            "optional_args": (
-                ["source_path", "content"]
-                if action == "install_nginx_config"
-                else (
-                    ["anchor"]
-                    if action == "edit_text_file"
-                    else (
-                        ["base_class"]
-                        if action == "upsert_python_class"
-                        else (
-                            ["assignment_name"]
-                            if action == "set_python_config_assignment"
-                            else (
-                                ["class_name"]
-                                if action == "set_python_class_attribute"
-                                else []
-                            )
-                        )
-                    )
-                )
-            ),
+            "optional_args": _optional_action_args(action),
             "action_description": (
                 self.action_registry.get(action).description
                 if self.action_registry.get(action) is not None
@@ -2087,11 +2075,7 @@ class PrivilegedExecutionAgent:
         action: str,
     ) -> dict[str, Any]:
         required = list(REQUIRED_ACTION_ARGS.get(action, ()))
-        optional = (
-            ["source_path", "content"]
-            if action == "install_nginx_config"
-            else (["anchor"] if action == "edit_text_file" else [])
-        )
+        optional = _optional_action_args(action)
         return _function_tool(
             "bind_action_%s" % action,
             "Bind grounded arguments for frozen registered Action %s." % action,
@@ -2333,13 +2317,31 @@ def _function_arguments(response: Any, expected_name: str) -> dict[str, Any]:
 def _action_arg_json_schema(name: str) -> dict[str, Any]:
     if name in {"ports"}:
         return {"type": "array", "items": {"type": "integer"}}
-    if name in {"packages", "argv", "sources", "entries"}:
+    if name in {
+        "packages",
+        "argv",
+        "sources",
+        "entries",
+        "port_bindings",
+        "environment",
+    }:
         return {"type": "array", "items": {"type": "string"}}
     if name in {"patch"}:
         return {"type": "object", "additionalProperties": True}
     if name in {"pid", "expected_port"}:
         return {"type": "integer"}
     return {"type": "string"}
+
+
+def _optional_action_args(action: str) -> list[str]:
+    return {
+        "install_nginx_config": ["source_path", "content"],
+        "edit_text_file": ["anchor"],
+        "upsert_python_class": ["base_class"],
+        "set_python_config_assignment": ["assignment_name"],
+        "set_python_class_attribute": ["class_name"],
+        "create_docker_container": ["environment", "restart_policy"],
+    }.get(action, [])
 
 
 def _normalize_selection(data: dict[str, Any]) -> dict[str, Any]:
@@ -2389,6 +2391,53 @@ def _safe_implementation_step_id(value: Any, *, fallback: str) -> str:
         str(value or "").strip(),
     ).strip("-_")
     return (text or fallback)[:80]
+
+
+def _topologically_order_implementation_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Compile a valid DAG emitted out of order into execution order."""
+
+    identities = [
+        _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        for index, item in enumerate(items, start=1)
+    ]
+    known = set(identities)
+    dependencies: dict[str, list[str]] = {}
+    for identity, item in zip(identities, items):
+        dependencies[identity] = [
+            _safe_implementation_step_id(value, fallback="")
+            for value in item.get("depends_on", [])
+        ] if isinstance(item.get("depends_on"), list) else []
+        unknown = set(dependencies[identity]).difference(known)
+        if unknown:
+            raise ExecutionBindingError(
+                "implementation dependency is unknown=%s" % sorted(unknown)[0],
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+    remaining = list(zip(identities, items))
+    emitted: set[str] = set()
+    ordered: list[dict[str, Any]] = []
+    while remaining:
+        ready_index = next(
+            (
+                index
+                for index, (identity, _) in enumerate(remaining)
+                if set(dependencies[identity]) <= emitted
+            ),
+            None,
+        )
+        if ready_index is None:
+            raise ExecutionBindingError(
+                "implementation dependency cycle",
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+        identity, item = remaining.pop(ready_index)
+        ordered.append(item)
+        emitted.add(identity)
+    return ordered
 
 
 def _is_discovery_only_implementation_step(
@@ -2663,7 +2712,50 @@ def _validate_action_resource_bindings(
 ) -> None:
     """Reject per-step arguments that diverge from the plan-wide manifest."""
 
-    del action  # Consumers intentionally bind semantic step + argument name.
+    if action == "create_docker_container":
+        relevant_resources = [
+            resource
+            for resource in resources
+            if resource.status == "frozen"
+            and resource.kind == "port"
+            and any(
+                step.step_id == consumer.rsplit(".", 1)[0]
+                or step.step_id.startswith(consumer.rsplit(".", 1)[0] + "__")
+                for consumer in resource.consumers
+            )
+        ]
+        step_text = "%s %s" % (step.title, step.objective)
+        service = next(
+            (
+                marker
+                for marker in ("mysql", "redis", "rabbitmq")
+                if marker in step_text.lower()
+            ),
+            "",
+        )
+        service_resources = [
+            resource
+            for resource in relevant_resources
+            if service
+            and service in " ".join(
+                [resource.name, resource.role, *resource.consumers]
+            ).lower()
+        ]
+        allowed_ports = {
+            int(resource.value)
+            for resource in (service_resources or relevant_resources)
+        }
+        for binding in _strings(args.get("port_bindings"), 20):
+            parts = binding.split(":")
+            try:
+                bound_ports = {int(parts[-2]), int(parts[-1])}
+            except (IndexError, ValueError):
+                raise ValueError("invalid_container_port_binding")
+            unknown = bound_ports.difference(allowed_ports)
+            if unknown:
+                raise ValueError(
+                    "unfrozen_container_port=%s" % min(unknown)
+                )
     for resource in resources:
         for consumer in resource.consumers:
             semantic_id, arg_name = consumer.rsplit(".", 1)
@@ -2764,6 +2856,13 @@ def _validate_action_objective_fit(
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     ).lower()
+    if action in {"manage_container", "start_docker_container"} and re.search(
+        r"(?:create|new|previously absent|创建|新建|全新).{0,40}(?:container|容器)|"
+        r"(?:container|容器).{0,40}(?:create|new|previously absent|创建|新建|全新)",
+        text,
+        re.IGNORECASE,
+    ):
+        return "action=%s cannot_create_new_container" % action
     if action == "manual_checkpoint":
         if step.risk == "readonly" and not step.expected_changes:
             return ""
@@ -3002,12 +3101,37 @@ def _infer_structural_action_args(
         "restart_screen_component",
         "stop_screen_component",
     }:
+        session = str(compiled.get("screen_session") or "").strip()
+        component_from_session = next(
+            (
+                component
+                for component, component_suffix in {
+                    "master": "m",
+                    "celery": "c",
+                    "web_terminal": "web",
+                    "worker": "w",
+                }.items()
+                if session.endswith("_" + component_suffix)
+            ),
+            "",
+        )
+        component = component_from_session or {
+            "web": "web_terminal",
+            "webserver": "web_terminal",
+            "controller": "celery",
+            "message": "master",
+            "manager": "master",
+        }.get(
+            str(compiled.get("component") or "").strip().lower(),
+            str(compiled.get("component") or "").strip(),
+        )
+        compiled["component"] = component
         suffix = {
             "master": "m",
             "celery": "c",
             "web_terminal": "web",
             "worker": "w",
-        }.get(str(compiled.get("component") or "").strip())
+        }.get(component)
         platform = str(
             compiled.get("session_prefix")
             or compiled.get("platform")

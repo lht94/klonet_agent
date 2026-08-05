@@ -68,6 +68,7 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "manage_service",
         "manage_process",
         "stop_klonet_runtime_instance",
+        "create_docker_container",
         "manage_container",
         "install_system_packages",
         "install_python_packages",
@@ -97,6 +98,9 @@ _COMPONENT_SUFFIX = {
     "worker": "w",
 }
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
+_SAFE_CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,119}$")
+_SAFE_CONTAINER_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,239}$")
+_SAFE_ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
 _SENSITIVE_NAME = re.compile(
     r"(?i)(?:^|[._-])(?:\.env|id_rsa|id_ed25519|private[_-]?key|"
     r"secret|token|credential|password)(?:$|[._-])"
@@ -1918,6 +1922,76 @@ class DirectPrivilegedActionRunner:
             % (name, operation),
         )
 
+    def _action_create_docker_container(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        name = str(step.args.get("name") or "").strip()
+        image = str(step.args.get("image") or "").strip()
+        port_bindings = _string_list(step.args.get("port_bindings"))
+        environment = _string_list(step.args.get("environment"))
+        restart_policy = str(
+            step.args.get("restart_policy") or "unless-stopped"
+        ).strip()
+        if not _SAFE_CONTAINER_NAME.fullmatch(name):
+            return self._blocked("invalid_new_container_name")
+        if not _SAFE_CONTAINER_IMAGE.fullmatch(image) or ".." in image:
+            return self._blocked("invalid_container_image")
+        if not port_bindings or any(
+            not _valid_container_port_binding(item) for item in port_bindings
+        ):
+            return self._blocked("invalid_container_port_bindings")
+        if any(not _valid_container_environment(item) for item in environment):
+            return self._blocked("invalid_container_environment")
+        if restart_policy not in {"no", "always", "unless-stopped", "on-failure"}:
+            return self._blocked("invalid_container_restart_policy")
+        docker = shutil.which("docker")
+        if not docker:
+            return self._blocked("docker_not_found")
+        inspect = self._command(
+            _sudo_if_needed([docker, "container", "inspect", name]),
+            timeout=min(step.timeout, 30),
+        )
+        if inspect.returncode == 0:
+            return self._blocked("container_already_exists=%s" % name)
+        if not re.search(
+            r"no such (?:object|container)",
+            str(inspect.stderr or ""),
+            re.I,
+        ):
+            return DirectActionResult(
+                "failed",
+                "container_absence_check_failed name=%s stderr=%s "
+                "environment_changed=false" % (name, _one_line(inspect.stderr)),
+                "inspect_docker",
+            )
+        image_check = self._command(
+            _sudo_if_needed([docker, "image", "inspect", image]),
+            timeout=min(step.timeout, 30),
+        )
+        if image_check.returncode != 0:
+            return self._blocked("container_image_not_observed=%s" % image)
+        argv = [docker, "run", "-d", "--name", name, "--restart", restart_policy]
+        for binding in port_bindings:
+            argv.extend(["-p", binding])
+        for variable in environment:
+            argv.extend(["-e", variable])
+        argv.append(image)
+        result = self._command(_sudo_if_needed(argv), timeout=step.timeout)
+        if result.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "create_docker_container_failed name=%s image=%s stderr=%s "
+                "environment_changed=unknown"
+                % (name, image, _one_line(result.stderr)),
+                "inspect_docker",
+            )
+        return DirectActionResult(
+            "completed",
+            "action=create_docker_container name=%s image=%s "
+            "environment_changed=true" % (name, image),
+        )
+
     def _action_install_system_packages(
         self,
         step: PrivilegedStep,
@@ -3454,6 +3528,23 @@ def _string_list(value) -> list[str]:
         for item in value[:100]
         if str(item).strip()
     ]
+
+
+def _valid_container_port_binding(value: str) -> bool:
+    match = re.fullmatch(r"127\.0\.0\.1:([1-9]\d{0,4}):([1-9]\d{0,4})", value)
+    if match is None:
+        return False
+    return all(1 <= int(port) <= 65535 for port in match.groups())
+
+
+def _valid_container_environment(value: str) -> bool:
+    key, separator, content = value.partition("=")
+    return bool(
+        separator
+        and _SAFE_ENV_KEY.fullmatch(key)
+        and len(content) <= 2048
+        and not any(character in content for character in ("\x00", "\n", "\r"))
+    )
 
 
 def _truthy(value, *, default: bool = False) -> bool:

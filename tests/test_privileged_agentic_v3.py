@@ -238,6 +238,78 @@ def test_config_assignment_action_cannot_masquerade_as_port_field_edit():
     )
 
 
+def test_existing_container_actions_cannot_masquerade_as_container_creation():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_objective_fit,
+    )
+
+    step = PrivilegedStep(
+        step_id="mysql",
+        title="Create isolated MySQL container",
+        objective="Create a new v4e2e-mysql container from mysql:latest",
+        expected_changes=["A previously absent container is created and started"],
+        risk="high",
+    )
+
+    assert "cannot_create_new_container" in _validate_action_objective_fit(
+        "manage_container", step
+    )
+    assert "cannot_create_new_container" in _validate_action_objective_fit(
+        "start_docker_container", step
+    )
+    assert not _validate_action_objective_fit("create_docker_container", step)
+
+
+def test_new_container_port_bindings_must_use_frozen_plan_ports():
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_resource_bindings,
+    )
+
+    step = PrivilegedStep(
+        step_id="change-3__mysql",
+        title="Create MySQL container",
+        risk="high",
+    )
+    resources = [
+        PlanResource(
+            "mysql_host_port",
+            "port",
+            "frozen",
+            "service_port",
+            47005,
+            "evidence",
+            consumers=["change-3.mysql_port"],
+        ),
+        PlanResource(
+            "mysql_internal_port",
+            "port",
+            "frozen",
+            "container_internal_port",
+            3306,
+            "image_contract",
+            consumers=["change-3.mysql_internal_port"],
+        ),
+    ]
+
+    _validate_action_resource_bindings(
+        step,
+        "create_docker_container",
+        {"port_bindings": ["127.0.0.1:47005:3306"]},
+        resources,
+    )
+    with pytest.raises(ValueError, match="unfrozen_container_port"):
+        _validate_action_resource_bindings(
+            step,
+            "create_docker_container",
+            {"port_bindings": ["127.0.0.1:47999:3306"]},
+            resources,
+        )
+
+
 def test_micro_predecessor_can_produce_frozen_instance_root_for_validation():
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
@@ -2520,6 +2592,22 @@ def test_invalid_implementation_json_triggers_local_rebuild(tmp_path):
     assert any("局部重建" in message for message in progress)
 
 
+def test_implementation_items_are_topologically_ordered_before_binding():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _topologically_order_implementation_items,
+    )
+
+    items = [
+        {"id": "verify", "depends_on": ["start"]},
+        {"id": "start", "depends_on": ["create"]},
+        {"id": "create", "depends_on": []},
+    ]
+
+    ordered = _topologically_order_implementation_items(items)
+
+    assert [item["id"] for item in ordered] == ["create", "start", "verify"]
+
+
 def test_screen_session_is_derived_from_platform_and_component():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.execution_agent import (
@@ -2548,6 +2636,26 @@ def test_screen_session_is_derived_from_platform_and_component():
 
     assert compiled["platform"] == "lht"
     assert compiled["screen_session"] == "lht_m"
+
+
+def test_screen_component_alias_is_compiled_from_frozen_session_suffix():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    compiled = _infer_structural_action_args(
+        "start_screen_component",
+        {
+            "platform": "v4e2e",
+            "component": "web",
+            "screen_session": "v4e2e_web",
+            "project_root": "/home/lzl/klonet_v4_e2e",
+        },
+        [],
+    )
+
+    assert compiled["component"] == "web_terminal"
+    assert compiled["screen_session"] == "v4e2e_web"
 
 
 def test_nginx_install_source_must_prove_declared_content(tmp_path):

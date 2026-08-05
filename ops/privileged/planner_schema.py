@@ -42,6 +42,7 @@ REQUIRED_ACTION_ARGS = {
     "merge_json_file": ("path", "patch"),
     "start_redis_instance": ("binary", "config_path", "expected_port"),
     "ensure_klonet_redis_instance": ("project_root",),
+    "create_docker_container": ("name", "image", "port_bindings"),
     "repair_klonet_active_master_ip": ("project_root",),
     "run_reviewed_script": ("script_path", "cwd", "sha256"),
     "manage_libvirt_domain": ("domain", "operation"),
