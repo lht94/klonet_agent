@@ -658,6 +658,23 @@ def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
     assert resources[2].consumers == ["clone-source.ref"]
 
 
+@pytest.mark.parametrize("alias", ["candidates", "candidate_ports"])
+def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    requests = V4ChangePlannerAgent._probe_requests(
+        [
+            {
+                "probe": "ports",
+                "args": {alias: [45561, "45562", 45561]},
+                "purpose": "freeze candidates",
+            }
+        ]
+    )
+
+    assert requests[0].args == {"ports": [45561, 45562]}
+
+
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

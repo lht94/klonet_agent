@@ -2171,15 +2171,36 @@ class V4ChangePlannerAgent:
     def _probe_requests(value: Any) -> list[ProbeRequest]:
         if not isinstance(value, list):
             return []
-        return [
-            ProbeRequest(
-                str(item.get("probe") or ""),
-                item.get("args") if isinstance(item.get("args"), dict) else {},
-                str(item.get("purpose") or "resolve planning evidence gap"),
+        requests = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            probe = str(item.get("probe") or "")
+            args = item.get("args") if isinstance(item.get("args"), dict) else {}
+            args = dict(args)
+            if probe == "ports" and "ports" not in args:
+                candidates = args.pop(
+                    "candidates",
+                    args.pop("candidate_ports", None),
+                )
+                if isinstance(candidates, list):
+                    ports = []
+                    for value in candidates:
+                        try:
+                            port = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                        if 1 <= port <= 65535 and port not in ports:
+                            ports.append(port)
+                    args["ports"] = ports
+            requests.append(
+                ProbeRequest(
+                    probe,
+                    args,
+                    str(item.get("purpose") or "resolve planning evidence gap"),
+                )
             )
-            for item in value
-            if isinstance(item, dict)
-        ]
+        return requests
 
     @staticmethod
     def _evidence_json(bundle: EvidenceBundle) -> str:
