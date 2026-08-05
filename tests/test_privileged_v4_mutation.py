@@ -591,10 +591,10 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
     assert "fixed instance identifiers are not frozen=v4e2e" in errors
     assert "fixed Nginx config names are not frozen=klonet-v4-e2e" in errors
     assert not any("/home/lzl/vemu_uestc" in error for error in errors)
-    assert "change deploy consumes multiple port resources; split it" in errors
+    assert not any("consumes multiple port resources" in error for error in errors)
 
 
-def test_deployment_contract_rejects_unfrozen_ports_and_bundled_mutations():
+def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic_steps():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 
@@ -667,8 +667,8 @@ def test_deployment_contract_rejects_unfrozen_ports_and_bundled_mutations():
     )
 
     assert "change configure uses unfrozen port=47002" in errors
-    assert "change configure bundles multiple configuration assertions; split it" in errors
-    assert "change start verifies multiple screen sessions; split it" in errors
+    assert not any("configuration assertions" in error for error in errors)
+    assert not any("multiple screen sessions" in error for error in errors)
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():

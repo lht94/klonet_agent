@@ -86,11 +86,12 @@ configuration file edits, startup commands, or source layout. For those, use
 need_evidence when state is missing, otherwise choose isolated values, freeze
 them as resources, and emit semantic changes.
 
-Keep every ChangeStep atomic: one configuration attribute, one container, one
-screen component, or one Nginx site mutation per step. Never bundle multiple
-ports, multiple IP attributes, or multiple containers into one ChangeStep.
-For an isolated deployment, explicitly plan new uniquely named containers and
-sessions; never assume reuse of an existing resource.
+Keep every ChangeStep semantically cohesive. A configuration or service-group
+ChangeStep may contain multiple related attributes or components; the Binding
+stage will decompose it into atomic Action/Shell implementation steps. For an
+isolated deployment, explicitly plan new uniquely named containers and
+sessions; never assume reuse of an existing resource. Every numeric port used
+anywhere in changes or postconditions must have its own frozen port resource.
 """.strip()
 
 
@@ -185,8 +186,9 @@ class V4ChangePlannerAgent:
                                 "Freeze every future configuration file path derived "
                                 "from instance_root and bind it as change-N.path. "
                                 "Do not reuse or modify existing instance resources. "
-                                "Keep every change atomic: one configuration attribute, "
-                                "one container, one screen component, or one Nginx site."
+                                "Keep semantic changes cohesive and let Binding split "
+                                "them into atomic implementation steps. Freeze every "
+                                "numeric port used anywhere in the plan."
                             )
                             % exc,
                         }
@@ -524,18 +526,6 @@ class V4ChangePlannerAgent:
                     "resource consumers reference unknown steps=%s"
                     % ",".join(unknown)
                 )
-        ports_by_step: dict[str, set[str]] = {}
-        for resource in frozen:
-            if resource.kind != "port":
-                continue
-            for consumer in resource.consumers:
-                step_id = consumer.rsplit(".", 1)[0]
-                ports_by_step.setdefault(step_id, set()).add(resource.name)
-        for step_id, port_names in ports_by_step.items():
-            if len(port_names) > 1:
-                errors.append(
-                    "change %s consumes multiple port resources; split it" % step_id
-                )
         frozen_port_values = {
             int(resource.value)
             for resource in frozen
@@ -555,34 +545,6 @@ class V4ChangePlannerAgent:
                 for port in sorted(used_ports - frozen_port_values):
                     errors.append(
                         "change %s uses unfrozen port=%s" % (step_id, port)
-                    )
-                postconditions = change.get("postconditions")
-                if not isinstance(postconditions, list):
-                    continue
-                file_assertions: dict[str, int] = {}
-                screen_sessions: set[str] = set()
-                for check in postconditions:
-                    if not isinstance(check, dict):
-                        continue
-                    args = check.get("args")
-                    if not isinstance(args, dict):
-                        continue
-                    checker = str(check.get("checker") or "")
-                    if checker == "file_contains":
-                        path = str(args.get("path") or "")
-                        file_assertions[path] = file_assertions.get(path, 0) + 1
-                    elif checker == "screen_session_exists":
-                        session = str(args.get("session") or "")
-                        if session:
-                            screen_sessions.add(session)
-                if any(count > 1 for count in file_assertions.values()):
-                    errors.append(
-                        "change %s bundles multiple configuration assertions; split it"
-                        % step_id
-                    )
-                if len(screen_sessions) > 1:
-                    errors.append(
-                        "change %s verifies multiple screen sessions; split it" % step_id
                     )
         root_resource = next(
             (
