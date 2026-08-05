@@ -72,6 +72,7 @@ class V4MutationWorkflow:
                 outcome.reason or "change planning did not produce an executable plan",
                 evidence=evidence_bundle,
             )
+        self.store.save(outcome.plan)
         try:
             plan = self.binder.bind(outcome.plan)
         except V4BindingError as exc:
@@ -88,13 +89,17 @@ class V4MutationWorkflow:
                     outcome.reason or "binding replan did not produce a ready plan",
                     evidence=evidence_bundle,
                 )
+            self.store.save(outcome.plan)
             try:
                 plan = self.binder.bind(outcome.plan)
             except V4BindingError as final_error:
+                outcome.plan.status = "blocked"
+                self.store.save(outcome.plan)
                 return V4WorkflowResult(
                     True,
                     "blocked",
                     "V4 binding replan budget exhausted: %s" % final_error,
+                    plan=outcome.plan,
                     evidence=evidence_bundle,
                 )
         plan.status = "awaiting_confirmation"

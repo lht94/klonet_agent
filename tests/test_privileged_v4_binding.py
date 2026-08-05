@@ -153,3 +153,15 @@ def test_v4_binder_rejects_verification_only_as_an_execution_step(hierarchical):
 
     with pytest.raises(V4BindingError, match="verification_only"):
         V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+
+
+def test_v4_binder_translates_shared_binding_failure_to_v4_boundary():
+    from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
+    from klonet_agent.ops.privileged.v4.binding import V4BindingError, V4ChangeBinder
+
+    class FailingSharedBinder:
+        def prepare_plan(self, plan, *, grounded_context):
+            raise ExecutionBindingError("clone target could not be grounded")
+
+    with pytest.raises(V4BindingError, match="clone target could not be grounded"):
+        V4ChangeBinder(FailingSharedBinder()).bind(_plan())

@@ -351,3 +351,38 @@ def test_binder_failure_replans_at_most_once_then_succeeds(tmp_path):
 
     assert result.kind == "awaiting_confirmation"
     assert planner.calls == binder.calls == 2
+
+
+def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_path):
+    from klonet_agent.ops.privileged.v4.binding import V4BindingError
+    from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    class Binder:
+        calls = 0
+
+        def bind(self, plan, **kwargs):
+            self.calls += 1
+            raise V4BindingError("clone target could not be grounded")
+
+    store = MemoryStore()
+    workflow = V4MutationWorkflow(
+        planner=FakePlanner(
+            [
+                V4PlanningOutcome(status="ready", plan=_change_plan()),
+                V4PlanningOutcome(status="ready", plan=_change_plan()),
+            ]
+        ),
+        binder=Binder(),
+        store=store,
+        executor=FakeExecutor(),
+        verifier=FakeVerifier(),
+    )
+
+    result = workflow.submit(
+        "deploy", evidence_bundle=object(), evidence_conclusion=object()
+    )
+
+    assert result.kind == "blocked"
+    assert result.plan.status == "blocked"
+    assert store.load(result.plan.plan_id).status == "blocked"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
 from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4
 
 
@@ -45,10 +46,13 @@ class V4ChangeBinder:
                 for step in plan.steps
             ],
         )
-        bound = self.capability_binder.prepare_plan(
-            legacy,
-            grounded_context=grounded_context,
-        )
+        try:
+            bound = self.capability_binder.prepare_plan(
+                legacy,
+                grounded_context=grounded_context,
+            )
+        except ExecutionBindingError as exc:
+            raise V4BindingError(str(exc)) from exc
         by_id = {step.step_id: step for step in bound.steps}
         for change in plan.steps:
             implementation = by_id[change.step_id]
