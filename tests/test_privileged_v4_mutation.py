@@ -206,6 +206,45 @@ def test_change_planner_returns_structured_evidence_gap_without_plan():
     assert outcome.probe_requests[0].probe == "ports"
 
 
+def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative():
+    from klonet_agent.ops.privileged.v4.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle = EvidenceBundle(goal="use Screen prefix vemu_uestc as source")
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("screen", {}, "source"),
+            (
+                "session=vemu_uestc_m runtime_cwds=/home/lzl/vemu_uestc/mains "
+                "git_roots=/home/lzl/vemu_uestc\n"
+                "path=/home/lzl/vemu_uestc inside_work_tree=true revision=abc\n"
+                "status=## develop...origin/develop\n"
+                "remotes=origin\tgitee:example/vemu.git (fetch)"
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="authoritative Screen source evidence"):
+        V4ChangePlannerAgent(None)._outcome(
+            {
+                "status": "need_evidence",
+                "probe_requests": [
+                    {
+                        "probe": "git_repository",
+                        "args": {"repository": "/home/lzl/vemu_uestc"},
+                        "purpose": "determine source remote and branch",
+                    }
+                ],
+            },
+            bundle.goal,
+            bundle,
+        )
+
+
 def test_change_planner_builds_only_mutating_change_steps():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

@@ -231,9 +231,23 @@ class V4ChangePlannerAgent:
     ) -> V4PlanningOutcome:
         status = str(data.get("status") or "").strip().lower()
         if status == "need_evidence":
+            requests = self._probe_requests(data.get("probe_requests"))
+            authoritative_roots = self._authoritative_screen_source_roots(
+                goal,
+                bundle,
+            )
+            if authoritative_roots and requests and all(
+                self._is_redundant_source_request(request, authoritative_roots)
+                for request in requests
+            ):
+                raise ValueError(
+                    "authoritative Screen source evidence already provides Git root, "
+                    "remote, branch, and revision; return a ready plan instead of "
+                    "requesting duplicate source probes"
+                )
             return V4PlanningOutcome(
                 status=status,
-                probe_requests=self._probe_requests(data.get("probe_requests")),
+                probe_requests=requests,
             )
         if status == "blocked":
             missing = data.get("missing_decisions")
@@ -319,6 +333,77 @@ class V4ChangePlannerAgent:
                 if isinstance(assumptions, list)
                 else [],
             ),
+        )
+
+    @staticmethod
+    def _authoritative_screen_source_roots(
+        goal: str,
+        bundle: EvidenceBundle,
+    ) -> set[str]:
+        goal_text = str(goal or "").lower()
+        roots: set[str] = set()
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "screen":
+                continue
+            output = record.output
+            for match in re.finditer(
+                r"(?m)^session=([A-Za-z0-9_.-]+).*?\bgit_roots=([^\s]+)",
+                output,
+            ):
+                session = match.group(1)
+                prefix = re.sub(
+                    r"_(?:web|m|c|w|worker|master|controller)$",
+                    "",
+                    session,
+                    flags=re.I,
+                )
+                if prefix.lower() not in goal_text:
+                    continue
+                for root in match.group(2).split(","):
+                    if root == "unknown" or not root:
+                        continue
+                    grounded = (
+                        "path=%s inside_work_tree=true" % root in output
+                        and "remotes=origin" in output
+                        and re.search(r"status=##\s+[^\s]+", output) is not None
+                    )
+                    if grounded:
+                        roots.add(root)
+        return roots
+
+    @staticmethod
+    def _is_redundant_source_request(
+        request: ProbeRequest,
+        authoritative_roots: set[str],
+    ) -> bool:
+        if request.probe not in {
+            "git_repository",
+            "screen",
+            "screen_session",
+            "process",
+            "process_detail",
+        }:
+            return False
+        requested_path = str(
+            request.args.get("repository") or request.args.get("path") or ""
+        )
+        if requested_path in authoritative_roots:
+            return True
+        purpose = str(request.purpose or "").lower()
+        if "target" in purpose or "目标" in purpose:
+            return False
+        return any(
+            marker in purpose
+            for marker in (
+                "source",
+                "remote",
+                "branch",
+                "screen",
+                "cwd",
+                "authoritative",
+                "resolve planning evidence gap",
+                "源实例",
+            )
         )
 
     @staticmethod
