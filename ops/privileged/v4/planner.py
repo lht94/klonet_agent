@@ -98,6 +98,9 @@ stage will decompose it into atomic Action/Shell implementation steps. For an
 isolated deployment, explicitly plan new uniquely named containers and
 sessions; never assume reuse of an existing resource. Every numeric port used
 in host configuration or postconditions must have its own frozen port resource.
+When a `ports` evidence record checks an explicit candidate list and reports no
+matching listeners, select host ports only from that checked list. Never invent
+familiar-looking 470xx ports or reuse ports merely seen in unrelated evidence.
 Mark fixed image/container-side ports with role `container_internal_port`;
 only host/listening ports require availability proof.
 If MySQL, Redis, RabbitMQ, or another stateful dependency is required by an
