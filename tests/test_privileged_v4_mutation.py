@@ -764,6 +764,45 @@ def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic
     assert not any("multiple screen sessions" in error for error in errors)
 
 
+def test_change_planner_rejects_resource_consumer_with_multiple_owners():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle, _, _ = _bundle_and_conclusion()
+    resources = [
+        PlanResource(
+            "instance_identifier",
+            "identifier",
+            "frozen",
+            "instance_identifier",
+            "v4e2e",
+            "user_input",
+            consumers=["change-3.config_name"],
+        ),
+        PlanResource(
+            "nginx_config_name",
+            "identifier",
+            "frozen",
+            "nginx_config_name",
+            "klonet-v4-e2e",
+            "user_input",
+            consumers=["change-3.config_name"],
+        ),
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"changes": [], "assumptions": []},
+        "configure deployment",
+        resources,
+        bundle,
+    )
+
+    assert (
+        "plan resource consumer has multiple owners="
+        "change-3.config_name:instance_identifier,nginx_config_name"
+    ) in errors
+
+
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

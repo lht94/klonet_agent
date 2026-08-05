@@ -488,6 +488,18 @@ class V4ChangePlannerAgent:
         bundle: EvidenceBundle,
     ) -> list[str]:
         errors: list[str] = []
+        consumer_owners: dict[str, list[str]] = {}
+        for resource in resources:
+            for consumer in resource.consumers:
+                owners = consumer_owners.setdefault(consumer, [])
+                if resource.name not in owners:
+                    owners.append(resource.name)
+        for consumer, owners in consumer_owners.items():
+            if len(owners) > 1:
+                errors.append(
+                    "plan resource consumer has multiple owners=%s:%s"
+                    % (consumer, ",".join(owners))
+                )
         known_checkers = set(DefaultCheckerRegistry().names)
         changes = data.get("changes")
         if isinstance(changes, list):
