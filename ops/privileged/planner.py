@@ -1431,7 +1431,7 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
         "manage_ovs_resource": {"add", "remove"},
         "git_operation": {
             "status", "rev_parse", "pull", "fetch", "checkout", "switch",
-            "clone", "submodule_update", "reset", "revert", "restore", "tag",
+            "clone", "clone_at_revision", "submodule_update", "reset", "revert", "restore", "tag",
             "push",
         },
     }
@@ -1526,8 +1526,12 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
             return "action=git_operation path_required"
         if operation == "tag" and not args.get("tag"):
             return "action=git_operation tag_required"
-        if operation == "clone" and not args.get("url"):
+        if operation in {"clone", "clone_at_revision"} and not args.get("url"):
             return "action=git_operation url_required"
+        if operation == "clone_at_revision" and not (
+            args.get("ref") and args.get("revision")
+        ):
+            return "action=git_operation clone_at_revision_requires_ref_and_revision"
         if _planner_truthy(args.get("force_with_lease")) and not (
             operation == "push" and args.get("remote") and args.get("ref")
         ):

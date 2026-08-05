@@ -944,6 +944,48 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
     assert checks[3]["args"] == {"pattern": "v4e2e-redis"}
 
 
+def test_change_planner_derives_frozen_source_revision_for_clone_binding():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    resources = [
+        PlanResource(
+            "instance_root",
+            "path",
+            "frozen",
+            "instance_root",
+            "/srv/v4e2e",
+            "user_input",
+            consumers=["clone.repository"],
+        )
+    ]
+    data = {
+        "changes": [
+            {
+                "step_id": "clone",
+                "title": "Clone source and pin revision",
+                "objective": "Create an exact isolated source checkout",
+                "expected_changes": ["repository is cloned"],
+                "postconditions": [
+                    {
+                        "checker": "git_revision",
+                        "args": {
+                            "repository": "/srv/v4e2e",
+                            "revision": "a" * 40,
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, resources)
+
+    revision = next(item for item in normalized if item.role == "source_revision")
+    assert revision.value == "a" * 40
+    assert revision.consumers == ["clone.revision"]
+
+
 def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

@@ -1321,6 +1321,50 @@ class V4ChangePlannerAgent:
                         )
                     )
                     explicit_internal_ports.add(port)
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                step_id = str(change.get("step_id") or "")
+                postconditions = change.get("postconditions")
+                if not isinstance(postconditions, list):
+                    continue
+                for check in postconditions:
+                    if not isinstance(check, dict) or check.get("checker") != "git_revision":
+                        continue
+                    args = check.get("args")
+                    revision = (
+                        str(args.get("revision") or "").strip()
+                        if isinstance(args, dict)
+                        else ""
+                    )
+                    if not revision:
+                        continue
+                    consumer = "%s.revision" % step_id
+                    existing = next(
+                        (
+                            item
+                            for item in normalized
+                            if item.status == "frozen"
+                            and item.role == "source_revision"
+                            and str(item.value) == revision
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        if consumer not in existing.consumers:
+                            existing.consumers.append(consumer)
+                        continue
+                    normalized.append(
+                        PlanResource(
+                            name="source_revision",
+                            kind="identifier",
+                            status="frozen",
+                            role="source_revision",
+                            value=revision,
+                            source="derived_from_git_revision_postcondition",
+                            consumers=[consumer],
+                        )
+                    )
         for step_id, ports in V4ChangePlannerAgent._used_ports_by_step(data).items():
             for port in sorted(ports):
                 consumer = "%s.port_%s" % (step_id, port)

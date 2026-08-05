@@ -2123,7 +2123,7 @@ class DirectPrivilegedActionRunner:
         if not argv:
             return self._blocked("unsupported_or_invalid_git_operation")
         cwd = repository
-        if operation == "clone":
+        if operation in {"clone", "clone_at_revision"}:
             cwd = repository.parent
         decision = decide_ops_command(
             {"program": "git", "argv": argv, "cwd": str(cwd)}
@@ -2142,6 +2142,28 @@ class DirectPrivilegedActionRunner:
                 % (operation, _one_line(result.stderr)),
                 "inspect_git_repository",
             )
+        if operation == "clone_at_revision":
+            revision = str(step.args.get("revision") or "").strip()
+            checkout_argv = ["checkout", "--detach", revision]
+            checkout_decision = decide_ops_command(
+                {"program": "git", "argv": checkout_argv, "cwd": str(repository)}
+            )
+            if not checkout_decision.allowed:
+                return self._blocked(
+                    "git_operation_not_allowed=%s" % checkout_decision.reason
+                )
+            checkout = self._command(
+                ["git", *checkout_decision.argv],
+                cwd=repository,
+                timeout=step.timeout,
+            )
+            if checkout.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "git_operation_failed operation=%s stderr=%s environment_changed=unknown"
+                    % (operation, _one_line(checkout.stderr)),
+                    "inspect_git_repository",
+                )
         return DirectActionResult(
             "completed",
             "action=git_operation operation=%s repository=%s output=%s environment_changed=%s"
@@ -3757,11 +3779,23 @@ def _git_operation_argv(operation: str, args: dict) -> list[str]:
     if operation in {"checkout", "switch"} and ref:
         create = _truthy(args.get("create"))
         return [operation, "-b" if operation == "checkout" else "-c", ref] if create else [operation, ref]
-    if operation == "clone":
+    if operation in {"clone", "clone_at_revision"}:
         url = str(args.get("url") or "").strip()
         repository = _absolute_path(args.get("repository"))
         if not url or repository is None:
             return []
+        if operation == "clone_at_revision":
+            revision = str(args.get("revision") or "").strip()
+            if not ref or not revision:
+                return []
+            return [
+                "clone",
+                "--branch",
+                ref,
+                "--single-branch",
+                url,
+                repository.name,
+            ]
         return ["clone", url, repository.name]
     if operation == "submodule_update":
         return ["submodule", "update", "--init", "--recursive"]

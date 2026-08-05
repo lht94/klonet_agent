@@ -2342,6 +2342,10 @@ def _optional_action_args(action: str) -> list[str]:
         "set_python_config_assignment": ["assignment_name"],
         "set_python_class_attribute": ["class_name"],
         "create_docker_container": ["environment", "restart_policy"],
+        "git_operation": [
+            "url", "remote", "ref", "revision", "path", "tag", "create",
+            "force_with_lease",
+        ],
     }.get(action, [])
 
 
@@ -3115,6 +3119,15 @@ def _infer_structural_action_args(
     """Infer stable AST facts from the current or predecessor source tree."""
 
     compiled = dict(args)
+    if action == "git_operation":
+        operation = str(compiled.get("operation") or "").strip().lower()
+        if operation in {
+            "clone+checkout",
+            "clone_and_checkout",
+            "clone-and-checkout",
+            "clone_checkout",
+        }:
+            compiled["operation"] = "clone_at_revision"
     if action in {
         "start_screen_component",
         "restart_screen_component",

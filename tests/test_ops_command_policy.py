@@ -307,6 +307,35 @@ def test_command_policy_allows_selected_git_workflows():
     assert push.risk == "dangerous"
 
 
+def test_command_policy_allows_frozen_branch_clone_and_detached_revision_checkout():
+    from klonet_agent.ops.command_policy import decide_ops_command
+
+    clone = decide_ops_command(
+        {
+            "program": "git",
+            "argv": [
+                "clone",
+                "--branch",
+                "develop",
+                "--single-branch",
+                "gitee:example/platform.git",
+                "v4e2e",
+            ],
+            "cwd": "/srv",
+        }
+    )
+    checkout = decide_ops_command(
+        {
+            "program": "git",
+            "argv": ["checkout", "--detach", "a" * 40],
+            "cwd": "/srv/v4e2e",
+        }
+    )
+
+    assert clone.allowed and clone.category == "git_clone"
+    assert checkout.allowed and checkout.category == "git_checkout"
+
+
 def test_command_policy_allows_workspace_directory_creation(tmp_path):
     from klonet_agent.ops.command_policy import decide_ops_command
 

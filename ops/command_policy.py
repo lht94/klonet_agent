@@ -757,9 +757,19 @@ def _normalize_argv(raw) -> object:
 
 
 def _git_clone_allowed(argv: tuple[str, ...], cwd: str) -> bool:
-    if len(argv) != 3 or argv[0] != "clone" or not cwd:
+    if not cwd or not argv or argv[0] != "clone":
         return False
-    repo_url, destination = argv[1], argv[2]
+    if len(argv) == 3:
+        repo_url, destination = argv[1], argv[2]
+    elif (
+        len(argv) == 6
+        and argv[1] == "--branch"
+        and SAFE_GIT_BRANCH.fullmatch(argv[2])
+        and argv[3] == "--single-branch"
+    ):
+        repo_url, destination = argv[4], argv[5]
+    else:
+        return False
     return bool(SAFE_GIT_URL.fullmatch(repo_url)) and _destination_within_cwd(destination, cwd)
 
 
@@ -813,6 +823,8 @@ def _git_checkout_allowed(argv: tuple[str, ...], cwd: str) -> bool:
         return bool(SAFE_GIT_BRANCH.fullmatch(argv[1]) and not argv[1].startswith("-"))
     if len(argv) == 3 and argv[1] in {"-b", "-c"}:
         return bool(SAFE_GIT_BRANCH.fullmatch(argv[2]))
+    if len(argv) == 3 and argv[1] == "--detach":
+        return bool(re.fullmatch(r"[0-9a-fA-F]{7,64}", argv[2]))
     return False
 
 

@@ -707,6 +707,53 @@ def test_direct_runner_python_packages_permissions_and_git_use_structured_argv(
     assert any(argv == ["git", "status", "--short", "--branch"] for argv, _ in calls)
 
 
+def test_direct_runner_clone_at_revision_uses_frozen_branch_then_detached_revision(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    repository = tmp_path / "v4e2e"
+    calls = []
+
+    def command_runner(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "git_operation",
+            {
+                "repository": str(repository),
+                "operation": "clone_at_revision",
+                "url": "gitee:example/platform.git",
+                "ref": "develop",
+                "revision": "a" * 40,
+            },
+            risk="high",
+        )
+    )
+
+    assert result.status == "completed"
+    assert calls == [
+        (
+            [
+                "git",
+                "clone",
+                "--branch",
+                "develop",
+                "--single-branch",
+                "gitee:example/platform.git",
+                "v4e2e",
+            ],
+                {"cwd": str(repository.parent), "env": None, "timeout": 120},
+        ),
+        (
+            ["git", "checkout", "--detach", "a" * 40],
+                {"cwd": str(repository), "env": None, "timeout": 120},
+        ),
+    ]
+
+
 def test_direct_runner_process_action_verifies_pid_identity(monkeypatch):
     from klonet_agent.ops.privileged import action_runner as module
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner

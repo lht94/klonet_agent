@@ -205,6 +205,26 @@ def test_structural_class_binding_extracts_a_single_full_class_wrapper():
     )
 
 
+def test_structural_git_binding_normalizes_compound_clone_alias():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    compiled = _infer_structural_action_args(
+        "git_operation",
+        {
+            "operation": "clone+checkout",
+            "repository": "/srv/v4e2e",
+            "url": "gitee:example/platform.git",
+            "ref": "develop",
+            "revision": "a" * 40,
+        },
+        [],
+    )
+
+    assert compiled["operation"] == "clone_at_revision"
+
+
 def test_config_assignment_action_cannot_masquerade_as_port_field_edit():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
