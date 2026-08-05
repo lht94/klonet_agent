@@ -1153,6 +1153,31 @@ def test_complete_klonet_deployment_contract_rejects_unsupported_data_server_com
     assert "complete Klonet runtime includes unsupported data_server component" in errors
 
 
+def test_complete_klonet_deployment_contract_rejects_invented_database_migration():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+        {
+            "goal": "deploy a complete isolated Klonet platform instance",
+            "changes": [
+                {
+                    "step_id": "db-init",
+                    "title": "Initialize database schema",
+                    "objective": "Run migrations and seed the new database",
+                    "expected_changes": ["Create initial tables"],
+                    "postconditions": [],
+                }
+            ],
+        },
+        [],
+    )
+
+    assert (
+        "complete Klonet runtime invents unsupported database initialization step"
+        in errors
+    )
+
+
 def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
@@ -1338,6 +1363,34 @@ def test_isolated_stateful_services_must_use_new_named_containers():
     )
 
     assert "isolated stateful service must use a new named container=redis" in errors
+
+
+def test_celery_start_is_not_misclassified_as_stateful_service_provisioning():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    changes = [
+        {
+            "step_id": "celery",
+            "title": "Start celery Screen session",
+            "objective": "Launch the celery worker for background tasks",
+            "depends_on": [],
+            "expected_changes": [
+                "Start celery and connect it to the isolated Redis and RabbitMQ"
+            ],
+            "postconditions": [
+                {"checker": "screen_session_exists", "args": {"session": "v4e2e_c"}}
+            ],
+        }
+    ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
+        "deploy a new isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert not any("stateful service must use" in error for error in errors)
 
 
 def test_isolated_nginx_must_depend_on_started_application():

@@ -127,6 +127,9 @@ proved independently. Do not rename the web-terminal port to a generic
 The currently registered complete-runtime capability does not start a separate
 data-server component, so do not add `data_server_port`, a data-server Screen,
 or a fifth application component to this V4 deployment contract.
+The discovered source initializes empty database tables during application
+startup (`app_factory` calls `create_all`); do not invent a separate migration,
+seed, or database-initialization ChangeStep without explicit contrary evidence.
 """.strip()
 
 
@@ -1004,6 +1007,15 @@ class V4ChangePlannerAgent:
                     ensure_ascii=False,
                 ).lower()
 
+            def primary_change_text(item: dict[str, Any]) -> str:
+                return json.dumps(
+                    {
+                        "title": item.get("title", ""),
+                        "objective": item.get("objective", ""),
+                    },
+                    ensure_ascii=False,
+                ).lower()
+
             def ancestors(step_id: str) -> set[str]:
                 found: set[str] = set()
                 pending = list(step_dependencies.get(step_id, set()))
@@ -1037,13 +1049,13 @@ class V4ChangePlannerAgent:
                 for item in indexed_changes
                 if re.search(
                     r"stateful|mysql|redis|rabbitmq|数据库|消息队列|有状态",
-                    change_text(item),
+                    primary_change_text(item),
                     re.I,
                 )
                 and re.search(
                     r"provision\b|create\b|start\b|run\b|container\b|"
                     r"部署|创建|启动|容器",
-                    change_text(item),
+                    primary_change_text(item),
                     re.I,
                 )
             ]
@@ -1197,6 +1209,16 @@ class V4ChangePlannerAgent:
         ):
             errors.append(
                 "complete Klonet runtime includes unsupported data_server component"
+            )
+        if re.search(
+            r"(?:database|schema).{0,24}(?:migration|initialize|initialization|seed)|"
+            r"(?:migration|initialize|initialization|seed).{0,24}(?:database|schema)|"
+            r"数据库.{0,16}(?:迁移|初始化|种子)|(?:迁移|初始化|种子).{0,16}数据库",
+            payload,
+            re.I,
+        ):
+            errors.append(
+                "complete Klonet runtime invents unsupported database initialization step"
             )
         if missing_components:
             errors.append(
