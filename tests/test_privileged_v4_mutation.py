@@ -619,7 +619,7 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
     }
     repair = llm.calls[1]["messages"][-1]["content"]
     assert "frozen resources" in repair
-    assert "missing_required_args=text" in repair
+    assert "missing_required_args=text" not in repair
     assert "Freeze every future configuration file path" in repair
 
 
@@ -856,6 +856,44 @@ def test_change_planner_normalizes_ambiguous_consumer_owners_by_resource_role():
         consumer for resource in normalized for consumer in resource.consumers
     ]
     assert len(all_consumers) == len(set(all_consumers))
+
+
+def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "postconditions": [
+                    {
+                        "checker": "git_revision",
+                        "args": {"path": "/srv/v4e2e", "revision": "abc123"},
+                    },
+                    {
+                        "checker": "file_contains",
+                        "args": {"path": "/srv/v4e2e/config.py", "content": "47001"},
+                    },
+                    {
+                        "checker": "screen_session_exists",
+                        "args": {"name": "v4e2e_web"},
+                    },
+                ]
+            }
+        ]
+    }
+
+    V4ChangePlannerAgent._normalize_postcondition_args(data)
+
+    checks = data["changes"][0]["postconditions"]
+    assert checks[0]["args"] == {
+        "repository": "/srv/v4e2e",
+        "revision": "abc123",
+    }
+    assert checks[1]["args"] == {
+        "path": "/srv/v4e2e/config.py",
+        "text": "47001",
+    }
+    assert checks[2]["args"] == {"session": "v4e2e_web"}
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():

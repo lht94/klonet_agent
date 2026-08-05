@@ -279,6 +279,7 @@ class V4ChangePlannerAgent:
             )
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")
+        self._normalize_postcondition_args(data)
         resources = [
             PlanResource.from_dict(item)
             for item in data.get("resources", [])
@@ -341,6 +342,38 @@ class V4ChangePlannerAgent:
                 else [],
             ),
         )
+
+    @staticmethod
+    def _normalize_postcondition_args(data: dict[str, Any]) -> None:
+        """Compile common model aliases into registered checker contracts."""
+
+        aliases = {
+            "git_revision": {"path": "repository"},
+            "file_contains": {"content": "text"},
+            "screen_session_exists": {"name": "session"},
+        }
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        for change in changes:
+            postconditions = (
+                change.get("postconditions") if isinstance(change, dict) else None
+            )
+            if not isinstance(postconditions, list):
+                continue
+            for check in postconditions:
+                if not isinstance(check, dict):
+                    continue
+                args = check.get("args")
+                if not isinstance(args, dict):
+                    continue
+                for source, target in aliases.get(
+                    str(check.get("checker") or ""), {}
+                ).items():
+                    if target not in args and source in args:
+                        args[target] = args[source]
+                    if source != target and source in args:
+                        del args[source]
 
     @staticmethod
     def _authoritative_screen_source_roots(
