@@ -276,6 +276,57 @@ def test_exact_reconfirmation_recovers_current_state_without_reexecuting(tmp_pat
     assert store.load(plan_id).status == "completed"
 
 
+def test_exact_reconfirmation_retries_only_conclusive_no_change_failure(tmp_path):
+    from klonet_agent.ops.privileged.contracts import ExecutionEvidence
+    from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    class SequenceExecutor:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, step):
+            self.calls += 1
+            return ExecutionEvidence(
+                return_code=1 if self.calls == 1 else 0,
+                environment_changed=False if self.calls == 1 else True,
+            )
+
+    class SequenceVerifier:
+        def __init__(self):
+            self.verify_calls = 0
+
+        def verify_step(self, plan, step):
+            self.verify_calls += 1
+            status = "failed" if self.verify_calls == 1 else "passed"
+            return SimpleNamespace(status=status, reason=status)
+
+        def verify_recovered_step(self, plan, step):
+            return SimpleNamespace(status="failed", reason="target still absent")
+
+    plan = _change_plan(hierarchical=True)
+    store = MemoryStore()
+    executor = SequenceExecutor()
+    workflow = V4MutationWorkflow(
+        planner=FakePlanner([V4PlanningOutcome(status="ready", plan=plan)]),
+        binder=FakeBinder(),
+        store=store,
+        executor=executor,
+        verifier=SequenceVerifier(),
+    )
+    submitted = workflow.submit(
+        "deploy", evidence_bundle=object(), evidence_conclusion=object()
+    )
+    plan_id = submitted.plan.plan_id
+    content_hash = submitted.plan.content_hash
+
+    assert workflow.confirm(plan_id, content_hash).kind == "paused"
+    resumed = workflow.confirm(plan_id, content_hash)
+
+    assert resumed.kind == "completed"
+    assert executor.calls == 2
+
+
 def test_semantic_config_verification_is_composed_from_atomic_bindings():
     from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
 

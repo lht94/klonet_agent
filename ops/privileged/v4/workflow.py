@@ -225,6 +225,13 @@ class V4MutationWorkflow:
                 )
                 step.checks = list(verification_step.checks)
                 if decision.status != "passed":
+                    if self._can_retry_conclusive_no_change(step):
+                        step.status = "pending"
+                        step.observation = ""
+                        step.checks = []
+                        change.status = "pending"
+                        self.store.save(plan)
+                        continue
                     step.observation = str(
                         getattr(decision, "reason", "current state is not verified")
                     )
@@ -250,6 +257,18 @@ class V4MutationWorkflow:
         plan.status = "approved"
         self.store.save(plan)
         return self._execute(plan)
+
+    @staticmethod
+    def _can_retry_conclusive_no_change(step: PrivilegedStep) -> bool:
+        """An exact reconfirmation may retry only a proven no-change failure."""
+
+        evidence = step.evidence
+        return bool(
+            evidence is not None
+            and evidence.return_code not in {None, 0}
+            and not evidence.timed_out
+            and evidence.environment_changed is False
+        )
 
     def handle_control(self, text: str) -> V4WorkflowResult | None:
         match = re.fullmatch(
