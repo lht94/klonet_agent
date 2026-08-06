@@ -4135,6 +4135,15 @@ def _file_sha256(path: Path) -> str:
 def _sudo_if_needed(argv: list[str]) -> list[str]:
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return argv
+    if (
+        argv
+        and Path(str(argv[0])).name == "docker"
+        and (
+            bool(str(os.environ.get("DOCKER_HOST") or "").strip())
+            or os.access("/var/run/docker.sock", os.R_OK | os.W_OK)
+        )
+    ):
+        return argv
     return ["sudo", *argv]
 
 

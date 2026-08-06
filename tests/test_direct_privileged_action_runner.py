@@ -8,6 +8,26 @@ import tarfile
 from pathlib import Path
 
 
+def test_docker_uses_direct_group_socket_access_without_sudo(monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+
+    monkeypatch.setattr(module.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(
+        module.os,
+        "access",
+        lambda path, mode: path == "/var/run/docker.sock"
+        and mode == (module.os.R_OK | module.os.W_OK),
+    )
+
+    assert module._sudo_if_needed(["/usr/bin/docker", "ps"]) == [
+        "/usr/bin/docker",
+        "ps",
+    ]
+    assert module._sudo_if_needed(
+        ["/usr/bin/systemctl", "restart", "nginx"]
+    )[0] == "sudo"
+
+
 ENTRY_FILES = (
     "gun.py",
     "master_main.py",
