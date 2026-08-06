@@ -756,6 +756,45 @@ class PrivilegedExecutionAgent:
         grounded_context: GroundedPlanContext | None,
         implementation_feedback: str = "",
     ) -> ExecutionBinding:
+        forced_action = _forced_registered_action_for_step(step)
+        if forced_action:
+            if self.action_registry.get(forced_action) is None:
+                raise ExecutionBindingError(
+                    "required registered action is unavailable=%s" % forced_action,
+                    replan_recommended=False,
+                    category="capability_mismatch",
+                )
+            self._progress(
+                "能力边界：步骤“%s”明确创建新容器，固定使用注册 Action：%s。"
+                % (
+                    _progress_text(step.title or step.objective),
+                    forced_action,
+                )
+            )
+            try:
+                return self._complete_registered_action_contract(
+                    data={
+                        "action": forced_action,
+                        "binding_reason": (
+                            "new container creation requires the dedicated "
+                            "creation capability"
+                        ),
+                        "resolved_from_evidence": [],
+                    },
+                    semantic_step=step,
+                    grounded_context=grounded_context,
+                    initial_error=(
+                        "bind the frozen new-container creation capability"
+                    ),
+                    plan_resources=plan.resources,
+                )
+            except (KeyError, TypeError, ValueError, OSError) as exc:
+                raise ExecutionBindingError(
+                    "required action contract failed for %s: %s"
+                    % (forced_action, exc),
+                    replan_recommended=True,
+                    category="capability_contract_invalid",
+                ) from exc
         messages = [
             {"role": "system", "content": EXECUTION_SELECTION_PROMPT},
             {
@@ -2869,6 +2908,28 @@ def _validate_mutating_action_paths(
         arg_name,
         candidate,
     )
+
+
+def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
+    """Freeze unambiguous capability choices before probabilistic selection."""
+
+    text = " ".join(
+        [step.title, step.objective, step.reason, *step.expected_changes]
+    ).lower()
+    mentions_container = bool(re.search(r"\b(?:docker\s+)?container\b|容器", text))
+    creates_absent = bool(
+        re.search(
+            r"(?:\bcreate\b|\bnew\b|previously absent|\bprovision\b|"
+            r"isolated|创建|新建|全新|隔离).{0,60}(?:\bcontainer\b|容器)|"
+            r"(?:\bcontainer\b|容器).{0,60}(?:\bcreate\b|\bnew\b|"
+            r"previously absent|\bprovision\b|isolated|创建|新建|全新|隔离)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    if mentions_container and creates_absent:
+        return "create_docker_container"
+    return ""
 
 
 def _validate_action_objective_fit(

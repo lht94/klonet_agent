@@ -281,6 +281,90 @@ def test_existing_container_actions_cannot_masquerade_as_container_creation():
     assert not _validate_action_objective_fit("create_docker_container", step)
 
 
+def test_new_container_creation_is_routed_to_creation_capability():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _forced_registered_action_for_step,
+    )
+
+    create = PrivilegedStep(
+        step_id="mysql",
+        title="Provision isolated MySQL container",
+        objective="Create and start a new v4e2e-mysql Docker container",
+        expected_changes=["A previously absent container is created"],
+        risk="high",
+    )
+    existing = PrivilegedStep(
+        step_id="restart",
+        title="Restart existing MySQL container",
+        objective="Restart the already present mysql-main container",
+        expected_changes=["Existing container restarts"],
+        risk="medium",
+    )
+
+    assert _forced_registered_action_for_step(create) == "create_docker_container"
+    assert _forced_registered_action_for_step(existing) == ""
+
+
+def test_new_container_binding_skips_probabilistic_capability_selection(monkeypatch):
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+    import klonet_agent.ops.privileged.execution_agent as execution_agent
+
+    monkeypatch.setattr(
+        execution_agent,
+        "_validate_action_resource_bindings",
+        lambda *_args, **_kwargs: None,
+    )
+
+    step = PrivilegedStep(
+        step_id="mysql",
+        title="Create isolated MySQL container",
+        objective="Create a new v4e2e-mysql Docker container",
+        expected_changes=["A previously absent container is created"],
+        risk="high",
+    )
+    plan = PrivilegedPlan(
+        plan_id="forced-create",
+        goal="deploy isolated service",
+        risk="high",
+        steps=[step],
+    )
+    llm = FakeLLM(
+        [
+            json.dumps(
+                {
+                    "status": "ready",
+                    "args": {
+                        "name": "v4e2e-mysql",
+                        "image": "mysql:8",
+                        "port_bindings": ["127.0.0.1:3308:3306"],
+                    },
+                    "binding_reason": "dedicated isolated container",
+                    "resolved_from_evidence": [],
+                    "preconditions": [],
+                    "postconditions": [
+                        {
+                            "checker": "container_running",
+                            "args": {"container": "v4e2e-mysql"},
+                        }
+                    ],
+                }
+            )
+        ]
+    )
+
+    binding = PrivilegedExecutionAgent(llm).prepare_step(
+        plan, step, grounded_context=None
+    )
+
+    assert binding.action == "create_docker_container"
+    assert len(llm.calls) == 1
+    assert llm.calls[0]["tools"][0]["function"]["name"] == (
+        "bind_action_create_docker_container"
+    )
+
+
 def test_new_container_port_bindings_must_use_frozen_plan_ports():
     import pytest
 
