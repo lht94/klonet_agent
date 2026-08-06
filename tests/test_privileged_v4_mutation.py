@@ -833,6 +833,25 @@ def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
     assert mains.consumers == ["master.project_root"]
 
 
+def test_ports_probe_explicitly_reports_checked_occupied_and_available(monkeypatch):
+    from klonet_agent.ops.privileged import probes
+
+    monkeypatch.setattr(
+        probes,
+        "_run",
+        lambda *_args, **_kwargs: (
+            "State Recv-Q Send-Q Local Address:Port Peer Address:Port\n"
+            "LISTEN 0 128 127.0.0.1:47002 0.0.0.0:*"
+        ),
+    )
+
+    result = probes._ports({"ports": [47001, 47002, 47003]})
+
+    assert "checked_ports=47001,47002,47003" in result
+    assert "occupied_ports=47002" in result
+    assert "available_ports=47001,47003" in result
+
+
 @pytest.mark.parametrize("alias", ["candidates", "candidate_ports"])
 def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

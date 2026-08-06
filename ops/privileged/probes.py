@@ -98,6 +98,23 @@ def _ports(args: dict[str, Any]) -> str:
             line for line in lines
             if any(re.search(rf":{port}\b", line) for port in requested)
         ]
+        occupied = [
+            port for port in requested
+            if any(re.search(rf":{port}\b", line) for line in lines)
+        ]
+        available = [port for port in requested if port not in occupied]
+        summary = [
+            "checked_ports=" + ",".join(str(port) for port in requested),
+            "occupied_ports=" + (
+                ",".join(str(port) for port in occupied) or "none"
+            ),
+            "available_ports=" + (
+                ",".join(str(port) for port in available) or "none"
+            ),
+        ]
+        return "inspect_ports\n" + "\n".join(
+            summary + (lines[:300] or ["no matching listeners"])
+        )
     return "inspect_ports\n" + ("\n".join(lines[:300]) or "no matching listeners")
 
 
