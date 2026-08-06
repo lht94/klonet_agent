@@ -470,7 +470,7 @@ def test_container_binding_compiles_semantic_name_and_credential_policy():
     assert "credential_source" not in compiled
 
 
-def test_complete_config_compiler_accepts_semantic_config_py_settings_title():
+def test_complete_config_compiler_accepts_semantic_instance_configuration_title():
     from klonet_agent.ops.privileged.contracts import (
         PlanResource,
         PrivilegedPlan,
@@ -504,8 +504,8 @@ def test_complete_config_compiler_accepts_semantic_config_py_settings_title():
     )
     semantic = PrivilegedStep(
         step_id="config",
-        title="Configure v4e2e instance settings in config.py",
-        objective="Write instance ports, IPs, and Celery DB endpoints",
+        title="Configure v4e2e instance settings",
+        objective="Write the isolated instance configuration with ports and IPs",
         expected_changes=["config changes"],
         risk="medium",
     )

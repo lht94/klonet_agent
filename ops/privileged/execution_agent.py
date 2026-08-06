@@ -2674,7 +2674,7 @@ def _deterministic_klonet_config_items(
     config_semantic = bool(
         re.search(r"wtxconfig", text, re.I)
         or (
-            re.search(r"config\.py", text, re.I)
+            re.search(r"config\.py|\bconfig(?:uration)?\b|配置", text, re.I)
             and re.search(r"settings?|ports?|ips?|endpoints?|配置|设置|端口", text, re.I)
         )
     )
