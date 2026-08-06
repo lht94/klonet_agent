@@ -79,7 +79,6 @@ def run_chat(
     user_id: str = DEFAULT_USER_ID,
     project_id: str = DEFAULT_PROJECT_ID,
     answer_style: str = "default",
-    ops_privilege_workflow: str | None = None,
 ):
     """进入命令行对话流程，即旧版 main.py 中的外层 while 循环。"""
 
@@ -92,7 +91,6 @@ def run_chat(
         profile=profile,
         session=session,
         answer_style=answer_style,
-        privileged_workflow_version=ops_privilege_workflow,
     )
     history = orchestrator.init_history()
     token = 0

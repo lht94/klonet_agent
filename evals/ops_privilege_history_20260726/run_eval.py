@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import signal
 from pathlib import Path
@@ -14,12 +15,8 @@ from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
 from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
 from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
-from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
-from klonet_agent.ops.privileged.store import PrivilegedPlanStore
-from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
-from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
 from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
@@ -69,7 +66,6 @@ def parse_args():
     parser.add_argument("--deterministic-only", action="store_true")
     parser.add_argument("--ids", default="")
     parser.add_argument("--timeout", type=int, default=75)
-    parser.add_argument("--workflow-version", choices=("v3", "v4"), default="v3")
     return parser.parse_args()
 
 
@@ -84,7 +80,10 @@ def load_cases(path):
 def deterministic_ingress(prompt):
     """Evaluate only the routing decisions that do not require the classifier."""
 
-    if PrivilegedOpsWorkflow.is_control_command(prompt):
+    if re.fullmatch(
+        r"confirm-priv-v4\s+priv-v4-[A-Za-z0-9_-]{1,64}\s+[0-9a-f]{64}",
+        str(prompt or "").strip(),
+    ):
         return "control"
     if GoalSafetyGuard().check(prompt).denied:
         return "denied"
@@ -144,26 +143,7 @@ def _run_registered_probes(requests):
     )
 
 
-def build_live_runtime(workflow_version, *, llm, root, executor):
-    version = str(workflow_version or "").strip().lower()
-    if version not in {"v3", "v4"}:
-        raise ValueError("workflow_version must be v3 or v4")
-    if version == "v3":
-        store = PrivilegedPlanStore(
-            root,
-            user_id="history-eval",
-            project_id="shared",
-        )
-        workflow = PrivilegedOpsWorkflow(
-            planner=PrivilegedPlannerAgent(llm),
-            executor=executor,
-            verifier=PrivilegedVerifierAgent(llm),
-            store=store,
-        )
-        return PrivilegedOpsSupervisor(
-            workflow=workflow,
-            classifier=PrivilegedIntentClassifier(llm),
-        )
+def build_live_runtime(*, llm, root, executor):
     discovery = V4DiscoveryAgent(
         llm,
         probe_runner=_run_registered_probes,
@@ -194,7 +174,7 @@ def build_live_runtime(workflow_version, *, llm, root, executor):
     )
 
 
-def live_result(case, llm, root, timeout, workflow_version="v3"):
+def live_result(case, llm, root, timeout):
     result = {
         "live_expected": case["expected_live"],
         "live_kind": "",
@@ -210,7 +190,6 @@ def live_result(case, llm, root, timeout, workflow_version="v3"):
     signal.alarm(timeout)
     try:
         supervisor = build_live_runtime(
-            workflow_version,
             llm=llm,
             root=root / case["id"].lower(),
             executor=executor,
@@ -278,7 +257,6 @@ def main():
                     llm,
                     state_root,
                     args.timeout,
-                    workflow_version=args.workflow_version,
                 )
             )
         rows.append(row)

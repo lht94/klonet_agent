@@ -32,7 +32,7 @@ from klonet_agent.ops.privileged.contracts import (
     ShellArtifact,
 )
 from klonet_agent.ops.privileged.context import GroundedPlanContext
-from klonet_agent.ops.privileged.planner import (
+from klonet_agent.ops.privileged.action_contracts import (
     _action_risk,
     _default_action_postconditions,
     _effective_declared_risk,

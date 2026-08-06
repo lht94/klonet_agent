@@ -1,4 +1,4 @@
-"""Ops-Privilege Agentic V3 planning, binding, execution and verification."""
+"""Shared contracts and safety primitives for Ops-Privilege V4."""
 
 from klonet_agent.ops.privileged.contracts import (
     CheckResult,
@@ -15,11 +15,6 @@ from klonet_agent.ops.privileged.intent import (
     PrivilegedIntentClassifier,
     PrivilegedIntentDecision,
 )
-from klonet_agent.ops.privileged.supervisor import (
-    PrivilegedOpsSupervisor,
-    SupervisorResult,
-)
-
 __all__ = [
     "CheckResult",
     "ExecutionBinding",
@@ -32,6 +27,4 @@ __all__ = [
     "GoalSafetyGuard",
     "PrivilegedIntentClassifier",
     "PrivilegedIntentDecision",
-    "PrivilegedOpsSupervisor",
-    "SupervisorResult",
 ]

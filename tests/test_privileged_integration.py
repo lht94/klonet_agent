@@ -45,10 +45,12 @@ class StubPrivilegedSupervisor:
         self.calls = []
 
     def handle(self, text, environment_context=""):
-        from klonet_agent.ops.privileged.supervisor import SupervisorResult
-
         self.calls.append((text, environment_context))
-        return SupervisorResult(True, "completed", "privileged supervisor completed")
+        return SimpleNamespace(
+            handled=True,
+            status="completed",
+            message="privileged supervisor completed",
+        )
 
 
 class NoCallLLM:
@@ -61,10 +63,8 @@ class DelegatingSupervisor:
         self.calls = []
 
     def handle(self, text, environment_context=""):
-        from klonet_agent.ops.privileged.supervisor import SupervisorResult
-
         self.calls.append((text, environment_context))
-        return SupervisorResult(False, "conversation")
+        return SimpleNamespace(handled=False, status="conversation", message="")
 
 
 class ContextCapturingSupervisor:
@@ -77,10 +77,12 @@ class ContextCapturingSupervisor:
         environment_context="",
         conversation_context="",
     ):
-        from klonet_agent.ops.privileged.supervisor import SupervisorResult
-
         self.calls.append((text, environment_context, conversation_context))
-        return SupervisorResult(True, "clarification", "context captured")
+        return SimpleNamespace(
+            handled=True,
+            status="clarification",
+            message="context captured",
+        )
 
 
 class AnswerLLM:
@@ -102,7 +104,7 @@ class AnswerLLM:
         )
 
 
-def test_orchestrator_builds_explicit_v4_runtime_without_v3_fallback():
+def test_orchestrator_builds_v4_as_the_only_privileged_runtime():
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
     from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
@@ -115,31 +117,14 @@ def test_orchestrator_builds_explicit_v4_runtime_without_v3_fallback():
             session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
             llm=NoCallLLM(),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
-            privileged_workflow_version="v4",
         )
 
-    assert orchestrator.privileged_workflow_version == "v4"
+    assert not hasattr(orchestrator, "privileged_workflow_version")
     assert isinstance(orchestrator.privileged_supervisor, PrivilegedOpsV4Coordinator)
     assert orchestrator.privileged_workflow is orchestrator.privileged_supervisor.mutation_workflow
 
 
-def test_orchestrator_rejects_unknown_privileged_runtime_instead_of_falling_back():
-    from klonet_agent.agents import get_profile
-    from klonet_agent.memory import MemoryStore
-    from klonet_agent.orchestrator import AgentOrchestrator
-    from klonet_agent.session import AgentSession
-
-    with local_temp_dir() as temp_dir, pytest.raises(ValueError, match="v3 or v4"):
-        AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
-            session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
-            llm=NoCallLLM(),
-            memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
-            privileged_workflow_version="automatic",
-        )
-
-
-def test_explicit_v4_readonly_turn_runs_through_staged_runtime(capsys):
+def test_v4_readonly_turn_runs_through_staged_runtime(capsys):
     import json
 
     from klonet_agent.agents import get_profile
@@ -188,7 +173,6 @@ def test_explicit_v4_readonly_turn_runs_through_staged_runtime(capsys):
             session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
             llm=QueueLLM(),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
-            privileged_workflow_version="v4",
         )
         reply, _, _ = orchestrator.single_chat("inspect platforms", [], 0)
 
@@ -333,118 +317,3 @@ def test_trace_logger_records_privileged_lifecycle_event(tmp_path):
     assert row["event"] == "privileged_plan_created"
     assert row["plan_id"] == "priv-123"
     assert row["risk"] == "medium"
-
-
-def test_end_to_end_supervisor_executes_and_verifies_a_confirmed_plan(tmp_path):
-    import json
-
-    from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
-    from klonet_agent.ops.privileged.execution_agent import (
-        PrivilegedExecutionAgent,
-    )
-    from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
-    from klonet_agent.ops.privileged.store import PrivilegedPlanStore
-    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
-    from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
-
-    target = tmp_path / "result.txt"
-
-    class SequentialLLM:
-        def __init__(self):
-            self.responses = [
-                json.dumps(
-                        {
-                            "status": "ready",
-                            "goal": "create result",
-                            "risk": "low",
-                            "steps": [
-                                {
-                                    "step_id": "create-result",
-                                    "title": "create result",
-                                    "objective": "create the requested result file",
-                                    "reason": "the user requested a durable result",
-                                    "success_criteria": ["the result file exists"],
-                                    "risk_suggestion": "low",
-                                }
-                            ],
-                        }
-                    ),
-                json.dumps(
-                        {
-                            "status": "registered_action",
-                            "action": "write_ops_file",
-                            "selection_reason": "registered writer covers objective",
-                        }
-                    ),
-                json.dumps(
-                        {
-                            "status": "ready",
-                            "args": {
-                                "path": str(target),
-                                "content": "ready",
-                            },
-                            "binding_reason": "registered file writer covers the objective",
-                            "postconditions": [
-                                {
-                                    "checker": "file_exists",
-                                    "args": {"path": str(target)},
-                                }
-                            ],
-                        }
-                    ),
-            ]
-
-        def complete(self, messages, tools=None, **kwargs):
-            del messages, kwargs
-            content = self.responses.pop(0)
-            if tools:
-                message = SimpleNamespace(
-                    content="",
-                    tool_calls=[
-                        SimpleNamespace(
-                            function=SimpleNamespace(
-                                name=tools[0]["function"]["name"],
-                                arguments=content,
-                            )
-                        )
-                    ],
-                )
-            else:
-                message = SimpleNamespace(content=content, tool_calls=None)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=message)]
-            )
-
-    llm = SequentialLLM()
-    store = PrivilegedPlanStore(tmp_path / "memory", user_id="u", project_id="p")
-
-    def action_runner(plan, step):
-        from klonet_agent.ops.operations import RecipeExecutionResult
-
-        del plan
-        target.write_text(step.args["content"], encoding="utf-8")
-        return RecipeExecutionResult(
-            "completed",
-            "environment_changed=true",
-        )
-
-    workflow = PrivilegedOpsWorkflow(
-        planner=PrivilegedPlannerAgent(llm),
-        execution_agent=PrivilegedExecutionAgent(
-            llm,
-            enable_implementation_plans=False,
-        ),
-        executor=PrivilegedCommandExecutor(action_runner=action_runner),
-        verifier=PrivilegedVerifierAgent(llm),
-        store=store,
-    )
-
-    waiting = workflow.submit("create result")
-    completed = workflow.handle_command(
-        "confirm-priv %s" % waiting.plan.plan_id
-    )
-
-    assert waiting.kind == "awaiting_confirmation"
-    assert completed.kind == "completed"
-    assert target.read_text(encoding="utf-8") == "ready"
-    assert store.load(waiting.plan.plan_id).steps[0].checks[0].status == "passed"

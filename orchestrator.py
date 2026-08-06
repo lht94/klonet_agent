@@ -24,9 +24,6 @@ from klonet_agent.config import (
     OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
     OPS_PRIVILEGE_PLANNER_MODEL,
     OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
-    OPS_PRIVILEGE_SUMMARIZER_MODEL,
-    OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
-    OPS_PRIVILEGE_WORKFLOW_VERSION,
     RAG_QUERY_PLANNER_MODEL,
     RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
@@ -63,12 +60,7 @@ from klonet_agent.ops.privileged.execution_agent import (
 )
 from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
 from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
-from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
-from klonet_agent.ops.privileged.store import PrivilegedPlanStore
-from klonet_agent.ops.privileged.summarizer import PrivilegedEvidenceSummarizer
-from klonet_agent.ops.privileged.supervisor import PrivilegedOpsSupervisor
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
-from klonet_agent.ops.privileged.workflow import PrivilegedOpsWorkflow
 from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
 from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
 from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
@@ -104,19 +96,10 @@ class AgentOrchestrator:
         journal_maintainer: ProjectJournalMaintainer | None = None,
         privileged_workflow: object | None = None,
         privileged_supervisor: object | None = None,
-        privileged_workflow_version: str | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
         self.session = session or AgentSession(mode=self.profile.name)
-        self.privileged_workflow_version = str(
-            privileged_workflow_version or OPS_PRIVILEGE_WORKFLOW_VERSION
-        ).strip().lower()
-        if (
-            self.profile.name == "ops-privilege"
-            and self.privileged_workflow_version not in {"v3", "v4"}
-        ):
-            raise ValueError("privileged_workflow_version must be v3 or v4")
         supplied_llm = llm
         self.llm = llm or LLMClient()
         self.answer_style = answer_style
@@ -185,71 +168,10 @@ class AgentOrchestrator:
 
             return emit
 
-        if (
-            self.profile.name == "ops-privilege"
-            and self.privileged_workflow is None
-            and self.privileged_workflow_version == "v3"
-        ):
-            planner_llm = self.llm
-            evidence_summarizer = None
-            if supplied_llm is None:
-                planner_llm = LLMClient(
-                    model=OPS_PRIVILEGE_PLANNER_MODEL,
-                    timeout=OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS,
-                    max_retries=0,
-                )
-                evidence_summarizer = PrivilegedEvidenceSummarizer(
-                    LLMClient(
-                        model=OPS_PRIVILEGE_SUMMARIZER_MODEL,
-                        timeout=OPS_PRIVILEGE_SUMMARIZER_TIMEOUT_SECONDS,
-                        max_retries=0,
-                    )
-                )
-
-            privileged_context_builder = PrivilegedPlanContextBuilder(
-                on_progress=privileged_progress("Evidence Collector"),
-            )
-            privileged_probe_runner = (
-                privileged_context_builder.run_recovery_diagnostics
-            )
-            self.privileged_workflow = PrivilegedOpsWorkflow(
-                planner=PrivilegedPlannerAgent(
-                    planner_llm,
-                    probe_runner=privileged_probe_runner,
-                    on_progress=privileged_progress("Planner"),
-                ),
-                execution_agent=PrivilegedExecutionAgent(
-                    planner_llm,
-                    probe_runner=privileged_probe_runner,
-                    on_progress=privileged_progress(
-                        "Implementation Binding Agent"
-                    ),
-                ),
-                executor=PrivilegedCommandExecutor(
-                    on_output=lambda channel, chunk: print(chunk, end="", flush=True),
-                    environment_fingerprint_provider=(
-                        privileged_context_builder.current_environment_fingerprint
-                    ),
-                ),
-                verifier=PrivilegedVerifierAgent(
-                    self.llm,
-                    probe_runner=privileged_probe_runner,
-                ),
-                store=PrivilegedPlanStore(
-                    MEMORY_DIR,
-                    user_id=self.session.user_id,
-                    project_id=self.session.project_id,
-                ),
-                event_sink=self._record_privileged_event,
-                context_builder=privileged_context_builder,
-                summarizer=evidence_summarizer,
-                on_progress=privileged_progress("Workflow Coordinator"),
-            )
         self.privileged_supervisor = privileged_supervisor
         if (
             self.profile.name == "ops-privilege"
             and self.privileged_supervisor is None
-            and self.privileged_workflow_version == "v4"
         ):
             planner_llm = self.llm
             classifier_llm = self.llm
@@ -313,23 +235,6 @@ class AgentOrchestrator:
                 synthesis=synthesis,
                 response=V4ResponseAgent(self.llm),
                 mutation_workflow=mutation_workflow,
-            )
-        if (
-            self.profile.name == "ops-privilege"
-            and self.privileged_supervisor is None
-            and self.privileged_workflow_version == "v3"
-        ):
-            classifier_llm = self.llm
-            if supplied_llm is None:
-                classifier_llm = LLMClient(
-                    model=OPS_PRIVILEGE_CLASSIFIER_MODEL,
-                    timeout=OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
-                    max_retries=0,
-                )
-            self.privileged_supervisor = PrivilegedOpsSupervisor(
-                workflow=self.privileged_workflow,
-                classifier=PrivilegedIntentClassifier(classifier_llm),
-                on_progress=privileged_progress("Supervisor"),
             )
 
     def init_history(self) -> list[dict]:

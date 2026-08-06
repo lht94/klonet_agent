@@ -28,11 +28,6 @@ def main():
     parser.add_argument("--mode", choices=["mentor", "coding", "ops", "ops-privilege"], default="mentor")
     parser.add_argument("--user-id", default="default")
     parser.add_argument("--project-id", default="default")
-    parser.add_argument(
-        "--ops-privilege-workflow",
-        choices=["v3", "v4"],
-        default=None,
-    )
     args = parser.parse_args()
 
     if args.command == "admin":
@@ -45,7 +40,6 @@ def main():
         mode=args.mode,
         user_id=args.user_id,
         project_id=args.project_id,
-        ops_privilege_workflow=args.ops_privilege_workflow,
     )
 
 

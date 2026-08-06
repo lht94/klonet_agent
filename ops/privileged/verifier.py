@@ -11,7 +11,7 @@ from klonet_agent.ops.privileged.contracts import (
     PrivilegedStep,
     VerificationDecision,
 )
-from klonet_agent.ops.privileged.planner import _parse_json_object
+from klonet_agent.ops.privileged.action_contracts import _parse_json_object
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 
 

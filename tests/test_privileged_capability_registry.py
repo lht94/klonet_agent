@@ -79,14 +79,14 @@ def test_every_direct_privileged_action_has_spec_handler_and_schema():
         assert name in REQUIRED_ACTION_ARGS or not spec.path_args, name
 
 
-def test_semantic_planner_does_not_import_action_or_workflow_registry():
+def test_shared_action_contracts_do_not_import_runtime_registries():
     from pathlib import Path
 
     source = (
         Path(__file__).resolve().parents[1]
         / "ops"
         / "privileged"
-        / "planner.py"
+        / "action_contracts.py"
     ).read_text(encoding="utf-8")
 
     assert "DEFAULT_DOMAIN_WORKFLOWS" not in source

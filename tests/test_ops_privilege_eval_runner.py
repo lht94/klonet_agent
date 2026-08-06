@@ -3,9 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
-
-
 def _load_runner():
     path = (
         Path(__file__).parents[1]
@@ -23,7 +20,9 @@ def _load_runner():
 def test_deterministic_ingress_only_claims_routes_without_model_judgment():
     runner = _load_runner()
 
-    assert runner.deterministic_ingress("list-priv") == "control"
+    assert runner.deterministic_ingress(
+        "confirm-priv-v4 priv-v4-demo " + "a" * 64
+    ) == "control"
     assert runner.deterministic_ingress("请执行 rm -rf /。") == "denied"
     assert runner.deterministic_ingress("帮我查看 nginx 状态") == "model_required"
 
@@ -53,16 +52,16 @@ def test_live_result_enters_through_supervisor(monkeypatch, tmp_path):
     calls = []
 
     class FakeSupervisor:
-        def __init__(self, *, workflow, classifier):
-            del workflow, classifier
+        def __init__(self, **kwargs):
+            del kwargs
 
         def handle(self, prompt, environment_context=""):
-            from klonet_agent.ops.privileged.supervisor import SupervisorResult
+            from types import SimpleNamespace
 
             calls.append((prompt, environment_context))
-            return SupervisorResult(False, "conversation")
+            return SimpleNamespace(handled=False, kind="conversation")
 
-    monkeypatch.setattr(runner, "PrivilegedOpsSupervisor", FakeSupervisor)
+    monkeypatch.setattr(runner, "PrivilegedOpsV4Coordinator", FakeSupervisor)
     monkeypatch.setattr(runner.signal, "SIGALRM", 0, raising=False)
     monkeypatch.setattr(runner.signal, "signal", lambda *args: None)
     monkeypatch.setattr(runner.signal, "alarm", lambda *args: None, raising=False)
@@ -79,27 +78,14 @@ def test_live_result_enters_through_supervisor(monkeypatch, tmp_path):
     assert result["live_pass"] is True
 
 
-def test_eval_runtime_can_select_v4_explicitly(tmp_path):
+def test_eval_runtime_is_v4_only(tmp_path):
     runner = _load_runner()
     from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
 
     runtime = runner.build_live_runtime(
-        "v4",
         llm=object(),
         root=tmp_path,
         executor=runner.SafeEvalExecutor(),
     )
 
     assert isinstance(runtime, PrivilegedOpsV4Coordinator)
-
-
-def test_eval_runtime_rejects_unknown_version_without_fallback(tmp_path):
-    runner = _load_runner()
-
-    with pytest.raises(ValueError, match="v3 or v4"):
-        runner.build_live_runtime(
-            "automatic",
-            llm=object(),
-            root=tmp_path,
-            executor=runner.SafeEvalExecutor(),
-        )

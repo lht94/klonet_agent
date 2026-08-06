@@ -93,28 +93,3 @@ def test_agent_cli_accepts_ops_privilege_mode(monkeypatch):
     main()
 
     assert captured["mode"] == "ops-privilege"
-
-
-def test_agent_cli_accepts_explicit_ops_privilege_v4_runtime(monkeypatch):
-    from klonet_agent.agent import main
-
-    captured = {}
-
-    monkeypatch.setattr(
-        "klonet_agent.app.run_chat",
-        lambda **kwargs: captured.update(kwargs),
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "agent.py",
-            "--mode",
-            "ops-privilege",
-            "--ops-privilege-workflow",
-            "v4",
-        ],
-    )
-
-    main()
-
-    assert captured["ops_privilege_workflow"] == "v4"

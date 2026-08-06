@@ -758,7 +758,7 @@ def _migrate_legacy_plan_values(
                 step.status = "blocked"
                 step.observation = (
                     "旧版原始命令计划已迁移为只读审计记录，不能执行；"
-                    "请重新生成 Agentic V3 计划。"
+                    "请重新生成 Ops-Privilege V4 计划。"
                 )
     values["schema_version"] = 3
     grounding = dict(values.get("grounding") or {})

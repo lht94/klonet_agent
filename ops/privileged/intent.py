@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from klonet_agent.ops.privileged.planner import _parse_json_object
+from klonet_agent.ops.privileged.action_contracts import _parse_json_object
 from klonet_agent.tools.environment import redact_sensitive_text
 
 
