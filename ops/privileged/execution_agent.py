@@ -3654,6 +3654,23 @@ def _infer_structural_action_args(
     """Infer stable AST facts from the current or predecessor source tree."""
 
     compiled = dict(args)
+    if action == "set_python_class_attribute":
+        attribute = str(compiled.get("attribute") or "").strip()
+        frozen_ports = {
+            str(resource.role or resource.name): int(resource.value)
+            for resource in resources
+            if resource.status == "frozen"
+            and resource.kind == "port"
+            and str(resource.value).isdigit()
+        }
+        if attribute in {"master_ip", "mysql_ip", "rabbitmq_ip"}:
+            compiled["value"] = "127.0.0.1"
+        elif attribute in frozen_ports:
+            compiled["value"] = frozen_ports[attribute]
+        elif attribute == "celery_redis_port_db" and "redis_port" in frozen_ports:
+            compiled["value"] = "%s/6" % frozen_ports["redis_port"]
+        elif attribute == "celery_rabbitmq_port_db" and "redis_port" in frozen_ports:
+            compiled["value"] = "%s/7" % frozen_ports["redis_port"]
     if action == "git_operation":
         operation = str(compiled.get("operation") or "").strip().lower()
         if operation == "clone" and str(compiled.get("revision") or "").strip():
@@ -3718,6 +3735,19 @@ def _infer_structural_action_args(
         "restart_screen_component",
         "stop_screen_component",
     }:
+        mains_root = next(
+            (
+                str(resource.value)
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.kind == "path"
+                and str(resource.value).rstrip("/").endswith("/mains")
+                and "mains" in "%s %s" % (resource.name, resource.role)
+            ),
+            "",
+        )
+        if mains_root:
+            compiled["project_root"] = mains_root
         session = str(compiled.get("screen_session") or "").strip()
         component_from_session = next(
             (

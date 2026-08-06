@@ -1331,6 +1331,43 @@ def test_structural_binding_infers_base_from_future_copied_source(tmp_path):
     assert compiled["base_class"] == "CommonConfig"
 
 
+def test_structural_binding_freezes_config_values_and_screen_runtime_root():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    resources = [
+        PlanResource("redis_port", "port", "frozen", "redis_port", 8378, "evidence"),
+        PlanResource("master_port", "port", "frozen", "master_port", 45561, "evidence"),
+        PlanResource(
+            "mains_path", "path", "frozen", "mains_path",
+            "/srv/v4e2e/mains", "derived",
+        ),
+    ]
+
+    endpoint = _infer_structural_action_args(
+        "set_python_class_attribute",
+        {
+            "attribute": "celery_rabbitmq_port_db",
+            "value": "'wrong/7'",
+        },
+        resources,
+    )
+    master = _infer_structural_action_args(
+        "start_screen_component",
+        {
+            "component": "master",
+            "screen_session": "v4e2e_m",
+            "project_root": "/srv/v4e2e",
+        },
+        resources,
+    )
+
+    assert endpoint["value"] == "8378/7"
+    assert master["project_root"] == "/srv/v4e2e/mains"
+
+
 def test_planner_can_probe_then_returns_semantic_plan_without_actions():
     from klonet_agent.ops.privileged.planner import PrivilegedPlannerAgent
 
