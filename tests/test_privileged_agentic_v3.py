@@ -523,6 +523,55 @@ def test_complete_config_compiler_accepts_semantic_instance_configuration_title(
     assert len(items) == 13
 
 
+def test_complete_config_compiler_reads_detailed_expected_changes():
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        _deterministic_klonet_config_items,
+    )
+
+    resources = [
+        PlanResource(
+            "config", "path", "frozen", "config_path",
+            "/srv/v4e2e/vemu_config/config.py", "derived",
+        ),
+        *[
+            PlanResource(role, "port", "frozen", role, value, "evidence")
+            for role, value in {
+                "master_port": 47001, "worker_port": 47002,
+                "web_terminal_port": 47003, "mysql_port": 47004,
+                "redis_port": 47005, "rabbitmq_port": 47006,
+            }.items()
+        ],
+    ]
+    plan = PrivilegedPlan(
+        plan_id="expected-config", goal="deploy isolated Klonet",
+        risk="high", resources=resources, steps=[],
+    )
+    semantic = PrivilegedStep(
+        step_id="config",
+        title="Configure new instance ports and service endpoints",
+        objective="Edit the cloned config for the new instance",
+        expected_changes=[
+            "Set master_port, worker_port, web_terminal_port",
+            "Set master_ip, mysql_ip, rabbitmq_ip to 127.0.0.1",
+            "Set mysql_port, redis_port, rabbitmq_port",
+        ],
+        risk="medium",
+    )
+
+    items = _deterministic_klonet_config_items(plan, semantic)
+
+    assert {item.get("attribute") for item in items} >= {
+        "master_ip", "mysql_ip", "rabbitmq_ip", "master_port",
+        "worker_port", "web_terminal_port", "mysql_port", "redis_port",
+        "rabbitmq_port", "celery_redis_port_db", "celery_rabbitmq_port_db",
+    }
+
+
 def test_complete_config_compiler_does_not_capture_nginx_site_configuration():
     from klonet_agent.ops.privileged.contracts import (
         PlanResource,

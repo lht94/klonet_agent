@@ -2738,7 +2738,13 @@ def _deterministic_klonet_config_items(
 ) -> list[dict[str, Any]]:
     """Compile the complete same-host WtxConfig contract from frozen resources."""
 
-    text = "%s %s" % (semantic_step.title, semantic_step.objective)
+    text = " ".join(
+        [
+            semantic_step.title,
+            semantic_step.objective,
+            *semantic_step.expected_changes,
+        ]
+    )
     if (
         re.search(r"nginx", text, re.I)
         and not re.search(r"wtxconfig|config\.py", text, re.I)
