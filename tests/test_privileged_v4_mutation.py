@@ -675,6 +675,57 @@ def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
     assert requests[0].args == {"ports": [45561, 45562]}
 
 
+def test_planner_reassigns_occupied_host_port_from_probed_free_candidates():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    bundle = EvidenceBundle(goal="deploy")
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest(
+                "ports",
+                {"ports": [45551, 45552, 5011]},
+                "freeze candidates",
+            ),
+            "inspect_ports\nLISTEN 0 128 127.0.0.1:45551 0.0.0.0:*",
+        )
+    )
+    data = {
+        "changes": [
+            {
+                "step_id": "start",
+                "title": "Start master on port 45551",
+                "objective": "Listen on 45551",
+                "postconditions": [
+                    {"checker": "port_listening", "args": {"port": 45551}}
+                ],
+            }
+        ]
+    }
+    resources = [
+        PlanResource(
+            "master_port", "port", "frozen", "master_port", 45551,
+            "model_selected", consumers=["start.master_port"],
+        ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 45552,
+            "model_selected", consumers=["start.worker_port"],
+        ),
+    ]
+
+    V4ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
+
+    assert resources[0].value == 5011
+    assert resources[1].value == 45552
+    assert data["changes"][0]["title"] == "Start master on port 5011"
+    assert data["changes"][0]["postconditions"][0]["args"]["port"] == 5011
+
+
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

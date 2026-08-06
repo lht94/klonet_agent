@@ -539,6 +539,7 @@ class V4ChangePlannerAgent:
         ]
         self._normalize_core_resource_consumers(data, resources)
         resources = self._normalize_derived_resources(data, resources)
+        self._normalize_occupied_host_ports(data, resources, bundle)
         self._normalize_nginx_postconditions(data, resources)
         contract_errors = self._ready_contract_errors(
             data,
@@ -751,6 +752,88 @@ class V4ChangePlannerAgent:
                     },
                 }
             )
+
+    @staticmethod
+    def _normalize_occupied_host_ports(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+    ) -> None:
+        """Allocate checked-free candidates when the model selects checked-busy ports."""
+
+        explicit_records = [
+            record
+            for record in bundle.records
+            if record.status == "available"
+            and record.request.probe == "ports"
+            and isinstance(record.request.args.get("ports"), list)
+            and record.request.args.get("ports")
+        ]
+        if not explicit_records:
+            return
+        candidates: list[int] = []
+        occupied: set[int] = set()
+        for record in explicit_records:
+            for raw_port in record.request.args.get("ports", []):
+                try:
+                    port = int(raw_port)
+                except (TypeError, ValueError):
+                    continue
+                if port not in candidates:
+                    candidates.append(port)
+                if re.search(r":%s\b" % port, record.output):
+                    occupied.add(port)
+        host_resources = [
+            resource
+            for resource in resources
+            if V4ChangePlannerAgent._requires_host_port_availability(resource)
+        ]
+        selected = {int(resource.value) for resource in host_resources}
+        busy_selected = []
+        for resource in host_resources:
+            port = int(resource.value)
+            if port in occupied and port not in busy_selected:
+                busy_selected.append(port)
+        if not busy_selected:
+            return
+        reserved = selected.difference(busy_selected)
+        free = [
+            port
+            for port in candidates
+            if port not in occupied and port not in reserved
+        ]
+        if len(free) < len(busy_selected):
+            return
+        replacements = dict(zip(busy_selected, free))
+        for resource in host_resources:
+            old = int(resource.value)
+            if old in replacements:
+                resource.value = replacements[old]
+                resource.source = "compiler_selected_from_checked_free_candidates"
+
+        def rewrite(value: Any) -> Any:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int):
+                return replacements.get(value, value)
+            if isinstance(value, str):
+                result = value
+                for old, new in replacements.items():
+                    result = re.sub(
+                        r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % old,
+                        str(new),
+                        result,
+                    )
+                return result
+            if isinstance(value, list):
+                return [rewrite(item) for item in value]
+            if isinstance(value, dict):
+                return {key: rewrite(item) for key, item in value.items()}
+            return value
+
+        rewritten = rewrite(data)
+        data.clear()
+        data.update(rewritten)
 
     @staticmethod
     def _authoritative_screen_source_roots(
