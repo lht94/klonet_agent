@@ -1476,21 +1476,25 @@ class V4ChangePlannerAgent:
                         % str(change.get("step_id") or "")
                     )
 
-            stateful_candidates = [
-                item
-                for item in indexed_changes
-                if re.search(
-                    r"stateful|mysql|redis|rabbitmq|数据库|消息队列|有状态",
-                    primary_change_text(item),
-                    re.I,
+            stateful_candidates = []
+            for item in indexed_changes:
+                primary = primary_change_text(item)
+                names_service = re.search(
+                    r"mysql|redis|rabbitmq|数据库|消息队列", primary, re.I
                 )
-                and re.search(
+                provisions_group = (
+                    re.search(r"stateful|有状态", primary, re.I)
+                    and re.search(r"provision\b|create\b|部署|创建", primary, re.I)
+                    and re.search(r"containers?\b|容器", primary, re.I)
+                )
+                mutates_service = re.search(
                     r"provision\b|create\b|start\b|run\b|container\b|"
                     r"部署|创建|启动|容器",
-                    primary_change_text(item),
+                    primary,
                     re.I,
                 )
-            ]
+                if (names_service or provisions_group) and mutates_service:
+                    stateful_candidates.append(item)
             stateful = [
                 item
                 for item in stateful_candidates
@@ -1667,6 +1671,16 @@ class V4ChangePlannerAgent:
         ):
             errors.append(
                 "complete Klonet runtime invents unsupported database initialization step"
+            )
+        if re.search(
+            r"(?:install|pip).{0,30}(?:python\s+)?(?:dependencies|requirements|packages)|"
+            r"(?:dependencies|requirements|packages).{0,30}(?:install|pip)|"
+            r"安装.{0,20}(?:依赖|包)|(?:依赖|包).{0,20}安装",
+            payload,
+            re.I,
+        ):
+            errors.append(
+                "complete Klonet runtime invents ungrounded dependency installation step"
             )
         if missing_components:
             errors.append(

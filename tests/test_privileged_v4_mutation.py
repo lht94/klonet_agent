@@ -1444,6 +1444,23 @@ def test_complete_klonet_deployment_contract_rejects_invented_database_migration
     )
 
 
+def test_complete_klonet_deployment_rejects_ungrounded_dependency_install_step():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+        {
+            "goal": "deploy a complete isolated Klonet platform instance",
+            "changes": [{
+                "title": "Install Python dependencies for the new instance",
+                "objective": "Run pip install for project requirements",
+            }],
+        },
+        [],
+    )
+
+    assert "ungrounded dependency installation step" in " ".join(errors)
+
+
 def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
@@ -1648,6 +1665,30 @@ def test_celery_start_is_not_misclassified_as_stateful_service_provisioning():
             ],
         }
     ]
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
+        "deploy a new isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert not any("stateful service must use" in error for error in errors)
+
+
+def test_runtime_start_after_stateful_dependencies_is_not_stateful_provisioning():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    changes = [{
+        "step_id": "runtime",
+        "title": "Start v4e2e complete runtime under four Screen sessions",
+        "objective": (
+            "Launch master, celery, web terminal, and worker after stateful "
+            "dependencies are up"
+        ),
+        "depends_on": [],
+        "expected_changes": ["four Screen sessions start"],
+    }]
 
     errors = V4ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
