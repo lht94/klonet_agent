@@ -593,7 +593,14 @@ class DirectPrivilegedActionRunner:
                 "-c", "worker_gun.py", "worker_main:flask_app",
             ],
             "celery": [python, "-c", "from celery_worker import celery"],
-            "web_terminal": [python, "-c", "import web_terminal_main"],
+            "web_terminal": [
+                python,
+                "-c",
+                "from vemu_uestc.webserver.app_factory import create_web_terminal_app; "
+                "from vemu_uestc.vemu_config.config import PROJ_CONFIG; "
+                "from gevent import pywsgi; "
+                "from geventwebsocket.handler import WebSocketHandler",
+            ],
         }
         for component in _COMPONENTS:
             result = self._command(
@@ -2852,7 +2859,14 @@ class DirectPrivilegedActionRunner:
                 "-c", "worker_gun.py", "worker_main:flask_app",
             ],
             "celery": [python, "-c", "from celery_worker import celery"],
-            "web_terminal": [python, "-c", "import web_terminal_main"],
+            "web_terminal": [
+                python,
+                "-c",
+                "from vemu_uestc.webserver.app_factory import create_web_terminal_app; "
+                "from vemu_uestc.vemu_config.config import PROJ_CONFIG; "
+                "from gevent import pywsgi; "
+                "from geventwebsocket.handler import WebSocketHandler",
+            ],
         }[component]
         checked = self._command(
             preflight,
@@ -3312,7 +3326,18 @@ def _component_commands(python: str) -> dict[str, list[str]]:
             python, "-m", "celery", "-A", "celery_worker.celery",
             "worker", "--loglevel=info",
         ],
-        "web_terminal": [python, "web_terminal_main.py"],
+        "web_terminal": [
+            python,
+            "-c",
+            "from vemu_uestc.webserver.app_factory import create_web_terminal_app; "
+            "from vemu_uestc.vemu_config.config import PROJ_CONFIG; "
+            "from gevent import pywsgi; "
+            "from geventwebsocket.handler import WebSocketHandler; "
+            "app=create_web_terminal_app(); "
+            "server=pywsgi.WSGIServer(('0.0.0.0', int(PROJ_CONFIG.web_terminal_port)), "
+            "app, handler_class=WebSocketHandler); "
+            "print('Started!'); server.serve_forever()",
+        ],
         "worker": [
             python, "-m", "gunicorn", "-c", "worker_gun.py",
             "worker_main:flask_app",

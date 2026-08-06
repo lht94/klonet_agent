@@ -92,6 +92,16 @@ def test_screen_component_waits_for_its_application_port(tmp_path, monkeypatch):
     assert waited == [("127.0.0.1", 47001, 20.0)]
 
 
+def test_web_terminal_command_uses_frozen_active_config_port():
+    from klonet_agent.ops.privileged.action_runner import _component_commands
+
+    command = _component_commands("/usr/bin/python3.8")["web_terminal"]
+
+    assert command[:2] == ["/usr/bin/python3.8", "-c"]
+    assert "PROJ_CONFIG.web_terminal_port" in command[2]
+    assert "web_terminal_main.py" not in command
+
+
 ENTRY_FILES = (
     "gun.py",
     "master_main.py",
