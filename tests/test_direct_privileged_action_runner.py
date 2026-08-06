@@ -28,6 +28,31 @@ def test_docker_uses_direct_group_socket_access_without_sudo(monkeypatch):
     )[0] == "sudo"
 
 
+def test_runtime_python_env_aliases_hardcoded_package_to_isolated_clone(
+    tmp_path, monkeypatch
+):
+    from klonet_agent.ops.privileged import action_runner as module
+
+    instance = tmp_path / "renamed_instance"
+    mains = instance / "mains"
+    config = instance / "vemu_config"
+    mains.mkdir(parents=True)
+    config.mkdir()
+    (instance / "__init__.py").write_text("", encoding="utf-8")
+    (mains / "gun.py").write_text(
+        "from original_package.vemu_config.config import PROJ_CONFIG\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    env = module._runtime_python_env(mains)
+
+    alias_root = Path(env["PYTHONPATH"].split(module.os.pathsep)[0])
+    alias = alias_root / "original_package"
+    assert alias.is_symlink()
+    assert alias.resolve() == instance.resolve()
+
+
 ENTRY_FILES = (
     "gun.py",
     "master_main.py",

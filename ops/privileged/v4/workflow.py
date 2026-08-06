@@ -263,11 +263,34 @@ class V4MutationWorkflow:
         """An exact reconfirmation may retry only a proven no-change failure."""
 
         evidence = step.evidence
-        return bool(
+        if bool(
             evidence is not None
             and evidence.return_code not in {None, 0}
             and not evidence.timed_out
             and evidence.environment_changed is False
+        ):
+            return True
+        binding = step.execution_binding
+        if (
+            evidence is None
+            or evidence.return_code is None
+            or evidence.timed_out
+            or binding is None
+            or binding.kind != "registered_action"
+            or binding.action != "start_screen_component"
+        ):
+            return False
+        session_checks = [
+            item for item in step.checks
+            if item.checker == "screen_session_exists"
+        ]
+        state_checks = [
+            item for item in step.checks
+            if item.checker in {"screen_session_exists", "port_listening"}
+        ]
+        return bool(
+            session_checks
+            and all(item.status == "failed" for item in state_checks)
         )
 
     def handle_control(self, text: str) -> V4WorkflowResult | None:

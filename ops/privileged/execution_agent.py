@@ -3973,6 +3973,31 @@ def _canonical_action_postconditions(
 ) -> list[dict[str, Any]]:
     """Ground structural Action checks in the finalized, typed Action args."""
 
+    if action == "start_screen_component":
+        session = str(args.get("screen_session") or "").strip()
+        component = str(args.get("component") or "").strip()
+        checks = [
+            {
+                "checker": "screen_session_exists",
+                "args": {"session": session},
+            }
+        ]
+        port_key = {
+            "master": "port_47001",
+            "worker": "port_47002",
+            "web_terminal": "port_47003",
+        }.get(component)
+        if port_key and str(args.get(port_key) or "").isdigit():
+            checks.append(
+                {
+                    "checker": "port_listening",
+                    "args": {
+                        "port": int(args[port_key]),
+                        "host": "127.0.0.1",
+                    },
+                }
+            )
+        return checks
     if action != "set_python_class_attribute":
         return checks
     existing = next(

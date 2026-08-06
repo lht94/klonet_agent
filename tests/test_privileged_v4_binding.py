@@ -39,6 +39,41 @@ def test_python_class_attribute_postcondition_is_canonicalized_from_action_args(
         }
     ]
 
+
+def test_screen_postconditions_are_canonical_for_component_role():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_postconditions,
+    )
+
+    common = {
+        "screen_session": "v4e2e_c",
+        "component": "celery",
+        "port_47001": "47001",
+        "port_47002": "47002",
+        "port_47003": "47003",
+    }
+    celery = _canonical_action_postconditions(
+        "start_screen_component",
+        common,
+        [{"checker": "port_listening", "args": {"port": 47002}}],
+    )
+    master = _canonical_action_postconditions(
+        "start_screen_component",
+        {**common, "screen_session": "v4e2e_m", "component": "master"},
+        [],
+    )
+
+    assert celery == [
+        {
+            "checker": "screen_session_exists",
+            "args": {"session": "v4e2e_c"},
+        }
+    ]
+    assert master[-1] == {
+        "checker": "port_listening",
+        "args": {"port": 47001, "host": "127.0.0.1"},
+    }
+
 import pytest
 
 

@@ -2835,7 +2835,43 @@ class DirectPrivilegedActionRunner:
         python = _python_executable(step.args)
         if not python:
             return self._blocked("python3.8_not_found")
+        try:
+            runtime_env = _runtime_python_env(root)
+        except OSError as exc:
+            return self._blocked(
+                "runtime_python_alias_failed=%s" % exc.__class__.__name__
+            )
         command = _component_commands(python)[component]
+        preflight = {
+            "master": [
+                python, "-m", "gunicorn", "--check-config",
+                "-c", "gun.py", "master_main:flask_app",
+            ],
+            "worker": [
+                python, "-m", "gunicorn", "--check-config",
+                "-c", "worker_gun.py", "worker_main:flask_app",
+            ],
+            "celery": [python, "-c", "from celery_worker import celery"],
+            "web_terminal": [python, "-c", "import web_terminal_main"],
+        }[component]
+        checked = self._command(
+            preflight,
+            cwd=root,
+            env=runtime_env,
+            timeout=min(step.timeout, 30),
+        )
+        if checked.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "startup_preflight_failed component=%s returncode=%s stderr=%s "
+                "environment_changed=false"
+                % (
+                    component,
+                    checked.returncode,
+                    _one_line(checked.stderr or checked.stdout, 10000),
+                ),
+                "inspect_project_layout",
+            )
         shell_command = "cd %s && exec %s" % (
             shlex.quote(str(root)),
             shlex.join(command),
@@ -2843,6 +2879,7 @@ class DirectPrivilegedActionRunner:
         result = self._command(
             ["screen", "-dmS", session, "bash", "-lc", shell_command],
             cwd=root,
+            env=runtime_env,
             timeout=min(step.timeout, 30),
         )
         if result.returncode != 0:
@@ -3202,11 +3239,45 @@ def _python_has_modules(raw: str, modules: tuple[str, ...]) -> bool:
     return result.returncode == 0
 
 def _runtime_pythonpath(root: Path) -> str:
+    instance_root = root.parent if root.name == "mains" else root
+    package_name = _expected_runtime_package(root, instance_root)
+    if package_name and package_name != instance_root.name:
+        digest = hashlib.sha256(str(instance_root.resolve()).encode("utf-8")).hexdigest()[:16]
+        alias_root = Path(tempfile.gettempdir()) / "klonet-runtime-aliases" / digest
+        alias_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        alias = alias_root / package_name
+        if alias.is_symlink():
+            if alias.resolve() != instance_root.resolve():
+                raise OSError("runtime package alias points to another instance")
+        elif alias.exists():
+            raise OSError("runtime package alias is not a symlink")
+        else:
+            alias.symlink_to(instance_root.resolve(), target_is_directory=True)
+        return str(alias_root)
     if root.name == "mains":
-        return str(root.parent.parent.resolve())
+        return str(instance_root.parent.resolve())
     if (root / "vemu_config").is_dir():
         return str(root.parent.resolve())
     return str(root.resolve())
+
+
+def _expected_runtime_package(root: Path, instance_root: Path) -> str:
+    for name in ("gun.py", "master_main.py", "celery_worker.py", "worker_gun.py"):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.finditer(
+            r"(?:from|import)\s+([A-Za-z_]\w*)\.([A-Za-z_]\w*)",
+            content,
+        ):
+            package_name, child = match.groups()
+            if (instance_root / child).exists():
+                return package_name
+    return ""
 
 
 def _runtime_python_env(root: Path) -> dict[str, str]:

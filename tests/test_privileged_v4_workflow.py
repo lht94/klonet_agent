@@ -327,6 +327,34 @@ def test_exact_reconfirmation_retries_only_conclusive_no_change_failure(tmp_path
     assert executor.calls == 2
 
 
+def test_exact_reconfirmation_can_retry_exited_screen_with_no_listener():
+    from klonet_agent.ops.privileged.contracts import (
+        CheckResult,
+        ExecutionBinding,
+        ExecutionEvidence,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    step = PrivilegedStep(
+        step_id="master",
+        title="start master",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="start_screen_component",
+            args={"screen_session": "v4e2e_m", "component": "master"},
+            risk="medium",
+        ),
+        evidence=ExecutionEvidence(return_code=0, environment_changed=True),
+        checks=[
+            CheckResult("screen_session_exists", "failed"),
+            CheckResult("port_listening", "failed"),
+        ],
+    )
+
+    assert V4MutationWorkflow._can_retry_conclusive_no_change(step) is True
+
+
 def test_semantic_config_verification_is_composed_from_atomic_bindings():
     from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
 
