@@ -2992,6 +2992,8 @@ def _validate_mutating_action_paths(
 def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
     """Freeze unambiguous capability choices before probabilistic selection."""
 
+    if _step_is_verification(step):
+        return ""
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     ).lower()

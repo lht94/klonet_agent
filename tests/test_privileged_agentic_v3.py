@@ -301,9 +301,17 @@ def test_new_container_creation_is_routed_to_creation_capability():
         expected_changes=["Existing container restarts"],
         risk="medium",
     )
+    verify = PrivilegedStep(
+        step_id="verify",
+        title="Verify the newly created MySQL container",
+        objective="Verify the new container is running",
+        expected_changes=[],
+        risk="readonly",
+    )
 
     assert _forced_registered_action_for_step(create) == "create_docker_container"
     assert _forced_registered_action_for_step(existing) == ""
+    assert _forced_registered_action_for_step(verify) == ""
 
 
 def test_new_container_binding_skips_probabilistic_capability_selection(monkeypatch):
