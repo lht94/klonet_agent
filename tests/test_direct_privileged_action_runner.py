@@ -233,7 +233,7 @@ def test_nginx_install_failure_before_copy_reports_no_environment_change():
             "install_nginx_config",
             {
                 "content": "server { listen 47007; }\n",
-                "config_name": "klonet-v4-e2e",
+                "config_name": "klonet-v4-install-failure-test",
             },
         )
     )

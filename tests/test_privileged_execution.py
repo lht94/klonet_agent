@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 def _step(command, **overrides):
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
@@ -200,6 +202,138 @@ def test_checker_registry_reports_unknown_or_missing_dependency_as_unavailable()
 
     assert unknown.status == "unavailable"
     assert unavailable.status == "failed"
+
+
+def test_nginx_checker_retries_permission_failure_with_unprivileged_config_copy(
+    tmp_path,
+    monkeypatch,
+):
+    import subprocess
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    config = tmp_path / "nginx.conf"
+    config.write_text(
+        "user root;\n"
+        "pid /run/nginx.pid;\n"
+        "error_log /var/log/nginx/error.log;\n"
+        "events {}\n"
+        "http { access_log /var/log/nginx/access.log; }\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                command,
+                1,
+                stdout="",
+                stderr='open() "/run/nginx.pid" failed (13: Permission denied)',
+            )
+        candidate = Path(command[command.index("-c") + 1]).read_text(
+            encoding="utf-8"
+        )
+        assert "/run/nginx.pid" not in candidate
+        assert "/var/log/nginx/error.log" not in candidate
+        assert "/var/log/nginx/access.log" not in candidate
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="",
+            stderr="syntax is ok\ntest is successful",
+        )
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.checkers.subprocess.run",
+        fake_run,
+    )
+
+    result = DefaultCheckerRegistry().run(
+        {
+            "checker": "nginx_config_valid",
+            "args": {"binary": "nginx", "config": str(config)},
+        }
+    )
+
+    assert result.status == "passed"
+    assert len(calls) == 2
+    assert "-c" in calls[1]
+
+
+def test_nginx_checker_accepts_completed_parse_with_only_runtime_permission_error(
+    monkeypatch,
+):
+    import subprocess
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr=(
+                "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\n"
+                "[emerg] open() \"/run/nginx.pid\" failed "
+                "(13: Permission denied)\n"
+                "nginx: configuration file /etc/nginx/nginx.conf test failed"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.checkers.subprocess.run",
+        fake_run,
+    )
+
+    result = DefaultCheckerRegistry().run(
+        {"checker": "nginx_config_valid", "args": {}}
+    )
+
+    assert result.status == "passed"
+    assert "runtime access deferred" in result.observed
+    assert calls == [["nginx", "-t"]]
+
+
+def test_nginx_checker_does_not_mask_real_syntax_failure(tmp_path, monkeypatch):
+    import subprocess
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    config = tmp_path / "nginx.conf"
+    config.write_text("events {\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        del kwargs
+        calls.append(list(command))
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr='unexpected end of file, expecting "}"',
+        )
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.checkers.subprocess.run",
+        fake_run,
+    )
+
+    result = DefaultCheckerRegistry().run(
+        {
+            "checker": "nginx_config_valid",
+            "args": {"binary": "nginx", "config": str(config)},
+        }
+    )
+
+    assert result.status == "failed"
+    assert len(calls) == 1
 
 
 def test_http_status_checker_accepts_one_of_multiple_expected_codes(monkeypatch):

@@ -9,6 +9,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -21,6 +22,10 @@ from klonet_agent.tools.environment import redact_sensitive_text
 
 Checker = Callable[[Dict[str, Any], Optional[ExecutionEvidence]], CheckResult]
 _STATIC_ATTRIBUTE_UNAVAILABLE = object()
+_NGINX_PRIVILEGE_FAILURE = re.compile(
+    r"(?i)(?:permission denied|operation not permitted|requires? root|"
+    r"interactive authentication required|/run/nginx\.pid|/var/log/nginx/)"
+)
 
 CHECKER_ARGUMENT_HINTS = {
     "exit_code_zero": "none",
@@ -806,8 +811,117 @@ class DefaultCheckerRegistry:
 
     def _nginx_config_valid(self, args, evidence):
         del evidence
-        command = [str(args.get("binary") or "nginx"), "-t"]
-        return self._command_check("nginx_config_valid", command, expected="syntax is ok")
+        binary = str(args.get("binary") or "nginx")
+        direct = self._command_check(
+            "nginx_config_valid",
+            [binary, "-t"],
+            expected="syntax is ok",
+        )
+        if direct.status == "passed":
+            return direct
+        if self._nginx_parse_completed_with_privilege_only_failure(direct):
+            direct.status = "passed"
+            direct.observed = (
+                "syntax parse passed; privileged runtime access deferred"
+            )
+            return direct
+        if not _NGINX_PRIVILEGE_FAILURE.search(
+            str(direct.observed or "")
+        ):
+            return direct
+
+        # ``nginx -t`` parses the full configuration but also attempts to
+        # open the configured root-owned PID and log paths.  A non-root
+        # verifier must not turn that incidental access failure into a syntax
+        # failure, nor should it prompt for credentials.  Retry against an
+        # ephemeral copy whose only changes are process-runtime paths; all
+        # includes (notably sites-enabled) remain the real files.
+        config = Path(
+            str(args.get("config") or "/etc/nginx/nginx.conf")
+        ).expanduser()
+        try:
+            original = config.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return direct
+        with tempfile.TemporaryDirectory(prefix="klonet-nginx-check-") as raw_dir:
+            directory = Path(raw_dir)
+            candidate = directory / "nginx.conf"
+            # Preserve the original prefix-relative include semantics without
+            # copying configuration or secrets.  Debian-style module snippets
+            # also load ``modules/<name>.so`` relative to the prefix, while
+            # the actual modules live under /usr/lib/nginx/modules.
+            try:
+                siblings = tuple(config.parent.iterdir())
+            except OSError:
+                siblings = ()
+            for sibling in siblings:
+                if sibling == config:
+                    continue
+                link = directory / sibling.name
+                try:
+                    link.symlink_to(
+                        sibling,
+                        target_is_directory=sibling.is_dir(),
+                    )
+                except OSError:
+                    pass
+            modules = directory / "modules"
+            system_modules = Path("/usr/lib/nginx/modules")
+            if not modules.exists() and system_modules.is_dir():
+                try:
+                    modules.symlink_to(system_modules, target_is_directory=True)
+                except OSError:
+                    pass
+            isolated = re.sub(
+                r"(?im)(^\s*pid\s+)[^;]+;",
+                r"\g<1>%s;" % (directory / "nginx.pid"),
+                original,
+            )
+            isolated = re.sub(
+                r"(?i)\berror_log\s+[^;]+;",
+                "error_log stderr;",
+                isolated,
+            )
+            isolated = re.sub(
+                r"(?i)\baccess_log\s+[^;]+;",
+                "access_log off;",
+                isolated,
+            )
+            try:
+                candidate.write_text(isolated, encoding="utf-8")
+            except (OSError, UnicodeError):
+                return direct
+            retried = self._command_check(
+                "nginx_config_valid",
+                [
+                    binary,
+                    "-t",
+                    "-p",
+                    str(directory) + "/",
+                    "-c",
+                    str(candidate),
+                ],
+                expected="syntax is ok",
+            )
+        if retried.status == "passed":
+            retried.observed = "non-privileged config parse passed: %s" % (
+                retried.observed
+            )
+        return retried
+
+    @staticmethod
+    def _nginx_parse_completed_with_privilege_only_failure(result):
+        detail = str(result.evidence or result.observed or "")
+        if "syntax is ok" not in detail.lower():
+            return False
+        fatal_lines = [
+            line
+            for line in detail.splitlines()
+            if "[emerg]" in line.lower() or "[alert]" in line.lower()
+        ]
+        return bool(fatal_lines) and all(
+            _NGINX_PRIVILEGE_FAILURE.search(line) for line in fatal_lines
+        )
 
     def _log_has_no_fatal_error(self, args, evidence):
         del evidence
