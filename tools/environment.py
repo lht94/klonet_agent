@@ -554,22 +554,51 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
     args = args or {}
     instances = {}
     evidence = []
-    for row in _screen_instance_rows():
-        entry = _platform_entry(instances, row["platform"])
+    screen_rows = _screen_instance_rows()
+    process_rows = [
+        row
+        for row in _process_instance_rows()
+        if row.get("role") and row.get("role") != "unknown"
+    ]
+    unresolved_process_rows = []
+    root_aliases = {}
+    screen_roots = {}
+    for row in process_rows:
+        root = _runtime_root_from_process_row(row)
+        screen_platform = _screen_platform_from_command(str(row.get("cmd") or ""))
+        if root and screen_platform:
+            root_aliases[root] = screen_platform
+            screen_roots[screen_platform] = root
+    for row in screen_rows:
+        root = screen_roots.get(row["platform"], "")
+        identity = f"root:{root}" if root else f"screen:{row['platform']}"
+        entry = _platform_entry(instances, row["platform"], identity=identity)
         entry["roles"].add(row["role"])
         entry["screen_sessions"].append(row["session"])
         entry["sources"].add("screen")
-    for row in _process_instance_rows():
-        entry = _platform_entry(instances, row["platform"])
+    for row in process_rows:
+        root = _runtime_root_from_process_row(row)
+        platform = root_aliases.get(root) or row["platform"]
+        if not root and platform == "unknown":
+            unresolved_process_rows.append(row)
+            continue
+        identity = f"root:{root}" if root else f"process:{platform}"
+        entry = _platform_entry(instances, platform, identity=identity)
         entry["roles"].add(row["role"])
         entry["pids"].append(row["pid"])
-        if row["cwd"] and row["cwd"] != "?":
-            entry["project_roots"].add(row["cwd"])
+        if root:
+            entry["project_roots"].add(root)
         entry["sources"].add("process")
     for root in _requested_project_roots(args):
         platform_name = _platform_from_project_root(root)
-        entry = _platform_entry(instances, platform_name)
-        entry["project_roots"].add(str(root))
+        canonical_root = str(_canonical_runtime_root(root))
+        platform_name = root_aliases.get(canonical_root) or platform_name
+        entry = _platform_entry(
+            instances,
+            platform_name,
+            identity=f"root:{canonical_root}",
+        )
+        entry["project_roots"].add(canonical_root)
         entry["sources"].add("config")
         ports = _read_config_ports_from_root(root)
         entry["ports"].update(ports)
@@ -580,10 +609,32 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
             "inspect_platform_instances",
             [ProbeResult("platform_instances", STATUS_MISSING, "no screen/process/config evidence found")],
         )
-    for name in sorted(instances)[:max_instances]:
-        entry = instances[name]
+    lines.append(f"instance_count={len(instances)}")
+    if unresolved_process_rows:
+        unresolved_roles = sorted(
+            {
+                str(row.get("role") or "unknown")
+                for row in unresolved_process_rows
+            }
+        )
+        unresolved_pids = sorted(
+            {
+                int(row["pid"])
+                for row in unresolved_process_rows
+                if str(row.get("pid", "")).isdigit()
+            }
+        )
+        lines.append(
+            "unresolved_process_evidence="
+            + "roles:"
+            + ",".join(unresolved_roles)
+            + " pids:"
+            + ",".join(str(pid) for pid in unresolved_pids)
+        )
+    for identity in sorted(instances)[:max_instances]:
+        entry = instances[identity]
         detail_parts = [
-            f"platform={name}",
+            f"platform={entry['platform']}",
             f"source={','.join(sorted(entry['sources'])) or 'unchecked'}",
             f"roles={','.join(sorted(entry['roles'])) or 'unchecked'}",
         ]
@@ -1016,10 +1067,12 @@ def inspect_screen_session(args: Optional[dict] = None) -> str:
                 pass
 
 
-def _platform_entry(instances: dict, platform: str) -> dict:
+def _platform_entry(instances: dict, platform: str, *, identity: str = "") -> dict:
     normalized = platform or "unknown"
-    if normalized not in instances:
-        instances[normalized] = {
+    key = identity or f"platform:{normalized}"
+    if key not in instances:
+        instances[key] = {
+            "platform": normalized,
             "roles": set(),
             "screen_sessions": [],
             "pids": [],
@@ -1027,7 +1080,35 @@ def _platform_entry(instances: dict, platform: str) -> dict:
             "ports": {},
             "sources": set(),
         }
-    return instances[normalized]
+    return instances[key]
+
+
+def _canonical_runtime_root(root: Path) -> Path:
+    if root.name.lower() == "mains" and root.parent != root:
+        return root.parent
+    return root
+
+
+def _runtime_root_from_process_row(row: dict) -> str:
+    cwd = str(row.get("cwd") or "").strip()
+    if cwd and cwd != "?":
+        return str(_canonical_runtime_root(Path(cwd)))
+    command = str(row.get("cmd") or "")
+    cd_match = re.search(r"(?:^|\s)cd\s+([^\s;&]+)", command)
+    if cd_match:
+        return str(_canonical_runtime_root(Path(cd_match.group(1).strip("'\""))))
+    path_match = re.search(r"(/[A-Za-z0-9._/-]+)/mains(?:/|\b)", command)
+    if path_match:
+        return str(Path(path_match.group(1)))
+    return ""
+
+
+def _screen_platform_from_command(command: str) -> str:
+    match = re.search(r"(?:^|\s)-dmS\s+(\S+)", command or "")
+    if not match:
+        return ""
+    parsed = _platform_role_from_name(match.group(1))
+    return parsed[0] if parsed else ""
 
 
 def _screen_instance_rows() -> list:
@@ -1085,17 +1166,19 @@ def _process_instance_rows() -> list:
         cwd = match.group(2)
         cmd = match.group(3)
         role = _role_from_command(cmd)
-        platform = _platform_from_cwd(cwd)
-        if role or platform != "unknown":
-            rows.append(
-                {
-                    "pid": pid,
-                    "cwd": cwd,
-                    "cmd": redact_sensitive_text(_single_line(cmd, max_chars=300)),
-                    "platform": platform,
-                    "role": role or "unknown",
-                }
-            )
+        if not role:
+            continue
+        row = {
+            "pid": pid,
+            "cwd": cwd,
+            "cmd": redact_sensitive_text(_single_line(cmd, max_chars=300)),
+            "platform": "unknown",
+            "role": role,
+        }
+        runtime_root = _runtime_root_from_process_row(row)
+        if runtime_root:
+            row["platform"] = _platform_from_project_root(Path(runtime_root))
+        rows.append(row)
     return rows
 
 
@@ -1127,7 +1210,7 @@ def _platform_role_from_name(name: str) -> Optional[tuple]:
 
 def _role_from_command(command: str) -> str:
     lowered = (command or "").lower()
-    if "web_terminal_main.py" in lowered:
+    if "web_terminal_main.py" in lowered or "web_terminal_main" in lowered:
         return "web_terminal"
     if "worker_main" in lowered or "worker_gun.py" in lowered:
         return "worker"

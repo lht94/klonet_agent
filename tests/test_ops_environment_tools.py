@@ -966,6 +966,77 @@ def test_platform_instance_inspection_groups_screens_processes_and_config(monkey
     assert "source=screen" in result
 
 
+def test_platform_instance_inspection_counts_runtime_roots_without_duplicate_aliases(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        target_root = temp_dir / "klonet_v4_e2e"
+        source_root = temp_dir / "vemu_uestc"
+        (target_root / "mains").mkdir(parents=True)
+        (source_root / "mains").mkdir(parents=True)
+        monkeypatch.setattr(
+            environment,
+            "_screen_instance_rows",
+            lambda: [
+                {"session": "1.v4e2e_m", "platform": "v4e2e", "role": "master"},
+                {"session": "2.vemu_uestc_m", "platform": "vemu_uestc", "role": "master"},
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {
+                    "pid": 1,
+                    "cwd": str(target_root / "mains"),
+                    "cmd": "SCREEN -dmS v4e2e_m bash -lc run",
+                    "platform": "mains",
+                    "role": "master",
+                },
+                {
+                    "pid": 2,
+                    "cwd": str(target_root / "mains"),
+                    "cmd": "python -m gunicorn -c gun.py master_main:flask_app",
+                    "platform": "mains",
+                    "role": "master",
+                },
+                {
+                    "pid": 3,
+                    "cwd": str(source_root / "mains"),
+                    "cmd": "SCREEN -dmS vemu_uestc_m bash -lc run",
+                    "platform": "mains",
+                    "role": "master",
+                },
+                {
+                    "pid": 4,
+                    "cwd": str(temp_dir / "agent-worktree"),
+                    "cmd": "python -m klonet_agent.agent",
+                    "platform": "agent-worktree",
+                    "role": "unknown",
+                },
+                {
+                    "pid": 5,
+                    "cwd": "?",
+                    "cmd": "python -m celery -A mains.celery_worker:celery worker",
+                    "platform": "unknown",
+                    "role": "celery",
+                },
+            ],
+        )
+
+        result = environment.inspect_platform_instances({"max_instances": 10})
+
+    assert "instance_count=2" in result
+    assert "platform=mains" not in result
+    assert "platform=agent-worktree" not in result
+    assert "unresolved_process_evidence=roles:celery pids:5" in result
+    assert result.count("platform=v4e2e") == 1
+    assert result.count("platform=vemu_uestc") == 1
+    assert f"project_roots={target_root}" in result
+    assert f"project_roots={source_root}" in result
+
+
 def test_executor_persists_ops_baseline_snapshot():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.tools.executor import ToolExecutor
