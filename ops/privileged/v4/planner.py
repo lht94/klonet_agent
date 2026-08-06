@@ -2481,6 +2481,47 @@ class V4ChangePlannerAgent:
                 for consumer in screen_consumers:
                     if consumer not in existing_mains.consumers:
                         existing_mains.consumers.append(consumer)
+        config_path = root_text + "/vemu_config/config.py"
+        config_consumers = [
+            "%s.path" % str(change.get("step_id") or "")
+            for change in changes
+            if isinstance(change, dict)
+            and re.search(
+                r"\bvemu_config/config\.py\b",
+                "%s %s" % (
+                    change.get("title") or "",
+                    change.get("objective") or "",
+                ),
+                re.I,
+            )
+        ]
+        if config_consumers:
+            existing_config = next(
+                (
+                    item
+                    for item in normalized
+                    if item.status == "frozen"
+                    and item.kind == "path"
+                    and str(item.value) == config_path
+                ),
+                None,
+            )
+            if existing_config is None:
+                normalized.append(
+                    PlanResource(
+                        name="config_path",
+                        kind="path",
+                        status="frozen",
+                        role="config_path",
+                        value=config_path,
+                        source="derived_from_instance_root",
+                        consumers=config_consumers,
+                    )
+                )
+            else:
+                for consumer in config_consumers:
+                    if consumer not in existing_config.consumers:
+                        existing_config.consumers.append(consumer)
         for change in changes:
             if not isinstance(change, dict):
                 continue

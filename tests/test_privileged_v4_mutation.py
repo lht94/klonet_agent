@@ -881,6 +881,42 @@ def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
     assert mains.consumers == ["master.project_root"]
 
 
+def test_planner_derives_config_path_after_checker_path_normalization():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "config",
+                "title": "Configure v4e2e in vemu_config/config.py",
+                "objective": "Set WtxConfig ports and IPs",
+                "postconditions": [
+                    {
+                        "checker": "python_attribute_equals",
+                        "args": {
+                            "module": "vemu_config.config",
+                            "attribute": "master_port",
+                            "expected": 47001,
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    root = PlanResource(
+        "instance_root", "path", "frozen", "instance_root",
+        "/home/lzl/klonet_v4_e2e", "user_input",
+        consumers=["clone.repository"],
+    )
+
+    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [root])
+
+    config = next(item for item in normalized if item.role == "config_path")
+    assert config.value == "/home/lzl/klonet_v4_e2e/vemu_config/config.py"
+    assert config.consumers == ["config.path"]
+
+
 def test_ports_probe_explicitly_reports_checked_occupied_and_available(monkeypatch):
     from klonet_agent.ops.privileged import probes
 
