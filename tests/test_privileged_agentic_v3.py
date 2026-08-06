@@ -365,6 +365,38 @@ def test_new_container_binding_skips_probabilistic_capability_selection(monkeypa
     )
 
 
+def test_container_micro_plan_collapses_redundant_start_after_create():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _collapse_redundant_container_starts,
+    )
+
+    items = [
+        {
+            "id": "create",
+            "title": "Create Redis container v4e2e-redis",
+            "objective": "Create and start the new isolated Redis container",
+            "depends_on": [],
+        },
+        {
+            "id": "start",
+            "title": "Start Redis container v4e2e-redis",
+            "objective": "Start the newly created Redis container",
+            "depends_on": ["create"],
+        },
+        {
+            "id": "verify",
+            "title": "Verify Redis container",
+            "objective": "Verify Redis is running",
+            "depends_on": ["start"],
+        },
+    ]
+
+    normalized = _collapse_redundant_container_starts(items)
+
+    assert [item["id"] for item in normalized] == ["create", "verify"]
+    assert normalized[1]["depends_on"] == ["create"]
+
+
 def test_new_container_port_bindings_must_use_frozen_plan_ports():
     import pytest
 

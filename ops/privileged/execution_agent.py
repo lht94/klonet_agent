@@ -647,6 +647,7 @@ class PrivilegedExecutionAgent:
                     category="implementation_contract_invalid",
                 )
             raw_ids.append(raw_id)
+        items = _collapse_redundant_container_starts(items)
         _remove_outer_semantic_dependencies(items, semantic_step.depends_on)
         items = _topologically_order_implementation_items(items)
         raw_ids = [
@@ -2454,6 +2455,84 @@ def _remove_outer_semantic_dependencies(
         item["depends_on"] = [
             value for value in dependencies if str(value) not in outer
         ]
+
+
+def _collapse_redundant_container_starts(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Treat create_docker_container as the create-and-start atomic capability."""
+
+    create_by_id: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if not re.search(r"\b(?:docker\s+)?container\b|容器", text, re.I):
+            continue
+        if not re.search(r"\b(?:create|provision)\b|创建|新建", text, re.I):
+            continue
+        service = next(
+            (
+                marker
+                for marker in ("mysql", "redis", "rabbitmq")
+                if marker in text.lower()
+            ),
+            "container",
+        )
+        create_by_id[item_id] = service
+    replacements: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        primary = "%s %s" % (
+            item.get("title") or "",
+            item.get("objective") or "",
+        )
+        if not re.match(r"^\s*(?:start|launch|启动)", primary, re.I):
+            continue
+        dependencies = item.get("depends_on")
+        if not isinstance(dependencies, list):
+            continue
+        for dependency in dependencies:
+            creator_id = _safe_implementation_step_id(dependency, fallback="")
+            service = create_by_id.get(creator_id)
+            if service is None:
+                continue
+            if service != "container" and service not in primary.lower():
+                continue
+            replacements[item_id] = creator_id
+            break
+    if not replacements:
+        return items
+
+    def resolve(item_id: str) -> str:
+        seen = set()
+        while item_id in replacements and item_id not in seen:
+            seen.add(item_id)
+            item_id = replacements[item_id]
+        return item_id
+
+    normalized = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        if item_id in replacements:
+            continue
+        dependencies = item.get("depends_on")
+        if isinstance(dependencies, list):
+            rewired = []
+            for dependency in dependencies:
+                target = resolve(
+                    _safe_implementation_step_id(dependency, fallback="")
+                )
+                if target and target != item_id and target not in rewired:
+                    rewired.append(target)
+            item["depends_on"] = rewired
+        normalized.append(item)
+    return normalized
 
 
 def _topologically_order_implementation_items(
