@@ -2608,9 +2608,15 @@ def _deterministic_klonet_config_items(
     """Compile the complete same-host WtxConfig contract from frozen resources."""
 
     text = "%s %s" % (semantic_step.title, semantic_step.objective)
-    if not (
+    config_semantic = bool(
         re.search(r"wtxconfig", text, re.I)
-        and re.search(r"config|配置", text, re.I)
+        or (
+            re.search(r"config\.py", text, re.I)
+            and re.search(r"settings?|ports?|ips?|endpoints?|配置|设置|端口", text, re.I)
+        )
+    )
+    if not (
+        config_semantic
         and re.search(r"complete|isolated|完整|隔离", "%s %s" % (plan.goal, text), re.I)
     ):
         return []
@@ -3801,6 +3807,18 @@ def _infer_semantic_action_args(
     )
     if names:
         compiled["name"] = names[0]
+    bindings = compiled.get("port_bindings")
+    if service and isinstance(bindings, list):
+        normalized_bindings = []
+        for binding in bindings:
+            parts = str(binding).split(":")
+            if len(parts) >= 2:
+                normalized_bindings.append(
+                    "127.0.0.1:%s:%s" % (parts[-2], parts[-1])
+                )
+            else:
+                normalized_bindings.append(str(binding))
+        compiled["port_bindings"] = normalized_bindings
     if service == "rabbitmq":
         compiled.pop("credential_source", None)
     return compiled

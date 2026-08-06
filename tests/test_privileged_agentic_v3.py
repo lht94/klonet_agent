@@ -459,13 +459,66 @@ def test_container_binding_compiles_semantic_name_and_credential_policy():
         {
             "name": "v4e2e",
             "image": "rabbitmq:latest",
+            "port_bindings": ["0.0.0.0:27701:5672"],
             "credential_source": {"path": "/srv/config.py", "service": "redis"},
         },
         semantic,
     )
 
     assert compiled["name"] == "v4e2e-rabbitmq"
+    assert compiled["port_bindings"] == ["127.0.0.1:27701:5672"]
     assert "credential_source" not in compiled
+
+
+def test_complete_config_compiler_accepts_semantic_config_py_settings_title():
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        _deterministic_klonet_config_items,
+    )
+
+    resources = [
+        PlanResource("config", "path", "frozen", "config_path",
+                     "/srv/v4e2e/vemu_config/config.py", "derived"),
+    ] + [
+        PlanResource(role, "port", "frozen", role, value, "evidence")
+        for role, value in {
+            "master_port": 47001,
+            "worker_port": 47002,
+            "web_terminal_port": 47003,
+            "mysql_port": 47004,
+            "redis_port": 47005,
+            "rabbitmq_port": 47006,
+        }.items()
+    ]
+    plan = PrivilegedPlan(
+        plan_id="config-semantic",
+        goal="deploy a complete isolated Klonet instance",
+        risk="high",
+        resources=resources,
+        steps=[],
+    )
+    semantic = PrivilegedStep(
+        step_id="config",
+        title="Configure v4e2e instance settings in config.py",
+        objective="Write instance ports, IPs, and Celery DB endpoints",
+        expected_changes=["config changes"],
+        risk="medium",
+    )
+
+    items = _deterministic_klonet_config_items(plan, semantic)
+    attributes = {
+        item.get("attribute") for item in items if item.get("attribute")
+    }
+
+    assert {
+        "master_ip", "mysql_ip", "rabbitmq_ip", "master_port", "worker_port",
+        "web_terminal_port", "mysql_port", "redis_port", "rabbitmq_port",
+        "celery_redis_port_db", "celery_rabbitmq_port_db",
+    } <= attributes
 
 
 def test_container_binding_requires_selected_image_in_discovery_evidence():
