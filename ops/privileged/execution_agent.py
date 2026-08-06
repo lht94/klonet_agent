@@ -613,9 +613,9 @@ class PrivilegedExecutionAgent:
                 category="implementation_contract_invalid",
             )
         items = result.get("implementation_steps")
-        if not isinstance(items, list) or not items or len(items) > 12:
+        if not isinstance(items, list) or not items or len(items) > 16:
             raise ExecutionBindingError(
-                "implementation_steps must contain 1-12 items",
+                "implementation_steps must contain 1-16 items",
                 replan_recommended=False,
                 category="implementation_contract_invalid",
             )
@@ -2118,7 +2118,7 @@ class PrivilegedExecutionAgent:
                     "implementation_steps": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 12,
+                        "maxItems": 16,
                         "items": step_schema,
                     },
                 },
@@ -3251,6 +3251,15 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     ).lower()
+    primary = "%s %s" % (step.title, step.objective)
+    if re.search(r"\b(?:clone|checkout)\b|克隆|检出", primary, re.I) and re.search(
+        r"\b(?:git|repository|source)\b|仓库|源码", primary, re.I
+    ):
+        return "git_operation"
+    if re.search(r"restart\s+policy|重启策略", primary, re.I) and re.search(
+        r"container|容器", primary, re.I
+    ):
+        return "manage_container"
     mentions_container = bool(re.search(r"\b(?:docker\s+)?container\b|容器", text))
     creates_absent = bool(
         re.search(

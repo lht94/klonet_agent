@@ -489,6 +489,7 @@ def test_complete_config_compiler_accepts_semantic_config_py_settings_title():
             "master_port": 47001,
             "worker_port": 47002,
             "web_terminal_port": 47003,
+            "public_port": 47007,
             "mysql_port": 47004,
             "redis_port": 47005,
             "rabbitmq_port": 47006,
@@ -519,6 +520,41 @@ def test_complete_config_compiler_accepts_semantic_config_py_settings_title():
         "web_terminal_port", "mysql_port", "redis_port", "rabbitmq_port",
         "celery_redis_port_db", "celery_rabbitmq_port_db",
     } <= attributes
+    assert len(items) == 13
+
+
+def test_implementation_plan_schema_allows_complete_config_expansion():
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    tool = PrivilegedExecutionAgent(None)._implementation_plan_function_tool()
+    schema = tool["function"]["parameters"]["properties"]["implementation_steps"]
+
+    assert schema["maxItems"] >= 13
+
+
+def test_forced_action_routes_clone_and_restart_policy_semantics():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _forced_registered_action_for_step,
+    )
+
+    clone = PrivilegedStep(
+        step_id="clone",
+        title="Clone authoritative source repository",
+        objective="Clone the repository at a pinned revision",
+        expected_changes=["new clone"],
+        risk="high",
+    )
+    policy = PrivilegedStep(
+        step_id="policy",
+        title="Apply container restart policy",
+        objective="Set restart policy on v4e2e-redis",
+        expected_changes=["restart policy changes"],
+        risk="medium",
+    )
+
+    assert _forced_registered_action_for_step(clone) == "git_operation"
+    assert _forced_registered_action_for_step(policy) == "manage_container"
 
 
 def test_container_binding_requires_selected_image_in_discovery_evidence():
