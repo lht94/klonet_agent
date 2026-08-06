@@ -852,6 +852,59 @@ def test_ports_probe_explicitly_reports_checked_occupied_and_available(monkeypat
     assert "available_ports=47001,47003" in result
 
 
+def test_planner_compiles_python_checker_aliases_and_drops_dependency_install():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "resources": [
+            {"value": "/srv/v4e2e/vemu_config/config.py"},
+        ],
+        "changes": [
+            {"step_id": "clone", "depends_on": [], "postconditions": []},
+            {
+                "step_id": "install",
+                "title": "Install Python dependencies",
+                "objective": "pip install requirements",
+                "depends_on": ["clone"],
+                "postconditions": [],
+            },
+            {
+                "step_id": "config",
+                "title": "Configure instance settings",
+                "depends_on": ["install"],
+                "postconditions": [
+                    {
+                        "checker": "python_attribute_equals",
+                        "args": {
+                            "path": "/srv/v4e2e/vemu_config/config.py",
+                            "attribute": "master_port",
+                            "value": 47001,
+                        },
+                    },
+                    {
+                        "checker": "python_import_succeeds",
+                        "args": {"path": "/srv/v4e2e/vemu_config/config.py"},
+                    },
+                ],
+            },
+        ],
+    }
+
+    V4ChangePlannerAgent._normalize_ungrounded_dependency_installs(data)
+    V4ChangePlannerAgent._normalize_postcondition_args(data)
+
+    assert [item["step_id"] for item in data["changes"]] == ["clone", "config"]
+    assert data["changes"][1]["depends_on"] == ["clone"]
+    assert data["changes"][1]["postconditions"][0]["args"] == {
+        "module": "vemu_config.config",
+        "attribute": "master_port",
+        "expected": 47001,
+    }
+    assert data["changes"][1]["postconditions"][1]["args"] == {
+        "module": "vemu_config.config",
+    }
+
+
 @pytest.mark.parametrize("alias", ["candidates", "candidate_ports"])
 def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

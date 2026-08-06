@@ -536,6 +536,7 @@ class V4ChangePlannerAgent:
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")
         self._normalize_instance_container_names(data)
+        self._normalize_ungrounded_dependency_installs(data)
         self._normalize_semantic_dependencies(data)
         self._normalize_change_order(data)
         self._normalize_verification_changes(data)
@@ -628,6 +629,15 @@ class V4ChangePlannerAgent:
         changes = data.get("changes")
         if not isinstance(changes, list):
             return
+        config_module = ""
+        raw_resources = data.get("resources")
+        if isinstance(raw_resources, list):
+            if any(
+                isinstance(item, dict)
+                and str(item.get("value") or "").endswith("/vemu_config/config.py")
+                for item in raw_resources
+            ):
+                config_module = "vemu_config.config"
         for change in changes:
             postconditions = (
                 change.get("postconditions") if isinstance(change, dict) else None
@@ -647,6 +657,87 @@ class V4ChangePlannerAgent:
                         args[target] = args[source]
                     if source != target and source in args:
                         del args[source]
+                checker = str(check.get("checker") or "")
+                if checker == "python_attribute_equals":
+                    if "expected" not in args and "value" in args:
+                        args["expected"] = args.pop("value")
+                    path = str(args.get("path") or "")
+                    if "module" not in args and (
+                        path.endswith("/vemu_config/config.py") or config_module
+                    ):
+                        args["module"] = "vemu_config.config"
+                    args.pop("path", None)
+                elif checker == "python_import_succeeds":
+                    path = str(args.get("path") or "")
+                    if "module" not in args and (
+                        path.endswith("/vemu_config/config.py") or config_module
+                    ):
+                        args["module"] = "vemu_config.config"
+                    args.pop("path", None)
+
+    @staticmethod
+    def _normalize_ungrounded_dependency_installs(data: dict[str, Any]) -> None:
+        """Drop standalone dependency installation invented for same-host clones."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        pattern = re.compile(
+            r"(?:install|pip).{0,30}(?:python\s+)?(?:dependencies|requirements|packages)|"
+            r"(?:dependencies|requirements|packages).{0,30}(?:install|pip)|"
+            r"安装.{0,20}(?:依赖|包)|(?:依赖|包).{0,20}安装",
+            re.I,
+        )
+        removed: dict[str, list[str]] = {}
+        retained = []
+        for change in changes:
+            if not isinstance(change, dict):
+                retained.append(change)
+                continue
+            text = "%s %s %s %s" % (
+                change.get("title") or "",
+                change.get("objective") or "",
+                change.get("reason") or "",
+                " ".join(str(item) for item in change.get("expected_changes", [])),
+            )
+            step_id = str(change.get("step_id") or "")
+            if step_id and pattern.search(text):
+                dependencies = change.get("depends_on")
+                removed[step_id] = [
+                    str(item) for item in dependencies
+                ] if isinstance(dependencies, list) else []
+                continue
+            retained.append(change)
+        if not removed:
+            return
+
+        def expand(step_id: str, seen: set[str] | None = None) -> list[str]:
+            if step_id not in removed:
+                return [step_id]
+            seen = set(seen or ())
+            if step_id in seen:
+                return []
+            seen.add(step_id)
+            result = []
+            for dependency in removed[step_id]:
+                for expanded in expand(dependency, seen):
+                    if expanded and expanded not in result:
+                        result.append(expanded)
+            return result
+
+        for change in retained:
+            if not isinstance(change, dict):
+                continue
+            dependencies = change.get("depends_on")
+            if not isinstance(dependencies, list):
+                continue
+            rewired = []
+            for dependency in dependencies:
+                for expanded in expand(str(dependency)):
+                    if expanded not in rewired:
+                        rewired.append(expanded)
+            change["depends_on"] = rewired
+        data["changes"] = retained
 
     @staticmethod
     def _normalize_instance_container_names(data: dict[str, Any]) -> None:
