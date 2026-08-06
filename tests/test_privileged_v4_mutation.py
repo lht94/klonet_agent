@@ -738,6 +738,40 @@ def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
     assert resources[2].consumers == ["clone-source.ref"]
 
 
+def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {"step_id": "clone", "title": "Clone Git source repository", "objective": "Clone source", "depends_on": []},
+            {"step_id": "redis", "title": "Provision Redis container", "objective": "Create new Redis container", "depends_on": []},
+            {"step_id": "runtime", "title": "Start complete Screen runtime", "objective": "Start master celery worker web terminal", "depends_on": []},
+            {"step_id": "nginx", "title": "Activate Nginx site", "objective": "Reload Nginx", "depends_on": []},
+        ]
+    }
+    resources = [
+        PlanResource(
+            "nginx_port", "port", "frozen", "nginx_listen_port", 47008,
+            "evidence", consumers=["change-99.listen"],
+        ),
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root", "/srv/v4e2e",
+            "user_input", consumers=["change-99.instance_root"],
+        ),
+    ]
+
+    V4ChangePlannerAgent._normalize_semantic_dependencies(data)
+    V4ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
+
+    by_id = {item["step_id"]: item for item in data["changes"]}
+    assert by_id["redis"]["depends_on"] == ["clone"]
+    assert by_id["runtime"]["depends_on"] == ["redis"]
+    assert by_id["nginx"]["depends_on"] == ["runtime"]
+    assert resources[0].consumers == ["nginx.listen"]
+    assert resources[1].consumers == ["nginx.instance_root"]
+
+
 @pytest.mark.parametrize("alias", ["candidates", "candidate_ports"])
 def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

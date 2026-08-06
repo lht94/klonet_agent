@@ -535,6 +535,7 @@ class V4ChangePlannerAgent:
             )
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")
+        self._normalize_semantic_dependencies(data)
         self._normalize_change_order(data)
         self._normalize_verification_changes(data)
         self._normalize_change_order(data)
@@ -546,6 +547,7 @@ class V4ChangePlannerAgent:
         ]
         self._normalize_core_resource_consumers(data, resources)
         resources = self._normalize_derived_resources(data, resources)
+        self._normalize_resource_consumer_owners(data, resources)
         self._normalize_occupied_host_ports(data, resources, bundle)
         self._normalize_nginx_postconditions(data, resources)
         contract_errors = self._ready_contract_errors(
@@ -644,6 +646,99 @@ class V4ChangePlannerAgent:
                         args[target] = args[source]
                     if source != target and source in args:
                         del args[source]
+
+    @staticmethod
+    def _normalize_semantic_dependencies(data: dict[str, Any]) -> None:
+        """Compile the fixed clone -> stateful -> runtime -> Nginx DAG."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        valid = [item for item in changes if isinstance(item, dict)]
+        text = lambda item: "%s %s" % (
+            item.get("title") or "", item.get("objective") or ""
+        )
+        clones = [
+            str(item.get("step_id") or "") for item in valid
+            if re.search(r"\b(?:clone|checkout)\b|克隆|检出", text(item), re.I)
+            and re.search(r"\b(?:git|repository|source)\b|仓库|源码", text(item), re.I)
+        ]
+        stateful = [
+            str(item.get("step_id") or "") for item in valid
+            if re.search(r"mysql|redis|rabbitmq", text(item), re.I)
+            and re.search(r"containers?\b|容器", text(item), re.I)
+            and re.search(r"\b(?:create|provision)\b|创建|部署", text(item), re.I)
+        ]
+        runtime = [
+            str(item.get("step_id") or "") for item in valid
+            if re.search(r"\b(?:start|launch)\b|启动", text(item), re.I)
+            and re.search(r"screen|master|celery|web.?terminal|worker", text(item), re.I)
+            and not re.search(r"mysql|redis|rabbitmq", text(item), re.I)
+        ]
+        nginx = [
+            str(item.get("step_id") or "") for item in valid
+            if re.search(r"nginx", text(item), re.I)
+            and re.search(r"\b(?:activate|enable|reload|create)\b|激活|启用|重载|创建", text(item), re.I)
+        ]
+        required_by_id = {
+            **{step_id: clones for step_id in stateful},
+            **{step_id: stateful for step_id in runtime},
+            **{step_id: runtime for step_id in nginx},
+        }
+        for item in valid:
+            step_id = str(item.get("step_id") or "")
+            dependencies = item.get("depends_on")
+            if not isinstance(dependencies, list):
+                continue
+            for required in required_by_id.get(step_id, []):
+                if required and required != step_id and required not in dependencies:
+                    dependencies.append(required)
+
+    @staticmethod
+    def _normalize_resource_consumer_owners(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> None:
+        """Repair a stale model step id when its field group has one owner."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        known = {
+            str(item.get("step_id") or "") for item in changes
+            if isinstance(item, dict) and str(item.get("step_id") or "")
+        }
+        unknown_fields: dict[str, set[str]] = {}
+        for resource in resources:
+            for consumer in resource.consumers:
+                owner, separator, field = str(consumer).partition(".")
+                if separator and owner not in known:
+                    unknown_fields.setdefault(owner, set()).add(field)
+        nginx_ids = [
+            str(item.get("step_id") or "") for item in changes
+            if isinstance(item, dict)
+            and re.search(
+                r"nginx",
+                "%s %s" % (item.get("title") or "", item.get("objective") or ""),
+                re.I,
+            )
+        ]
+        replacements = {}
+        nginx_fields = {
+            "config_name", "site_name", "proxy_pass", "listen", "listen_port",
+            "nginx_port", "http_status", "enabled_path", "nginx_config_path",
+        }
+        if len(nginx_ids) == 1:
+            for owner, fields in unknown_fields.items():
+                if fields.intersection(nginx_fields):
+                    replacements[owner] = nginx_ids[0]
+        for resource in resources:
+            resource.consumers = [
+                "%s.%s" % (replacements.get(owner, owner), field)
+                if separator else str(consumer)
+                for consumer in resource.consumers
+                for owner, separator, field in [str(consumer).partition(".")]
+            ]
 
     @staticmethod
     def _normalize_core_resource_consumers(
