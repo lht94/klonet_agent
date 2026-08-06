@@ -653,6 +653,7 @@ class PrivilegedExecutionAgent:
             raw_ids.append(raw_id)
         items = _collapse_redundant_container_starts(items)
         items = _drop_nginx_activation_from_prepare(items, semantic_step)
+        items = _collapse_redundant_nginx_activations(items, semantic_step)
         _remove_outer_semantic_dependencies(items, semantic_step.depends_on)
         items = _topologically_order_implementation_items(items)
         raw_ids = [
@@ -1296,6 +1297,10 @@ class PrivilegedExecutionAgent:
             args,
             plan_resources or [],
         )
+        args = _infer_semantic_action_args(action, args, semantic_step)
+        problem = _validate_action_evidence(action, args, grounded_context)
+        if problem:
+            raise ValueError(problem)
         missing = [
             key
             for key in REQUIRED_ACTION_ARGS.get(action, ())
@@ -2547,6 +2552,55 @@ def _collapse_redundant_container_starts(
     return normalized
 
 
+def _collapse_redundant_nginx_activations(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """One semantic Nginx activation compiles to exactly one reload action."""
+
+    semantic_text = "%s %s" % (semantic_step.title, semantic_step.objective)
+    if not (
+        re.search(r"nginx", semantic_text, re.I)
+        and re.search(r"\b(?:activate|reload|restart)\b|激活|重载|重新加载", semantic_text, re.I)
+    ):
+        return items
+    activation_ids = []
+    for index, item in enumerate(items, start=1):
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if re.search(r"nginx", text, re.I) and re.search(
+            r"\b(?:reload|restart)\b|重载|重新加载", text, re.I
+        ):
+            activation_ids.append(
+                _safe_implementation_step_id(
+                    item.get("id"), fallback="step-%s" % index
+                )
+            )
+    if len(activation_ids) <= 1:
+        return items
+    keeper = activation_ids[0]
+    replacements = {item_id: keeper for item_id in activation_ids[1:]}
+    normalized = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        if item_id in replacements:
+            continue
+        dependencies = item.get("depends_on")
+        if isinstance(dependencies, list):
+            rewired = []
+            for dependency in dependencies:
+                target = replacements.get(
+                    _safe_implementation_step_id(dependency, fallback=""),
+                    _safe_implementation_step_id(dependency, fallback=""),
+                )
+                if target and target != item_id and target not in rewired:
+                    rewired.append(target)
+            item["depends_on"] = rewired
+        normalized.append(item)
+    return normalized
+
+
 def _deterministic_klonet_config_items(
     plan: PrivilegedPlan,
     semantic_step: PrivilegedStep,
@@ -3324,6 +3378,33 @@ def _validate_action_contract_consistency(
     return ""
 
 
+def _validate_action_evidence(
+    action: str,
+    args: dict[str, Any],
+    grounded_context: GroundedPlanContext | None,
+) -> str:
+    """Require container images to come from the Docker image Discovery record."""
+
+    if action != "create_docker_container" or grounded_context is None:
+        return ""
+    evidence = str(grounded_context.environment_evidence or "")
+    if "inspect_docker_images" not in evidence:
+        return "docker_image_evidence_missing"
+    image = str(args.get("image") or "").strip()
+    if not image:
+        return "docker_image_missing"
+    repository, separator, tag = image.rpartition(":")
+    if not separator or "/" in tag:
+        repository, tag = image, "latest"
+    pattern = r"(?m)^%s\s+%s(?:\s|$)" % (
+        re.escape(repository),
+        re.escape(tag),
+    )
+    if re.search(pattern, evidence) is None:
+        return "docker_image_not_observed=%s" % image
+    return ""
+
+
 def _normalize_resolved_resource_semantic_step(
     step: PrivilegedStep,
     resources: list[PlanResource],
@@ -3692,6 +3773,36 @@ def _infer_structural_action_args(
         ):
             compiled["base_class"] = "CommonConfig"
             break
+    return compiled
+
+
+def _infer_semantic_action_args(
+    action: str,
+    args: dict[str, Any],
+    step: PrivilegedStep,
+) -> dict[str, Any]:
+    """Compile identifiers and service policy stated by the semantic change."""
+
+    compiled = dict(args)
+    if action != "create_docker_container":
+        return compiled
+    text = " ".join(
+        [step.title, step.objective, step.reason, *step.expected_changes]
+    )
+    service = next(
+        (item for item in ("mysql", "redis", "rabbitmq") if item in text.lower()),
+        "",
+    )
+    names = re.findall(
+        r"\b[A-Za-z0-9][A-Za-z0-9_.-]{0,70}[-_]"
+        r"(?:mysql|redis|rabbitmq)\b",
+        text,
+        re.I,
+    )
+    if names:
+        compiled["name"] = names[0]
+    if service == "rabbitmq":
+        compiled.pop("credential_source", None)
     return compiled
 
 

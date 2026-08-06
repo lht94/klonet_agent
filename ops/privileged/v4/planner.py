@@ -592,18 +592,28 @@ class V4ChangePlannerAgent:
         steps = self._steps(data.get("changes"), bundle)
         risk = max(steps, key=lambda item: RISK_LEVELS.index(item.risk)).risk
         assumptions = data.get("assumptions")
-        return V4PlanningOutcome(
-            status="ready",
-            plan=ChangePlanV4.new(
-                goal=goal,
-                risk=risk,
-                steps=steps,
-                resources=resources,
-                assumptions=[str(item) for item in assumptions]
-                if isinstance(assumptions, list)
-                else [],
-            ),
+        plan = ChangePlanV4.new(
+            goal=goal,
+            risk=risk,
+            steps=steps,
+            resources=resources,
+            assumptions=[str(item) for item in assumptions]
+            if isinstance(assumptions, list)
+            else [],
         )
+        if self._plan_needs_docker_images(plan) and not self._has_docker_images(bundle):
+            return V4PlanningOutcome(
+                status="need_evidence",
+                candidate_plan=plan,
+                probe_requests=[
+                    ProbeRequest(
+                        "docker_images",
+                        {},
+                        "select an already installed image for each new container",
+                    )
+                ],
+            )
+        return V4PlanningOutcome(status="ready", plan=plan)
 
     @staticmethod
     def _normalize_postcondition_args(data: dict[str, Any]) -> None:
@@ -1012,7 +1022,42 @@ class V4ChangePlannerAgent:
                 reason="candidate ports became occupied: %s"
                 % ",".join(str(item) for item in occupied),
             )
+        if (
+            V4ChangePlannerAgent._plan_needs_docker_images(candidate)
+            and not V4ChangePlannerAgent._has_docker_images(bundle)
+        ):
+            return V4PlanningOutcome(
+                status="need_evidence",
+                candidate_plan=candidate,
+                probe_requests=[
+                    ProbeRequest(
+                        "docker_images",
+                        {},
+                        "select an already installed image for each new container",
+                    )
+                ],
+            )
         return V4PlanningOutcome(status="ready", plan=candidate)
+
+    @staticmethod
+    def _plan_needs_docker_images(plan: ChangePlanV4) -> bool:
+        return any(
+            re.search(
+                r"\b(?:docker\s+)?container\b|容器",
+                "%s %s" % (step.title, step.objective),
+                re.I,
+            )
+            for step in plan.steps
+        )
+
+    @staticmethod
+    def _has_docker_images(bundle: EvidenceBundle) -> bool:
+        return any(
+            record.request.probe == "docker_images"
+            and record.status == "available"
+            and "inspect_docker_images" in record.output
+            for record in bundle.records
+        )
 
     @staticmethod
     def _ready_contract_errors(

@@ -111,9 +111,11 @@ class FakePlanner:
 class FakeBinder:
     def __init__(self):
         self.calls = 0
+        self.kwargs = []
 
     def bind(self, plan, **kwargs):
         self.calls += 1
+        self.kwargs.append(kwargs)
         plan.status = "awaiting_confirmation"
         return plan
 
@@ -179,6 +181,28 @@ def test_submit_binds_and_persists_but_never_executes_before_confirmation(tmp_pa
     assert "deploy isolated instance" in result.message
     assert "registered_action: service_control" in result.message
     assert "exit_code_zero" in result.message
+
+
+def test_submit_passes_collected_discovery_evidence_to_binding(tmp_path):
+    from klonet_agent.ops.privileged.v4.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+
+    workflow, _, binder, _, _, _ = _workflow(tmp_path, _change_plan())
+    bundle = EvidenceBundle(goal="deploy")
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("docker_images", {}, "select image"),
+            "inspect_docker_images\nredis latest sha256:a sha256:b now 1MB",
+        )
+    )
+
+    workflow.submit("deploy", evidence_bundle=bundle, evidence_conclusion=object())
+
+    context = binder.kwargs[0]["grounded_context"]
+    assert "inspect_docker_images" in context.environment_evidence
 
 
 def test_confirmation_rejects_stale_hash_without_execution(tmp_path):

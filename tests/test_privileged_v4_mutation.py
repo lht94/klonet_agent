@@ -88,6 +88,48 @@ def test_change_plan_authorization_hash_covers_resources_steps_and_bindings():
     assert plan.is_authorized is False
 
 
+def test_container_plan_requires_docker_image_discovery_before_binding():
+    from klonet_agent.ops.privileged.v4.contracts import (
+        ChangePlanV4,
+        ChangeStepV4,
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    plan = ChangePlanV4(
+        plan_id="priv-v4-images",
+        goal="deploy isolated redis",
+        risk="high",
+        steps=[
+            ChangeStepV4(
+                step_id="redis",
+                title="Provision isolated Redis container v4e2e-redis",
+                objective="Create the new Redis container",
+                risk="high",
+                expected_changes=["container is running"],
+                postconditions=[
+                    {"checker": "container_running", "args": {"container": "v4e2e-redis"}}
+                ],
+            )
+        ],
+    )
+    bundle = EvidenceBundle(goal=plan.goal)
+
+    missing = V4ChangePlannerAgent.finalize_candidate(plan, bundle)
+
+    assert missing.status == "need_evidence"
+    assert missing.probe_requests[0].probe == "docker_images"
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest("docker_images", {}, "select an installed image"),
+            "inspect_docker_images\nredis latest sha256:a sha256:b now 1MB",
+        )
+    )
+    assert V4ChangePlannerAgent.finalize_candidate(plan, bundle).status == "ready"
+
+
 def test_v4_store_uses_separate_directory_and_recovers_without_reexecution(tmp_path):
     from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
     from klonet_agent.ops.privileged.v4.store import V4PlanStore

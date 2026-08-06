@@ -440,6 +440,83 @@ def test_container_micro_plan_collapses_redundant_start_after_create():
     assert normalized[1]["depends_on"] == ["create"]
 
 
+def test_container_binding_compiles_semantic_name_and_credential_policy():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_semantic_action_args,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="rabbit",
+        title="Provision isolated RabbitMQ container v4e2e-rabbitmq",
+        objective="Create and start the new v4e2e-rabbitmq container",
+        expected_changes=["v4e2e-rabbitmq is running"],
+        risk="high",
+    )
+
+    compiled = _infer_semantic_action_args(
+        "create_docker_container",
+        {
+            "name": "v4e2e",
+            "image": "rabbitmq:latest",
+            "credential_source": {"path": "/srv/config.py", "service": "redis"},
+        },
+        semantic,
+    )
+
+    assert compiled["name"] == "v4e2e-rabbitmq"
+    assert "credential_source" not in compiled
+
+
+def test_container_binding_requires_selected_image_in_discovery_evidence():
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_evidence,
+    )
+
+    grounded = GroundedPlanContext(
+        knowledge_evidence="",
+        environment_evidence=(
+            "inspect_docker_images\n"
+            "REPOSITORY TAG DIGEST IMAGE ID CREATED SIZE\n"
+            "rabbitmq latest sha256:a sha256:b now 1MB\n"
+        ),
+        action_catalog="",
+    )
+
+    assert _validate_action_evidence(
+        "create_docker_container", {"image": "rabbitmq:latest"}, grounded
+    ) == ""
+    assert "not_observed" in _validate_action_evidence(
+        "create_docker_container", {"image": "rabbitmq:3-management"}, grounded
+    )
+
+
+def test_nginx_activation_micro_plan_collapses_duplicate_reloads():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _collapse_redundant_nginx_activations,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="activate-nginx",
+        title="Reload Nginx to activate klonet-v4-e2e",
+        objective="Validate and reload Nginx after the application starts",
+        expected_changes=["site is active"],
+        risk="medium",
+    )
+    items = [
+        {"id": "validate", "title": "Validate and reload Nginx", "depends_on": []},
+        {"id": "reload", "title": "Reload Nginx", "depends_on": ["validate"]},
+        {"id": "verify", "title": "Verify Nginx health", "depends_on": ["reload"]},
+    ]
+
+    normalized = _collapse_redundant_nginx_activations(items, semantic)
+
+    assert [item["id"] for item in normalized] == ["validate", "verify"]
+    assert normalized[1]["depends_on"] == ["validate"]
+
+
 def test_nginx_prepare_micro_plan_does_not_activate_service():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (

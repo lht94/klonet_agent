@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
+from klonet_agent.ops.privileged.context import GroundedPlanContext
 from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
 from klonet_agent.ops.privileged.v4.coordinator import V4WorkflowResult
 from klonet_agent.ops.privileged.v4.binding import V4BindingError
@@ -112,8 +113,12 @@ class V4MutationWorkflow:
                 evidence=evidence_bundle,
             )
         self.store.save(outcome.plan)
+        grounded_context = self._binding_context(evidence_bundle)
         try:
-            plan = self.binder.bind(outcome.plan)
+            plan = self.binder.bind(
+                outcome.plan,
+                grounded_context=grounded_context,
+            )
         except V4BindingError as exc:
             outcome = self.planner.plan(
                 goal,
@@ -130,7 +135,10 @@ class V4MutationWorkflow:
                 )
             self.store.save(outcome.plan)
             try:
-                plan = self.binder.bind(outcome.plan)
+                plan = self.binder.bind(
+                    outcome.plan,
+                    grounded_context=grounded_context,
+                )
             except V4BindingError as final_error:
                 outcome.plan.status = "blocked"
                 self.store.save(outcome.plan)
@@ -150,6 +158,28 @@ class V4MutationWorkflow:
             self._confirmation_message(plan),
             plan=plan,
             evidence=evidence_bundle,
+        )
+
+    @staticmethod
+    def _binding_context(evidence_bundle: Any) -> GroundedPlanContext | None:
+        """Expose only collected read-only evidence to the capability binder."""
+
+        records = getattr(evidence_bundle, "records", None)
+        if not isinstance(records, list):
+            return None
+        sections = []
+        for record in records:
+            output = str(getattr(record, "output", "") or "").strip()
+            if not output:
+                continue
+            evidence_id = str(getattr(record, "evidence_id", "") or "evidence")
+            sections.append("[%s]\n%s" % (evidence_id, output))
+        if not sections:
+            return None
+        return GroundedPlanContext(
+            knowledge_evidence="V4 Binding uses the frozen semantic plan contract.",
+            environment_evidence=redact_sensitive_text("\n\n".join(sections))[:24000],
+            action_catalog="V4 audited Action/Shell registry",
         )
 
     def confirm(self, plan_id: str, content_hash: str) -> V4WorkflowResult:
