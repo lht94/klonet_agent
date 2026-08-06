@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
@@ -19,6 +20,7 @@ from klonet_agent.tools.environment import redact_sensitive_text
 
 
 Checker = Callable[[Dict[str, Any], Optional[ExecutionEvidence]], CheckResult]
+_STATIC_ATTRIBUTE_UNAVAILABLE = object()
 
 CHECKER_ARGUMENT_HINTS = {
     "exit_code_zero": "none",
@@ -724,12 +726,69 @@ class DefaultCheckerRegistry:
             "print(json.dumps(obj,ensure_ascii=False,sort_keys=True))\n"
             "raise SystemExit(0 if obj==expected else 1)\n"
         )
-        return self._command_check(
+        result = self._command_check(
             "python_attribute_equals",
             [python, "-c", script, module, attribute, expected_json],
             cwd=cwd,
             expected="%s.%s == %s" % (module, attribute, expected_json),
         )
+        if result.status == "passed" or cwd is None:
+            return result
+        static = self._static_python_attribute(cwd, module, attribute)
+        if static is _STATIC_ATTRIBUTE_UNAVAILABLE:
+            return result
+        matched = static == args["expected"]
+        return CheckResult(
+            "python_attribute_equals",
+            "passed" if matched else "failed",
+            expected="%s.%s == %s" % (module, attribute, expected_json),
+            observed=(
+                "%s (static literal)"
+                % json.dumps(static, ensure_ascii=False, sort_keys=True)
+            ),
+            evidence="module import failed; compared literal assignment without executing imports",
+        )
+
+    @staticmethod
+    def _static_python_attribute(cwd, module, attribute):
+        """Resolve a literal module/class attribute without importing the module."""
+
+        module_path = Path(cwd).joinpath(*module.split(".")).with_suffix(".py")
+        try:
+            tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, SyntaxError):
+            return _STATIC_ATTRIBUTE_UNAVAILABLE
+        body = tree.body
+        parts = attribute.split(".")
+        for name in parts[:-1]:
+            classes = [
+                node for node in body
+                if isinstance(node, ast.ClassDef) and node.name == name
+            ]
+            if not classes:
+                return _STATIC_ATTRIBUTE_UNAVAILABLE
+            body = classes[-1].body
+        target_name = parts[-1]
+        for node in reversed(body):
+            value = None
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == target_name
+                for target in node.targets
+            ):
+                value = node.value
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == target_name
+            ):
+                value = node.value
+            if value is None:
+                continue
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, TypeError):
+                return _STATIC_ATTRIBUTE_UNAVAILABLE
+        return _STATIC_ATTRIBUTE_UNAVAILABLE
 
     def _package_version(self, args, evidence):
         del evidence

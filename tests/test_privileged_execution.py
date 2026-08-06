@@ -297,6 +297,40 @@ def test_python_attribute_checker_compares_grounded_class_value(tmp_path):
     assert registry.run(contract).status == "failed"
 
 
+def test_python_attribute_checker_falls_back_to_static_literal_when_import_fails(
+    tmp_path,
+):
+    import sys
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    package = tmp_path / "demo_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "config.py").write_text(
+        "import dependency_that_is_not_installed\n"
+        "class DemoConfig:\n"
+        "    master_ip = '127.0.0.1'\n",
+        encoding="utf-8",
+    )
+    registry = DefaultCheckerRegistry()
+    contract = {
+        "checker": "python_attribute_equals",
+        "args": {
+            "module": "demo_pkg.config",
+            "attribute": "DemoConfig.master_ip",
+            "expected": "127.0.0.1",
+            "python_executable": sys.executable,
+            "cwd": str(tmp_path),
+        },
+    }
+
+    result = registry.run(contract)
+
+    assert result.status == "passed"
+    assert result.observed == '"127.0.0.1" (static literal)'
+
+
 def test_checker_bug_is_reported_unavailable_instead_of_escaping():
     from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
 

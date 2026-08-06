@@ -184,7 +184,16 @@ class V4MutationWorkflow:
 
     def confirm(self, plan_id: str, content_hash: str) -> V4WorkflowResult:
         plan = self.store.load(plan_id)
-        if plan.status != "awaiting_confirmation" or content_hash != plan.content_hash:
+        if content_hash != plan.content_hash:
+            return V4WorkflowResult(
+                True,
+                "confirmation_rejected",
+                "V4 confirmation hash or plan state does not match; nothing executed.",
+                plan=plan,
+            )
+        if plan.status == "paused" and plan.is_authorized:
+            return self._resume_verified_state(plan)
+        if plan.status != "awaiting_confirmation":
             return V4WorkflowResult(
                 True,
                 "confirmation_rejected",
@@ -193,6 +202,46 @@ class V4MutationWorkflow:
             )
         self._approve_shell_artifacts(plan)
         plan.authorize()
+        self.store.save(plan)
+        return self._execute(plan)
+
+    def _resume_verified_state(self, plan: ChangePlanV4) -> V4WorkflowResult:
+        """Resume an authorized plan only after checking paused effects in place."""
+
+        verification_plan = self._verification_plan(plan)
+        for change in plan.steps:
+            execution_steps = list(self._execution_steps(change))
+            for step in execution_steps:
+                if step.status not in {"paused", "execution_unknown"}:
+                    continue
+                decision = self.verifier.verify_recovered_step(
+                    verification_plan,
+                    step,
+                )
+                if decision.status != "passed":
+                    step.observation = str(
+                        getattr(decision, "reason", "current state is not verified")
+                    )
+                    change.status = plan.status = "paused"
+                    self.store.save(plan)
+                    return V4WorkflowResult(
+                        True,
+                        "paused",
+                        step.observation,
+                        plan=plan,
+                        verification=decision,
+                    )
+                step.status = "completed"
+                step.observation = str(
+                    getattr(decision, "reason", "current state verified")
+                )
+                if change.implementation_plan is None:
+                    change.status = "completed"
+                    change.observation = step.observation
+                self.store.save(plan)
+            if change.implementation_plan is not None and change.status == "paused":
+                change.status = "pending"
+        plan.status = "approved"
         self.store.save(plan)
         return self._execute(plan)
 

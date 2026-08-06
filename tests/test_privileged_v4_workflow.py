@@ -140,6 +140,10 @@ class FakeVerifier:
         self.steps.append(step.step_id)
         return SimpleNamespace(status=self.status, reason=self.status)
 
+    def verify_recovered_step(self, plan, step):
+        self.steps.append("recovered:" + step.step_id)
+        return SimpleNamespace(status=self.status, reason=self.status)
+
 
 class RaisingVerifier:
     def verify_step(self, plan, step):
@@ -248,6 +252,28 @@ def test_failed_verification_pauses_without_retrying_execution(tmp_path):
     assert result.kind == "paused"
     assert executor.steps == ["deploy"]
     assert store.load(submitted.plan.plan_id).steps[0].status == "paused"
+
+
+def test_exact_reconfirmation_recovers_current_state_without_reexecuting(tmp_path):
+    workflow, _, _, store, executor, verifier = _workflow(
+        tmp_path, _change_plan(hierarchical=True), verifier_status="failed"
+    )
+    submitted = workflow.submit(
+        "deploy", evidence_bundle=object(), evidence_conclusion=object()
+    )
+    plan_id = submitted.plan.plan_id
+    content_hash = submitted.plan.content_hash
+    paused = workflow.confirm(plan_id, content_hash)
+    assert paused.kind == "paused"
+    assert executor.steps == ["deploy-1"]
+
+    verifier.status = "passed"
+    resumed = workflow.confirm(plan_id, content_hash)
+
+    assert resumed.kind == "completed"
+    assert executor.steps == ["deploy-1"]
+    assert "recovered:deploy-1" in verifier.steps
+    assert store.load(plan_id).status == "completed"
 
 
 def test_control_command_requires_exact_v4_syntax(tmp_path):
