@@ -242,7 +242,7 @@ def test_nginx_install_failure_before_copy_reports_no_environment_change():
     assert "environment_changed=false" in result.output
 
 
-def test_reload_nginx_activates_inactive_service(monkeypatch):
+def test_reload_nginx_starts_inactive_service(monkeypatch):
     from klonet_agent.ops.privileged.action_runner import (
         DirectPrivilegedActionRunner,
     )
@@ -253,12 +253,18 @@ def test_reload_nginx_activates_inactive_service(monkeypatch):
         return {
             "nginx": "/usr/sbin/nginx",
             "systemctl": "/usr/bin/systemctl",
+            "pgrep": "/usr/bin/pgrep",
         }.get(command)
 
     def command_runner(argv, **kwargs):
         del kwargs
         calls.append(list(argv[1:] if argv and argv[0] == "sudo" else argv))
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            argv,
+            1 if "pgrep" in str(argv[0]) else 0,
+            stdout="",
+            stderr="",
+        )
 
     monkeypatch.setattr(
         "klonet_agent.ops.privileged.action_runner.shutil.which",
@@ -272,9 +278,44 @@ def test_reload_nginx_activates_inactive_service(monkeypatch):
     assert result.status == "completed"
     assert calls == [
         ["/usr/sbin/nginx", "-t"],
-        ["/usr/bin/systemctl", "reload-or-restart", "nginx"],
+        ["/usr/bin/pgrep", "-f", "^nginx: master process"],
+        ["/usr/bin/systemctl", "start", "nginx"],
     ]
-    assert "activation=reload-or-restart" in result.output
+    assert "activation=start" in result.output
+
+
+def test_reload_nginx_signals_existing_master(monkeypatch):
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    calls = []
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.action_runner.shutil.which",
+        lambda command: {
+            "nginx": "/usr/sbin/nginx",
+            "systemctl": "/usr/bin/systemctl",
+            "pgrep": "/usr/bin/pgrep",
+        }.get(command),
+    )
+
+    def command_runner(argv, **kwargs):
+        del kwargs
+        calls.append(list(argv[1:] if argv and argv[0] == "sudo" else argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step("reload_nginx", {})
+    )
+
+    assert result.status == "completed"
+    assert calls == [
+        ["/usr/sbin/nginx", "-t"],
+        ["/usr/bin/pgrep", "-f", "^nginx: master process"],
+        ["/usr/sbin/nginx", "-s", "reload"],
+    ]
+    assert "activation=signal-reload" in result.output
 
 
 def test_sync_directory_refuses_nonempty_destination(tmp_path):

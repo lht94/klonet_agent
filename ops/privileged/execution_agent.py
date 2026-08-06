@@ -3998,6 +3998,14 @@ def _canonical_action_postconditions(
                 }
             )
         return checks
+    if action == "reload_nginx":
+        return [
+            {"checker": "nginx_config_valid", "args": {}},
+            {
+                "checker": "process_running",
+                "args": {"pattern": "^nginx: master process"},
+            },
+        ]
     if action != "set_python_class_attribute":
         return checks
     existing = next(

@@ -39,6 +39,38 @@ def test_v4_confirmation_redacts_registered_action_credentials():
     assert "[REDACTED]" in message
 
 
+def test_reload_nginx_verification_accepts_non_systemd_master_process():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    step = PrivilegedStep(
+        step_id="reload-nginx",
+        title="reload nginx",
+        postconditions=[
+            {"checker": "service_active", "args": {"service": "nginx"}}
+        ],
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="reload_nginx",
+            args={},
+            risk="medium",
+        ),
+    )
+
+    verification = V4MutationWorkflow._verification_step(step)
+
+    assert verification.postconditions == [
+        {"checker": "nginx_config_valid", "args": {}},
+        {
+            "checker": "process_running",
+            "args": {"pattern": "^nginx: master process"},
+        },
+    ]
+
+
 def _change_plan(*, hierarchical=False):
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,

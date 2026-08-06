@@ -1463,13 +1463,24 @@ class DirectPrivilegedActionRunner:
                 % _one_line(check.stderr),
                 "inspect_nginx_routes",
             )
+        pgrep = shutil.which("pgrep")
+        master_running = False
+        if pgrep:
+            process_check = self._command(
+                [pgrep, "-f", "^nginx: master process"],
+                timeout=min(step.timeout, 5),
+            )
+            master_running = process_check.returncode == 0
         systemctl = shutil.which("systemctl")
-        activation = "reload-or-restart" if systemctl else "signal-reload"
-        activation_command = (
-            [systemctl, "reload-or-restart", "nginx"]
-            if systemctl
-            else [nginx, "-s", "reload"]
-        )
+        if master_running:
+            activation = "signal-reload"
+            activation_command = [nginx, "-s", "reload"]
+        elif systemctl:
+            activation = "start"
+            activation_command = [systemctl, "start", "nginx"]
+        else:
+            activation = "start"
+            activation_command = [nginx]
         reload_result = self._command(
             _sudo_if_needed(activation_command),
             timeout=min(step.timeout, 30),
