@@ -326,18 +326,7 @@ class V4MutationWorkflow:
                 step.observation = str(getattr(decision, "reason", "passed"))
                 self.store.save(plan)
             if change.implementation_plan is not None:
-                semantic_evidence = change.implementation_plan.steps[-1].evidence
-                semantic_step = PrivilegedStep(
-                    step_id=change.step_id,
-                    title=change.title,
-                    objective=change.objective,
-                    reason=change.reason,
-                    risk=change.risk,
-                    expected_changes=list(change.expected_changes),
-                    postconditions=list(change.postconditions),
-                    status="verifying",
-                    evidence=semantic_evidence,
-                )
+                semantic_step = self._semantic_verification_step(change)
                 try:
                     semantic_decision = self.verifier.verify_step(
                         verification_plan,
@@ -416,6 +405,52 @@ class V4MutationWorkflow:
             list(step.postconditions),
         )
         return candidate
+
+    @staticmethod
+    def _semantic_verification_step(change: ChangeStepV4) -> PrivilegedStep:
+        """Compose hierarchical verification from its authorized atomic bindings."""
+
+        implementation = change.implementation_plan
+        assert implementation is not None
+        atomic_steps = list(implementation.steps)
+        postconditions = list(change.postconditions)
+        config_steps = [
+            step
+            for step in atomic_steps
+            if step.execution_binding is not None
+            and step.execution_binding.kind == "registered_action"
+            and step.execution_binding.action == "set_python_class_attribute"
+        ]
+        if config_steps:
+            postconditions = []
+            for step in config_steps:
+                postconditions.extend(
+                    V4MutationWorkflow._verification_step(step).postconditions
+                )
+            first_args = config_steps[0].execution_binding.args
+            path = str(first_args.get("path") or "").strip()
+            class_name = str(first_args.get("class_name") or "").strip()
+            if path and class_name:
+                postconditions.append(
+                    {
+                        "checker": "file_contains",
+                        "args": {
+                            "path": path,
+                            "text": "PROJ_CONFIG = %s()" % class_name,
+                        },
+                    }
+                )
+        return PrivilegedStep(
+            step_id=change.step_id,
+            title=change.title,
+            objective=change.objective,
+            reason=change.reason,
+            risk=change.risk,
+            expected_changes=list(change.expected_changes),
+            postconditions=postconditions,
+            status="verifying",
+            evidence=atomic_steps[-1].evidence,
+        )
 
     @staticmethod
     def _verification_plan(plan: ChangePlanV4) -> PrivilegedPlan:

@@ -276,6 +276,53 @@ def test_exact_reconfirmation_recovers_current_state_without_reexecuting(tmp_pat
     assert store.load(plan_id).status == "completed"
 
 
+def test_semantic_config_verification_is_composed_from_atomic_bindings():
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    plan = _change_plan(hierarchical=True)
+    change = plan.steps[0]
+    step = change.implementation_plan.steps[0]
+    step.execution_binding.action = "set_python_class_attribute"
+    step.execution_binding.args = {
+        "path": "/srv/v4/vemu_config/config.py",
+        "class_name": "WtxConfig",
+        "attribute": "master_port",
+        "value": "47001",
+    }
+    step.postconditions = [
+        {
+            "checker": "python_attribute_equals",
+            "args": {
+                "module": "vemu_config.config",
+                "attribute": "master_port",
+                "expected": "47001",
+                "cwd": "/srv/v4",
+            },
+        }
+    ]
+
+    semantic = V4MutationWorkflow._semantic_verification_step(change)
+
+    assert semantic.postconditions == [
+        {
+            "checker": "python_attribute_equals",
+            "args": {
+                "module": "vemu_config.config",
+                "attribute": "WtxConfig.master_port",
+                "expected": 47001,
+                "cwd": "/srv/v4",
+            },
+        },
+        {
+            "checker": "file_contains",
+            "args": {
+                "path": "/srv/v4/vemu_config/config.py",
+                "text": "PROJ_CONFIG = WtxConfig()",
+            },
+        },
+    ]
+
+
 def test_control_command_requires_exact_v4_syntax(tmp_path):
     workflow, _, _, _, executor, _ = _workflow(tmp_path, _change_plan())
     submitted = workflow.submit("deploy", evidence_bundle=object(), evidence_conclusion=object())
