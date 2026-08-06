@@ -508,6 +508,14 @@ def test_structural_binding_compiles_pinned_clone_active_config_and_credentials(
         {"name": "v4e2e-redis", "image": "redis:7"},
         resources,
     )
+    nginx = _infer_structural_action_args(
+        "install_nginx_config",
+        {
+            "content": "server {\n  listen 47004;\n  location / {\n"
+                       "    proxy_pass http://127.0.0.1:47001;\n  }\n}",
+        },
+        resources,
+    )
 
     assert clone["operation"] == "clone_at_revision"
     assert active["assignment_name"] == "PROJ_CONFIG"
@@ -515,6 +523,8 @@ def test_structural_binding_compiles_pinned_clone_active_config_and_credentials(
         "path": "/srv/v4e2e/vemu_config/config.py",
         "service": "redis",
     }
+    assert "location = /healthz" in nginx["content"]
+    assert "proxy_pass http://127.0.0.1:47001" in nginx["content"]
 
 
 def test_micro_predecessor_can_produce_frozen_instance_root_for_validation():

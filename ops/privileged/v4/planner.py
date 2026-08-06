@@ -739,22 +739,32 @@ class V4ChangePlannerAgent:
                 postconditions = []
                 change["postconditions"] = postconditions
             port = int(listen_resource.value)
-            if any(
-                isinstance(check, dict)
-                and check.get("checker") == "http_status"
-                and re.search(
-                    r"https?://[^/:]+:%s(?:/|$)" % port,
-                    str((check.get("args") or {}).get("url") or ""),
-                    re.I,
-                )
-                for check in postconditions
-            ):
+            matching_http = next(
+                (
+                    check
+                    for check in postconditions
+                    if isinstance(check, dict)
+                    and check.get("checker") == "http_status"
+                    and re.search(
+                        r"https?://[^/:]+:%s(?:/|$)" % port,
+                        str((check.get("args") or {}).get("url") or ""),
+                        re.I,
+                    )
+                ),
+                None,
+            )
+            if matching_http is not None:
+                args = matching_http.get("args")
+                if not isinstance(args, dict):
+                    args = {}
+                    matching_http["args"] = args
+                args["url"] = "http://127.0.0.1:%s/healthz" % port
                 continue
             postconditions.append(
                 {
                     "checker": "http_status",
                     "args": {
-                        "url": "http://127.0.0.1:%s" % port,
+                        "url": "http://127.0.0.1:%s/healthz" % port,
                         "expected_status": 200,
                     },
                 }

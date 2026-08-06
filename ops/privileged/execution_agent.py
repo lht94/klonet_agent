@@ -3331,6 +3331,23 @@ def _infer_structural_action_args(
                 "path": config_path,
                 "service": service,
             }
+    if action == "install_nginx_config":
+        content = str(compiled.get("content") or "")
+        if content and "location = /healthz" not in content:
+            health = (
+                "    location = /healthz {\n"
+                "        access_log off;\n"
+                "        return 200;\n"
+                "    }\n"
+            )
+            location = re.search(r"(?m)^\s*location\s+/\s*\{", content)
+            if location is not None:
+                content = content[:location.start()] + health + content[location.start():]
+            else:
+                closing = content.rfind("}")
+                if closing >= 0:
+                    content = content[:closing] + health + content[closing:]
+            compiled["content"] = content
     if action in {
         "start_screen_component",
         "restart_screen_component",

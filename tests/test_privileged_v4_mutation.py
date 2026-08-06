@@ -1864,7 +1864,7 @@ def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
 
     assert data["changes"][0]["postconditions"][-1] == {
         "checker": "http_status",
-        "args": {"url": "http://127.0.0.1:47008", "expected_status": 200},
+        "args": {"url": "http://127.0.0.1:47008/healthz", "expected_status": 200},
     }
 
 
