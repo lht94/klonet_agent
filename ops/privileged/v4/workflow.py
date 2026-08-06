@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 from typing import Any, Iterable
 
 from klonet_agent.ops.privileged.context import GroundedPlanContext
 from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+from klonet_agent.ops.privileged.execution_agent import (
+    _canonical_action_postconditions,
+)
 from klonet_agent.ops.privileged.v4.coordinator import V4WorkflowResult
 from klonet_agent.ops.privileged.v4.binding import V4BindingError
 from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
@@ -214,10 +218,12 @@ class V4MutationWorkflow:
             for step in execution_steps:
                 if step.status not in {"paused", "execution_unknown"}:
                     continue
+                verification_step = self._verification_step(step)
                 decision = self.verifier.verify_recovered_step(
                     verification_plan,
-                    step,
+                    verification_step,
                 )
+                step.checks = list(verification_step.checks)
                 if decision.status != "passed":
                     step.observation = str(
                         getattr(decision, "reason", "current state is not verified")
@@ -287,7 +293,12 @@ class V4MutationWorkflow:
                     self.store.save(plan)
                     return V4WorkflowResult(True, "paused", "execution outcome unknown", plan=plan)
                 try:
-                    decision = self.verifier.verify_step(verification_plan, step)
+                    verification_step = self._verification_step(step)
+                    decision = self.verifier.verify_step(
+                        verification_plan,
+                        verification_step,
+                    )
+                    step.checks = list(verification_step.checks)
                 except Exception as exc:
                     step.status = "paused"
                     step.observation = "Verifier or Checker failed safely: %s" % exc
@@ -390,6 +401,21 @@ class V4MutationWorkflow:
                 execution_attempts=change.execution_attempts,
             )
         ]
+
+    @staticmethod
+    def _verification_step(step: PrivilegedStep) -> PrivilegedStep:
+        """Derive checks from the exact authorized binding without changing it."""
+
+        binding = step.execution_binding
+        if binding is None or binding.kind != "registered_action":
+            return step
+        candidate = deepcopy(step)
+        candidate.postconditions = _canonical_action_postconditions(
+            binding.action,
+            binding.args,
+            list(step.postconditions),
+        )
+        return candidate
 
     @staticmethod
     def _verification_plan(plan: ChangePlanV4) -> PrivilegedPlan:

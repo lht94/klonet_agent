@@ -1,5 +1,44 @@
 from __future__ import annotations
 
+
+def test_python_class_attribute_postcondition_is_canonicalized_from_action_args():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_postconditions,
+    )
+
+    checks = _canonical_action_postconditions(
+        "set_python_class_attribute",
+        {
+            "path": "/srv/v4/vemu_config/config.py",
+            "class_name": "WtxConfig",
+            "attribute": "master_port",
+            "value": 47001,
+        },
+        [
+            {
+                "checker": "python_attribute_equals",
+                "args": {
+                    "module": "vemu_config.config",
+                    "attribute": "master_port",
+                    "expected": "47001",
+                    "cwd": "/srv/v4",
+                },
+            }
+        ],
+    )
+
+    assert checks == [
+        {
+            "checker": "python_attribute_equals",
+            "args": {
+                "module": "vemu_config.config",
+                "attribute": "WtxConfig.master_port",
+                "expected": 47001,
+                "cwd": "/srv/v4",
+            },
+        }
+    ]
+
 import pytest
 
 

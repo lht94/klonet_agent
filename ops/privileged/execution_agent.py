@@ -1381,6 +1381,7 @@ class PrivilegedExecutionAgent:
         )
         checks = self._valid_checks(data.get("postconditions"))
         checks = checks or _default_action_postconditions(action, args)
+        checks = _canonical_action_postconditions(action, args, checks)
         if not checks:
             checks = [{"checker": "exit_code_zero", "args": {}}]
         problem = _validate_action_postcondition_fit(action, args, checks)
@@ -3963,6 +3964,42 @@ def _infer_structural_action_args(
             compiled["base_class"] = "CommonConfig"
             break
     return compiled
+
+
+def _canonical_action_postconditions(
+    action: str,
+    args: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Ground structural Action checks in the finalized, typed Action args."""
+
+    if action != "set_python_class_attribute":
+        return checks
+    existing = next(
+        (
+            item.get("args")
+            for item in checks
+            if item.get("checker") == "python_attribute_equals"
+            and isinstance(item.get("args"), dict)
+        ),
+        {},
+    )
+    check_args = dict(existing)
+    path = Path(str(args.get("path") or ""))
+    if not str(check_args.get("module") or "").strip() and path.suffix == ".py":
+        check_args["module"] = "%s.%s" % (path.parent.name, path.stem)
+    if not str(check_args.get("cwd") or "").strip() and path.is_absolute():
+        check_args["cwd"] = str(path.parent.parent)
+    attribute = str(args.get("attribute") or "").strip()
+    class_name = str(args.get("class_name") or "").strip()
+    check_args["attribute"] = (
+        "%s.%s" % (class_name, attribute) if class_name else attribute
+    )
+    check_args["expected"] = args.get("value")
+    python = str(args.get("python_executable") or "").strip()
+    if python:
+        check_args["python_executable"] = python
+    return [{"checker": "python_attribute_equals", "args": check_args}]
 
 
 def _infer_semantic_action_args(
