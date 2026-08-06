@@ -1831,8 +1831,51 @@ def test_isolation_contract_distinguishes_negated_and_positive_reuse_claims():
         _bundle_and_conclusion()[0],
     )
 
+    comparative = V4ChangePlannerAgent._ready_contract_errors(
+        {
+            "changes": [],
+            "assumptions": [
+                "Create a dedicated Redis container rather than reusing the shared existing container."
+            ],
+        },
+        "deploy an isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
     assert "isolated deployment cannot reuse existing resources" not in negative
+    assert "isolated deployment cannot reuse existing resources" not in comparative
     assert "isolated deployment cannot reuse existing resources" in positive
+
+
+def test_isolation_contract_does_not_classify_celery_consumer_as_stateful_provisioning():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    errors = V4ChangePlannerAgent._ready_contract_errors(
+        {
+            "changes": [
+                {
+                    "step_id": "celery",
+                    "title": "Start celery Screen session",
+                    "objective": "Connect celery to the isolated Redis and RabbitMQ endpoints",
+                    "depends_on": [],
+                    "expected_changes": ["celery starts"],
+                    "postconditions": [
+                        {"checker": "screen_session_exists", "args": {"name": "v4e2e_c"}}
+                    ],
+                }
+            ],
+            "assumptions": [],
+        },
+        "deploy an isolated instance",
+        [],
+        _bundle_and_conclusion()[0],
+    )
+
+    assert not any(
+        error == "isolated stateful service must use a new named container=celery"
+        for error in errors
+    )
 
 
 def test_isolated_application_start_must_depend_on_stateful_provisioning():

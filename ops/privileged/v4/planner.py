@@ -1775,21 +1775,22 @@ class V4ChangePlannerAgent:
             stateful_candidates = []
             for item in indexed_changes:
                 primary = primary_change_text(item)
-                names_service = re.search(
-                    r"mysql|redis|rabbitmq|数据库|消息队列", primary, re.I
+                title_text = str(item.get("title") or "")
+                names_service_in_title = re.search(
+                    r"mysql|redis|rabbitmq|数据库|消息队列", title_text, re.I
                 )
                 provisions_group = (
                     re.search(r"stateful|有状态", primary, re.I)
                     and re.search(r"provision\b|create\b|部署|创建", primary, re.I)
                     and re.search(r"containers?\b|容器", primary, re.I)
                 )
-                mutates_service = re.search(
+                mutates_named_service = names_service_in_title and re.search(
                     r"provision\b|create\b|start\b|run\b|container\b|"
                     r"部署|创建|启动|容器",
                     primary,
                     re.I,
                 )
-                if (names_service or provisions_group) and mutates_service:
+                if mutates_named_service or provisions_group:
                     stateful_candidates.append(item)
             stateful = [
                 item
@@ -2229,9 +2230,17 @@ class V4ChangePlannerAgent:
 
     @staticmethod
     def _strip_negated_reuse_claims(text: str) -> str:
-        return re.sub(
+        text = re.sub(
             r"(?:never|no|not|without|do\s+not|must\s+not|禁止|不要|不得|不应|不复用)"
             r"[^.!?。！？]{0,30}(?:reuse|share|复用|共享)"
+            r"[^.!?。！？]{0,40}(?:existing|container|现有|容器)",
+            "",
+            text,
+            flags=re.I,
+        )
+        return re.sub(
+            r"(?:rather\s+than|instead\s+of)"
+            r"[^.!?。！？]{0,30}(?:reus\w*|shar\w*|复用|共享)"
             r"[^.!?。！？]{0,40}(?:existing|container|现有|容器)",
             "",
             text,
