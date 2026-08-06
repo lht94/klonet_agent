@@ -772,6 +772,67 @@ def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
     assert resources[1].consumers == ["nginx.instance_root"]
 
 
+def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "resources": [
+            {
+                "name": "instance_identifier",
+                "kind": "identifier",
+                "status": "frozen",
+                "role": "instance_identifier",
+                "value": "v4e2e",
+                "source": "user_input",
+                "consumers": ["mysql.container"],
+            },
+            {
+                "name": "mysql_container",
+                "kind": "identifier",
+                "status": "frozen",
+                "role": "container_name",
+                "value": "v4e2e_mysql",
+                "source": "derived",
+                "consumers": ["mysql.container_name"],
+            },
+        ],
+        "changes": [
+            {
+                "step_id": "mysql",
+                "title": "Provision v4e2e_mysql container",
+                "objective": "Create v4e2e_mysql",
+                "postconditions": [
+                    {"checker": "container_running", "args": {"name": "v4e2e_mysql"}}
+                ],
+            },
+            {
+                "step_id": "master",
+                "title": "Start master Screen component",
+                "objective": "Launch Screen session v4e2e_m",
+                "postconditions": [],
+            },
+        ],
+    }
+
+    V4ChangePlannerAgent._normalize_instance_container_names(data)
+    resources = [
+        PlanResource.from_dict(item) for item in data["resources"]
+    ] + [
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root",
+            "/home/lzl/klonet_v4_e2e", "user_input",
+        )
+    ]
+    resources = V4ChangePlannerAgent._normalize_derived_resources(data, resources)
+
+    assert data["resources"][1]["value"] == "v4e2e-mysql"
+    assert data["changes"][0]["postconditions"][0]["args"]["name"] == "v4e2e-mysql"
+    mains = next(item for item in resources if item.role == "runtime_mains_root")
+    assert mains.value == "/home/lzl/klonet_v4_e2e/mains"
+    assert mains.consumers == ["master.project_root"]
+
+
 @pytest.mark.parametrize("alias", ["candidates", "candidate_ports"])
 def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

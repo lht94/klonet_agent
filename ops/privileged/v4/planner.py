@@ -535,6 +535,7 @@ class V4ChangePlannerAgent:
             )
         if status != "ready":
             raise ValueError("planner status must be need_evidence, ready, or blocked")
+        self._normalize_instance_container_names(data)
         self._normalize_semantic_dependencies(data)
         self._normalize_change_order(data)
         self._normalize_verification_changes(data)
@@ -646,6 +647,46 @@ class V4ChangePlannerAgent:
                         args[target] = args[source]
                     if source != target and source in args:
                         del args[source]
+
+    @staticmethod
+    def _normalize_instance_container_names(data: dict[str, Any]) -> None:
+        """Compile instance service names to the canonical hyphenated form."""
+
+        raw_resources = data.get("resources")
+        if not isinstance(raw_resources, list):
+            return
+        instance = next(
+            (
+                str(item.get("value") or "").strip()
+                for item in raw_resources
+                if isinstance(item, dict)
+                and str(item.get("role") or "") == "instance_identifier"
+            ),
+            "",
+        )
+        if not instance:
+            return
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9])%s_(mysql|redis|rabbitmq)(?![A-Za-z0-9])"
+            % re.escape(instance),
+            re.I,
+        )
+
+        def rewrite(value: Any) -> Any:
+            if isinstance(value, str):
+                return pattern.sub(
+                    lambda match: "%s-%s" % (instance, match.group(1).lower()),
+                    value,
+                )
+            if isinstance(value, list):
+                return [rewrite(item) for item in value]
+            if isinstance(value, dict):
+                return {key: rewrite(item) for key, item in value.items()}
+            return value
+
+        rewritten = rewrite(data)
+        data.clear()
+        data.update(rewritten)
 
     @staticmethod
     def _normalize_semantic_dependencies(data: dict[str, Any]) -> None:
@@ -2222,6 +2263,55 @@ class V4ChangePlannerAgent:
         changes = data.get("changes")
         if not isinstance(changes, list):
             return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
+        screen_consumers = [
+            "%s.project_root" % str(change.get("step_id") or "")
+            for change in changes
+            if isinstance(change, dict)
+            and re.search(
+                r"screen",
+                "%s %s" % (
+                    change.get("title") or "",
+                    change.get("objective") or "",
+                ),
+                re.I,
+            )
+            and re.search(
+                r"\b(?:start|launch)\b|启动",
+                "%s %s" % (
+                    change.get("title") or "",
+                    change.get("objective") or "",
+                ),
+                re.I,
+            )
+        ]
+        if screen_consumers:
+            mains_path = root_text + "/mains"
+            existing_mains = next(
+                (
+                    item
+                    for item in normalized
+                    if item.status == "frozen"
+                    and item.kind == "path"
+                    and str(item.value).rstrip("/") == mains_path
+                ),
+                None,
+            )
+            if existing_mains is None:
+                normalized.append(
+                    PlanResource(
+                        name="runtime_mains_root",
+                        kind="path",
+                        status="frozen",
+                        role="runtime_mains_root",
+                        value=mains_path,
+                        source="derived_from_instance_root",
+                        consumers=screen_consumers,
+                    )
+                )
+            else:
+                for consumer in screen_consumers:
+                    if consumer not in existing_mains.consumers:
+                        existing_mains.consumers.append(consumer)
         for change in changes:
             if not isinstance(change, dict):
                 continue
