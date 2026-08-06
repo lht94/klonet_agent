@@ -33,6 +33,8 @@ use it as the source contract and do not request source discovery again.
 
 Return one JSON object with status `need_evidence`, `ready`, or `blocked`.
 For need_evidence return at most four registered read-only probe_requests.
+A ports probe must contain at most 64 candidate ports; a small bounded sample
+is sufficient and prevents evidence requests from dominating the plan JSON.
 For blocked return reason and missing_decisions.
 For ready return goal, assumptions, frozen/deferred resources and `changes`.
 Every change needs step_id, title, objective, reason, evidence_refs, depends_on,
@@ -329,6 +331,23 @@ class V4ChangePlannerAgent:
                                     "probe": {"type": "string", "maxLength": 100},
                                     "args": {
                                         "type": "object",
+                                        "properties": {
+                                            "ports": {
+                                                "type": "array",
+                                                "maxItems": 64,
+                                                "items": {"type": "integer"},
+                                            },
+                                            "candidates": {
+                                                "type": "array",
+                                                "maxItems": 64,
+                                                "items": {"type": "integer"},
+                                            },
+                                            "candidate_ports": {
+                                                "type": "array",
+                                                "maxItems": 64,
+                                                "items": {"type": "integer"},
+                                            },
+                                        },
                                         "additionalProperties": True,
                                     },
                                     "purpose": text,
@@ -2756,7 +2775,9 @@ class V4ChangePlannerAgent:
                             continue
                         if 1 <= port <= 65535 and port not in ports:
                             ports.append(port)
-                    args["ports"] = ports
+                    args["ports"] = ports[:64]
+            elif probe == "ports" and isinstance(args.get("ports"), list):
+                args["ports"] = args["ports"][:64]
             requests.append(
                 ProbeRequest(
                     probe,

@@ -970,6 +970,22 @@ def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
     assert requests[0].args == {"ports": [45561, 45562]}
 
 
+def test_planner_bounds_port_probe_candidates():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    requests = V4ChangePlannerAgent._probe_requests(
+        [
+            {
+                "probe": "ports",
+                "args": {"candidate_ports": list(range(10000, 10200))},
+                "purpose": "find a small free set",
+            }
+        ]
+    )
+
+    assert requests[0].args == {"ports": list(range(10000, 10064))}
+
+
 def test_planner_reassigns_occupied_host_port_from_probed_free_candidates():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.contracts import (
