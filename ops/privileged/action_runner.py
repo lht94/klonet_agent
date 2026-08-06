@@ -2889,6 +2889,18 @@ class DirectPrivilegedActionRunner:
                 % (component, _one_line(result.stderr)),
                 "inspect_runtime",
             )
+        port_key = {
+            "master": "port_47001",
+            "worker": "port_47002",
+            "web_terminal": "port_47003",
+        }.get(component)
+        raw_port = step.args.get(port_key) if port_key else None
+        if str(raw_port or "").isdigit():
+            _wait_tcp_listening(
+                "127.0.0.1",
+                int(raw_port),
+                timeout=min(float(step.timeout), 20.0),
+            )
         return DirectActionResult(
             "completed",
             "action=restart_screen_component component=%s session=%s environment_changed=true"

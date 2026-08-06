@@ -53,6 +53,45 @@ def test_runtime_python_env_aliases_hardcoded_package_to_isolated_clone(
     assert alias.resolve() == instance.resolve()
 
 
+def test_screen_component_waits_for_its_application_port(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    python = tmp_path / "python3.8"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    waited = []
+    monkeypatch.setattr(module, "_python_executable", lambda _args: str(python))
+    monkeypatch.setattr(module, "_runtime_python_env", lambda _root: {})
+    monkeypatch.setattr(
+        module,
+        "_wait_tcp_listening",
+        lambda host, port, timeout: waited.append((host, port, timeout)) or True,
+    )
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "", ""
+        )
+    )
+
+    result = runner(
+        _step(
+            "start_screen_component",
+            {
+                "platform": "v4e2e",
+                "component": "master",
+                "screen_session": "v4e2e_m",
+                "project_root": str(tmp_path),
+                "port_47001": "47001",
+            },
+            risk="medium",
+        )
+    )
+
+    assert result.status == "completed"
+    assert waited == [("127.0.0.1", 47001, 20.0)]
+
+
 ENTRY_FILES = (
     "gun.py",
     "master_main.py",
