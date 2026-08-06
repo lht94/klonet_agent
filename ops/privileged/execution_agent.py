@@ -652,6 +652,7 @@ class PrivilegedExecutionAgent:
                 )
             raw_ids.append(raw_id)
         items = _collapse_redundant_container_starts(items)
+        items = _collapse_redundant_container_policy_steps(items)
         items = _drop_nginx_activation_from_prepare(items, semantic_step)
         items = _collapse_redundant_nginx_activations(items, semantic_step)
         _remove_outer_semantic_dependencies(items, semantic_step.depends_on)
@@ -2601,6 +2602,68 @@ def _collapse_redundant_nginx_activations(
     return normalized
 
 
+def _collapse_redundant_container_policy_steps(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Creation already applies the audited default unless-stopped policy."""
+
+    create_ids = set()
+    for index, item in enumerate(items, start=1):
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if re.search(r"containers?\b|容器", text, re.I) and re.search(
+            r"\b(?:create|provision)\b|创建|新建", text, re.I
+        ):
+            create_ids.add(
+                _safe_implementation_step_id(
+                    item.get("id"), fallback="step-%s" % index
+                )
+            )
+    replacements = {}
+    for index, item in enumerate(items, start=1):
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if not re.search(r"restart\s+policy|重启策略", text, re.I):
+            continue
+        dependencies = item.get("depends_on")
+        if not isinstance(dependencies, list):
+            continue
+        creator = next(
+            (
+                _safe_implementation_step_id(value, fallback="")
+                for value in dependencies
+                if _safe_implementation_step_id(value, fallback="") in create_ids
+            ),
+            "",
+        )
+        if creator:
+            replacements[
+                _safe_implementation_step_id(
+                    item.get("id"), fallback="step-%s" % index
+                )
+            ] = creator
+    if not replacements:
+        return items
+    normalized = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        if item_id in replacements:
+            continue
+        dependencies = item.get("depends_on")
+        if isinstance(dependencies, list):
+            rewired = []
+            for dependency in dependencies:
+                target = replacements.get(
+                    _safe_implementation_step_id(dependency, fallback=""),
+                    _safe_implementation_step_id(dependency, fallback=""),
+                )
+                if target and target != item_id and target not in rewired:
+                    rewired.append(target)
+            item["depends_on"] = rewired
+        normalized.append(item)
+    return normalized
+
+
 def _deterministic_klonet_config_items(
     plan: PrivilegedPlan,
     semantic_step: PrivilegedStep,
@@ -3256,7 +3319,9 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
         r"\b(?:git|repository|source)\b|仓库|源码", primary, re.I
     ):
         return "git_operation"
-    if re.search(r"restart\s+policy|重启策略", primary, re.I) and re.search(
+    if re.match(r"^\s*(?:apply|set|update)\b|^\s*(?:应用|设置|更新)", primary, re.I) and re.search(
+        r"restart\s+policy|重启策略", primary, re.I
+    ) and re.search(
         r"container|容器", primary, re.I
     ) and not re.search(r"\b(?:create|new|provision)\b|创建|新建", primary, re.I):
         return "manage_container"

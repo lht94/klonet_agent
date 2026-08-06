@@ -617,6 +617,38 @@ def test_nginx_activation_micro_plan_collapses_duplicate_reloads():
     assert normalized[1]["depends_on"] == ["validate"]
 
 
+def test_container_micro_plan_drops_redundant_restart_policy_after_create():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _collapse_redundant_container_policy_steps,
+    )
+
+    items = [
+        {
+            "id": "create",
+            "title": "Create Redis container v4e2e-redis",
+            "objective": "Create with the default unless-stopped restart policy",
+            "depends_on": [],
+        },
+        {
+            "id": "policy",
+            "title": "Verify the Redis container restart policy",
+            "objective": "Confirm restart policy is unless-stopped",
+            "depends_on": ["create"],
+        },
+        {
+            "id": "verify",
+            "title": "Verify Redis is running",
+            "objective": "Check container state",
+            "depends_on": ["policy"],
+        },
+    ]
+
+    normalized = _collapse_redundant_container_policy_steps(items)
+
+    assert [item["id"] for item in normalized] == ["create", "verify"]
+    assert normalized[1]["depends_on"] == ["create"]
+
+
 def test_nginx_prepare_micro_plan_does_not_activate_service():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
