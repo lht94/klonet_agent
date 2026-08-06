@@ -1406,6 +1406,8 @@ class DirectPrivilegedActionRunner:
             return self._blocked("invalid_nginx_config_name")
         destination = Path("/etc/nginx/sites-available") / name
         enabled = Path("/etc/nginx/sites-enabled") / name
+        if destination.exists() or enabled.exists():
+            return self._blocked("nginx_config_already_exists=%s" % name)
         try:
             command = _sudo_if_needed(
                 ["install", "-o", "root", "-g", "root", "-m", "0644",
@@ -1415,7 +1417,7 @@ class DirectPrivilegedActionRunner:
             if result.returncode != 0:
                 return DirectActionResult(
                     "failed",
-                    "nginx_config_install_failed stderr=%s environment_changed=unknown"
+                    "nginx_config_install_failed stderr=%s environment_changed=false"
                     % _one_line(result.stderr),
                     "inspect_nginx_routes",
                 )

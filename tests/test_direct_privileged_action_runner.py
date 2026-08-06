@@ -219,6 +219,29 @@ def test_install_nginx_config_accepts_inline_content():
     assert any(command[0] == "ln" for command in calls)
 
 
+def test_nginx_install_failure_before_copy_reports_no_environment_change():
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    result = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr="sudo: a password is required"
+        )
+    )(
+        _step(
+            "install_nginx_config",
+            {
+                "content": "server { listen 47007; }\n",
+                "config_name": "klonet-v4-e2e",
+            },
+        )
+    )
+
+    assert result.status == "failed"
+    assert "environment_changed=false" in result.output
+
+
 def test_sync_directory_refuses_nonempty_destination(tmp_path):
     from klonet_agent.ops.privileged.action_runner import (
         DirectPrivilegedActionRunner,

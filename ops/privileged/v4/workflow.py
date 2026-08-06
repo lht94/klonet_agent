@@ -277,8 +277,17 @@ class V4MutationWorkflow:
             or evidence.timed_out
             or binding is None
             or binding.kind != "registered_action"
-            or binding.action != "start_screen_component"
         ):
+            return False
+        if binding.action == "install_nginx_config":
+            file_checks = [
+                item for item in step.checks if item.checker == "file_exists"
+            ]
+            return bool(
+                file_checks
+                and all(item.status == "failed" for item in file_checks)
+            )
+        if binding.action != "start_screen_component":
             return False
         session_checks = [
             item for item in step.checks

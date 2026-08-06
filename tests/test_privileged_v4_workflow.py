@@ -355,6 +355,31 @@ def test_exact_reconfirmation_can_retry_exited_screen_with_no_listener():
     assert V4MutationWorkflow._can_retry_conclusive_no_change(step) is True
 
 
+def test_exact_reconfirmation_can_retry_nginx_when_destination_is_absent():
+    from klonet_agent.ops.privileged.contracts import (
+        CheckResult,
+        ExecutionBinding,
+        ExecutionEvidence,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    step = PrivilegedStep(
+        step_id="nginx",
+        title="install nginx site",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            action="install_nginx_config",
+            args={"config_name": "klonet-v4-e2e"},
+            risk="medium",
+        ),
+        evidence=ExecutionEvidence(return_code=1, environment_changed=True),
+        checks=[CheckResult("file_exists", "failed")],
+    )
+
+    assert V4MutationWorkflow._can_retry_conclusive_no_change(step) is True
+
+
 def test_semantic_config_verification_is_composed_from_atomic_bindings():
     from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
 
