@@ -281,6 +281,41 @@ def test_existing_container_actions_cannot_masquerade_as_container_creation():
     assert not _validate_action_objective_fit("create_docker_container", step)
 
 
+def test_new_container_contract_matches_semantic_name_service_and_credentials():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_contract_consistency,
+    )
+
+    step = PrivilegedStep(
+        step_id="rabbit",
+        title="Create isolated RabbitMQ container v4e2e-rabbitmq",
+        objective="Create v4e2e-rabbitmq from the RabbitMQ image",
+        expected_changes=["v4e2e-rabbitmq is running"],
+        risk="high",
+    )
+
+    assert "container_name_mismatch" in _validate_action_contract_consistency(
+        "create_docker_container",
+        {"name": "v4e2e", "image": "rabbitmq:latest"},
+        step,
+    )
+    assert "credential_source_not_allowed" in _validate_action_contract_consistency(
+        "create_docker_container",
+        {
+            "name": "v4e2e-rabbitmq",
+            "image": "rabbitmq:latest",
+            "credential_source": {"service": "rabbitmq", "path": "/x/config.py"},
+        },
+        step,
+    )
+    assert not _validate_action_contract_consistency(
+        "create_docker_container",
+        {"name": "v4e2e-rabbitmq", "image": "rabbitmq:latest"},
+        step,
+    )
+
+
 def test_new_container_creation_is_routed_to_creation_capability():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
@@ -403,6 +438,91 @@ def test_container_micro_plan_collapses_redundant_start_after_create():
 
     assert [item["id"] for item in normalized] == ["create", "verify"]
     assert normalized[1]["depends_on"] == ["create"]
+
+
+def test_nginx_prepare_micro_plan_does_not_activate_service():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _drop_nginx_activation_from_prepare,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="prepare-nginx",
+        title="Create Nginx site klonet-v4-e2e",
+        objective="Write and enable the isolated site configuration",
+        expected_changes=["site files exist"],
+        risk="medium",
+    )
+    items = [
+        {"id": "install", "title": "Install Nginx config", "depends_on": []},
+        {"id": "reload", "title": "Validate and reload Nginx",
+         "depends_on": ["install"]},
+        {"id": "verify", "title": "Verify config files", "depends_on": ["reload"]},
+    ]
+
+    normalized = _drop_nginx_activation_from_prepare(items, semantic)
+
+    assert [item["id"] for item in normalized] == ["install", "verify"]
+    assert normalized[1]["depends_on"] == ["install"]
+
+
+def test_complete_wtx_config_compiles_to_one_atomic_step_per_attribute():
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource,
+        PrivilegedPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        _deterministic_klonet_config_items,
+    )
+
+    resources = [
+        PlanResource("config", "path", "frozen", "config_path",
+                     "/srv/v4e2e/vemu_config/config.py", "derived"),
+        *[
+            PlanResource(name, "port", "frozen", name, value, "evidence")
+            for name, value in (
+                ("master_port", 47001), ("worker_port", 47002),
+                ("web_terminal_port", 47003), ("public_port", 47004),
+                ("redis_port", 47005), ("mysql_port", 47006),
+                ("rabbitmq_port", 47007),
+            )
+        ],
+    ]
+    plan = PrivilegedPlan(
+        plan_id="config", goal="deploy complete isolated Klonet",
+        risk="high", resources=resources, steps=[],
+    )
+    semantic = PrivilegedStep(
+        step_id="configure",
+        title="Write isolated WtxConfig configuration",
+        objective="Configure complete WtxConfig and retain PROJ_CONFIG",
+        risk="medium",
+        expected_changes=["all isolated config values change"],
+    )
+
+    items = _deterministic_klonet_config_items(plan, semantic)
+
+    values = {
+        item["attribute"]: item["value"]
+        for item in items
+        if item.get("attribute")
+    }
+    assert values == {
+        "master_ip": "127.0.0.1",
+        "mysql_ip": "127.0.0.1",
+        "rabbitmq_ip": "127.0.0.1",
+        "master_port": 47001,
+        "worker_port": 47002,
+        "web_terminal_port": 47003,
+        "public_port": 47004,
+        "redis_port": 47005,
+        "mysql_port": 47006,
+        "rabbitmq_port": 47007,
+        "celery_redis_port_db": "47005/6",
+        "celery_rabbitmq_port_db": "47005/7",
+    }
+    assert items[-1]["expected_changes"] == []
 
 
 def test_new_container_port_bindings_must_use_frozen_plan_ports():

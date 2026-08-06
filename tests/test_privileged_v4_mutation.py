@@ -1868,6 +1868,49 @@ def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
     }
 
 
+def test_nginx_health_check_moves_from_prepare_to_activation():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "prepare",
+                "title": "Create Nginx site",
+                "objective": "Write config for port 47008",
+                "postconditions": [
+                    {"checker": "port_listening", "args": {"port": 47008}},
+                    {"checker": "http_status", "args": {
+                        "url": "http://127.0.0.1:47008/", "status": 200}},
+                ],
+            },
+            {
+                "step_id": "activate",
+                "title": "Reload Nginx after application start",
+                "objective": "Activate the prepared site",
+                "postconditions": [{"checker": "nginx_config_valid", "args": {}}],
+            },
+        ]
+    }
+    resources = [
+        PlanResource(
+            "nginx_port", "port", "frozen", "nginx_listen_port", 47008,
+            "evidence", consumers=["prepare.listen_port"],
+        )
+    ]
+
+    V4ChangePlannerAgent._normalize_nginx_postconditions(data, resources)
+
+    assert all(
+        check["checker"] not in {"http_status", "port_listening"}
+        for check in data["changes"][0]["postconditions"]
+    )
+    assert data["changes"][1]["postconditions"][-1] == {
+        "checker": "http_status",
+        "args": {"url": "http://127.0.0.1:47008/healthz", "expected_status": 200},
+    }
+
+
 def test_http_observation_does_not_claim_a_listening_port():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

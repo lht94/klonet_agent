@@ -703,63 +703,81 @@ class V4ChangePlannerAgent:
         changes = data.get("changes")
         if not isinstance(changes, list):
             return
-        for change in changes:
-            if not isinstance(change, dict):
-                continue
-            step_id = str(change.get("step_id") or "")
-            text = "%s %s" % (
-                str(change.get("title") or ""),
-                str(change.get("objective") or ""),
+        nginx_changes = [
+            change
+            for change in changes
+            if isinstance(change, dict)
+            and re.search(
+                r"nginx",
+                "%s %s" % (change.get("title") or "", change.get("objective") or ""),
+                re.I,
             )
-            if not re.search(r"nginx", text, re.I):
-                continue
-            listen_resource = next(
-                (
-                    resource
-                    for resource in resources
-                    if resource.status == "frozen"
-                    and resource.kind == "port"
-                    and V4ChangePlannerAgent._requires_host_port_availability(resource)
-                    and any(
-                        consumer.rsplit(".", 1)[0] == step_id
-                        and (
-                            consumer.endswith(".listen_port")
-                            or "nginx" in str(resource.role or "").lower()
-                            or "nginx" in str(resource.name or "").lower()
-                        )
-                        for consumer in resource.consumers
-                    )
-                ),
-                None,
-            )
-            if listen_resource is None:
-                continue
+        ]
+        if not nginx_changes:
+            return
+        listen_resource = next(
+            (
+                resource
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.kind == "port"
+                and V4ChangePlannerAgent._requires_host_port_availability(resource)
+                and "nginx" in (
+                    "%s %s" % (resource.name, resource.role)
+                ).lower()
+            ),
+            None,
+        )
+        if listen_resource is None:
+            return
+        port = int(listen_resource.value)
+        activation = next(
+            (
+                change
+                for change in reversed(nginx_changes)
+                if re.search(
+                    r"\b(?:activate|reload|restart)\b|激活|重载|重新加载",
+                    "%s %s" % (
+                        change.get("title") or "", change.get("objective") or ""
+                    ),
+                    re.I,
+                )
+            ),
+            nginx_changes[-1],
+        )
+        for change in nginx_changes:
             postconditions = change.get("postconditions")
             if not isinstance(postconditions, list):
                 postconditions = []
                 change["postconditions"] = postconditions
-            port = int(listen_resource.value)
-            matching_http = next(
-                (
-                    check
-                    for check in postconditions
-                    if isinstance(check, dict)
-                    and check.get("checker") == "http_status"
-                    and re.search(
-                        r"https?://[^/:]+:%s(?:/|$)" % port,
-                        str((check.get("args") or {}).get("url") or ""),
-                        re.I,
-                    )
-                ),
-                None,
-            )
-            if matching_http is not None:
-                args = matching_http.get("args")
-                if not isinstance(args, dict):
-                    args = {}
-                    matching_http["args"] = args
-                args["url"] = "http://127.0.0.1:%s/healthz" % port
+            if change is activation:
                 continue
+            change["postconditions"] = [
+                check
+                for check in postconditions
+                if not (
+                    isinstance(check, dict)
+                    and (
+                        check.get("checker") == "http_status"
+                        or (
+                            check.get("checker") == "port_listening"
+                            and int((check.get("args") or {}).get("port") or 0) == port
+                        )
+                    )
+                )
+            ]
+        postconditions = activation.get("postconditions")
+        if not isinstance(postconditions, list):
+            postconditions = []
+            activation["postconditions"] = postconditions
+        matching_http = next(
+            (
+                check for check in postconditions
+                if isinstance(check, dict) and check.get("checker") == "http_status"
+            ),
+            None,
+        )
+        if matching_http is None:
             postconditions.append(
                 {
                     "checker": "http_status",
@@ -769,6 +787,12 @@ class V4ChangePlannerAgent:
                     },
                 }
             )
+        else:
+            args = matching_http.get("args")
+            if not isinstance(args, dict):
+                args = {}
+                matching_http["args"] = args
+            args["url"] = "http://127.0.0.1:%s/healthz" % port
 
     @staticmethod
     def _normalize_occupied_host_ports(
@@ -1407,6 +1431,12 @@ class V4ChangePlannerAgent:
                 for item in stateful_candidates
                 if re.search(r"containers?\b|容器", change_text(item), re.I)
             ]
+            source_preparations = [
+                item
+                for item in indexed_changes
+                if re.search(r"\b(?:clone|checkout)\b|克隆|检出", change_text(item), re.I)
+                and re.search(r"\b(?:git|repository|source)\b|仓库|源码", change_text(item), re.I)
+            ]
             for service in stateful_candidates:
                 if service in stateful:
                     continue
@@ -1414,6 +1444,16 @@ class V4ChangePlannerAgent:
                     "isolated stateful service must use a new named container=%s"
                     % str(service.get("step_id") or "")
                 )
+            for service in stateful:
+                service_id = str(service.get("step_id") or "")
+                service_ancestors = ancestors(service_id)
+                for preparation in source_preparations:
+                    preparation_id = str(preparation.get("step_id") or "")
+                    if preparation_id not in service_ancestors:
+                        errors.append(
+                            "stateful credential source requires earlier clone="
+                            "%s:%s" % (service_id, preparation_id)
+                        )
             application_starts = [
                 item
                 for item in indexed_changes

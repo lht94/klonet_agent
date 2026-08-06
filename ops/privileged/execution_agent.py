@@ -577,23 +577,27 @@ class PrivilegedExecutionAgent:
             ),
             "previous_attempt_feedback": feedback,
         }
-        try:
-            result = self._call_function(
-                [
-                    {"role": "system", "content": IMPLEMENTATION_PLANNING_PROMPT},
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, ensure_ascii=False),
-                    },
-                ],
-                self._implementation_plan_function_tool(),
-            )
-        except ValueError as exc:
-            raise ExecutionBindingError(
-                "invalid implementation function response: %s" % exc,
-                replan_recommended=False,
-                category="implementation_contract_invalid",
-            ) from exc
+        deterministic = _deterministic_klonet_config_items(plan, semantic_step)
+        if deterministic:
+            result = {"status": "ready", "implementation_steps": deterministic}
+        else:
+            try:
+                result = self._call_function(
+                    [
+                        {"role": "system", "content": IMPLEMENTATION_PLANNING_PROMPT},
+                        {
+                            "role": "user",
+                            "content": json.dumps(payload, ensure_ascii=False),
+                        },
+                    ],
+                    self._implementation_plan_function_tool(),
+                )
+            except ValueError as exc:
+                raise ExecutionBindingError(
+                    "invalid implementation function response: %s" % exc,
+                    replan_recommended=False,
+                    category="implementation_contract_invalid",
+                ) from exc
         status = str(result.get("status") or "").strip().lower()
         if status == "blocked":
             raise ExecutionBindingError(
@@ -648,6 +652,7 @@ class PrivilegedExecutionAgent:
                 )
             raw_ids.append(raw_id)
         items = _collapse_redundant_container_starts(items)
+        items = _drop_nginx_activation_from_prepare(items, semantic_step)
         _remove_outer_semantic_dependencies(items, semantic_step.depends_on)
         items = _topologically_order_implementation_items(items)
         raw_ids = [
@@ -1312,6 +1317,11 @@ class PrivilegedExecutionAgent:
         if problem:
             raise ValueError(problem)
         problem = _validate_action_objective_fit(action, semantic_step)
+        if problem:
+            raise ValueError(problem)
+        problem = _validate_action_contract_consistency(
+            action, args, semantic_step
+        )
         if problem:
             raise ValueError(problem)
         problem = _validate_action_semantics(action, args)
@@ -2537,6 +2547,161 @@ def _collapse_redundant_container_starts(
     return normalized
 
 
+def _deterministic_klonet_config_items(
+    plan: PrivilegedPlan,
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Compile the complete same-host WtxConfig contract from frozen resources."""
+
+    text = "%s %s" % (semantic_step.title, semantic_step.objective)
+    if not (
+        re.search(r"wtxconfig", text, re.I)
+        and re.search(r"config|配置", text, re.I)
+        and re.search(r"complete|isolated|完整|隔离", "%s %s" % (plan.goal, text), re.I)
+    ):
+        return []
+    config_path = next(
+        (
+            str(resource.value)
+            for resource in plan.resources
+            if resource.status == "frozen"
+            and resource.kind == "path"
+            and str(resource.value).endswith("/vemu_config/config.py")
+        ),
+        "",
+    )
+    ports = {
+        role: int(resource.value)
+        for resource in plan.resources
+        if resource.status == "frozen"
+        and resource.kind == "port"
+        for role in (
+            "master_port", "worker_port", "web_terminal_port", "public_port",
+            "redis_port", "mysql_port", "rabbitmq_port",
+        )
+        if role in "%s %s" % (resource.name, resource.role)
+    }
+    required = {
+        "master_port", "worker_port", "web_terminal_port",
+        "redis_port", "mysql_port", "rabbitmq_port",
+    }
+    if not config_path or not required <= set(ports):
+        return []
+    attributes: list[tuple[str, Any]] = [
+        ("master_ip", "127.0.0.1"),
+        ("mysql_ip", "127.0.0.1"),
+        ("rabbitmq_ip", "127.0.0.1"),
+        ("master_port", ports["master_port"]),
+        ("worker_port", ports["worker_port"]),
+        ("web_terminal_port", ports["web_terminal_port"]),
+    ]
+    if "public_port" in ports:
+        attributes.append(("public_port", ports["public_port"]))
+    attributes.extend(
+        [
+            ("redis_port", ports["redis_port"]),
+            ("mysql_port", ports["mysql_port"]),
+            ("rabbitmq_port", ports["rabbitmq_port"]),
+            ("celery_redis_port_db", "%s/6" % ports["redis_port"]),
+            ("celery_rabbitmq_port_db", "%s/7" % ports["redis_port"]),
+        ]
+    )
+    items = []
+    previous = ""
+    for index, (attribute, value) in enumerate(attributes, start=1):
+        item_id = "set-%s" % attribute.replace("_", "-")
+        items.append(
+            {
+                "id": item_id,
+                "title": "Set WtxConfig %s" % attribute,
+                "objective": (
+                    "Set class WtxConfig attribute %s to %r in %s"
+                    % (attribute, value, config_path)
+                ),
+                "reason": "compile the frozen complete isolated runtime contract",
+                "depends_on": [previous] if previous else [],
+                "expected_changes": ["WtxConfig.%s becomes %r" % (attribute, value)],
+                "success_criteria": ["WtxConfig.%s equals %r" % (attribute, value)],
+                "risk_suggestion": "medium",
+                "attribute": attribute,
+                "value": value,
+            }
+        )
+        previous = item_id
+    items.append(
+        {
+            "id": "verify-proj-config",
+            "title": "Verify PROJ_CONFIG remains WtxConfig",
+            "objective": "Verify PROJ_CONFIG is an instance of WtxConfig",
+            "reason": "prove active configuration selection",
+            "depends_on": [previous],
+            "expected_changes": [],
+            "success_criteria": ["PROJ_CONFIG uses WtxConfig"],
+            "risk_suggestion": "readonly",
+        }
+    )
+    return items
+
+
+def _drop_nginx_activation_from_prepare(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Keep Nginx file preparation separate from post-application activation."""
+
+    primary = "%s %s" % (semantic_step.title, semantic_step.objective)
+    if not (
+        re.search(r"nginx", primary, re.I)
+        and re.search(r"\b(?:create|write|install|prepare)\b|创建|写入|准备", primary, re.I)
+        and not re.search(r"\b(?:activate|reload|restart)\b|激活|重载", primary, re.I)
+    ):
+        return items
+    removed: dict[str, list[str]] = {}
+    for index, item in enumerate(items, start=1):
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if re.search(r"\b(?:reload|restart)\b|重载|重新加载", text, re.I):
+            item_id = _safe_implementation_step_id(
+                item.get("id"), fallback="step-%s" % index
+            )
+            dependencies = item.get("depends_on")
+            removed[item_id] = [
+                _safe_implementation_step_id(value, fallback="")
+                for value in dependencies
+            ] if isinstance(dependencies, list) else []
+    if not removed:
+        return items
+
+    def expand(item_id: str) -> list[str]:
+        if item_id not in removed:
+            return [item_id]
+        result = []
+        for dependency in removed[item_id]:
+            for expanded in expand(dependency):
+                if expanded and expanded not in result:
+                    result.append(expanded)
+        return result
+
+    normalized = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        if item_id in removed:
+            continue
+        dependencies = item.get("depends_on")
+        rewired = []
+        if isinstance(dependencies, list):
+            for dependency in dependencies:
+                for target in expand(
+                    _safe_implementation_step_id(dependency, fallback="")
+                ):
+                    if target and target != item_id and target not in rewired:
+                        rewired.append(target)
+        item["depends_on"] = rewired
+        normalized.append(item)
+    return normalized
+
+
 def _topologically_order_implementation_items(
     items: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -3021,6 +3186,8 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
 
     if _step_is_verification(step):
         return ""
+    if re.match(r"^\s*Set\s+WtxConfig\s+", step.title, re.I):
+        return "set_python_class_attribute"
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     ).lower()
@@ -3117,6 +3284,43 @@ def _validate_action_postcondition_fit(
             expected = str(check_args.get("text") or "")
             if expected and expected not in content:
                 return "nginx_source_missing_declared_content=%s" % expected
+    return ""
+
+
+def _validate_action_contract_consistency(
+    action: str,
+    args: dict[str, Any],
+    step: PrivilegedStep,
+) -> str:
+    """Cross-check typed Action arguments against the frozen semantic objective."""
+
+    if action != "create_docker_container":
+        return ""
+    text = " ".join(
+        [step.title, step.objective, step.reason, *step.expected_changes]
+    )
+    service = next(
+        (item for item in ("mysql", "redis", "rabbitmq") if item in text.lower()),
+        "",
+    )
+    names = re.findall(
+        r"\b[A-Za-z0-9][A-Za-z0-9_.-]{0,70}[-_]"
+        r"(?:mysql|redis|rabbitmq)\b",
+        text,
+        re.I,
+    )
+    expected_name = names[0] if names else ""
+    observed_name = str(args.get("name") or "")
+    if expected_name and observed_name != expected_name:
+        return "container_name_mismatch=%s expected=%s" % (
+            observed_name or "<missing>", expected_name
+        )
+    image = str(args.get("image") or "").lower()
+    if service and service not in image:
+        return "container_image_service_mismatch=%s:%s" % (service, image)
+    credential_source = args.get("credential_source")
+    if service == "rabbitmq" and credential_source is not None:
+        return "container_credential_source_not_allowed=rabbitmq"
     return ""
 
 
