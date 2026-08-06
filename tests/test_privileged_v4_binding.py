@@ -192,6 +192,63 @@ def test_v4_binder_lifts_hierarchical_verification_out_of_execution_plan():
     }
 
 
+def test_v4_binder_rewires_precondition_verification_without_lifting_it():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding,
+        ImplementationPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+
+    def apply(plan):
+        plan.steps[0].implementation_plan = ImplementationPlan(
+            implementation_id="impl-deploy",
+            semantic_step_id="deploy",
+            objective="deploy",
+            steps=[
+                PrivilegedStep(
+                    step_id="check-absent",
+                    title="verify target is absent",
+                    risk="readonly",
+                    execution_binding=ExecutionBinding(
+                        kind="verification_only",
+                        risk="readonly",
+                        postconditions=[{
+                            "checker": "container_absent",
+                            "args": {"container": "v4e2e-redis"},
+                        }],
+                    ),
+                ),
+                PrivilegedStep(
+                    step_id="create",
+                    title="create target",
+                    risk="high",
+                    depends_on=["check-absent"],
+                    execution_binding=ExecutionBinding(
+                        kind="registered_action",
+                        risk="high",
+                        action="create_docker_container",
+                        args={"name": "v4e2e-redis"},
+                        postconditions=[{
+                            "checker": "container_running",
+                            "args": {"container": "v4e2e-redis"},
+                        }],
+                    ),
+                ),
+            ],
+        )
+
+    plan = V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+
+    implementation = plan.steps[0].implementation_plan
+    assert [item.step_id for item in implementation.steps] == ["create"]
+    assert implementation.steps[0].depends_on == []
+    assert not any(
+        check["checker"] == "container_absent"
+        for check in plan.steps[0].postconditions
+    )
+
+
 def test_v4_binder_translates_shared_binding_failure_to_v4_boundary():
     from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
     from klonet_agent.ops.privileged.v4.binding import V4BindingError, V4ChangeBinder

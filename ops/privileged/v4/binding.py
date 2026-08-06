@@ -87,15 +87,38 @@ class V4ChangeBinder:
             raise V4BindingError(
                 "hierarchical change has no Action or Shell implementation"
             )
-        if any(
-            dependency in verification_ids
+        by_id = {item.step_id: item for item in verification_steps}
+        precondition_ids = {
+            dependency
             for item in executable
             for dependency in item.depends_on
-        ):
-            raise V4BindingError(
-                "executable step cannot depend on lifted verification step"
-            )
+            if dependency in verification_ids
+        }
+
+        def expand(dependency: str, seen: set[str] | None = None) -> list[str]:
+            if dependency not in verification_ids:
+                return [dependency]
+            seen = set(seen or ())
+            if dependency in seen:
+                return []
+            seen.add(dependency)
+            result = []
+            for predecessor in by_id[dependency].depends_on:
+                for expanded in expand(predecessor, seen):
+                    if expanded not in result:
+                        result.append(expanded)
+            return result
+
+        for item in executable:
+            rewired = []
+            for dependency in item.depends_on:
+                for expanded in expand(dependency):
+                    if expanded != item.step_id and expanded not in rewired:
+                        rewired.append(expanded)
+            item.depends_on = rewired
         for verification in verification_steps:
+            if verification.step_id in precondition_ids:
+                continue
             binding = verification.execution_binding
             for postcondition in binding.postconditions:
                 if postcondition not in change.postconditions:

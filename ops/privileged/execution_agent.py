@@ -3258,7 +3258,7 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
         return "git_operation"
     if re.search(r"restart\s+policy|重启策略", primary, re.I) and re.search(
         r"container|容器", primary, re.I
-    ):
+    ) and not re.search(r"\b(?:create|new|provision)\b|创建|新建", primary, re.I):
         return "manage_container"
     mentions_container = bool(re.search(r"\b(?:docker\s+)?container\b|容器", text))
     creates_absent = bool(

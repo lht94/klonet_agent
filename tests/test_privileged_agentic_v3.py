@@ -552,9 +552,20 @@ def test_forced_action_routes_clone_and_restart_policy_semantics():
         expected_changes=["restart policy changes"],
         risk="medium",
     )
+    create_with_policy = PrivilegedStep(
+        step_id="create",
+        title="Create and start v4e2e-redis container",
+        objective="Create a new container with an always restart policy",
+        expected_changes=["new container"],
+        risk="high",
+    )
 
     assert _forced_registered_action_for_step(clone) == "git_operation"
     assert _forced_registered_action_for_step(policy) == "manage_container"
+    assert (
+        _forced_registered_action_for_step(create_with_policy)
+        == "create_docker_container"
+    )
 
 
 def test_container_binding_requires_selected_image_in_discovery_evidence():
