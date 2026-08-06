@@ -2368,7 +2368,7 @@ def _action_arg_json_schema(name: str) -> dict[str, Any]:
         "command",
     }:
         return {"type": "array", "items": {"type": "string"}}
-    if name in {"patch"}:
+    if name in {"patch", "credential_source"}:
         return {"type": "object", "additionalProperties": True}
     if name in {"pid", "expected_port"}:
         return {"type": "integer"}
@@ -2382,7 +2382,9 @@ def _optional_action_args(action: str) -> list[str]:
         "upsert_python_class": ["base_class"],
         "set_python_config_assignment": ["assignment_name"],
         "set_python_class_attribute": ["class_name"],
-        "create_docker_container": ["environment", "restart_policy", "command"],
+        "create_docker_container": [
+            "environment", "restart_policy", "command", "credential_source"
+        ],
         "git_operation": [
             "url", "remote", "ref", "revision", "path", "tag", "create",
             "force_with_lease",
@@ -2855,6 +2857,13 @@ def _validate_action_resource_bindings(
     """Reject per-step arguments that diverge from the plan-wide manifest."""
 
     if action == "create_docker_container":
+        bindings = _strings(args.get("port_bindings"), 20)
+        if any(
+            re.fullmatch(r"127\.0\.0\.1:[1-9]\d{0,4}:[1-9]\d{0,4}", item)
+            is None
+            for item in bindings
+        ):
+            raise ValueError("container_port_binding_not_loopback")
         relevant_resources = [
             resource
             for resource in resources
@@ -2875,6 +2884,24 @@ def _validate_action_resource_bindings(
             ),
             "",
         )
+        credential_source = args.get("credential_source")
+        if service in {"mysql", "redis"}:
+            if not isinstance(credential_source, dict):
+                raise ValueError("container_credential_source_required=%s" % service)
+            source_path = str(credential_source.get("path") or "")
+            if credential_source.get("service") != service:
+                raise ValueError("container_credential_source_service_mismatch")
+            frozen_config_paths = {
+                str(resource.value)
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.kind == "path"
+                and "config" in (
+                    "%s %s" % (resource.name, resource.role)
+                ).lower()
+            }
+            if source_path not in frozen_config_paths:
+                raise ValueError("container_credential_source_not_frozen")
         service_resources = [
             resource
             for resource in relevant_resources
@@ -3264,6 +3291,8 @@ def _infer_structural_action_args(
     compiled = dict(args)
     if action == "git_operation":
         operation = str(compiled.get("operation") or "").strip().lower()
+        if operation == "clone" and str(compiled.get("revision") or "").strip():
+            compiled["operation"] = "clone_at_revision"
         if operation in {
             "clone+checkout",
             "clone_and_checkout",
@@ -3271,6 +3300,37 @@ def _infer_structural_action_args(
             "clone_checkout",
         }:
             compiled["operation"] = "clone_at_revision"
+    if action == "set_python_config_assignment" and str(
+        compiled.get("class_name") or ""
+    ).strip() == "WtxConfig":
+        compiled["assignment_name"] = "PROJ_CONFIG"
+    if action == "create_docker_container":
+        identity = "%s %s" % (
+            compiled.get("name") or "",
+            compiled.get("image") or "",
+        )
+        service = next(
+            (item for item in ("mysql", "redis") if item in identity.lower()),
+            "",
+        )
+        config_path = next(
+            (
+                str(resource.value)
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.kind == "path"
+                and str(resource.value).endswith("/vemu_config/config.py")
+                and "config" in ("%s %s" % (
+                    resource.name, resource.role
+                )).lower()
+            ),
+            "",
+        )
+        if service and config_path:
+            compiled["credential_source"] = {
+                "path": config_path,
+                "service": service,
+            }
     if action in {
         "start_screen_component",
         "restart_screen_component",

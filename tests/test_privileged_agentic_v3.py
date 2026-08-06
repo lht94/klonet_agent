@@ -437,21 +437,84 @@ def test_new_container_port_bindings_must_use_frozen_plan_ports():
             "image_contract",
             consumers=["change-3.mysql_internal_port"],
         ),
+        PlanResource(
+            "config_path", "path", "frozen", "config_path",
+            "/srv/v4e2e/vemu_config/config.py", "derived",
+            consumers=["configure.path"],
+        ),
     ]
+    credential_source = {
+        "path": "/srv/v4e2e/vemu_config/config.py",
+        "service": "mysql",
+    }
 
     _validate_action_resource_bindings(
         step,
         "create_docker_container",
-        {"port_bindings": ["127.0.0.1:47005:3306"]},
+        {
+            "port_bindings": ["127.0.0.1:47005:3306"],
+            "credential_source": credential_source,
+        },
         resources,
     )
     with pytest.raises(ValueError, match="unfrozen_container_port"):
         _validate_action_resource_bindings(
             step,
             "create_docker_container",
-            {"port_bindings": ["127.0.0.1:47999:3306"]},
+            {
+                "port_bindings": ["127.0.0.1:47999:3306"],
+                "credential_source": credential_source,
+            },
             resources,
         )
+    with pytest.raises(ValueError, match="container_port_binding_not_loopback"):
+        _validate_action_resource_bindings(
+            step,
+            "create_docker_container",
+            {
+                "port_bindings": ["47005:3306"],
+                "credential_source": credential_source,
+            },
+            resources,
+        )
+
+
+def test_structural_binding_compiles_pinned_clone_active_config_and_credentials():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    resources = [
+        PlanResource(
+            "config_path", "path", "frozen", "config_path",
+            "/srv/v4e2e/vemu_config/config.py", "derived",
+            consumers=["configure.path"],
+        )
+    ]
+    clone = _infer_structural_action_args(
+        "git_operation",
+        {"operation": "clone", "revision": "abc123"},
+        resources,
+    )
+    active = _infer_structural_action_args(
+        "set_python_config_assignment",
+        {"path": "/srv/v4e2e/vemu_config/config.py", "class_name": "WtxConfig",
+         "assignment_name": "config"},
+        resources,
+    )
+    redis = _infer_structural_action_args(
+        "create_docker_container",
+        {"name": "v4e2e-redis", "image": "redis:7"},
+        resources,
+    )
+
+    assert clone["operation"] == "clone_at_revision"
+    assert active["assignment_name"] == "PROJ_CONFIG"
+    assert redis["credential_source"] == {
+        "path": "/srv/v4e2e/vemu_config/config.py",
+        "service": "redis",
+    }
 
 
 def test_micro_predecessor_can_produce_frozen_instance_root_for_validation():

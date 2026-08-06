@@ -25,7 +25,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from klonet_agent.ops.actions import (
     OpsActionRegistry,
@@ -1931,6 +1931,25 @@ class DirectPrivilegedActionRunner:
         port_bindings = _string_list(step.args.get("port_bindings"))
         environment = _string_list(step.args.get("environment"))
         command = _string_list(step.args.get("command"))
+        credential_source = step.args.get("credential_source")
+        if credential_source is not None:
+            resolved, problem = _resolve_klonet_container_credentials(
+                credential_source,
+                name=name,
+                image=image,
+            )
+            if problem:
+                return self._blocked(problem)
+            protected_environment = {
+                item.partition("=")[0] for item in resolved.get("environment", [])
+            }
+            environment = [
+                item for item in environment
+                if item.partition("=")[0] not in protected_environment
+            ]
+            environment.extend(resolved.get("environment", []))
+            if resolved.get("command"):
+                command = resolved["command"]
         restart_policy = str(
             step.args.get("restart_policy") or "unless-stopped"
         ).strip()
@@ -3561,6 +3580,90 @@ def _valid_container_port_binding(value: str) -> bool:
     if match is None:
         return False
     return all(1 <= int(port) <= 65535 for port in match.groups())
+
+
+def _resolve_klonet_container_credentials(
+    source: Any,
+    *,
+    name: str,
+    image: str,
+) -> tuple[dict[str, list[str]], str]:
+    """Resolve an allowlisted subset of cloned config secrets without model exposure."""
+
+    if not isinstance(source, dict):
+        return {}, "invalid_container_credential_source"
+    path = _absolute_path(source.get("path"))
+    service = str(source.get("service") or "").strip().lower()
+    try:
+        valid_path = bool(
+            path is not None
+            and path.is_file()
+            and path.name == "config.py"
+            and path.stat().st_size <= 1_000_000
+        )
+    except OSError:
+        valid_path = False
+    if (
+        not valid_path
+        or service not in {"mysql", "redis"}
+        or service not in ("%s %s" % (name, image)).lower()
+    ):
+        return {}, "invalid_container_credential_source"
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, UnicodeError, SyntaxError):
+        return {}, "container_credential_source_not_parseable"
+    classes: dict[str, dict[str, Any]] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        values = {}
+        for statement in node.body:
+            if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+                continue
+            target = statement.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            try:
+                values[target.id] = ast.literal_eval(statement.value)
+            except (ValueError, TypeError):
+                continue
+        classes[node.name] = values
+    if service == "mysql":
+        values = classes.get("MysqlConfig", {})
+        password = values.get("mysql_password")
+        database = values.get("mysql_database")
+        if not (
+            isinstance(password, str)
+            and 1 <= len(password) <= 128
+            and not any(char in password for char in "\x00\n\r")
+            and isinstance(database, str)
+            and re.fullmatch(r"[A-Za-z0-9_]{1,64}", database)
+        ):
+            return {}, "mysql_container_credentials_unavailable"
+        return {
+            "environment": [
+                "MYSQL_ROOT_PASSWORD=%s" % password,
+                "MYSQL_DATABASE=%s" % database,
+            ],
+            "command": [],
+        }, ""
+    values = {
+        **classes.get("RedisConfig", {}),
+        **classes.get("WtxConfig", {}),
+    }
+    password = values.get("redis_password")
+    if not (
+        isinstance(password, str)
+        and 8 <= len(password) <= 128
+        and not any(char.isspace() for char in password)
+        and not any(char in password for char in "\x00\n\r")
+    ):
+        return {}, "redis_container_credentials_unavailable"
+    return {
+        "environment": [],
+        "command": ["redis-server", "--requirepass", password],
+    }, ""
 
 
 def _valid_container_environment(value: str) -> bool:
