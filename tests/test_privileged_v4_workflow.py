@@ -434,7 +434,7 @@ def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
         status="need_evidence",
         probe_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
     )
-    planner = FakePlanner([gap, gap, gap])
+    planner = FakePlanner([gap, gap, gap, gap, gap])
     discovery = SimpleNamespace(
         collect_requests=lambda requests, evidence_bundle: evidence_bundle
     )
@@ -449,7 +449,7 @@ def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
         verifier=FakeVerifier(),
         discovery=discovery,
         synthesis=synthesis,
-        max_replanning_rounds=2,
+        max_replanning_rounds=4,
     )
 
     result = workflow.submit(
@@ -458,7 +458,41 @@ def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
 
     assert result.kind == "blocked"
     assert "budget" in result.message
-    assert planner.calls == 3
+    assert planner.calls == 5
+
+
+def test_default_discovery_budget_allows_four_rounds_then_ready(tmp_path):
+    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.v4.planner import V4PlanningOutcome
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    gap = V4PlanningOutcome(
+        status="need_evidence",
+        probe_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
+    )
+    planner = FakePlanner([gap, gap, gap, gap, V4PlanningOutcome(
+        status="ready", plan=_change_plan()
+    )])
+    workflow = V4MutationWorkflow(
+        planner=planner,
+        binder=FakeBinder(),
+        store=MemoryStore(),
+        executor=FakeExecutor(),
+        verifier=FakeVerifier(),
+        discovery=SimpleNamespace(
+            collect_requests=lambda requests, evidence_bundle: evidence_bundle
+        ),
+        synthesis=SimpleNamespace(
+            synthesize=lambda goal, evidence_bundle: SimpleNamespace()
+        ),
+    )
+
+    result = workflow.submit(
+        "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
+    )
+
+    assert result.kind == "awaiting_confirmation"
+    assert planner.calls == 5
 
 
 def test_verifier_exception_is_persisted_as_pause_after_single_execution(tmp_path):

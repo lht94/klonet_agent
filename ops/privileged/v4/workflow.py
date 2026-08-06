@@ -24,7 +24,7 @@ class V4MutationWorkflow:
         verifier: Any,
         discovery: Any | None = None,
         synthesis: Any | None = None,
-        max_replanning_rounds: int = 2,
+        max_replanning_rounds: int = 4,
         max_candidate_replans: int = 1,
     ) -> None:
         self.planner = planner
