@@ -1463,8 +1463,15 @@ class DirectPrivilegedActionRunner:
                 % _one_line(check.stderr),
                 "inspect_nginx_routes",
             )
+        systemctl = shutil.which("systemctl")
+        activation = "reload-or-restart" if systemctl else "signal-reload"
+        activation_command = (
+            [systemctl, "reload-or-restart", "nginx"]
+            if systemctl
+            else [nginx, "-s", "reload"]
+        )
         reload_result = self._command(
-            _sudo_if_needed([nginx, "-s", "reload"]),
+            _sudo_if_needed(activation_command),
             timeout=min(step.timeout, 30),
         )
         if reload_result.returncode != 0:
@@ -1476,7 +1483,8 @@ class DirectPrivilegedActionRunner:
             )
         return DirectActionResult(
             "completed",
-            "action=reload_nginx config_test=passed environment_changed=true",
+            "action=reload_nginx config_test=passed activation=%s "
+            "environment_changed=true" % activation,
         )
 
     def _action_start_docker_container(

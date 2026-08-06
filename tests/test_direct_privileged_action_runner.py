@@ -242,6 +242,41 @@ def test_nginx_install_failure_before_copy_reports_no_environment_change():
     assert "environment_changed=false" in result.output
 
 
+def test_reload_nginx_activates_inactive_service(monkeypatch):
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    calls = []
+
+    def fake_which(command):
+        return {
+            "nginx": "/usr/sbin/nginx",
+            "systemctl": "/usr/bin/systemctl",
+        }.get(command)
+
+    def command_runner(argv, **kwargs):
+        del kwargs
+        calls.append(list(argv[1:] if argv and argv[0] == "sudo" else argv))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.action_runner.shutil.which",
+        fake_which,
+    )
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step("reload_nginx", {})
+    )
+
+    assert result.status == "completed"
+    assert calls == [
+        ["/usr/sbin/nginx", "-t"],
+        ["/usr/bin/systemctl", "reload-or-restart", "nginx"],
+    ]
+    assert "activation=reload-or-restart" in result.output
+
+
 def test_sync_directory_refuses_nonempty_destination(tmp_path):
     from klonet_agent.ops.privileged.action_runner import (
         DirectPrivilegedActionRunner,
