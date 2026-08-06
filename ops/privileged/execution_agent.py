@@ -3995,7 +3995,18 @@ def _canonical_action_postconditions(
     check_args["attribute"] = (
         "%s.%s" % (class_name, attribute) if class_name else attribute
     )
-    check_args["expected"] = args.get("value")
+    expected = args.get("value")
+    if isinstance(expected, str):
+        stripped = expected.strip()
+        if re.fullmatch(r"-?(?:0|[1-9]\d*)", stripped):
+            expected = int(stripped)
+        elif stripped.lower() in {"true", "false"}:
+            expected = stripped.lower() == "true"
+        elif stripped.lower() in {"none", "null"}:
+            expected = None
+        else:
+            expected = stripped
+    check_args["expected"] = expected
     python = str(args.get("python_executable") or "").strip()
     if python:
         check_args["python_executable"] = python

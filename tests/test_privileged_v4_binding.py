@@ -12,7 +12,7 @@ def test_python_class_attribute_postcondition_is_canonicalized_from_action_args(
             "path": "/srv/v4/vemu_config/config.py",
             "class_name": "WtxConfig",
             "attribute": "master_port",
-            "value": 47001,
+            "value": "47001",
         },
         [
             {
