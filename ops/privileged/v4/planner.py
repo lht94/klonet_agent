@@ -579,13 +579,9 @@ class V4ChangePlannerAgent:
             return V4PlanningOutcome(
                 status="need_evidence",
                 candidate_plan=candidate_plan,
-                probe_requests=[
-                    ProbeRequest(
-                        "ports",
-                        {"ports": sorted({int(item.value) for item in unproven_ports})},
-                        "verify frozen port availability",
-                    )
-                ],
+                probe_requests=self._candidate_evidence_requests(
+                    candidate_plan, bundle, unproven_ports
+                ),
             )
         if contract_errors:
             raise ValueError("; ".join(contract_errors))
@@ -994,13 +990,9 @@ class V4ChangePlannerAgent:
             return V4PlanningOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
-                probe_requests=[
-                    ProbeRequest(
-                        "ports",
-                        {"ports": sorted({int(item.value) for item in unproven})},
-                        "verify frozen port availability",
-                    )
-                ],
+                probe_requests=V4ChangePlannerAgent._candidate_evidence_requests(
+                    candidate, bundle, unproven
+                ),
             )
         occupied = []
         for resource in candidate.resources:
@@ -1049,6 +1041,34 @@ class V4ChangePlannerAgent:
             )
             for step in plan.steps
         )
+
+    @staticmethod
+    def _candidate_evidence_requests(
+        candidate: ChangePlanV4,
+        bundle: EvidenceBundle,
+        unproven_ports: list[PlanResource],
+    ) -> list[ProbeRequest]:
+        requests = []
+        if unproven_ports:
+            requests.append(
+                ProbeRequest(
+                    "ports",
+                    {"ports": sorted({int(item.value) for item in unproven_ports})},
+                    "verify frozen port availability",
+                )
+            )
+        if (
+            V4ChangePlannerAgent._plan_needs_docker_images(candidate)
+            and not V4ChangePlannerAgent._has_docker_images(bundle)
+        ):
+            requests.append(
+                ProbeRequest(
+                    "docker_images",
+                    {},
+                    "select an already installed image for each new container",
+                )
+            )
+        return requests
 
     @staticmethod
     def _has_docker_images(bundle: EvidenceBundle) -> bool:

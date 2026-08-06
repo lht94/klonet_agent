@@ -130,6 +130,44 @@ def test_container_plan_requires_docker_image_discovery_before_binding():
     assert V4ChangePlannerAgent.finalize_candidate(plan, bundle).status == "ready"
 
 
+def test_container_candidate_batches_port_and_image_discovery():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.contracts import (
+        ChangePlanV4,
+        ChangeStepV4,
+        EvidenceBundle,
+    )
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    port = PlanResource(
+        "redis_port", "port", "frozen", "redis_port", 45557, "planner_choice"
+    )
+    plan = ChangePlanV4(
+        plan_id="priv-v4-batch",
+        goal="deploy isolated containers",
+        risk="high",
+        resources=[port],
+        steps=[
+            ChangeStepV4(
+                step_id="stateful",
+                title="Provision isolated stateful containers",
+                objective="Create new MySQL, Redis, and RabbitMQ containers",
+                risk="high",
+                expected_changes=["containers run"],
+                postconditions=[{"checker": "exit_code_zero", "args": {}}],
+            )
+        ],
+    )
+
+    outcome = V4ChangePlannerAgent.finalize_candidate(
+        plan, EvidenceBundle(goal=plan.goal)
+    )
+
+    assert {request.probe for request in outcome.probe_requests} == {
+        "ports", "docker_images"
+    }
+
+
 def test_v4_store_uses_separate_directory_and_recovers_without_reexecution(tmp_path):
     from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
     from klonet_agent.ops.privileged.v4.store import V4PlanStore
