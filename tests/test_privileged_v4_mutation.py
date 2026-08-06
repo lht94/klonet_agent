@@ -772,6 +772,54 @@ def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
     assert resources[1].consumers == ["nginx.instance_root"]
 
 
+def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_steps():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {
+                "step_id": "change-1",
+                "title": "Clone source",
+                "objective": "Clone into /home/lzl/klonet_v4_e2e",
+            },
+            {
+                "step_id": "change-3",
+                "title": "Configure application",
+                "objective": "Edit /home/lzl/klonet_v4_e2e/vemu_config/config.py",
+            },
+            {
+                "step_id": "change-5",
+                "title": "Activate Nginx",
+                "objective": "Create /etc/nginx/sites-available/klonet-v4-e2e",
+            },
+        ]
+    }
+    resources = [
+        PlanResource(
+            "instance_identifier", "identifier", "frozen",
+            "instance_identifier", "v4e2e", "user_input",
+            consumers=["change-1.instance_name", "change-6.instance_name"],
+        ),
+        PlanResource(
+            "config_path", "path", "frozen", "config_path",
+            "/home/lzl/klonet_v4_e2e/vemu_config/config.py", "derived",
+            consumers=["change-5.path", "change-6.path"],
+        ),
+        PlanResource(
+            "nginx_config_path", "path", "frozen", "nginx_config_path",
+            "/etc/nginx/sites-available/klonet-v4-e2e", "derived",
+            consumers=["change-5.path", "change-6.path"],
+        ),
+    ]
+
+    V4ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
+
+    assert resources[0].consumers == ["change-1.instance_name"]
+    assert resources[1].consumers == ["change-3.path"]
+    assert resources[2].consumers == ["change-5.path"]
+
+
 def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent

@@ -872,6 +872,56 @@ class V4ChangePlannerAgent:
                 for owner, separator, field in [str(consumer).partition(".")]
             ]
 
+        # Model repairs can remove or renumber semantic changes while leaving
+        # old resource consumers behind. Unknown owners are never bindable and
+        # must not survive merely because a different resource happened to
+        # make the stale id look Nginx-related.
+        for resource in resources:
+            resource.consumers = list(dict.fromkeys(
+                consumer
+                for consumer in resource.consumers
+                if consumer.partition(".")[0] in known
+            ))
+
+        # Future file paths are stronger evidence than a model-generated
+        # change number. Ground them only in semantic changes that explicitly
+        # mention the exact path. Keep root and runtime-directory resources on
+        # their dedicated repository/project_root bindings.
+        change_text = {
+            str(item.get("step_id") or ""): json.dumps(
+                item, ensure_ascii=False, sort_keys=True
+            )
+            for item in changes
+            if isinstance(item, dict) and str(item.get("step_id") or "")
+        }
+        for resource in resources:
+            value = str(resource.value or "")
+            if (
+                resource.kind != "path"
+                or resource.role in {"instance_root", "runtime_mains_root"}
+                or not value.startswith("/")
+            ):
+                continue
+            matching = [
+                step_id for step_id, serialized in change_text.items()
+                if value in serialized
+            ]
+            if not matching:
+                continue
+            grounded = [
+                consumer for consumer in resource.consumers
+                if consumer.partition(".")[0] in matching
+            ]
+            grounded_owners = {
+                consumer.partition(".")[0] for consumer in grounded
+            }
+            for step_id in matching:
+                if step_id not in grounded_owners:
+                    grounded.append("%s.path" % step_id)
+            resource.consumers = list(dict.fromkeys(grounded))
+
+        V4ChangePlannerAgent._normalize_consumer_owners(resources)
+
     @staticmethod
     def _normalize_core_resource_consumers(
         data: dict[str, Any],
