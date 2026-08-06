@@ -1043,7 +1043,7 @@ class V4ChangePlannerAgent:
     def _plan_needs_docker_images(plan: ChangePlanV4) -> bool:
         return any(
             re.search(
-                r"\b(?:docker\s+)?container\b|容器",
+                r"\b(?:docker\s+)?containers?\b|容器",
                 "%s %s" % (step.title, step.objective),
                 re.I,
             )

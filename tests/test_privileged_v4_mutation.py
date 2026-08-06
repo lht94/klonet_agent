@@ -105,8 +105,8 @@ def test_container_plan_requires_docker_image_discovery_before_binding():
         steps=[
             ChangeStepV4(
                 step_id="redis",
-                title="Provision isolated Redis container v4e2e-redis",
-                objective="Create the new Redis container",
+                title="Provision isolated stateful containers",
+                objective="Create the new MySQL, Redis, and RabbitMQ containers",
                 risk="high",
                 expected_changes=["container is running"],
                 postconditions=[
