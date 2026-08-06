@@ -1444,6 +1444,27 @@ def test_complete_klonet_deployment_contract_rejects_invented_database_migration
     )
 
 
+def test_complete_klonet_contract_allows_create_all_during_application_start():
+    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+
+    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+        {
+            "goal": "deploy a complete isolated Klonet platform instance",
+            "changes": [{
+                "step_id": "start",
+                "title": "Start the four application Screen components",
+                "objective": (
+                    "Launch the application; app_factory create_all initializes "
+                    "empty database tables during startup"
+                ),
+            }],
+        },
+        [],
+    )
+
+    assert not any("database initialization" in error for error in errors)
+
+
 def test_complete_klonet_deployment_rejects_ungrounded_dependency_install_step():
     from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 

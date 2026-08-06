@@ -1662,13 +1662,29 @@ class V4ChangePlannerAgent:
             errors.append(
                 "complete Klonet runtime includes unsupported data_server component"
             )
-        if re.search(
-            r"(?:database|schema).{0,24}(?:migration|initialize|initialization|seed)|"
-            r"(?:migration|initialize|initialization|seed).{0,24}(?:database|schema)|"
-            r"数据库.{0,16}(?:迁移|初始化|种子)|(?:迁移|初始化|种子).{0,16}数据库",
-            payload,
-            re.I,
-        ):
+        invented_database_step = False
+        for change in data.get("changes", []):
+            if not isinstance(change, dict):
+                continue
+            primary = "%s %s" % (
+                change.get("title") or "",
+                change.get("objective") or "",
+            )
+            mentions_database_change = re.search(
+                r"(?:database|schema).{0,24}(?:migration|initialize|initialization|seed)|"
+                r"(?:migration|initialize|initialization|seed).{0,24}(?:database|schema)|"
+                r"数据库.{0,16}(?:迁移|初始化|种子)|(?:迁移|初始化|种子).{0,16}数据库",
+                primary,
+                re.I,
+            )
+            allowed_startup_fact = (
+                re.search(r"\b(?:start|launch|startup)\b|启动", primary, re.I)
+                and re.search(r"create_all|app_factory", primary, re.I)
+            )
+            if mentions_database_change and not allowed_startup_fact:
+                invented_database_step = True
+                break
+        if invented_database_step:
             errors.append(
                 "complete Klonet runtime invents unsupported database initialization step"
             )
