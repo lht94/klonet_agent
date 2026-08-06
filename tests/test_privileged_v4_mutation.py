@@ -1305,7 +1305,9 @@ def test_complete_klonet_deployment_contract_requires_config_fields_and_master_n
 
     assert (
         "complete Klonet configuration missing attributes="
-        "master_port,worker_port,web_terminal_port,mysql_port,redis_port,rabbitmq_port"
+        "master_port,worker_port,web_terminal_port,mysql_port,redis_port,"
+        "rabbitmq_port,master_ip,mysql_ip,rabbitmq_ip,celery_redis_port_db,"
+        "celery_rabbitmq_port_db,proj_config"
     ) in errors
     assert "complete Klonet Nginx must proxy to frozen master_port=47001" in errors
 

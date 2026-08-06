@@ -119,8 +119,15 @@ master (`<instance>_m`), celery (`<instance>_c`), web terminal
 (`<instance>_web`), and worker (`<instance>_w`). It has distinct frozen
 `master_port`, `worker_port`, and `web_terminal_port` host resources; celery
 does not listen on a fourth application port. Configuration changes must name
-those exact Python attributes as well as mysql_port, redis_port and
-rabbitmq_port when isolated stateful containers are planned. The Nginx site
+those exact Python attributes as well as mysql_port, redis_port,
+rabbitmq_port, master_ip, mysql_ip, rabbitmq_ip, celery_redis_port_db and
+celery_rabbitmq_port_db when isolated stateful containers are planned. For a
+same-host isolated instance with loopback-only container publishing, set the
+three *_ip fields to 127.0.0.1, set both Celery Redis DB endpoint strings to
+the frozen Redis host port plus their existing /6 and /7 DB suffixes, and
+keep the top-level `PROJ_CONFIG = WtxConfig()` activation. Existing cloned
+MySQL/Redis credentials are consumed locally by the container Action and must
+not be copied into the model response. The Nginx site
 fronts the master application port; web-terminal and worker liveness are
 proved independently. Do not rename the web-terminal port to a generic
 `web_port`, and do not spell Screen suffixes as `_master` or `_worker`.
@@ -1612,6 +1619,9 @@ class V4ChangePlannerAgent:
         required_attributes = (
             "master_port", "worker_port", "web_terminal_port",
             "mysql_port", "redis_port", "rabbitmq_port",
+            "master_ip", "mysql_ip", "rabbitmq_ip",
+            "celery_redis_port_db", "celery_rabbitmq_port_db",
+            "proj_config",
         )
         missing_attributes = [
             attribute
