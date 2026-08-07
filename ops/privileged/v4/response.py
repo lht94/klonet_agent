@@ -21,6 +21,8 @@ class V4ResponseAgent:
                             "content": (
                                 "你是 Klonet Ops-Privilege V4 回答器。只根据已确认事实和"
                                 "不确定项回答中文，不输出内部证据 ID，不建议或执行变更。"
+                                "保持事实、顺序和含义不变；使用合理分段，列表项分别换行，"
+                                "不要输出多余空行。"
                             ),
                         },
                         {
@@ -33,7 +35,7 @@ class V4ResponseAgent:
                     temperature=0,
                     extra_body={"thinking": {"type": "disabled"}},
                 )
-                text = " ".join((response.choices[0].message.content or "").split())
+                text = (response.choices[0].message.content or "").strip()
                 if text:
                     return text
             except Exception:
