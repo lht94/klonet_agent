@@ -8,6 +8,14 @@ import tarfile
 from pathlib import Path
 
 
+def _write_runtime_entries(root: Path) -> None:
+    for name in (
+        "gun.py", "master_main.py", "celery_worker.py",
+        "web_terminal_main.py", "worker_gun.py", "worker_main.py",
+    ):
+        (root / name).write_text("# entry\n", encoding="utf-8")
+
+
 def test_docker_uses_direct_group_socket_access_without_sudo(monkeypatch):
     from klonet_agent.ops.privileged import action_runner as module
 
@@ -51,12 +59,14 @@ def test_runtime_python_env_aliases_hardcoded_package_to_isolated_clone(
     alias = alias_root / "original_package"
     assert alias.is_symlink()
     assert alias.resolve() == instance.resolve()
+    assert alias_root.stat().st_mode & 0o777 == 0o755
 
 
 def test_screen_component_waits_for_its_application_port(tmp_path, monkeypatch):
     from klonet_agent.ops.privileged import action_runner as module
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
 
+    _write_runtime_entries(tmp_path)
     python = tmp_path / "python3.8"
     python.write_text("", encoding="utf-8")
     python.chmod(0o755)
@@ -88,8 +98,229 @@ def test_screen_component_waits_for_its_application_port(tmp_path, monkeypatch):
         )
     )
 
-    assert result.status == "completed"
+    assert result.status == "completed", result.output
     assert waited == [("127.0.0.1", 47001, 20.0)]
+
+
+def test_screen_component_uses_frozen_runtime_uid_and_python(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    _write_runtime_entries(tmp_path)
+    python = tmp_path / "python3.8"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    monkeypatch.setattr(module, "_runtime_python_env", lambda _root: {"PYTHONPATH": "/runtime/alias"})
+    monkeypatch.setattr(module, "_wait_tcp_listening", lambda *_args, **_kwargs: True)
+    calls = []
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: calls.append(argv)
+        or subprocess.CompletedProcess(argv, 0, "", "")
+    )
+
+    result = runner(_step(
+        "start_screen_component",
+        {
+            "platform": "102",
+            "component": "master",
+            "screen_session": "102_m",
+            "project_root": str(tmp_path),
+            "master_port": 27694,
+            "run_as_uid": 997,
+            "python_executable": str(python),
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "completed", result.output
+    runtime_calls = [call for call in calls if call[:4] == ["sudo", "-n", "-u", "#997"]]
+    assert len(runtime_calls) >= 3
+    assert any(str(python) in call for call in runtime_calls)
+    assert any("PYTHONPATH=/runtime/alias" in call for call in runtime_calls)
+
+
+def test_screen_component_keeps_interactive_shell_after_foreground_service_stops(
+    tmp_path, monkeypatch
+):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    _write_runtime_entries(tmp_path)
+    python = tmp_path / "python3.8"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    monkeypatch.setattr(module, "_runtime_python_env", lambda _root: {
+        "PYTHONPATH": "/tmp/runtime-alias",
+    })
+    monkeypatch.setattr(module, "_wait_tcp_listening", lambda *_args, **_kwargs: True)
+    calls = []
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: calls.append(argv)
+        or subprocess.CompletedProcess(argv, 0, "", "")
+    )
+
+    result = runner(_step(
+        "start_screen_component",
+        {
+            "platform": "v4e2e",
+            "component": "worker",
+            "screen_session": "v4e2e_w",
+            "project_root": str(tmp_path),
+            "worker_port": 47002,
+            "python_executable": str(python),
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "completed", result.output
+    screen_call = next(call for call in calls if "screen" in call and "-dmS" in call)
+    assert "--rcfile" in screen_call
+    assert "-i" in screen_call
+    assert "-lc" not in screen_call
+    assert not any("exec " in str(item) for item in screen_call)
+    rc_write = next(call for call in calls if "p.write_text" in " ".join(call))
+    rc_body = rc_write[-1]
+    assert "klonet_start()" in rc_body
+    assert "Ctrl-C" in rc_body
+    assert "exec " not in rc_body
+    assert "python3.8 -m gunicorn -c worker_gun.py worker_main:flask_app" in rc_body
+    assert "session_mode=interactive_foreground" in result.output
+
+
+def test_restart_preserves_existing_interactive_screen_shell(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    _write_runtime_entries(tmp_path)
+    python = tmp_path / "python3.8"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    monkeypatch.setattr(module, "_wait_tcp_released", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(module, "_wait_tcp_listening", lambda *_args, **_kwargs: True)
+    calls = []
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: calls.append(argv)
+        or subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    monkeypatch.setattr(
+        runner,
+        "_screen_session_targets",
+        lambda session, run_as_uid="": ["123.v4e2e_w"],
+    )
+
+    result = runner(_step(
+        "restart_screen_component",
+        {
+            "platform": "v4e2e",
+            "component": "worker",
+            "screen_session": "v4e2e_w",
+            "project_root": str(tmp_path),
+            "worker_port": 47002,
+            "python_executable": str(python),
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "completed", result.output
+    stuff = [call for call in calls if "stuff" in call]
+    assert stuff[0][-1] == "\x03"
+    assert stuff[1][-1] == "klonet_start\n"
+    assert not any("quit" in call for call in calls)
+    assert "session_preserved=true" in result.output
+
+
+def test_screen_component_waits_for_generic_role_port_and_fails_if_not_ready(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    _write_runtime_entries(tmp_path)
+    python = tmp_path / "python3.8"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    waited = []
+    monkeypatch.setattr(module, "_python_executable", lambda _args: str(python))
+    monkeypatch.setattr(module, "_runtime_python_env", lambda _root: {})
+    monkeypatch.setattr(
+        module,
+        "_wait_tcp_listening",
+        lambda host, port, timeout: waited.append((host, port, timeout)) or False,
+    )
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+
+    result = runner(_step(
+        "start_screen_component",
+        {
+            "platform": "test",
+            "component": "worker",
+            "screen_session": "test_w",
+            "project_root": str(tmp_path),
+            "worker_port": "45555",
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "failed"
+    assert "component_port_not_ready" in result.output
+    assert waited == [("127.0.0.1", 45555, 20.0)]
+
+
+def test_dead_screen_target_is_identified_for_exact_session(monkeypatch):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    runner = DirectPrivilegedActionRunner()
+    monkeypatch.setattr(
+        runner,
+        "_screen_ls_text",
+        lambda: (
+            "2561348.vemu_uestc_w (Dead ???)\n"
+            "2561338.vemu_uestc_m (Detached)\n"
+        ),
+    )
+
+    assert runner._dead_screen_session_targets("vemu_uestc_w") == [
+        "2561348.vemu_uestc_w"
+    ]
+    assert runner._dead_screen_session_targets("vemu_uestc_m") == []
+
+
+def test_start_component_waits_for_exact_dead_screen_cleanup(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    _write_runtime_entries(tmp_path)
+    python = tmp_path / "python3.8"
+    python.write_text("", encoding="utf-8")
+    python.chmod(0o755)
+    monkeypatch.setattr(module, "_python_executable", lambda _args: str(python))
+    monkeypatch.setattr(module, "_runtime_python_env", lambda _root: {})
+    monkeypatch.setattr(module, "_wait_tcp_listening", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+    calls = []
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    states = iter([
+        "123.vemu_uestc_w (Dead ???)",
+        "123.vemu_uestc_w (Dead ???)",
+        "No Sockets found",
+        "No Sockets found",
+    ])
+    monkeypatch.setattr(runner, "_screen_ls_text", lambda: next(states, "No Sockets found"))
+
+    result = runner(_step(
+        "start_screen_component",
+        {
+            "platform": "vemu_uestc", "component": "worker",
+            "screen_session": "vemu_uestc_w", "project_root": str(tmp_path),
+            "worker_port": "45552",
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "completed"
+    assert ["screen", "-wipe", "123.vemu_uestc_w"] in calls
 
 
 def test_web_terminal_command_uses_frozen_active_config_port():
@@ -1237,6 +1468,230 @@ def test_direct_runner_stops_klonet_runtime_instance_by_cwd(monkeypatch, tmp_pat
     assert "ports=45551,45552,5005" in result.output
 
 
+def test_direct_runner_stops_only_exact_root_bound_component(monkeypatch, tmp_path):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    runtime = tmp_path / "vemu_uestc"
+    (runtime / "vemu_config").mkdir(parents=True)
+    processes = [
+        {"pid": 1001, "pgid": 1001, "cmdline": "gunicorn worker_main:flask_app", "cwd": str(runtime)},
+        {"pid": 1002, "pgid": 1001, "cmdline": "gunicorn worker_main:flask_app", "cwd": str(runtime)},
+        {"pid": 2001, "pgid": 2001, "cmdline": "python web_terminal_main.py", "cwd": str(runtime)},
+    ]
+    calls = []
+    monkeypatch.setattr(module, "_klonet_runtime_processes", lambda root: processes)
+    monkeypatch.setattr(
+        module, "_listener_pids_for_port", lambda port: [1002] if processes else []
+    )
+    monkeypatch.setattr(module.Path, "exists", lambda path: False if str(path) == "/proc/1001" else True)
+    monkeypatch.setattr(module, "_proc_uid", lambda pid: 1000)
+    monkeypatch.setattr(module.os, "geteuid", lambda: 1000, raising=False)
+
+    def command_runner(argv, **kwargs):
+        calls.append(list(argv))
+        processes.clear()
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "stop_klonet_component",
+            {"runtime_cwd": str(runtime), "component": "worker", "pid": 1001, "port": 45552},
+            risk="high",
+        )
+    )
+
+    assert result.status == "completed"
+    assert calls == [["kill", "-TERM", "-1001"]]
+    assert "component=worker" in result.output
+
+
+def test_component_stop_accepts_instance_root_with_complete_mains(monkeypatch, tmp_path):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    runtime = tmp_path / "102"
+    mains = runtime / "mains"
+    mains.mkdir(parents=True)
+    _write_runtime_entries(mains)
+    processes = [{
+        "pid": 1001,
+        "pgid": 1001,
+        "cmdline": "gunicorn master_main:flask_app",
+        "cwd": str(runtime),
+    }]
+    monkeypatch.setattr(module, "_klonet_runtime_processes", lambda root: processes)
+    monkeypatch.setattr(
+        module,
+        "_listener_pids_for_port",
+        lambda port: [1001] if processes else [],
+    )
+    monkeypatch.setattr(
+        module.Path,
+        "exists",
+        lambda path: False if str(path) == "/proc/1001" else True,
+    )
+    monkeypatch.setattr(module, "_proc_uid", lambda pid: 1000)
+    monkeypatch.setattr(module.os, "geteuid", lambda: 1000, raising=False)
+
+    def command_runner(argv, **kwargs):
+        processes.clear()
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    result = DirectPrivilegedActionRunner(command_runner=command_runner)(
+        _step(
+            "stop_klonet_component",
+            {
+                "runtime_cwd": str(runtime),
+                "component": "master",
+                "pid": 1001,
+                "port": 27694,
+            },
+            risk="high",
+        )
+    )
+
+    assert result.status == "completed"
+    assert "runtime_cwd=%s" % runtime in result.output
+
+
+def test_runtime_cwd_normalizes_complete_mains_to_instance_root(tmp_path):
+    from klonet_agent.ops.privileged.action_runner import (
+        _normalized_klonet_runtime_cwd,
+    )
+
+    root = tmp_path / "102"
+    mains = root / "mains"
+    mains.mkdir(parents=True)
+    _write_runtime_entries(mains)
+
+    assert _normalized_klonet_runtime_cwd(mains) == root.resolve()
+
+
+def test_proc_cwd_uses_bounded_sudo_readlink_for_other_user(monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+
+    original_resolve = module.Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        if str(path) == "/proc/1234/cwd":
+            raise PermissionError("cross-user proc cwd")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.Path, "resolve", resolve)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="/srv/instance\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    assert module._proc_cwd(1234) == "/srv/instance"
+    assert calls == [["sudo", "-n", "readlink", "-f", "/proc/1234/cwd"]]
+
+
+def test_listener_pid_query_retries_with_bounded_sudo(monkeypatch):
+    from klonet_agent.ops.privileged import action_runner as module
+
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/sbin/ss")
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(list(argv))
+        stdout = (
+            "LISTEN 0 128 127.0.0.1:27694 0.0.0.0:* "
+            'users:(("gunicorn",pid=4321,fd=5))\n'
+            if argv[0] == "sudo"
+            else "LISTEN 0 128 127.0.0.1:27694 0.0.0.0:*\n"
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    assert module._listener_pids_for_port(27694) == [4321]
+    assert calls == [
+        ["/usr/sbin/ss", "-ltnp"],
+        ["sudo", "-n", "/usr/sbin/ss", "-ltnp"],
+    ]
+
+
+def test_component_stop_blocks_role_or_port_mismatch(monkeypatch, tmp_path):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    runtime = tmp_path / "vemu_uestc"
+    (runtime / "vemu_config").mkdir(parents=True)
+    monkeypatch.setattr(module, "_klonet_runtime_processes", lambda root: [{
+        "pid": 1001, "pgid": 1001,
+        "cmdline": "gunicorn master_main:flask_app", "cwd": str(runtime),
+    }])
+    monkeypatch.setattr(module, "_listener_pids_for_port", lambda port: [1001])
+
+    result = DirectPrivilegedActionRunner()(
+        _step(
+            "stop_klonet_component",
+            {"runtime_cwd": str(runtime), "component": "worker", "pid": 1001, "port": 45552},
+            risk="high",
+        )
+    )
+
+    assert result.status == "blocked"
+    assert "component_role_mismatch" in result.output
+
+
+def test_stop_runtime_does_not_require_shared_ports_owned_by_other_root_to_close(
+    monkeypatch, tmp_path,
+):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    runtime = tmp_path / "vemu_uestc"
+    (runtime / "vemu_config").mkdir(parents=True)
+    snapshots = [[{
+        "pid": 1001,
+        "pgid": 1001,
+        "cmdline": "python -m gunicorn -c worker_gun.py worker_main:flask_app",
+        "cwd": str(runtime),
+    }], []]
+    monkeypatch.setattr(
+        module,
+        "_klonet_runtime_processes",
+        lambda path: snapshots.pop(0) if snapshots else [],
+    )
+    monkeypatch.setattr(
+        module,
+        "_runtime_ports_owned_by_allowed_cwd",
+        lambda ports, root: [],
+    )
+    monkeypatch.setattr(
+        module,
+        "_ports_currently_listening",
+        lambda runner, ports: [45551],
+    )
+    monkeypatch.setattr(module, "_proc_uid", lambda pid: 1000)
+    monkeypatch.setattr(module.os, "geteuid", lambda: 1000, raising=False)
+
+    result = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, stdout="", stderr=""
+        )
+    )(
+        _step(
+            "stop_klonet_runtime_instance",
+            {"runtime_cwd": str(runtime), "ports": [45551, 45552]},
+            risk="high",
+        )
+    )
+
+    assert result.status == "completed"
+
+
 def test_direct_runner_exact_text_replacement_creates_backup(tmp_path):
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
 
@@ -1262,6 +1717,33 @@ def test_direct_runner_exact_text_replacement_creates_backup(tmp_path):
     backups = list(tmp_path.glob("config.py.klonet-agent.bak.*"))
     assert len(backups) == 1
     assert "redis_port = 8368" in backups[0].read_text(encoding="utf-8")
+
+
+def test_text_replacement_preserves_existing_mode_and_owner(tmp_path):
+    import os
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    target = tmp_path / "master_main.py"
+    target.write_text("flask_app = create_app()\n", encoding="utf-8")
+    target.chmod(0o775)
+    before = target.stat()
+    runner = DirectPrivilegedActionRunner()
+
+    result = runner(_step(
+        "replace_text_in_file",
+        {
+            "path": str(target),
+            "old_text": "flask_app = create_app()",
+            "new_text": "flask_app = create_master_app()",
+        },
+        risk="medium",
+    ))
+
+    after = target.stat()
+    assert result.status == "completed"
+    assert (after.st_uid, after.st_gid, after.st_mode & 0o777) == (
+        before.st_uid, before.st_gid, 0o775,
+    )
 
 
 def test_direct_runner_exact_text_replacement_requires_unique_match(tmp_path):

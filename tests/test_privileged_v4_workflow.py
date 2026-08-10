@@ -5,6 +5,49 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_binding_context_preserves_exact_ops_source_before_large_runtime_evidence():
+    from klonet_agent.ops.privileged.v4.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+
+    bundle = EvidenceBundle(goal="repair 102")
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest(
+                probe="running_platforms",
+                args={"project_roots": ["/x"]},
+                purpose="runtime baseline",
+            ),
+            "runtime evidence\n" + "x" * 20000,
+        )
+    )
+    exact_source = (
+        "def KLONET_E2E_INJECTED_102_MASTER_BOOT_FAILURE():\n"
+        '    raise RuntimeError("KLONET_E2E_INJECTED_102_MASTER_BOOT_FAILURE")\n'
+    )
+    bundle.add(
+        EvidenceRecord.from_probe(
+            ProbeRequest(
+                probe="ops_file",
+                args={"path": "/home/klonet-agent/102/mains/master_main.py"},
+                purpose="read exact source",
+            ),
+            exact_source,
+        )
+    )
+
+    context = V4MutationWorkflow._binding_context(bundle)
+
+    assert context is not None
+    assert exact_source in context.environment_evidence
+    assert context.environment_evidence.index("probe=ops_file") < context.environment_evidence.index(
+        "probe=running_platforms"
+    )
+
+
 def test_v4_confirmation_redacts_registered_action_credentials():
     from klonet_agent.ops.privileged.contracts import ExecutionBinding
     from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
@@ -37,6 +80,12 @@ def test_v4_confirmation_redacts_registered_action_credentials():
 
     assert "local-secret" not in message
     assert "[REDACTED]" in message
+    assert "V4 变更计划" in message
+    assert "目标：" in message
+    assert "风险：" in message
+    assert "冻结资源：" not in message
+    assert "变更步骤：" in message
+    assert "请使用以下命令确认这份精确计划" in message
 
 
 def test_reload_nginx_verification_accepts_non_systemd_master_process():
@@ -215,7 +264,7 @@ def test_submit_binds_and_persists_but_never_executes_before_confirmation(tmp_pa
         result.plan.content_hash,
     ) in result.message
     assert "deploy isolated instance" in result.message
-    assert "registered_action: service_control" in result.message
+    assert "已注册动作 service_control" in result.message
     assert "exit_code_zero" in result.message
 
 
@@ -417,6 +466,12 @@ def test_semantic_config_verification_is_composed_from_atomic_bindings():
 
     plan = _change_plan(hierarchical=True)
     change = plan.steps[0]
+    change.postconditions = [
+        {"checker": "process_not_running", "args": {"pattern": "worker_main"}},
+        {"checker": "port_listening", "args": {"port": 47001}},
+        {"checker": "backend_health", "args": {"url": "http://127.0.0.1:47001/server_health/", "expected_code": 1}},
+        {"checker": "backend_health", "args": {"url": "http://127.0.0.1:49999/server_health/", "expected_code": 1}},
+    ]
     step = change.implementation_plan.steps[0]
     step.execution_binding.action = "set_python_class_attribute"
     step.execution_binding.args = {
@@ -440,6 +495,17 @@ def test_semantic_config_verification_is_composed_from_atomic_bindings():
     semantic = V4MutationWorkflow._semantic_verification_step(change)
 
     assert semantic.postconditions == [
+        {
+            "checker": "port_listening",
+            "args": {"port": 47001},
+        },
+        {
+            "checker": "backend_health",
+            "args": {
+                "url": "http://127.0.0.1:47001/server_health/",
+                "expected_code": 1,
+            },
+        },
         {
             "checker": "python_attribute_equals",
             "args": {

@@ -9,6 +9,7 @@ def test_readonly_probe_registry_covers_required_environment_evidence():
     from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
 
     expected = {
+        "privilege_capabilities",
         "system_environment",
         "project_layout",
         "python_runtime",
@@ -16,6 +17,7 @@ def test_readonly_probe_registry_covers_required_environment_evidence():
         "port_owner",
         "process",
         "process_tree",
+        "process_logs",
         "service",
         "screen",
         "docker",
@@ -47,6 +49,142 @@ def test_readonly_probe_registry_covers_required_environment_evidence():
 
     assert expected <= {spec.name for spec in DEFAULT_READONLY_PROBES.describe()}
     assert all(spec.description for spec in DEFAULT_READONLY_PROBES.describe())
+
+
+def test_process_logs_requires_pid_cwd_and_log_inside_same_project_root(
+    tmp_path, monkeypatch
+):
+    from klonet_agent.ops.privileged import probes
+
+    runtime = tmp_path / "102"
+    logs = runtime / "logs"
+    logs.mkdir(parents=True)
+    log = logs / "master.any-name.log"
+    log.write_text("RuntimeError: boot failed\n", encoding="utf-8")
+    monkeypatch.setattr(
+        probes,
+        "_safe_readlink",
+        lambda path: str(runtime) if str(path) == "/proc/123/cwd" else "",
+    )
+    monkeypatch.setattr(probes, "_process_log_paths", lambda pid: [log])
+    monkeypatch.setattr(
+        probes,
+        "_resolve_process_log_path",
+        lambda path, root: path,
+    )
+
+    output = probes.DEFAULT_READONLY_PROBES.run(
+        "process_logs",
+        {"pids": [123], "project_root": str(runtime)},
+    )
+
+    assert "fd_log=%s" % log in output
+    assert "RuntimeError: boot failed" in output
+
+    monkeypatch.setattr(
+        probes,
+        "_safe_readlink",
+        lambda path: "/srv/unrelated" if str(path) == "/proc/123/cwd" else "",
+    )
+    refused = probes.DEFAULT_READONLY_PROBES.run(
+        "process_logs",
+        {"pids": [123], "project_root": str(runtime)},
+    )
+    assert "refused_cwd_outside_project_root" in refused
+    assert "RuntimeError" not in refused
+
+
+def test_process_log_privileged_fallback_stays_inside_bound_root(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged import probes
+
+    root = tmp_path / "102"
+    log = root / "logs" / "master.log"
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[2:4] == ["readlink", "-f"]:
+            return str(log)
+        if argv[2:4] == ["tail", "-c"]:
+            return "RuntimeError: injected boot failure"
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(probes, "_run", fake_run)
+    assert probes._resolve_process_log_path(log, root) == log
+    output = probes._read_process_log(log)
+    assert "RuntimeError: injected boot failure" in output
+    assert calls == [
+        (["sudo", "-n", "readlink", "-f", str(log)], {"timeout": 4}),
+        (
+            ["sudo", "-n", "tail", "-c", "20000", "--", str(log)],
+            {"timeout": 8},
+        ),
+    ]
+
+    calls.clear()
+    outside = tmp_path / "elsewhere" / "master.log"
+    assert probes._resolve_process_log_path(outside, root) is None
+    assert not calls
+
+
+def test_process_metadata_readlink_uses_bounded_sudo_only_for_allowlisted_proc_links(
+    monkeypatch,
+):
+    from klonet_agent.ops.privileged import probes
+
+    calls = []
+    monkeypatch.setattr(probes, "_safe_readlink", lambda _path: "")
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return "/home/klonet-agent/102"
+
+    monkeypatch.setattr(probes, "_run", fake_run)
+
+    assert probes._process_metadata_readlink(
+        probes.Path("/proc/123/cwd")
+    ) == "/home/klonet-agent/102"
+    assert calls == [
+        (
+            ["sudo", "-n", "readlink", "-f", "/proc/123/cwd"],
+            {"timeout": 4},
+        )
+    ]
+
+    calls.clear()
+    assert probes._process_metadata_readlink(probes.Path("/proc/123/environ")) == ""
+    assert probes._process_metadata_readlink(probes.Path("/proc/self/cwd")) == ""
+    assert not calls
+
+
+def test_process_metadata_readlink_falls_back_when_resolve_returns_proc_path(
+    monkeypatch,
+):
+    from klonet_agent.ops.privileged import probes
+
+    monkeypatch.setattr(probes, "_safe_readlink", lambda path: str(path))
+    monkeypatch.setattr(
+        probes,
+        "_run",
+        lambda argv, **kwargs: "/home/klonet-agent/102/logs/master.log",
+    )
+
+    assert probes._process_metadata_readlink(
+        probes.Path("/proc/123/fd/1")
+    ) == "/home/klonet-agent/102/logs/master.log"
+
+
+def test_process_metadata_readlink_rejects_ambiguous_privileged_output(monkeypatch):
+    from klonet_agent.ops.privileged import probes
+
+    monkeypatch.setattr(probes, "_safe_readlink", lambda _path: "")
+    monkeypatch.setattr(
+        probes,
+        "_run",
+        lambda _argv, **_kwargs: "/home/klonet-agent/102\nsudo: warning",
+    )
+
+    assert probes._process_metadata_readlink(probes.Path("/proc/123/fd/2")) == ""
 
 
 def test_project_layout_probe_discovers_nested_klonet_package(tmp_path):

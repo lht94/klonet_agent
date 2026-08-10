@@ -63,6 +63,8 @@ from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
 from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+from klonet_agent.ops.privileged.v4.context_store import OperationalContextStore
+from klonet_agent.ops.privileged.v4.diagnosis import V4DiagnosticPlannerAgent
 from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
 from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
 from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
@@ -160,6 +162,11 @@ class AgentOrchestrator:
                     "Execution Agent：",
                     "Verifier：",
                     "Workflow Coordinator：",
+                    "计划器：",
+                    "实施绑定：",
+                    "执行器：",
+                    "验证器：",
+                    "工作流协调器：",
                 )
                 if text.startswith(known_prefixes):
                     print(text, flush=True)
@@ -214,7 +221,7 @@ class AgentOrchestrator:
                         planner_llm,
                         probe_runner=probe_runner,
                         on_progress=privileged_progress(
-                            "Implementation Binding Agent"
+                            "实施绑定"
                         ),
                     )
                 ),
@@ -235,6 +242,12 @@ class AgentOrchestrator:
                 synthesis=synthesis,
                 response=V4ResponseAgent(self.llm),
                 mutation_workflow=mutation_workflow,
+                diagnostic_planner=V4DiagnosticPlannerAgent(planner_llm),
+                context_store=OperationalContextStore(
+                    MEMORY_DIR,
+                    user_id=self.session.user_id,
+                    project_id=self.session.project_id,
+                ),
             )
 
     def init_history(self) -> list[dict]:
@@ -574,7 +587,7 @@ class AgentOrchestrator:
             assistant_msg = {"role": "assistant", "content": privileged_reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
-            print(f"Workflow Coordinator：{privileged_reply}")
+            print(f"工作流协调器：{privileged_reply}")
             return privileged_reply, history, token
 
         thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."

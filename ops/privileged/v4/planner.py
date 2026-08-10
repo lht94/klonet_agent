@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from klonet_agent.ops.privileged.contracts import PlanResource, RISK_LEVELS
+from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
 from klonet_agent.ops.privileged.checkers import (
     CHECKER_REQUIRED_ARGS,
     DefaultCheckerRegistry,
@@ -17,9 +19,74 @@ from klonet_agent.ops.privileged.v4.contracts import (
     ChangeStepV4,
     EvidenceBundle,
     EvidenceConclusion,
+    EvidenceRecord,
     ProbeRequest,
+    normalize_probe_request,
 )
 from klonet_agent.ops.privileged.v4.discovery import parse_json_object
+
+
+def _inventory_missing_runtime_roles(
+    bundle: EvidenceBundle,
+) -> list[tuple[str, str, set[str]]]:
+    missing = []
+    for record in bundle.records:
+        if record.request.probe != "running_platforms":
+            continue
+        for line in record.output.splitlines():
+            if "backend_status=abnormal" not in line:
+                continue
+            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+            alias_match = re.search(r"\bplatform=([^\s]+)", line)
+            roles = {
+                role
+                for role in ("master", "worker")
+                if re.search(
+                    r"\b%s_endpoint=not_checked\s+reason=role_not_running\b"
+                    % role,
+                    line,
+                )
+            }
+            if root_match is not None and roles:
+                missing.append(
+                    (
+                        root_match.group(1),
+                        alias_match.group(1) if alias_match else "",
+                        roles,
+                    )
+                )
+    return missing
+
+
+def _request_rechecks_confirmed_missing_role(
+    request: ProbeRequest,
+    missing: list[tuple[str, str, set[str]]],
+) -> bool:
+    if request.probe not in {"process", "process_detail", "screen", "screen_session"}:
+        return False
+    text = "%s %s" % (
+        json.dumps(request.args, ensure_ascii=False),
+        request.purpose,
+    )
+    lowered = text.lower()
+    for root, alias, roles in missing:
+        selected = (
+            root in text
+            or bool(alias and re.search(
+                r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
+                % re.escape(alias),
+                text,
+                re.I,
+            ))
+            or len(missing) == 1
+        )
+        if not selected:
+            continue
+        for role in roles:
+            suffix = "_m" if role == "master" else "_w"
+            if role in lowered or suffix in lowered:
+                return True
+    return False
 
 
 CHANGE_PLANNER_SYSTEM_PROMPT = """
@@ -30,6 +97,11 @@ must never appear as changes. Do not select Action names or emit commands.
 When the evidence conclusion contains a deterministic `User-selected Screen
 source maps authoritatively` fact with repository, remote, branch and revision,
 use it as the source contract and do not request source discovery again.
+When `plan_execution` evidence is present, this is recovery replanning after an
+approved plan failed verification. Preserve steps already proved completed,
+never emit them again, and plan only the failed or still-unmet effects. Use the
+execution observation, checks, and fresh runtime evidence to address the actual
+failure instead of blindly retrying the old plan.
 
 Return one JSON object with status `need_evidence`, `ready`, or `blocked`.
 For need_evidence return at most four registered read-only probe_requests.
@@ -181,6 +253,14 @@ class V4ChangePlannerAgent:
         *,
         binding_feedback: str = "",
     ) -> V4PlanningOutcome:
+        deterministic = self._deterministic_runtime_restart(goal, bundle)
+        if deterministic is not None:
+            try:
+                return self._outcome(deterministic, goal, bundle)
+            except ValueError:
+                # Keep the existing bounded planner as a compatibility fallback
+                # when evidence is insufficient for the deterministic contract.
+                pass
         messages = [
             {"role": "system", "content": CHANGE_PLANNER_SYSTEM_PROMPT},
             {
@@ -193,6 +273,19 @@ class V4ChangePlannerAgent:
                 ),
             },
         ]
+        if len(set(re.findall(r"/[A-Za-z0-9._/-]+", goal))) >= 2:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "This is a multi-root repair. Return at most 4 semantic changes "
+                        "and 16 resources. Group each instance's cohesive configuration "
+                        "and runtime recovery into one semantic change; leave atomic file, "
+                        "process, and component actions to Binding. Do not repeat evidence "
+                        "or narrate per-process diagnostics in expected_changes."
+                    ),
+                }
+            )
         if binding_feedback:
             messages.append(
                 {
@@ -208,19 +301,28 @@ class V4ChangePlannerAgent:
             )
         last_error: Exception | None = None
         content = ""
+        oversized_repairs = 0
         max_generations = 4
         for attempt in range(max_generations):
             try:
                 response = self._complete(messages)
                 choices = getattr(response, "choices", None)
                 message = getattr(choices[0], "message", None) if choices else None
-                content = getattr(message, "content", None) or ""
+                content = self._raw_planner_content(message)
                 data, normalized_content = self._planner_payload(response)
                 content = normalized_content or content
                 return self._outcome(data, goal, bundle)
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
                 if attempt < max_generations - 1:
+                    oversized_output = len(content) > 12000
+                    if oversized_output and oversized_repairs >= 1:
+                        last_error = ValueError(
+                            "bounded output remained oversized after compact retry"
+                        )
+                        break
+                    if oversized_output:
+                        oversized_repairs += 1
                     previous = (
                         content
                         if len(content) <= 12000
@@ -257,6 +359,14 @@ class V4ChangePlannerAgent:
                                 "processes. Nginx activation must follow application startup. "
                                 "An isolated Nginx site must use an explicit dedicated "
                                 "frozen listen port, and http_status must check that port."
+                                + (
+                                    " The previous output exceeded the bounded contract. "
+                                    "Return at most 4 semantic changes and 16 resources; "
+                                    "group cohesive work by instance and leave atomic "
+                                    "implementation steps to Binding."
+                                    if oversized_output
+                                    else ""
+                                )
                             )
                             % exc,
                         }
@@ -272,6 +382,171 @@ class V4ChangePlannerAgent:
                 % str(last_error or "unknown planner failure")
             ),
         )
+
+    @staticmethod
+    def _deterministic_runtime_restart(
+        goal: str,
+        bundle: EvidenceBundle,
+    ) -> dict[str, Any] | None:
+        """Compile explicit master/worker restart intent from runtime evidence."""
+
+        text = str(goal or "")
+        lowered = text.lower()
+        if not any(marker in lowered for marker in ("重启", "restart")):
+            return None
+        requested_roles = [
+            role for role in ("master", "worker")
+            if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role, lowered)
+        ]
+        if not requested_roles:
+            return None
+        selected: tuple[EvidenceRecord, str, str] | None = None
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for line in record.output.splitlines():
+                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                alias_match = re.search(r"\bplatform=([^\s]+)", line)
+                if root_match is None:
+                    continue
+                root = root_match.group(1)
+                alias = alias_match.group(1) if alias_match else Path(root).name
+                if root in text or re.search(
+                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
+                    % re.escape(alias),
+                    text,
+                    re.I,
+                ):
+                    selected = (record, line, alias)
+                    break
+            if selected is not None:
+                break
+        if selected is None:
+            return None
+        record, line, alias = selected
+        root = re.search(r"\bproject_root=(/[^\s]+)", line).group(1)
+        step_id = "restart-backend-roles"
+        resources: list[dict[str, Any]] = [
+            {
+                "name": "instance_root", "kind": "path", "status": "frozen",
+                "role": "instance_root", "value": root,
+                "source": "running_platforms",
+                "consumers": [step_id + ".instance_root", step_id + ".project_root"],
+            },
+            {
+                "name": "instance_identifier", "kind": "identifier",
+                "status": "frozen", "role": "instance_identifier", "value": alias,
+                "source": "running_platforms",
+                "consumers": [step_id + ".platform"],
+            },
+        ]
+        expected = []
+        postconditions = []
+        for role in requested_roles:
+            port_match = re.search(r"\b%s_port=(\d{1,5})" % role, line)
+            endpoint_match = re.search(r"\b%s_endpoint=([^\s]+)" % role, line)
+            if port_match is None or endpoint_match is None:
+                return None
+            port = int(port_match.group(1))
+            endpoint = endpoint_match.group(1)
+            disposition = (
+                "start missing"
+                if endpoint == "not_checked"
+                and re.search(
+                    r"\b%s_endpoint=not_checked\s+reason=role_not_running" % role,
+                    line,
+                )
+                else "restart requested"
+            )
+            expected.append(
+                "%s %s role at %s and backend health succeeds"
+                % (disposition, role, port)
+            )
+            resources.append({
+                "name": role + "_port", "kind": "port", "status": "frozen",
+                "role": role + "_port", "value": port,
+                "source": "existing_runtime",
+                "consumers": [step_id + "." + role + "_port"],
+            })
+            postconditions.append({
+                "checker": "backend_health",
+                "args": {
+                    "url": "http://127.0.0.1:%s/server_health/" % port,
+                    "expected_code": 1,
+                },
+            })
+        identity_text = "\n".join(
+            item.output for item in bundle.records if item.status == "available"
+        )
+        run_as_uid: int | None = None
+        python_executable = ""
+        process_identity = re.search(
+            r"pid=\d+\s+cwd=%s(?:/mains)?\s+cmdline=(/[^\s]*python[^\s]*)"
+            % re.escape(root.rstrip("/")),
+            identity_text,
+        )
+        current_uid = re.search(r"\bcurrent_uid=(\d+)\b", identity_text)
+        if process_identity is not None and current_uid is not None:
+            run_as_uid = int(current_uid.group(1))
+            python_executable = process_identity.group(1)
+        else:
+            # Identity tuples must come from the selected instance row; a
+            # global first match could silently borrow another root's UID.
+            identity = re.search(
+                r"(?:^|[=,\s])(\d+):(\d+):(/[^,\s]*python[^,\s]*)",
+                line,
+            )
+            if identity is not None:
+                run_as_uid = int(identity.group(2))
+                python_executable = identity.group(3)
+        if run_as_uid is not None and python_executable:
+            resources.extend([
+                {
+                    "name": "run_as_uid", "kind": "identifier", "status": "frozen",
+                    "role": "run_as_uid", "value": run_as_uid,
+                    "source": "runtime_evidence",
+                    "consumers": [step_id + ".run_as_uid"],
+                },
+                {
+                    "name": "python_executable", "kind": "path", "status": "frozen",
+                    "role": "python_executable", "value": python_executable,
+                    "source": "runtime_evidence",
+                    "consumers": [step_id + ".python_executable"],
+                },
+            ])
+        return {
+            "status": "ready",
+            "goal": goal,
+            "assumptions": [],
+            "resources": resources,
+            "changes": [{
+                "step_id": step_id,
+                "title": "重启 %s 的后端角色" % alias,
+                "objective": "按项目根目录 %s 重启 %s" % (
+                    root, " 和 ".join(requested_roles),
+                ),
+                "reason": "用户明确要求重启，运行清单已绑定实例根目录和角色端口",
+                "evidence_refs": [record.evidence_id],
+                "depends_on": [],
+                "risk": "medium",
+                "expected_changes": expected,
+                "postconditions": postconditions,
+            }],
+        }
+
+    @staticmethod
+    def _raw_planner_content(message: Any) -> str:
+        if message is None:
+            return ""
+        calls = getattr(message, "tool_calls", None)
+        if calls:
+            function = getattr(calls[0], "function", None)
+            arguments = getattr(function, "arguments", None)
+            if arguments is not None:
+                if isinstance(arguments, dict):
+                    return json.dumps(arguments, ensure_ascii=False)
+                return str(arguments)
+        return str(getattr(message, "content", None) or "")
 
     def _complete(self, messages: list[dict[str, str]]) -> Any:
         tool = self._planner_tool()
@@ -507,6 +782,54 @@ class V4ChangePlannerAgent:
         status = str(data.get("status") or "").strip().lower()
         if status == "need_evidence":
             requests = self._probe_requests(data.get("probe_requests"))
+            impossible_process_logs = [
+                request
+                for request in requests
+                if request.probe == "process_logs"
+                and (
+                    not isinstance(request.args.get("pids"), list)
+                    or not any(
+                        str(pid).isdigit() and int(pid) > 1
+                        for pid in request.args.get("pids", [])
+                    )
+                    or not str(request.args.get("project_root") or "").startswith("/")
+                )
+            ]
+            if impossible_process_logs and len(impossible_process_logs) == len(requests):
+                raise ValueError(
+                    "process_logs requires an existing PID list and project_root; "
+                    "a role confirmed as role_not_running has no process log to probe. "
+                    "Use the frozen missing-role, configuration, dependency, and port "
+                    "evidence to return a ready plan or a genuine blocker."
+                )
+            if impossible_process_logs:
+                requests = [
+                    request
+                    for request in requests
+                    if request not in impossible_process_logs
+                ]
+            missing_roles = _inventory_missing_runtime_roles(bundle)
+            redundant_absence_requests = [
+                request
+                for request in requests
+                if _request_rechecks_confirmed_missing_role(
+                    request, missing_roles
+                )
+            ]
+            if redundant_absence_requests and len(redundant_absence_requests) == len(requests):
+                raise ValueError(
+                    "running_platforms already proves the requested runtime role is "
+                    "role_not_running for its project_root. Do not re-query process or "
+                    "screen presence for that role; start_screen_component handles a "
+                    "stale/dead target session safely. Return a ready plan or a genuine "
+                    "non-presence blocker."
+                )
+            if redundant_absence_requests:
+                requests = [
+                    request
+                    for request in requests
+                    if request not in redundant_absence_requests
+                ]
             authoritative_roots = self._authoritative_screen_source_roots(
                 goal,
                 bundle,
@@ -561,6 +884,16 @@ class V4ChangePlannerAgent:
         self._normalize_verification_changes(data)
         self._normalize_change_order(data)
         self._normalize_postcondition_args(data)
+        self._normalize_port_resource_roles(data)
+        self._normalize_runtime_stop_scope(data, goal, bundle)
+        self._normalize_runtime_repair_coverage(data, bundle)
+        explicit_runtime_restart = (
+            any(marker in str(goal or "").lower() for marker in ("重启", "restart"))
+            and any(role in str(goal or "").lower() for role in ("master", "worker"))
+        )
+        if not explicit_runtime_restart:
+            self._normalize_healthy_runtime_role_changes(data, bundle)
+        self._collapse_redundant_runtime_repair_changes(data)
         resources = [
             PlanResource.from_dict(item)
             for item in data.get("resources", [])
@@ -568,8 +901,13 @@ class V4ChangePlannerAgent:
         ]
         self._normalize_core_resource_consumers(data, resources)
         resources = self._normalize_derived_resources(data, resources)
+        self._normalize_existing_config_paths(data, resources)
         self._normalize_resource_consumer_owners(data, resources)
+        self._compile_existing_runtime_role_ports(data, resources, bundle)
+        self._mark_existing_runtime_ports(data, resources, bundle)
+        self._mark_existing_config_ports(data, resources, bundle)
         self._normalize_occupied_host_ports(data, resources, bundle)
+        self._normalize_backend_role_health_contracts(data, resources)
         self._normalize_nginx_postconditions(data, resources)
         contract_errors = self._ready_contract_errors(
             data,
@@ -902,10 +1240,6 @@ class V4ChangePlannerAgent:
                 if consumer.partition(".")[0] in known
             ))
 
-        # Future file paths are stronger evidence than a model-generated
-        # change number. Ground them only in semantic changes that explicitly
-        # mention the exact path. Keep root and runtime-directory resources on
-        # their dedicated repository/project_root bindings.
         change_text = {
             str(item.get("step_id") or ""): json.dumps(
                 item, ensure_ascii=False, sort_keys=True
@@ -913,6 +1247,34 @@ class V4ChangePlannerAgent:
             for item in changes
             if isinstance(item, dict) and str(item.get("step_id") or "")
         }
+
+        # A project root is an instance identity, not a global path hint.  A
+        # same-named sibling must never inherit it merely because the model
+        # attached both roots to one semantic change.
+        for resource in resources:
+            if resource.kind != "path" or resource.role != "instance_root":
+                continue
+            value = str(resource.value or "").rstrip("/")
+            matching = [
+                step_id for step_id, serialized in change_text.items()
+                if value and value in serialized
+            ]
+            if not matching:
+                continue
+            grounded = [
+                consumer for consumer in resource.consumers
+                if consumer.partition(".")[0] in matching
+            ]
+            grounded_owners = {item.partition(".")[0] for item in grounded}
+            for step_id in matching:
+                if step_id not in grounded_owners:
+                    grounded.append("%s.instance_root" % step_id)
+            resource.consumers = list(dict.fromkeys(grounded))
+
+        # Future file paths are stronger evidence than a model-generated
+        # change number. Ground them only in semantic changes that explicitly
+        # mention the exact path. Keep root and runtime-directory resources on
+        # their dedicated repository/project_root bindings.
         for resource in resources:
             value = str(resource.value or "")
             if (
@@ -1126,20 +1488,37 @@ class V4ChangePlannerAgent:
                     candidates.append(port)
                 if re.search(r":%s\b" % port, record.output):
                     occupied.add(port)
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for configured in re.findall(r"\bconfigured_ports=([^\s]+)", record.output):
+                occupied.update(
+                    int(raw)
+                    for raw in re.findall(r"(?:^|,)[A-Za-z_]+:(\d{1,5})", configured)
+                    if 1 <= int(raw) <= 65535
+                )
         host_resources = [
             resource
             for resource in resources
             if V4ChangePlannerAgent._requires_host_port_availability(resource)
         ]
-        selected = {int(resource.value) for resource in host_resources}
         busy_selected = []
+        busy_resources = []
         for resource in host_resources:
             port = int(resource.value)
             if port in occupied and port not in busy_selected:
                 busy_selected.append(port)
+            if port in occupied:
+                busy_resources.append(resource)
         if not busy_selected:
             return
-        reserved = selected.difference(busy_selected)
+        reserved = {
+            int(resource.value)
+            for resource in resources
+            if resource.status == "frozen"
+            and resource.kind == "port"
+            and resource not in busy_resources
+        }
         free = [
             port
             for port in candidates
@@ -1148,20 +1527,24 @@ class V4ChangePlannerAgent:
         if len(free) < len(busy_selected):
             return
         replacements = dict(zip(busy_selected, free))
+        replacements_by_step: dict[str, dict[int, int]] = {}
         for resource in host_resources:
             old = int(resource.value)
             if old in replacements:
                 resource.value = replacements[old]
                 resource.source = "compiler_selected_from_checked_free_candidates"
+                for consumer in resource.consumers:
+                    owner = str(consumer).partition(".")[0]
+                    replacements_by_step.setdefault(owner, {})[old] = replacements[old]
 
-        def rewrite(value: Any) -> Any:
+        def rewrite(value: Any, scoped: dict[int, int]) -> Any:
             if isinstance(value, bool):
                 return value
             if isinstance(value, int):
-                return replacements.get(value, value)
+                return scoped.get(value, value)
             if isinstance(value, str):
                 result = value
-                for old, new in replacements.items():
+                for old, new in scoped.items():
                     result = re.sub(
                         r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % old,
                         str(new),
@@ -1169,14 +1552,1031 @@ class V4ChangePlannerAgent:
                     )
                 return result
             if isinstance(value, list):
-                return [rewrite(item) for item in value]
+                return [rewrite(item, scoped) for item in value]
             if isinstance(value, dict):
-                return {key: rewrite(item) for key, item in value.items()}
+                return {key: rewrite(item, scoped) for key, item in value.items()}
             return value
 
-        rewritten = rewrite(data)
-        data.clear()
-        data.update(rewritten)
+        changes = data.get("changes")
+        if isinstance(changes, list):
+            data["changes"] = [
+                rewrite(
+                    change,
+                    replacements_by_step.get(str(change.get("step_id") or ""), {}),
+                )
+                if isinstance(change, dict)
+                else change
+                for change in changes
+            ]
+
+    @staticmethod
+    def _mark_existing_config_ports(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+    ) -> None:
+        """Mark role-matched active config ports as existing, not allocations."""
+
+        changes = {
+            str(item.get("step_id") or ""): json.dumps(item, ensure_ascii=False)
+            for item in data.get("changes", [])
+            if isinstance(item, dict)
+        }
+        configured: list[tuple[str, str, int]] = []
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for line in record.output.splitlines():
+                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                ports_match = re.search(r"\bconfigured_ports=([^\s]+)", line)
+                if root_match is None or ports_match is None:
+                    continue
+                for role, raw in re.findall(
+                    r"(?:^|,)([A-Za-z_]+):(\d{1,5})",
+                    ports_match.group(1),
+                ):
+                    configured.append((root_match.group(1), role, int(raw)))
+        for resource in resources:
+            if resource.status != "frozen" or resource.kind != "port":
+                continue
+            owners = {str(item).partition(".")[0] for item in resource.consumers}
+            owner_text = " ".join(changes.get(owner, "") for owner in owners)
+            if any(
+                resource.role == role
+                and int(resource.value) == port
+                and root in owner_text
+                for root, role, port in configured
+            ):
+                resource.source = "existing_config"
+
+    @staticmethod
+    def _compile_existing_runtime_role_ports(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+    ) -> None:
+        """Keep an existing instance's evidenced role ports unless migration is explicit."""
+
+        changes = {
+            str(item.get("step_id") or ""): item
+            for item in data.get("changes", [])
+            if isinstance(item, dict)
+        }
+        observed: dict[tuple[str, str], int] = {}
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for line in record.output.splitlines():
+                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                if root_match is None:
+                    continue
+                for role in ("master", "worker"):
+                    port_match = re.search(r"\b%s_port=(\d{1,5})\b" % role, line)
+                    if port_match is not None:
+                        observed[(root_match.group(1), "%s_port" % role)] = int(
+                            port_match.group(1)
+                        )
+
+        replacements: dict[str, dict[int, int]] = {}
+        for resource in resources:
+            if (
+                resource.status != "frozen"
+                or resource.kind != "port"
+                or resource.role not in {"master_port", "worker_port"}
+            ):
+                continue
+            owners = {str(item).partition(".")[0] for item in resource.consumers}
+            for owner in owners:
+                change = changes.get(owner)
+                if change is None:
+                    continue
+                text = json.dumps(change, ensure_ascii=False)
+                root = next(
+                    (
+                        candidate_root
+                        for candidate_root, candidate_role in observed
+                        if candidate_role == resource.role and candidate_root in text
+                    ),
+                    "",
+                )
+                if not root:
+                    continue
+                if re.search(
+                    r"\b(?:migrate|move|change|set|allocate)\w*\b[^.!?。！？]{0,40}\bport\b|"
+                    r"(?:迁移|切换|修改|设置|分配)[^。！？]{0,30}端口",
+                    text,
+                    re.I,
+                ):
+                    continue
+                expected = observed[(root, resource.role)]
+                old = int(resource.value)
+                if old != expected:
+                    replacements.setdefault(owner, {})[old] = expected
+                    resource.value = expected
+                resource.source = "existing_runtime"
+
+        def rewrite(value: Any, mapping: dict[int, int]) -> Any:
+            if isinstance(value, int):
+                return mapping.get(value, value)
+            if isinstance(value, str):
+                result = value
+                for old, new in mapping.items():
+                    result = re.sub(r"(?<!\d)%s(?!\d)" % old, str(new), result)
+                return result
+            if isinstance(value, list):
+                return [rewrite(item, mapping) for item in value]
+            if isinstance(value, dict):
+                return {key: rewrite(item, mapping) for key, item in value.items()}
+            return value
+
+        if replacements:
+            data["changes"] = [
+                rewrite(item, replacements.get(str(item.get("step_id") or ""), {}))
+                if isinstance(item, dict)
+                else item
+                for item in data.get("changes", [])
+            ]
+
+    @staticmethod
+    def _normalize_backend_role_health_contracts(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> None:
+        """Verify every started/migrated backend role on its planned port."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            step_id = str(change.get("step_id") or "")
+            fragments = [
+                "%s %s" % (change.get("title") or "", change.get("objective") or ""),
+                *[str(item) for item in change.get("expected_changes") or []],
+            ]
+            postconditions = change.setdefault("postconditions", [])
+            if not isinstance(postconditions, list):
+                postconditions = []
+                change["postconditions"] = postconditions
+            for role in ("master", "worker"):
+                role_port = next(
+                    (
+                        int(resource.value)
+                        for resource in resources
+                        if resource.status == "frozen"
+                        and resource.kind == "port"
+                        and resource.role == "%s_port" % role
+                        and any(
+                            str(consumer).rsplit(".", 1)[0] == step_id
+                            for consumer in resource.consumers
+                        )
+                        and str(resource.value).isdigit()
+                    ),
+                    None,
+                )
+                existing_role_check = bool(
+                    role_port is not None
+                    and any(
+                        isinstance(item, dict)
+                        and item.get("checker") in {"http_status", "backend_health"}
+                        and isinstance(item.get("args"), dict)
+                        and re.search(
+                            r":%s(?:/|$)" % role_port,
+                            str(item["args"].get("url") or ""),
+                        )
+                        for item in postconditions
+                    )
+                )
+                authorized = any(
+                    re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role, fragment, re.I)
+                    and re.search(
+                        r"\b(?:start|restart|restore|recover|migrate|move|healthy|health)\w*\b|"
+                        r"启动|重启|恢复|迁移|健康",
+                        fragment,
+                        re.I,
+                    )
+                    and not re.search(r"\b(?:preserve|keep|remain|unchanged)\b|保持|保留|不变|不修改", fragment, re.I)
+                    for fragment in fragments
+                )
+                if not authorized and not existing_role_check:
+                    continue
+                port = role_port
+                if port is None:
+                    continue
+                postconditions[:] = [
+                    item for item in postconditions
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("checker") in {"http_status", "backend_health"}
+                        and isinstance(item.get("args"), dict)
+                        and re.search(
+                            r":%s(?:/|$)" % port,
+                            str(item["args"].get("url") or ""),
+                        )
+                    )
+                ]
+                postconditions.append({
+                    "checker": "backend_health",
+                    "args": {
+                        "url": "http://127.0.0.1:%s/server_health/" % port,
+                        "expected_code": 1,
+                    },
+                })
+
+    @staticmethod
+    def _mark_existing_runtime_ports(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+    ) -> None:
+        """Distinguish ports owned by a repaired root from new-port candidates."""
+
+        changes = {
+            str(item.get("step_id") or ""): json.dumps(item, ensure_ascii=False)
+            for item in data.get("changes", [])
+            if isinstance(item, dict)
+        }
+        runtime_ports: list[tuple[str, str, int]] = []
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for line in record.output.splitlines():
+                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                if root_match is None:
+                    continue
+                for role, raw_port in re.findall(
+                    r"\b(master_port|worker_port)=(\d{1,5})\b",
+                    line,
+                ):
+                    runtime_ports.append((root_match.group(1), role, int(raw_port)))
+        for resource in resources:
+            if resource.status != "frozen" or resource.kind != "port":
+                continue
+            try:
+                value = int(resource.value)
+            except (TypeError, ValueError):
+                continue
+            consumer_steps = {
+                consumer.rsplit(".", 1)[0] for consumer in resource.consumers
+            }
+            owner_text = " ".join(changes.get(step_id, "") for step_id in consumer_steps)
+            matches = [
+                role
+                for root, role, port in runtime_ports
+                if value == port and root in owner_text
+            ]
+            if matches:
+                resource.source = "existing_runtime"
+                if str(resource.role or "") not in {"master_port", "worker_port"}:
+                    unique_roles = sorted(set(matches))
+                    if len(unique_roles) == 1:
+                        resource.role = unique_roles[0]
+
+    @staticmethod
+    def _normalize_runtime_repair_coverage(
+        data: dict[str, Any],
+        bundle: EvidenceBundle,
+    ) -> None:
+        """Compile unhealthy runtime roles into mandatory repair acceptance."""
+
+        unhealthy: dict[
+            str,
+            dict[str, tuple[int, str, list[int], dict[int, tuple[int, str]]]],
+        ] = {}
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for line in record.output.splitlines():
+                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                if root_match is None or "backend_status=abnormal" not in line:
+                    continue
+                roles: dict[
+                    str,
+                    tuple[int, str, list[int], dict[int, tuple[int, str]]],
+                ] = {}
+                for role in ("master", "worker"):
+                    port_match = re.search(r"\b%s_port=(\d{1,5})\b" % role, line)
+                    endpoint_match = re.search(
+                        r"\b%s_endpoint=([^\s]+)" % role,
+                        line,
+                    )
+                    if (
+                        port_match is not None
+                        and endpoint_match is not None
+                        and endpoint_match.group(1) != "healthy"
+                    ):
+                        endpoint = endpoint_match.group(1)
+                        disposition = (
+                            "start missing"
+                            if endpoint == "not_checked"
+                            and re.search(r"\b%s_endpoint=not_checked\s+reason=role_not_running" % role, line)
+                            else "restart unhealthy"
+                        )
+                        pids_match = re.search(
+                            r"\b%s_pids=([0-9,]+)" % role,
+                            line,
+                        )
+                        pids = (
+                            sorted({int(item) for item in pids_match.group(1).split(",")})
+                            if pids_match is not None
+                            else []
+                        )
+                        identities_match = re.search(
+                            r"\b%s_identities=([^\s]+)" % role,
+                            line,
+                        )
+                        identities: dict[int, tuple[int, str]] = {}
+                        if identities_match is not None:
+                            for raw_identity in identities_match.group(1).split(","):
+                                match = re.fullmatch(
+                                    r"(\d+):(\d+):(/[^\s,]+)", raw_identity,
+                                )
+                                if match is not None:
+                                    identities[int(match.group(1))] = (
+                                        int(match.group(2)), match.group(3),
+                                    )
+                        roles[role] = (
+                            int(port_match.group(1)), disposition, pids, identities,
+                        )
+                if roles:
+                    unhealthy[root_match.group(1)] = roles
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        for root, roles in unhealthy.items():
+            candidates = [
+                item for item in changes
+                if isinstance(item, dict)
+                and root in json.dumps(item, ensure_ascii=False)
+            ]
+            change = next(
+                (
+                    item for item in candidates
+                    if re.search(
+                        r"\b(?:start|restart|restore|recover|launch)\w*\b|"
+                        r"启动|重启|恢复",
+                        "%s %s %s" % (
+                            item.get("title") or "",
+                            item.get("objective") or "",
+                            " ".join(item.get("expected_changes") or []),
+                        ),
+                        re.I,
+                    )
+                    and not re.match(
+                        r"^\s*(?:(?:precisely|safely|only|精确|安全|仅)\s*)?"
+                        r"(?:stop|terminate|停止|终止)",
+                        str(item.get("title") or ""),
+                        re.I,
+                    )
+                ),
+                candidates[0] if candidates else None,
+            )
+            if change is None:
+                continue
+            expected = change.setdefault("expected_changes", [])
+            postconditions = change.setdefault("postconditions", [])
+            additions = []
+            step_id = str(change.get("step_id") or "")
+            raw_resources = data.get("resources")
+            if not isinstance(raw_resources, list):
+                raw_resources = []
+                data["resources"] = raw_resources
+            for role, (observed_port, disposition, pids, identities) in roles.items():
+                planned_port = next(
+                    (
+                        int(item.get("value"))
+                        for item in raw_resources or []
+                        if isinstance(item, dict)
+                        and str(item.get("role") or "") == "%s_port" % role
+                        and any(
+                            str(consumer).rsplit(".", 1)[0] == step_id
+                            for consumer in item.get("consumers") or []
+                        )
+                        and str(item.get("value") or "").isdigit()
+                    ),
+                    observed_port,
+                )
+                marker = "%s %s role at %s and backend health succeeds" % (
+                    disposition, role, planned_port,
+                )
+                if disposition == "restart unhealthy":
+                    expected[:] = [
+                        item
+                        for item in expected
+                        if not (
+                            re.search(
+                                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role,
+                                str(item),
+                                re.I,
+                            )
+                            and re.search(
+                                r"\b(?:preserve|keeps?|remains?|unchanged|do not restart|not restart\w*)\b|"
+                                r"保持|保留|不变|不重启|无需重启",
+                                str(item),
+                                re.I,
+                            )
+                        )
+                    ]
+                if not any(
+                    disposition in str(item).lower()
+                    and role in str(item).lower()
+                    for item in expected
+                ):
+                    expected.append(marker)
+                additions.append("recover %s" % role)
+                if disposition == "restart unhealthy" and pids:
+                    resource_name = "%s_pid" % role
+                    if len(unhealthy) > 1:
+                        resource_name = "%s_%s" % (
+                            re.sub(r"[^A-Za-z0-9]+", "_", root).strip("_")[-60:],
+                            resource_name,
+                        )
+                    if not any(
+                        isinstance(item, dict)
+                        and item.get("name") == resource_name
+                        for item in raw_resources or []
+                    ):
+                        raw_resources.append(
+                            {
+                                "name": resource_name,
+                                "kind": "identifier",
+                                "status": "frozen",
+                                "role": "%s_pid" % role,
+                                "value": pids[0],
+                                "source": "running_platforms",
+                                "consumers": [
+                                    "%s.%s_pid" % (step_id, role)
+                                ],
+                            }
+                        )
+                    runtime_identity = identities.get(pids[0])
+                    if runtime_identity is not None:
+                        run_as_uid, python_executable = runtime_identity
+                        identity_resources = (
+                            ("%s_uid" % role, "identifier", "%s_uid" % role,
+                             run_as_uid, "run_as_uid"),
+                            ("%s_python_executable" % role, "path",
+                             "%s_python_executable" % role,
+                             python_executable, "python_executable"),
+                        )
+                        for name, kind, resource_role, value, arg_name in identity_resources:
+                            if any(
+                                isinstance(item, dict)
+                                and item.get("role") == resource_role
+                                and any(
+                                    str(consumer).rsplit(".", 1)[0] == step_id
+                                    for consumer in item.get("consumers") or []
+                                )
+                                for item in raw_resources
+                            ):
+                                continue
+                            raw_resources.append({
+                                "name": name,
+                                "kind": kind,
+                                "status": "frozen",
+                                "role": resource_role,
+                                "value": value,
+                                "source": "running_platforms",
+                                "consumers": ["%s.%s" % (step_id, arg_name)],
+                            })
+                # Backend acceptance is one exact contract.  Remove generic or
+                # legacy HTTP checks for this role's port (/, /check_health,
+                # external host aliases) and require /server_health/ JSON code=1.
+                postconditions[:] = [
+                    item
+                    for item in postconditions
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("checker") in {"http_status", "backend_health"}
+                        and isinstance(item.get("args"), dict)
+                        and re.search(
+                            r":%s(?:/|$)" % planned_port,
+                            str(item["args"].get("url") or ""),
+                        )
+                    )
+                ]
+                postconditions.append({
+                    "checker": "backend_health",
+                    "args": {
+                        "url": "http://127.0.0.1:%s/server_health/" % planned_port,
+                        "expected_code": 1,
+                    },
+                })
+            objective = str(change.get("objective") or "")
+            coverage = "; ".join(additions)
+            if coverage and coverage not in objective:
+                change["objective"] = "%s; %s for %s" % (objective, coverage, root)
+
+    @staticmethod
+    def _collapse_redundant_runtime_repair_changes(data: dict[str, Any]) -> None:
+        """Merge same-root recovery semantics after role coverage is compiled."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        runtime_roots = sorted(
+            {
+                str(resource.get("value") or "").rstrip("/")
+                for resource in data.get("resources") or []
+                if isinstance(resource, dict)
+                and resource.get("status") == "frozen"
+                and resource.get("kind") == "path"
+                and str(resource.get("name") or resource.get("role") or "")
+                in {
+                    "project_root", "runtime_cwd", "instance_root",
+                    "platform_runtime_root", "platform_instance_root",
+                }
+                and str(resource.get("value") or "").startswith("/")
+            },
+            key=len,
+            reverse=True,
+        )
+        owner_by_root: dict[str, dict[str, Any]] = {}
+        replacements: dict[str, str] = {}
+        kept = []
+        for change in changes:
+            if not isinstance(change, dict):
+                kept.append(change)
+                continue
+            text = json.dumps(change, ensure_ascii=False)
+            root = next((item for item in runtime_roots if item in text), "")
+            if not root and not runtime_roots:
+                paths = re.findall(
+                    r"/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+",
+                    text,
+                )
+                root = min(paths, key=len).rstrip("/") if paths else ""
+            recovery = bool(re.search(
+                r"\b(?:start|restart|restore|recover)\w*\b|启动|重启|恢复",
+                "%s %s %s" % (
+                    change.get("title") or "",
+                    change.get("objective") or "",
+                    " ".join(change.get("expected_changes") or []),
+                ),
+                re.I,
+            ))
+            if not root or not recovery:
+                kept.append(change)
+                continue
+            owner = owner_by_root.get(root)
+            if owner is None:
+                owner_by_root[root] = change
+                kept.append(change)
+                continue
+            duplicate_id = str(change.get("step_id") or "")
+            owner_id = str(owner.get("step_id") or "")
+            if duplicate_id and owner_id:
+                replacements[duplicate_id] = owner_id
+            for field in ("expected_changes", "postconditions"):
+                target = owner.setdefault(field, [])
+                for value in change.get(field) or []:
+                    if value not in target:
+                        target.append(value)
+        # A source/runtime recovery owner deterministically decomposes to
+        # edit -> exact role stop -> start.  A sibling semantic step that only
+        # repeats that same role stop must be folded into the owner, otherwise
+        # the confirmed plan can target the predecessor PID twice.
+        for change in list(kept):
+            if not isinstance(change, dict):
+                continue
+            text = json.dumps(change, ensure_ascii=False)
+            root = next((item for item in runtime_roots if item in text), "")
+            owner = owner_by_root.get(root)
+            if not root or owner is None or owner is change:
+                continue
+            primary = "%s %s" % (
+                change.get("title") or "", change.get("objective") or "",
+            )
+            stop_role = next(
+                (
+                    role for role in ("master", "worker")
+                    if re.search(
+                        r"\b(?:stop|terminate)\w*\b|停止|终止", primary, re.I,
+                    )
+                    and re.search(
+                        r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role,
+                        primary,
+                        re.I,
+                    )
+                ),
+                "",
+            )
+            owner_text = json.dumps(owner, ensure_ascii=False)
+            if not stop_role or not re.search(
+                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % stop_role,
+                owner_text,
+                re.I,
+            ):
+                continue
+            duplicate_id = str(change.get("step_id") or "")
+            owner_id = str(owner.get("step_id") or "")
+            if duplicate_id and owner_id:
+                replacements[duplicate_id] = owner_id
+            for field in ("expected_changes", "postconditions"):
+                target = owner.setdefault(field, [])
+                for value in change.get(field) or []:
+                    if value not in target:
+                        target.append(value)
+            kept.remove(change)
+        if not replacements:
+            return
+        for change in kept:
+            if not isinstance(change, dict):
+                continue
+            dependencies = []
+            for raw in change.get("depends_on") or []:
+                dependency = replacements.get(str(raw), str(raw))
+                if dependency != change.get("step_id") and dependency not in dependencies:
+                    dependencies.append(dependency)
+            change["depends_on"] = dependencies
+        for resource in data.get("resources") or []:
+            if not isinstance(resource, dict):
+                continue
+            consumers = []
+            for consumer in resource.get("consumers") or []:
+                owner, separator, argument = str(consumer).partition(".")
+                owner = replacements.get(owner, owner)
+                normalized = "%s.%s" % (owner, argument) if separator else str(consumer)
+                if normalized not in consumers:
+                    consumers.append(normalized)
+            resource["consumers"] = consumers
+        data["changes"] = kept
+
+    @staticmethod
+    def _normalize_healthy_runtime_role_changes(
+        data: dict[str, Any],
+        bundle: EvidenceBundle,
+    ) -> None:
+        """Keep authoritative healthy roles read-only during a scoped repair."""
+
+        states: dict[str, dict[str, tuple[str, int]]] = {}
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            for line in record.output.splitlines():
+                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                if root_match is None:
+                    continue
+                root = root_match.group(1)
+                for role in ("master", "worker"):
+                    endpoint = re.search(r"\b%s_endpoint=([^\s]+)" % role, line)
+                    port = re.search(r"\b%s_port=(\d{1,5})" % role, line)
+                    if endpoint is not None and port is not None:
+                        states.setdefault(root, {})[role] = (
+                            endpoint.group(1), int(port.group(1)),
+                        )
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        mutation_pattern = re.compile(
+            r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+            re.I,
+        )
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            serialized = json.dumps(change, ensure_ascii=False)
+            root = next(
+                (candidate for candidate in states if candidate in serialized),
+                "",
+            )
+            if not root:
+                continue
+            mutating_roles = {
+                role
+                for role in ("master", "worker")
+                if re.search(
+                    r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role,
+                    serialized,
+                    re.I,
+                )
+                and mutation_pattern.search(serialized)
+            }
+            healthy_mutations = {
+                role for role in mutating_roles
+                if states[root].get(role, ("", 0))[0] == "healthy"
+            }
+            unhealthy_mutations = mutating_roles.difference(healthy_mutations)
+            if len(healthy_mutations) != 1 or unhealthy_mutations:
+                if healthy_mutations:
+                    expected = change.setdefault("expected_changes", [])
+                    for role in sorted(healthy_mutations):
+                        marker = "preserve healthy %s role without restart" % role
+                        if marker not in expected:
+                            expected.append(marker)
+                continue
+            role = next(iter(healthy_mutations))
+            port = states[root][role][1]
+            change["title"] = "Verify healthy %s backend" % role
+            change["objective"] = (
+                "Verify %s for %s remains healthy without restarting it"
+                % (role, root)
+            )
+            change["reason"] = (
+                "running_platforms already proves %s /server_health/ healthy"
+                % role
+            )
+            change["risk"] = "readonly"
+            change["expected_changes"] = []
+            change["postconditions"] = [{
+                "checker": "backend_health",
+                "args": {
+                    "url": "http://127.0.0.1:%s/server_health/" % port,
+                    "expected_code": 1,
+                },
+            }]
+
+    @staticmethod
+    def _normalize_port_resource_roles(data: dict[str, Any]) -> None:
+        """Canonicalize instance-prefixed role names before health compilation."""
+
+        resources = data.get("resources")
+        if not isinstance(resources, list):
+            return
+        canonical = (
+            "master_port", "worker_port", "public_port", "web_terminal_port",
+            "redis_port", "mysql_port", "rabbitmq_port",
+        )
+        for resource in resources:
+            if not isinstance(resource, dict) or resource.get("kind") != "port":
+                continue
+            identity = "%s %s" % (
+                resource.get("name") or "", resource.get("role") or ""
+            )
+            matches = [
+                role for role in canonical
+                if re.search(r"(?:^|_)%s(?:$|\s)" % re.escape(role), identity)
+            ]
+            for component in ("master", "worker", "public", "web_terminal"):
+                if re.search(
+                    r"(?:^|_)%s_(?:(?:new|target|destination)_port|"
+                    r"port_(?:new|target|destination))(?:$|\s)" % component,
+                    identity,
+                    re.I,
+                ):
+                    matches.append("%s_port" % component)
+            if len(matches) == 1:
+                resource["role"] = matches[0]
+
+    @staticmethod
+    def _normalize_existing_config_paths(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+    ) -> None:
+        """Bind config resources to the existing active Klonet config file."""
+
+        changes = {
+            str(item.get("step_id") or ""): json.dumps(item, ensure_ascii=False)
+            for item in data.get("changes", [])
+            if isinstance(item, dict)
+        }
+        roots = [
+            resource for resource in resources
+            if resource.status == "frozen"
+            and resource.kind == "path"
+            and resource.role == "instance_root"
+        ]
+        for root_resource in roots:
+            root = Path(str(root_resource.value))
+            candidates = (
+                root / "vemu_config" / "config.py",
+                root / "vemu_uestc" / "vemu_config" / "config.py",
+            )
+            config = next((path for path in candidates if path.is_file()), None)
+            if config is None:
+                continue
+            owners = {
+                step_id for step_id, serialized in changes.items()
+                if str(root) in serialized
+            }
+            port_mutation_owners = {
+                step_id for step_id in owners
+                if re.search(r"\b(?:master_port|worker_port)\b", changes[step_id], re.I)
+                and re.search(r"\b(?:set|change|update|edit|migrate|move)\w*\b|设置|修改|更新|迁移|改为", changes[step_id], re.I)
+            }
+            for resource in resources:
+                if resource.status != "frozen" or resource.kind != "path":
+                    continue
+                if Path(str(resource.value)).name in {"gun.py", "worker_gun.py"}:
+                    rewritten = []
+                    for consumer in resource.consumers:
+                        owner, separator, target = str(consumer).partition(".")
+                        if owner in port_mutation_owners and target == "path":
+                            rewritten.append("%s.worker_gun" % owner)
+                        else:
+                            rewritten.append(str(consumer))
+                    resource.consumers = rewritten
+                    continue
+                if resource.role != "config_path" and "config" not in resource.name:
+                    continue
+                resource_owners = {
+                    str(consumer).partition(".")[0]
+                    for consumer in resource.consumers
+                }
+                if resource_owners.intersection(owners):
+                    resource.value = str(config.resolve())
+                    resource.role = "config_path"
+                    resource.source = "derived_from_existing_instance_root"
+            for owner in port_mutation_owners:
+                if any(
+                    resource.status == "frozen"
+                    and resource.kind == "path"
+                    and str(resource.value) == str(config.resolve())
+                    and "%s.path" % owner in resource.consumers
+                    for resource in resources
+                ):
+                    continue
+                resources.append(PlanResource(
+                    "%s_active_config" % owner.replace("-", "_"),
+                    "path",
+                    "frozen",
+                    "config_path",
+                    str(config.resolve()),
+                    "derived_from_existing_instance_root",
+                    consumers=["%s.path" % owner],
+                ))
+
+    @staticmethod
+    def _normalize_runtime_stop_scope(
+        data: dict[str, Any],
+        goal: str = "",
+        bundle: EvidenceBundle | None = None,
+    ) -> None:
+        """Narrow a port-release stop to the named root, role, and port."""
+
+        changes = data.get("changes")
+        if not isinstance(changes, list):
+            return
+        authoritative: list[tuple[str, int]] = []
+        if bundle is not None and re.search(r"\bworker\b|工作进程", goal, re.I):
+            for record in bundle.records:
+                if record.status != "available" or record.request.probe != "running_platforms":
+                    continue
+                for line in record.output.splitlines():
+                    root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+                    port_match = re.search(r"\bworker_port=(\d{1,5})\b", line)
+                    if root_match is None or port_match is None:
+                        continue
+                    root = root_match.group(1).rstrip("/")
+                    port = int(port_match.group(1))
+                    if root in goal and re.search(r"(?<!\d)%s(?!\d)" % port, goal):
+                        authoritative.append((root, port))
+        authoritative = sorted(set(authoritative), key=lambda item: len(item[0]), reverse=True)
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            primary = "%s %s" % (
+                change.get("title") or "", change.get("objective") or ""
+            )
+            if not (
+                re.search(
+                    r"\b(?:stop|terminate)\w*\b|停止|终止",
+                    primary,
+                    re.I,
+                )
+                and re.search(r"\b(?:master|worker)\b|主进程|工作进程", primary, re.I)
+                and re.search(r"\b(?:port|listener)\b|端口|监听", primary, re.I)
+            ):
+                continue
+            roots = re.findall(r"/[A-Za-z0-9._/-]*vemu_uestc", primary)
+            root = max(roots, key=len).rstrip("/") if roots else ""
+            port_match = re.search(r"\b([1-9]\d{3,4})\b", primary)
+            if authoritative:
+                root, port = authoritative[0]
+            elif root and port_match is not None:
+                port = int(port_match.group(1))
+            else:
+                continue
+            combined_migration = bool(
+                (
+                    re.search(r"\bworker_port\b|config|配置|改端口|\b(?:set|change|move)\w*\b.{0,30}\bport\b", primary, re.I)
+                    or len(set(re.findall(r"\b[1-9]\d{3,4}\b", primary))) >= 2
+                )
+                and re.search(r"\b(?:start|restart|migrate|move)\w*\b|启动|重启|迁移", primary, re.I)
+            )
+            if not combined_migration:
+                change["title"] = "Stop root-bound worker on port %s" % port
+                change["objective"] = (
+                    "Stop only worker processes whose cwd belongs to %s and whose "
+                    "listener owns port %s; preserve master, data_server, celery, "
+                    "web_terminal, and every other project root."
+                ) % (root, port)
+                change["expected_changes"] = [
+                    "worker processes for %s on port %s stop" % (root, port),
+                    "all non-worker roles and other project roots remain unchanged",
+                ]
+                change["postconditions"] = [
+                    {"checker": "port_not_listening", "args": {"port": port}}
+                ]
+            step_id = str(change.get("step_id") or "")
+            owner_pid: int | None = None
+            if bundle is not None:
+                for record in bundle.records:
+                    if record.status != "available" or record.request.probe != "port_owner":
+                        continue
+                    for line in record.output.splitlines():
+                        if not (
+                            re.search(r"\bport=%s\b" % port, line)
+                            and "worker_main:flask_app" in line
+                            and re.search(r"\bcwd=%s(?:\s|$)" % re.escape(root), line)
+                        ):
+                            continue
+                        pid_match = re.search(r"\btree_root_pid=(\d+)\b", line)
+                        if pid_match is None:
+                            pid_match = re.search(r"\bpid=(\d+)\b", line)
+                        if pid_match is not None:
+                            owner_pid = int(pid_match.group(1))
+                            break
+                    if owner_pid is not None:
+                        break
+                if owner_pid is None:
+                    for record in bundle.records:
+                        if record.status != "available" or record.request.probe != "running_platforms":
+                            continue
+                        for line in record.output.splitlines():
+                            if not (
+                                re.search(r"\bproject_root=%s(?:\s|$)" % re.escape(root), line)
+                                and re.search(r"\bworker_port=%s\b" % port, line)
+                            ):
+                                continue
+                            group_match = re.search(r"\bworker_pgids=([0-9,]+)", line)
+                            if group_match is None:
+                                continue
+                            groups = [
+                                int(value) for value in group_match.group(1).split(",")
+                                if value.isdigit()
+                            ]
+                            if groups:
+                                owner_pid = min(groups)
+                                break
+                        if owner_pid is not None:
+                            break
+            for resource in data.get("resources") or []:
+                if not isinstance(resource, dict) or resource.get("kind") != "port":
+                    continue
+                if not any(
+                    str(consumer).rsplit(".", 1)[0] == step_id
+                    for consumer in resource.get("consumers") or []
+                ):
+                    continue
+                identity = "%s %s" % (
+                    resource.get("name") or "", resource.get("role") or "",
+                )
+                consumer_targets = " ".join(
+                    str(consumer).rsplit(".", 1)[-1]
+                    for consumer in resource.get("consumers") or []
+                )
+                if (
+                    not re.search(r"new|target|destination", identity, re.I)
+                    and (
+                        re.search(r"old|source|current", identity, re.I)
+                        or re.search(r"old|source|current", consumer_targets, re.I)
+                        or str(resource.get("value") or "") == str(port)
+                    )
+                ):
+                    resource["value"] = port
+                    resource["role"] = "worker_port"
+                    resource["source"] = "existing_runtime"
+            raw_resources = data.setdefault("resources", [])
+            if owner_pid is not None and not any(
+                isinstance(resource, dict)
+                and resource.get("kind") == "identifier"
+                and str(resource.get("value") or "") == str(owner_pid)
+                and any(
+                    str(consumer).rsplit(".", 1)[0] == step_id
+                    for consumer in resource.get("consumers") or []
+                )
+                for resource in raw_resources
+            ):
+                raw_resources.append({
+                    "name": "%s_worker_pid" % step_id.replace("-", "_"),
+                    "kind": "identifier",
+                    "status": "frozen",
+                    "role": "worker_pid",
+                    "value": owner_pid,
+                    "source": "port_owner_tree_root",
+                    "consumers": ["%s.pid" % step_id],
+                })
+            if not any(
+                isinstance(resource, dict)
+                and resource.get("kind") == "path"
+                and str(resource.get("value") or "").rstrip("/") == root
+                and any(
+                    str(consumer).rsplit(".", 1)[0] == step_id
+                    for consumer in resource.get("consumers") or []
+                )
+                for resource in raw_resources
+            ):
+                raw_resources.append({
+                    "name": "%s_runtime_cwd" % step_id.replace("-", "_"),
+                    "kind": "path",
+                    "status": "frozen",
+                    "role": "runtime_cwd",
+                    "value": root,
+                    "source": "port_owner_cwd",
+                    "consumers": ["%s.runtime_cwd" % step_id],
+                })
 
     @staticmethod
     def _authoritative_screen_source_roots(
@@ -2361,6 +3761,7 @@ class V4ChangePlannerAgent:
                             consumers=[consumer],
                         )
                     )
+        declared_listeners = V4ChangePlannerAgent._declared_listening_ports_by_step(data)
         for step_id, ports in V4ChangePlannerAgent._used_ports_by_step(data).items():
             for port in sorted(ports):
                 consumer = "%s.port_%s" % (step_id, port)
@@ -2371,13 +3772,20 @@ class V4ChangePlannerAgent:
                     continue
                 if port in explicit_internal_ports:
                     continue
+                observational = port not in declared_listeners.get(step_id, set())
                 resource = PlanResource(
                     name="derived_host_port_%s" % port,
                     kind="port",
                     status="frozen",
-                    role="selected_host_port",
+                    role=(
+                        "observed_endpoint_port"
+                        if observational else "selected_host_port"
+                    ),
                     value=port,
-                    source="derived_from_change_contract",
+                    source=(
+                        "derived_observation"
+                        if observational else "derived_from_change_contract"
+                    ),
                     consumers=[consumer],
                 )
                 normalized.append(resource)
@@ -2415,46 +3823,80 @@ class V4ChangePlannerAgent:
                 )
                 break
 
-        root = next(
-            (
-                item
-                for item in normalized
-                if item.status == "frozen"
-                and item.kind == "path"
-                and str(item.role or "").lower()
-                in {"instance_root", "target_root", "deployment_root"}
-            ),
-            None,
-        )
-        if root is None:
+        roots = [
+            item
+            for item in normalized
+            if item.status == "frozen"
+            and item.kind == "path"
+            and str(item.role or "").lower()
+            in {"instance_root", "target_root", "deployment_root"}
+        ]
+        if not roots:
             return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
-        root_text = str(root.value).rstrip("/")
         changes = data.get("changes")
         if not isinstance(changes, list):
             return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
-        screen_consumers = [
-            "%s.project_root" % str(change.get("step_id") or "")
-            for change in changes
-            if isinstance(change, dict)
-            and re.search(
-                r"screen",
-                "%s %s" % (
-                    change.get("title") or "",
-                    change.get("objective") or "",
-                ),
-                re.I,
+
+        def changes_for_root(root: PlanResource) -> list[dict[str, Any]]:
+            if len(roots) == 1:
+                return [change for change in changes if isinstance(change, dict)]
+            root_text = str(root.value).rstrip("/")
+            consumer_owners = {
+                str(consumer).partition(".")[0]
+                for consumer in root.consumers
+            }
+            return [
+                change for change in changes
+                if isinstance(change, dict)
+                and (
+                    str(change.get("step_id") or "") in consumer_owners
+                    or root_text in json.dumps(change, ensure_ascii=False)
+                )
+            ]
+
+        for root_index, root in enumerate(roots, start=1):
+            root_text = str(root.value).rstrip("/")
+            owned_changes = changes_for_root(root)
+            screen_consumers = [
+                "%s.project_root" % str(change.get("step_id") or "")
+                for change in owned_changes
+                if re.search(
+                    r"screen",
+                    "%s %s" % (
+                        change.get("title") or "",
+                        change.get("objective") or "",
+                    ),
+                    re.I,
+                )
+                and re.search(
+                    r"\b(?:start|launch|restart)\b|启动|重启",
+                    "%s %s" % (
+                        change.get("title") or "",
+                        change.get("objective") or "",
+                    ),
+                    re.I,
+                )
+            ]
+            if not screen_consumers:
+                continue
+            root_path = Path(root_text)
+            mains_candidates = (
+                root_path / "mains",
+                root_path / "vemu_uestc" / "mains",
             )
-            and re.search(
-                r"\b(?:start|launch)\b|启动",
-                "%s %s" % (
-                    change.get("title") or "",
-                    change.get("objective") or "",
-                ),
-                re.I,
+            mains_path = str(
+                next(
+                    (
+                        candidate
+                        for candidate in mains_candidates
+                        if all(
+                            (candidate / name).is_file()
+                            for name in REQUIRED_ENTRY_FILES
+                        )
+                    ),
+                    mains_candidates[0],
+                )
             )
-        ]
-        if screen_consumers:
-            mains_path = root_text + "/mains"
             existing_mains = next(
                 (
                     item
@@ -2468,7 +3910,11 @@ class V4ChangePlannerAgent:
             if existing_mains is None:
                 normalized.append(
                     PlanResource(
-                        name="runtime_mains_root",
+                        name=(
+                            "runtime_mains_root"
+                            if len(roots) == 1
+                            else "runtime_mains_root_%s" % root_index
+                        ),
                         kind="path",
                         status="frozen",
                         role="runtime_mains_root",
@@ -2481,21 +3927,26 @@ class V4ChangePlannerAgent:
                 for consumer in screen_consumers:
                     if consumer not in existing_mains.consumers:
                         existing_mains.consumers.append(consumer)
-        config_path = root_text + "/vemu_config/config.py"
-        config_consumers = [
-            "%s.path" % str(change.get("step_id") or "")
-            for change in changes
-            if isinstance(change, dict)
-            and re.search(
-                r"\bvemu_config/config\.py\b",
-                "%s %s" % (
-                    change.get("title") or "",
-                    change.get("objective") or "",
-                ),
-                re.I,
-            )
-        ]
-        if config_consumers:
+
+        for root_index, root in enumerate(roots, start=1):
+            root_text = str(root.value).rstrip("/")
+            owned_changes = changes_for_root(root)
+            config_path = root_text + "/vemu_config/config.py"
+            config_consumers = [
+                "%s.path" % str(change.get("step_id") or "")
+                for change in owned_changes
+                if re.search(
+                    r"\bvemu_config/config\.py\b",
+                    "%s %s %s" % (
+                        change.get("title") or "",
+                        change.get("objective") or "",
+                        " ".join(change.get("expected_changes") or []),
+                    ),
+                    re.I,
+                )
+            ]
+            if not config_consumers:
+                continue
             existing_config = next(
                 (
                     item
@@ -2509,7 +3960,11 @@ class V4ChangePlannerAgent:
             if existing_config is None:
                 normalized.append(
                     PlanResource(
-                        name="config_path",
+                        name=(
+                            "config_path"
+                            if len(roots) == 1
+                            else "config_path_%s" % root_index
+                        ),
                         kind="path",
                         status="frozen",
                         role="config_path",
@@ -2522,50 +3977,50 @@ class V4ChangePlannerAgent:
                 for consumer in config_consumers:
                     if consumer not in existing_config.consumers:
                         existing_config.consumers.append(consumer)
-        for change in changes:
-            if not isinstance(change, dict):
-                continue
-            step_id = str(change.get("step_id") or "")
-            postconditions = change.get("postconditions")
-            if not isinstance(postconditions, list):
-                continue
-            future_paths = []
-            for check in postconditions:
-                args = check.get("args") if isinstance(check, dict) else None
-                path = str(args.get("path") or "") if isinstance(args, dict) else ""
-                if path.startswith(root_text + "/") and path != root_text + "/.git":
-                    if path not in future_paths:
-                        future_paths.append(path)
-            for path_index, path in enumerate(future_paths, start=1):
-                consumer = "%s.path%s" % (
-                    step_id,
-                    "_%s" % path_index if len(future_paths) > 1 else "",
-                )
-                existing = next(
-                    (
-                        item
-                        for item in normalized
-                        if item.status == "frozen"
-                        and item.kind == "path"
-                        and str(item.value) == path
-                    ),
-                    None,
-                )
-                if existing is not None:
-                    if consumer not in existing.consumers:
-                        existing.consumers.append(consumer)
+        for root in roots:
+            root_text = str(root.value).rstrip("/")
+            for change in changes_for_root(root):
+                step_id = str(change.get("step_id") or "")
+                postconditions = change.get("postconditions")
+                if not isinstance(postconditions, list):
                     continue
-                normalized.append(
-                    PlanResource(
-                        name="derived_path_%s" % (len(normalized) + 1),
-                        kind="path",
-                        status="frozen",
-                        role="derived_configuration_path",
-                        value=path,
-                        source="derived_from_instance_root",
-                        consumers=[consumer],
+                future_paths = []
+                for check in postconditions:
+                    args = check.get("args") if isinstance(check, dict) else None
+                    path = str(args.get("path") or "") if isinstance(args, dict) else ""
+                    if path.startswith(root_text + "/") and path != root_text + "/.git":
+                        if path not in future_paths:
+                            future_paths.append(path)
+                for path_index, path in enumerate(future_paths, start=1):
+                    consumer = "%s.path%s" % (
+                        step_id,
+                        "_%s" % path_index if len(future_paths) > 1 else "",
                     )
-                )
+                    existing = next(
+                        (
+                            item
+                            for item in normalized
+                            if item.status == "frozen"
+                            and item.kind == "path"
+                            and str(item.value) == path
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        if consumer not in existing.consumers:
+                            existing.consumers.append(consumer)
+                        continue
+                    normalized.append(
+                        PlanResource(
+                            name="derived_path_%s" % (len(normalized) + 1),
+                            kind="path",
+                            status="frozen",
+                            role="derived_configuration_path",
+                            value=path,
+                            source="derived_from_instance_root",
+                            consumers=[consumer],
+                        )
+                    )
         return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
 
     @staticmethod
@@ -2655,12 +4110,20 @@ class V4ChangePlannerAgent:
             if isinstance(expected, list):
                 text_parts.extend(str(item) for item in expected)
             text = "\n".join(text_parts)
-            for match in re.findall(
+            for match in re.finditer(
                 r"(?:\bport\b|_port|\u7aef\u53e3).{0,20}?([1-9]\d{1,4})(?![\d.])",
                 text,
                 re.I,
             ):
-                port = int(match)
+                number_start = match.start(1)
+                prefix = text[max(0, number_start - 24):number_start]
+                if re.search(
+                    r"(?:http(?:[_ -]?status)?|status|状态码)\s*[:=]?\s*$",
+                    prefix,
+                    re.I,
+                ):
+                    continue
+                port = int(match.group(1))
                 if 1 <= port <= 65535:
                     ports.add(port)
             postconditions = change.get("postconditions")
@@ -2717,6 +4180,16 @@ class V4ChangePlannerAgent:
                 port = int(match)
                 if 1 <= port <= 65535:
                     ports.add(port)
+            for match in re.findall(
+                r"(?:\b(?:set|configure|assign|allocate|change|migrate)\w*\b|"
+                r"设置|配置|分配|修改|迁移).{0,35}?"
+                r"(?:\bport\b|_port|端口).{0,20}?([1-9]\d{1,4})",
+                text,
+                re.I,
+            ):
+                port = int(match)
+                if 1 <= port <= 65535:
+                    ports.add(port)
             postconditions = change.get("postconditions")
             if isinstance(postconditions, list):
                 for check in postconditions:
@@ -2756,10 +4229,21 @@ class V4ChangePlannerAgent:
             return False
         role_and_name = "%s %s" % (resource.role or "", resource.name or "")
         lowered = role_and_name.lower()
-        return not (
+        # Old/current ports describe observed runtime state (for example the
+        # listener a root-bound stop must target).  They are not destination
+        # allocations and must never be rewritten merely because they are, by
+        # definition, occupied.
+        if re.search(
+            r"(?:^|_)(?:old|current|existing|observed|source)(?:_|$).*port|"
+            r"port(?:_|$).*(?:old|current|existing|observed|source)(?:_|$)",
+            lowered,
+        ):
+            return False
+        return str(resource.source or "") not in {"existing_runtime", "existing_config"} and not (
             "internal" in lowered
             or "container_port" in lowered
             or "image_port" in lowered
+            or str(resource.source or "") == "derived_observation"
         )
 
     @staticmethod
@@ -2811,6 +4295,7 @@ class V4ChangePlannerAgent:
             probe = str(item.get("probe") or "")
             args = item.get("args") if isinstance(item.get("args"), dict) else {}
             args = dict(args)
+            probe, args = normalize_probe_request(probe, args)
             if probe == "ports" and "ports" not in args:
                 candidates = args.pop(
                     "candidates",

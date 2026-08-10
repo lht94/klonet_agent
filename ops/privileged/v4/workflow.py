@@ -17,6 +17,14 @@ from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
 from klonet_agent.tools.environment import redact_sensitive_text
 
 
+def _head_tail(value: Any, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    half = max(1, (limit - 64) // 2)
+    return text[:half] + "\n...[evidence compacted]...\n" + text[-half:]
+
+
 class V4MutationWorkflow:
     def __init__(
         self,
@@ -172,20 +180,41 @@ class V4MutationWorkflow:
         if not isinstance(records, list):
             return None
         sections = []
-        for record in records:
+        priority = {
+            "ops_file": 0,
+            "process_logs": 1,
+            "running_platforms": 2,
+        }
+        ordered_records = sorted(
+            enumerate(records),
+            key=lambda item: (
+                priority.get(
+                    str(getattr(getattr(item[1], "request", None), "probe", "")),
+                    10,
+                ),
+                item[0],
+            ),
+        )
+        for _index, record in ordered_records:
             output = str(getattr(record, "output", "") or "").strip()
             if not output:
                 continue
             evidence_id = str(getattr(record, "evidence_id", "") or "evidence")
-            sections.append("[%s]\n%s" % (evidence_id, output))
+            probe = str(getattr(getattr(record, "request", None), "probe", ""))
+            sections.append(
+                "[%s probe=%s]\n%s"
+                % (evidence_id, probe or "unknown", _head_tail(output, 8000))
+            )
         if not sections:
             return None
         return GroundedPlanContext(
             knowledge_evidence="V4 Binding uses the frozen semantic plan contract.",
-            environment_evidence=redact_sensitive_text("\n\n".join(sections))[:24000],
+            environment_evidence=_head_tail(
+                redact_sensitive_text("\n\n".join(sections)),
+                24000,
+            ),
             action_catalog="V4 audited Action/Shell registry",
         )
-
     def confirm(self, plan_id: str, content_hash: str) -> V4WorkflowResult:
         plan = self.store.load(plan_id)
         if content_hash != plan.content_hash:
@@ -418,7 +447,7 @@ class V4MutationWorkflow:
             self.store.save(plan)
         plan.status = "completed"
         self.store.save(plan)
-        return V4WorkflowResult(True, "completed", "V4 change plan completed.", plan=plan)
+        return V4WorkflowResult(True, "completed", "变更计划已执行并通过验证。", plan=plan)
 
     @staticmethod
     def _execution_steps(change: ChangeStepV4) -> Iterable[PrivilegedStep]:
@@ -473,7 +502,28 @@ class V4MutationWorkflow:
             and step.execution_binding.action == "set_python_class_attribute"
         ]
         if config_steps:
-            postconditions = []
+            # Preserve the canonical runtime outcome while replacing only
+            # weak/model-authored file checks with exact typed config checks.
+            # Global process-name checks are invalid in a multi-root server.
+            listening_ports = {
+                int((check.get("args") or {}).get("port"))
+                for check in postconditions
+                if str(check.get("checker") or "") == "port_listening"
+                and str((check.get("args") or {}).get("port") or "").isdigit()
+            }
+            filtered = []
+            for check in postconditions:
+                checker = str(check.get("checker") or "")
+                if checker in {"port_listening", "port_not_listening"}:
+                    filtered.append(check)
+                    continue
+                if checker != "backend_health":
+                    continue
+                url = str((check.get("args") or {}).get("url") or "")
+                match = re.search(r":([1-9]\d{3,4})(?:/|$)", url)
+                if match and int(match.group(1)) in listening_ports:
+                    filtered.append(check)
+            postconditions = filtered
             for step in config_steps:
                 postconditions.extend(
                     V4MutationWorkflow._verification_step(step).postconditions
@@ -533,26 +583,35 @@ class V4MutationWorkflow:
     @staticmethod
     def _confirmation_message(plan: ChangePlanV4) -> str:
         lines = [
-            "V4 change plan %s" % plan.plan_id,
-            "Goal: %s" % plan.goal,
-            "Risk: %s" % plan.risk,
+            "V4 变更计划 %s" % plan.plan_id,
+            "目标：%s" % plan.goal,
+            "风险：%s" % plan.risk,
         ]
         if plan.resources:
-            lines.append("Frozen resources:")
+            lines.append("冻结资源：")
             for resource in plan.resources:
                 lines.append(
                     "- %s (%s/%s): %s"
                     % (resource.name, resource.kind, resource.status, resource.value)
                 )
-        lines.append("Changes:")
+        lines.append("变更步骤：")
         for change in plan.steps:
             lines.append(
                 "- %s: %s — %s"
-                % (change.step_id, change.title, change.objective)
+                % (
+                    change.step_id,
+                    _localized_plan_text(change.title),
+                    _localized_plan_text(change.objective),
+                )
             )
-            lines.append("  expected: %s" % "; ".join(change.expected_changes))
             lines.append(
-                "  verify: %s"
+                "  预期：%s"
+                % "; ".join(
+                    _localized_plan_text(item) for item in change.expected_changes
+                )
+            )
+            lines.append(
+                "  验收：%s"
                 % ", ".join(
                     str(item.get("checker") or "unknown")
                     for item in change.postconditions
@@ -561,17 +620,17 @@ class V4MutationWorkflow:
             for step in V4MutationWorkflow._execution_steps(change):
                 binding = step.execution_binding
                 if binding is None:
-                    lines.append("  binding: missing")
+                    lines.append("  执行绑定：缺失")
                     continue
                 if binding.kind == "registered_action":
                     lines.append(
-                        "  binding: registered_action: %s args=%s"
+                        "  执行绑定：已注册动作 %s 参数=%s"
                         % (binding.action, _redacted_binding_args(binding.args))
                     )
                     continue
                 artifact = binding.shell_artifact
                 lines.append(
-                    "  binding: shell_artifact: %s sha256=%s"
+                    "  执行绑定：受控脚本 %s sha256=%s"
                     % (
                         artifact.artifact_id if artifact is not None else "missing",
                         artifact.sha256 if artifact is not None else "missing",
@@ -580,7 +639,7 @@ class V4MutationWorkflow:
                 if artifact is not None:
                     lines.extend(
                         [
-                            "  script:",
+                            "  脚本：",
                             "```bash",
                             artifact.script,
                             "```",
@@ -588,12 +647,32 @@ class V4MutationWorkflow:
                     )
         lines.extend(
             [
-                "Exact plan hash: %s" % plan.content_hash,
-                "Confirm this exact V4 change plan with:",
+                "精确计划哈希：%s" % plan.content_hash,
+                "请使用以下命令确认这份精确计划：",
                 "confirm-priv-v4 %s %s" % (plan.plan_id, plan.content_hash),
             ]
         )
         return "\n".join(lines)
+
+
+def _localized_plan_text(value: Any) -> str:
+    """Translate deterministic runtime phrases at the presentation boundary."""
+
+    text = str(value or "")
+    substitutions = (
+        (r"\bStart master screen component\b", "启动 master Screen 组件"),
+        (r"\bStart worker screen component\b", "启动 worker Screen 组件"),
+        (r"\bRestart master screen component\b", "重启 master Screen 组件"),
+        (r"\bRestart worker screen component\b", "重启 worker Screen 组件"),
+        (r"start missing (master|worker) role at (\d+) and backend health succeeds",
+         r"启动缺失的 \1 角色（端口 \2），并确认后端健康"),
+        (r"restart requested (master|worker) role at (\d+) and backend health succeeds",
+         r"按要求重启 \1 角色（端口 \2），并确认后端健康"),
+        (r"recover (master|worker) for (/[^;\s]+)", r"恢复 \1（实例 \2）"),
+    )
+    for pattern, replacement in substitutions:
+        text = re.sub(pattern, replacement, text, flags=re.I)
+    return text
 
 
 def _redacted_binding_args(args: dict[str, Any]) -> str:

@@ -475,6 +475,22 @@ DEFAULT_OPS_ACTIONS = (
         backends=("ops-privilege",),
     ),
     OpsActionSpec(
+        "stop_klonet_component",
+        "_stop_klonet_component",
+        "dangerous",
+        True,
+        confirmation_scope="step",
+        category="process",
+        description="按 PID、cwd、组件角色和监听端口四重证据停止一个 Klonet 后端组件进程组",
+        preconditions=(
+            "pid_exists", "runtime_cwd_observed", "component_role_observed",
+            "listener_port_owned_by_pid_group",
+        ),
+        effects=("component_process_group_signalled",),
+        postconditions=("component_pid_absent", "component_port_released"),
+        backends=("ops-privilege",),
+    ),
+    OpsActionSpec(
         "stop_klonet_runtime_instance",
         "_stop_klonet_runtime_instance",
         "dangerous",

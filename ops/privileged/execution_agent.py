@@ -398,8 +398,12 @@ class PrivilegedExecutionAgent:
                 semantic_step,
                 plan.resources,
             )
+            _normalize_semantic_backend_health_contract(
+                semantic_step,
+                plan.resources,
+            )
             self._progress(
-                "语义步骤 %s/%s：正在把“%s”展开为原子 Implementation Plan…"
+                "语义步骤 %s/%s：正在把“%s”展开为原子实施计划…"
                 % (
                     index,
                     len(plan.steps),
@@ -443,6 +447,14 @@ class PrivilegedExecutionAgent:
                             grounded_context=grounded_context,
                         )
                         _apply_binding_to_step(micro_step, binding)
+                    _validate_runtime_recovery_action_coverage(
+                        semantic_step,
+                        micro_steps,
+                    )
+                    _validate_source_mutation_action_coverage(
+                        semantic_step,
+                        micro_steps,
+                    )
                     _validate_semantic_resource_coverage(
                         semantic_step,
                         micro_steps,
@@ -577,7 +589,10 @@ class PrivilegedExecutionAgent:
             ),
             "previous_attempt_feedback": feedback,
         }
-        deterministic = _deterministic_klonet_config_items(plan, semantic_step)
+        deterministic = (
+            _deterministic_runtime_stop_items(semantic_step)
+            or _deterministic_klonet_config_items(plan, semantic_step)
+        )
         if deterministic:
             result = {"status": "ready", "implementation_steps": deterministic}
         else:
@@ -616,6 +631,41 @@ class PrivilegedExecutionAgent:
         if not isinstance(items, list) or not items or len(items) > 16:
             raise ExecutionBindingError(
                 "implementation_steps must contain 1-16 items",
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+        items = _split_multi_attribute_config_items(
+            items,
+            semantic_step,
+            plan.resources,
+        )
+        items = _drop_unauthorized_config_mutations(items, semantic_step)
+        items = _drop_preservation_only_config_mutations(items, semantic_step)
+        items = _collapse_redundant_config_mutations(items)
+        items = _drop_unauthorized_source_mutations(items, semantic_step)
+        items = _collapse_redundant_python_removal_items(items)
+        items = _split_multi_component_runtime_items(items, semantic_step)
+        items = _filter_unauthorized_runtime_role_mutations(items, semantic_step)
+        items = _drop_runtime_stops_for_roles_known_missing(items, semantic_step)
+        items = _drop_runtime_stops_covered_by_semantic_predecessor(
+            items, semantic_step, plan,
+        )
+        items = _drop_runtime_stops_covered_by_same_step_restart(items)
+        items = _ensure_runtime_migration_stop_item(items, semantic_step)
+        items = _ensure_runtime_role_recovery_items(items, semantic_step)
+        items = _normalize_runtime_role_recovery_verbs(items, semantic_step)
+        items = _drop_runtime_stops_covered_by_same_step_restart(items)
+        items = _expand_unhealthy_role_restarts(items, semantic_step)
+        items = _collapse_redundant_runtime_role_mutations(items)
+        items = _ground_runtime_item_roots(items, semantic_step, plan.resources)
+        items = _drop_redundant_implementation_verifications(
+            items, semantic_step,
+        )
+        items = _order_runtime_migration_items(items, semantic_step)
+        items = _order_source_runtime_recovery_items(items, semantic_step)
+        if len(items) > 16:
+            raise ExecutionBindingError(
+                "atomic configuration decomposition exceeds 16 items",
                 replan_recommended=False,
                 category="implementation_contract_invalid",
             )
@@ -776,12 +826,39 @@ class PrivilegedExecutionAgent:
                     category="capability_mismatch",
                 )
             self._progress(
-                "能力边界：步骤“%s”明确创建新容器，固定使用注册 Action：%s。"
+                "能力边界：步骤“%s”固定使用已注册动作：%s。"
                 % (
                     _progress_text(step.title or step.objective),
                     forced_action,
                 )
             )
+            if forced_action in {
+                "start_screen_component",
+                "restart_screen_component",
+            }:
+                # A new Screen session is derived from the frozen instance root
+                # and the atomic component role.  Requiring evidence that the
+                # session already exists contradicts the start operation and
+                # lets the probabilistic contract stage invent a false blocker.
+                try:
+                    return self._registered_binding(
+                        {
+                            "action": forced_action,
+                            "args": {},
+                            "binding_reason": (
+                                "screen identity is compiled from the frozen "
+                                "instance root and component role"
+                            ),
+                            "resolved_from_evidence": [],
+                        },
+                        step,
+                        grounded_context,
+                        plan.resources,
+                    )
+                except (KeyError, TypeError, ValueError):
+                    # Keep the existing bounded contract repair path for older
+                    # plans that genuinely lack a root or atomic role.
+                    pass
             try:
                 return self._complete_registered_action_contract(
                     data={
@@ -1291,24 +1368,302 @@ class PrivilegedExecutionAgent:
                 "action=%s args must be an object, got=%s"
                 % (action, type(data.get("args")).__name__)
             )
-        args = _inject_frozen_resource_args(
-            semantic_step,
-            args,
-            plan_resources or [],
+        semantic_text = " ".join(
+            [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
         )
+        if (
+            action == "edit_text_file"
+            and str(args.get("operation") or "").strip().lower() == "replace_once"
+            and str(args.get("anchor") or "")
+            and re.search(r"\b(?:remove|delete)\b|移除|删除", semantic_text, re.I)
+        ):
+            action = "replace_text_in_file"
+            args = {
+                "path": args.get("path"),
+                "old_text": args.get("anchor"),
+                "new_text": "",
+            }
+            spec = self.action_registry.get(action)
+            if spec is None or action not in DIRECT_PRIVILEGED_ACTIONS:
+                raise ValueError("action_not_directly_registered=%s" % action)
+        if (
+            action == "edit_text_file"
+            and str(args.get("operation") or "").strip().lower() == "replace_file"
+            and str(args.get("path") or "").strip().endswith(".py")
+            and re.search(r"\b(?:remove|delete)\b|移除|删除", semantic_text, re.I)
+        ):
+            exact_removal = _grounded_python_removal_from_semantics(
+                semantic_text,
+                grounded_context,
+            )
+            if exact_removal:
+                action = "replace_text_in_file"
+                args = {
+                    "path": args.get("path"),
+                    "old_text": exact_removal,
+                    "new_text": "",
+                }
+                spec = self.action_registry.get(action)
+                if spec is None or action not in DIRECT_PRIVILEGED_ACTIONS:
+                    raise ValueError("action_not_directly_registered=%s" % action)
+        if action == "replace_text_in_file" and not str(args.get("new_text") or ""):
+            removes_definition_and_call = bool(
+                re.search(r"\bfunction\s+definition\b|函数定义", semantic_text, re.I)
+                and re.search(r"\b(?:unconditional\s+)?call\b|无条件调用|调用", semantic_text, re.I)
+            )
+            exact_semantic_removal = (
+                _grounded_python_removal_from_semantics(
+                    semantic_text, grounded_context,
+                )
+                if removes_definition_and_call else ""
+            )
+            args["old_text"] = exact_semantic_removal or (
+                _expand_grounded_python_function_removal(
+                    str(args.get("old_text") or ""),
+                    grounded_context,
+                )
+            )
+            if removes_definition_and_call and not re.search(
+                r"(?m)^def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(",
+                str(args.get("old_text") or ""),
+            ):
+                raise ValueError(
+                    "python_function_and_call_removal_not_grounded"
+                )
         args = _infer_structural_action_args(
             action,
             args,
             plan_resources or [],
         )
         args = _infer_semantic_action_args(action, args, semantic_step)
+        # Semantic inference repairs model-supplied role/root values, but the
+        # frozen manifest remains the final authority for the exact consumer
+        # slot (notably instance-specific screen names).  Inject it last so a
+        # deterministic fallback such as ``test_w`` cannot overwrite a
+        # planned ``test_vemu_uestc_w`` resource.
+        args = _inject_frozen_resource_args(
+            semantic_step,
+            args,
+            plan_resources or [],
+        )
+        if action == "stop_klonet_component":
+            semantic_text = " ".join(
+                [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+            )
+            role = _atomic_runtime_role(semantic_text)
+            root = _semantic_runtime_root(semantic_text)
+            port_match = re.search(r"\b([1-9]\d{3,4})\b", semantic_text)
+            pid = next(
+                (
+                    resource.value
+                    for resource in plan_resources or []
+                    if resource.status == "frozen"
+                    and resource.kind == "identifier"
+                    and "pid" in "%s %s" % (resource.name, resource.role)
+                    and (not role or role in "%s %s" % (resource.name, resource.role))
+                    and any(
+                        semantic_step.step_id == str(consumer).rsplit(".", 1)[0]
+                        for consumer in resource.consumers
+                    )
+                ),
+                None,
+            )
+            if isinstance(pid, list):
+                numeric_pids = []
+                for value in pid:
+                    try:
+                        numeric_pids.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+                pid = min(numeric_pids) if numeric_pids else None
+            elif isinstance(pid, str) and pid.strip().startswith("["):
+                try:
+                    parsed_pids = json.loads(pid)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed_pids = []
+                numeric_pids = []
+                if isinstance(parsed_pids, list):
+                    for value in parsed_pids:
+                        try:
+                            numeric_pids.append(int(value))
+                        except (TypeError, ValueError):
+                            continue
+                pid = min(numeric_pids) if numeric_pids else None
+            if role:
+                args["component"] = role
+            if root:
+                args["runtime_cwd"] = root
+            if port_match:
+                args["port"] = port_match.group(1)
+            if pid is not None:
+                args["pid"] = pid
+        if action in {
+            "set_python_class_attribute",
+            "start_screen_component",
+            "restart_screen_component",
+        }:
+            for port_role in ("master_port", "worker_port"):
+                scoped_port = _scoped_role_port_value(
+                    semantic_step,
+                    plan_resources or [],
+                    port_role,
+                )
+                if scoped_port is not None:
+                    args[port_role] = scoped_port
+        if action == "set_python_class_attribute":
+            semantic_root = _semantic_runtime_root(
+                " ".join([
+                    semantic_step.title,
+                    semantic_step.objective,
+                    *semantic_step.expected_changes,
+                ])
+            )
+            if not semantic_root or not Path(semantic_root).is_dir():
+                semantic_root = _runtime_root_from_frozen_paths(
+                    plan_resources or [],
+                )
+            if semantic_root:
+                args["path"] = semantic_root.rstrip("/") + "/vemu_config/config.py"
+            attribute = str(args.get("attribute") or "").strip()
+            if (
+                str(args.get("path") or "").endswith("/vemu_config/config.py")
+                and attribute in {
+                    "master_port", "worker_port", "public_port",
+                    "web_terminal_port", "master_ip", "mysql_ip",
+                    "rabbitmq_ip", "redis_port", "mysql_port",
+                    "rabbitmq_port", "celery_redis_port_db",
+                    "celery_rabbitmq_port_db",
+                }
+            ):
+                # Resolve PROJ_CONFIG at execution time. A model-provided
+                # instance label must never select a Python class to mutate.
+                args.pop("class_name", None)
+            scoped_value = _scoped_role_port_value(
+                semantic_step,
+                plan_resources or [],
+                attribute,
+            )
+            if scoped_value is not None:
+                args["value"] = scoped_value
+            elif attribute and attribute in args:
+                args["value"] = args[attribute]
+        if action in {"start_screen_component", "restart_screen_component"}:
+            session = str(args.get("screen_session") or "").strip()
+            component = str(args.get("component") or "").strip()
+            suffix = {
+                "master": "_m",
+                "worker": "_w",
+                "celery": "_c",
+                "web_terminal": "_web",
+            }.get(component, "")
+            semantic_root = _semantic_runtime_root(
+                " ".join([
+                    semantic_step.title,
+                    semantic_step.objective,
+                    *semantic_step.expected_changes,
+                ])
+            )
+            if not semantic_root or not Path(semantic_root).is_dir():
+                semantic_root = _runtime_root_from_frozen_paths(
+                    plan_resources or [],
+                )
+            if semantic_root:
+                root_path = Path(semantic_root)
+                frozen_session = any(
+                    resource.status == "frozen"
+                    and resource.role == "screen_session"
+                    and str(resource.value) == session
+                    and suffix
+                    and session.endswith(suffix)
+                    for resource in plan_resources or []
+                )
+                platform_name = (
+                    session[:-len(suffix)]
+                    if frozen_session and suffix
+                    else (
+                        root_path.parent.name
+                        if root_path.name == "vemu_uestc"
+                        and root_path.parent.name == "test"
+                        else root_path.name
+                    )
+                )
+                entry_candidates = (
+                    root_path / "mains",
+                    root_path / "vemu_uestc" / "mains",
+                )
+                entry_root = next(
+                    (
+                        candidate
+                        for candidate in entry_candidates
+                        if candidate.is_dir()
+                        and (candidate / "master_main.py").is_file()
+                        and (candidate / "worker_main.py").is_file()
+                    ),
+                    None,
+                )
+                args["platform"] = platform_name
+                if entry_root is not None:
+                    args["project_root"] = str(entry_root.resolve())
+                if suffix and not frozen_session:
+                    args["screen_session"] = "%s%s" % (
+                        platform_name, suffix,
+                    )
+                    session = str(args["screen_session"])
+            if (
+                suffix
+                and "/test/" in semantic_root
+                and not re.search(
+                    r"(?:^|[_-])test(?:$|[_-])", session, re.I
+                )
+            ):
+                args["platform"] = "test"
+                args["screen_session"] = "test%s" % suffix
+                session = str(args["screen_session"])
+            if suffix and session.endswith(suffix):
+                args["platform"] = session[:-len(suffix)]
+            # The runtime canonicalizer may derive a convenient platform name
+            # from the project directory or Screen session.  An instance
+            # identifier frozen by the semantic plan is stronger evidence and
+            # must win, especially when an atomic child step inherited the
+            # parent step's resource consumer.
+            frozen_platform = next(
+                (
+                    resource.value
+                    for resource in plan_resources or []
+                    if resource.status == "frozen"
+                    and resource.role == "instance_identifier"
+                    and any(
+                        str(consumer).rsplit(".", 1)[-1] == "platform"
+                        and (
+                            semantic_step.step_id
+                            == str(consumer).rsplit(".", 1)[0]
+                            or semantic_step.step_id.startswith(
+                                str(consumer).rsplit(".", 1)[0] + "__"
+                            )
+                        )
+                        for consumer in resource.consumers
+                    )
+                ),
+                None,
+            )
+            if frozen_platform is not None:
+                args["platform"] = frozen_platform
+                if suffix and not frozen_session:
+                    args["screen_session"] = "%s%s" % (
+                        frozen_platform, suffix,
+                    )
         problem = _validate_action_evidence(action, args, grounded_context)
         if problem:
             raise ValueError(problem)
         missing = [
             key
             for key in REQUIRED_ACTION_ARGS.get(action, ())
-            if not args.get(key)
+            if key not in args
+            or args.get(key) is None
+            or (
+                not args.get(key)
+                and not (action == "replace_text_in_file" and key == "new_text")
+            )
         ]
         if missing:
             raise ValueError(
@@ -1379,6 +1734,10 @@ class PrivilegedExecutionAgent:
             risk_floor,
             semantic_step.risk,
         )
+        preconditions = self._valid_checks(data.get("preconditions"))
+        preconditions = _canonical_action_preconditions(
+            action, args, preconditions,
+        )
         checks = self._valid_checks(data.get("postconditions"))
         checks = checks or _default_action_postconditions(action, args)
         checks = _canonical_action_postconditions(action, args, checks)
@@ -1397,7 +1756,7 @@ class PrivilegedExecutionAgent:
                 data.get("resolved_from_evidence"),
                 20,
             ),
-            preconditions=self._valid_checks(data.get("preconditions")),
+            preconditions=preconditions,
             postconditions=checks,
             binding_reason=str(data.get("binding_reason") or "").strip()[:1000],
         )
@@ -2763,6 +3122,12 @@ def _deterministic_klonet_config_items(
         and re.search(r"complete|isolated|完整|隔离", "%s %s" % (plan.goal, text), re.I)
     ):
         return []
+    def scoped(resource: PlanResource) -> bool:
+        return any(
+            str(consumer).partition(".")[0] == semantic_step.step_id
+            for consumer in resource.consumers
+        )
+
     config_path = next(
         (
             str(resource.value)
@@ -2770,19 +3135,20 @@ def _deterministic_klonet_config_items(
             if resource.status == "frozen"
             and resource.kind == "path"
             and str(resource.value).endswith("/vemu_config/config.py")
+            and scoped(resource)
         ),
         "",
     )
     ports = {
-        role: int(resource.value)
+        str(resource.role): int(resource.value)
         for resource in plan.resources
         if resource.status == "frozen"
         and resource.kind == "port"
-        for role in (
+        and scoped(resource)
+        and str(resource.role) in {
             "master_port", "worker_port", "web_terminal_port", "public_port",
             "redis_port", "mysql_port", "rabbitmq_port",
-        )
-        if role in "%s %s" % (resource.name, resource.role)
+        }
     }
     required = {
         "master_port", "worker_port", "web_terminal_port",
@@ -2844,6 +3210,1443 @@ def _deterministic_klonet_config_items(
         }
     )
     return items
+
+
+def _deterministic_runtime_stop_items(
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Compile a scoped orphan-runtime stop without model-expanded targets."""
+
+    text = " ".join(
+        [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+    )
+    if not (
+        re.match(
+            r"^\s*(?:(?:precisely|safely|only|精确|安全|仅)\s*)?"
+            r"(?:stop|terminate|停止|终止)",
+            text,
+            re.I,
+        )
+        and re.search(r"\bworker\b|工作进程", text, re.I)
+        and re.search(r"\b(?:port|listener)\b|端口|监听", text, re.I)
+    ):
+        return []
+    root = _semantic_runtime_root(text)
+    port_match = re.search(r"\b([1-9]\d{3,4})\b", text)
+    if not root or port_match is None:
+        return []
+    port = int(port_match.group(1))
+    return [
+        {
+            "id": "stop-root-worker",
+            "title": "Stop root-bound worker runtime",
+            "objective": "Stop only worker processes for %s owning port %s"
+            % (root, port),
+            "reason": "release the conflicting listener with PID/cwd/role/port checks",
+            "depends_on": [],
+            "expected_changes": ["root-bound worker listener on %s stops" % port],
+            "success_criteria": ["port %s is released by that root" % port],
+            "risk_suggestion": "high",
+        }
+    ]
+
+
+def _split_multi_attribute_config_items(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> list[dict[str, Any]]:
+    """Compile plural scalar config edits into singular Action-sized steps."""
+
+    fields = (
+        "master_ip", "mysql_ip", "rabbitmq_ip", "master_port",
+        "worker_port", "web_terminal_port", "public_port", "redis_port",
+        "mysql_port", "rabbitmq_port", "celery_redis_port_db",
+        "celery_rabbitmq_port_db",
+    )
+    semantic_id = semantic_step.step_id
+    scoped_values = {
+        str(resource.role or resource.name): resource.value
+        for resource in resources
+        if resource.status == "frozen"
+        and any(
+            consumer.rsplit(".", 1)[0] == semantic_id
+            for consumer in resource.consumers
+            if "." in consumer
+        )
+    }
+    expanded: list[dict[str, Any]] = []
+    replacements: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes", [])],
+            ]
+        )
+        mentioned = [
+            field
+            for field in fields
+            if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(field), text)
+            and field in scoped_values
+        ]
+        if len(mentioned) < 2:
+            expanded.append(dict(item))
+            continue
+        previous = ""
+        original_dependencies = list(item.get("depends_on") or [])
+        for field in mentioned:
+            atomic_id = "%s-%s" % (item_id, field.replace("_", "-"))
+            value = scoped_values[field]
+            expanded.append(
+                {
+                    "id": atomic_id,
+                    "title": "Set WtxConfig %s" % field,
+                    "objective": "Set WtxConfig.%s to the frozen value %r" % (field, value),
+                    "reason": str(item.get("reason") or "apply the frozen configuration contract"),
+                    "depends_on": [previous] if previous else original_dependencies,
+                    "expected_changes": ["WtxConfig.%s becomes %r" % (field, value)],
+                    "success_criteria": ["WtxConfig.%s equals %r" % (field, value)],
+                    "risk_suggestion": str(item.get("risk_suggestion") or "medium"),
+                }
+            )
+            previous = atomic_id
+        replacements[item_id] = previous
+    if not replacements:
+        return expanded
+    for item in expanded:
+        dependencies = item.get("depends_on")
+        if not isinstance(dependencies, list):
+            continue
+        item["depends_on"] = [
+            replacements.get(
+                _safe_implementation_step_id(dependency, fallback=""),
+                _safe_implementation_step_id(dependency, fallback=""),
+            )
+            for dependency in dependencies
+        ]
+    return expanded
+
+
+def _split_multi_component_runtime_items(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Compile plural runtime starts into one component capability per step."""
+
+    expanded: list[dict[str, Any]] = []
+    replacements: dict[str, str] = {}
+    role_patterns = (
+        ("master", r"(?<![A-Za-z0-9_])master(?![A-Za-z0-9_])"),
+        ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
+        ("celery", r"(?<![A-Za-z0-9_])celery(?![A-Za-z0-9_])"),
+        ("web_terminal", r"web[_ -]?terminal"),
+    )
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes", [])],
+            ]
+        )
+        roles = [role for role, pattern in role_patterns if re.search(pattern, text, re.I)]
+        starts = re.search(r"\b(?:start|restart|restore|recover|launch)\b|启动|重启|恢复", text, re.I)
+        if not starts or len(roles) < 2:
+            expanded.append(dict(item))
+            continue
+        previous = ""
+        original_dependencies = list(item.get("depends_on") or [])
+        for role in roles:
+            atomic_id = "%s-%s" % (item_id, role.replace("_", "-"))
+            expanded.append(
+                {
+                    "id": atomic_id,
+                    "title": "Start %s screen component" % role,
+                    "objective": "Start the %s role for %s" % (
+                        role,
+                        semantic_step.objective or semantic_step.title,
+                    ),
+                    "reason": str(item.get("reason") or "restore the runtime role"),
+                    "depends_on": [previous] if previous else original_dependencies,
+                    "expected_changes": ["%s role starts" % role],
+                    "success_criteria": ["%s role is running" % role],
+                    "risk_suggestion": str(item.get("risk_suggestion") or "medium"),
+                }
+            )
+            previous = atomic_id
+        replacements[item_id] = previous
+    if not replacements:
+        return expanded
+    for item in expanded:
+        dependencies = item.get("depends_on")
+        if not isinstance(dependencies, list):
+            continue
+        item["depends_on"] = [
+            replacements.get(
+                _safe_implementation_step_id(dependency, fallback=""),
+                _safe_implementation_step_id(dependency, fallback=""),
+            )
+            for dependency in dependencies
+        ]
+    return expanded
+
+
+def _collapse_redundant_config_mutations(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one atomic WtxConfig write per attribute and rewire its users."""
+
+    kept: list[dict[str, Any]] = []
+    owner_by_attribute: dict[str, str] = {}
+    replacements: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes", [])],
+            ]
+        )
+        attributes = [
+            attribute
+            for attribute in (
+                "master_port", "worker_port", "public_port", "web_terminal_port",
+                "redis_port", "mysql_port", "rabbitmq_port", "master_ip",
+                "mysql_ip", "rabbitmq_ip", "celery_redis_port_db",
+                "celery_rabbitmq_port_db",
+            )
+            if re.search(
+                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(attribute),
+                text,
+            )
+        ]
+        config_write = bool(
+            len(attributes) == 1
+            and _contains_mutation_intent(text)
+            and re.search(
+                r"config|WtxConfig|配置|"
+                r"\b(?:set|update|change)\b|设置|修改|更新|改为",
+                text,
+                re.I,
+            )
+        )
+        if not config_write:
+            kept.append(item)
+            continue
+        attribute = attributes[0]
+        owner = owner_by_attribute.get(attribute)
+        if owner is None:
+            owner_by_attribute[attribute] = item_id
+            kept.append(item)
+            continue
+        replacements[item_id] = owner
+    if not replacements:
+        return kept
+    for item in kept:
+        dependencies = []
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            while dependency in replacements:
+                dependency = replacements[dependency]
+            current = _safe_implementation_step_id(item.get("id"), fallback="")
+            if dependency and dependency != current and dependency not in dependencies:
+                dependencies.append(dependency)
+        item["depends_on"] = dependencies
+    return kept
+
+
+def _drop_unauthorized_config_mutations(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Drop scalar config writes that the semantic change never authorizes."""
+
+    fields = (
+        "master_port", "worker_port", "public_port", "web_terminal_port",
+        "redis_port", "mysql_port", "rabbitmq_port", "master_ip",
+        "mysql_ip", "rabbitmq_ip", "celery_redis_port_db",
+        "celery_rabbitmq_port_db",
+    )
+    fragments = [
+        semantic_step.title,
+        semantic_step.objective,
+        *semantic_step.expected_changes,
+    ]
+    semantic_text = " ".join(str(fragment) for fragment in fragments)
+    if re.search(
+        r"complete.{0,30}(?:config|contract)|(?:完整|全部).{0,20}配置",
+        semantic_text,
+        re.I,
+    ):
+        return items
+    preservation = re.compile(
+        r"\b(?:preserve|keep|remain|unchanged|do not (?:change|modify))\b|"
+        r"保持|保留|不变|不修改",
+        re.I,
+    )
+    authorized = {
+        field
+        for field in fields
+        if any(
+            re.search(
+                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(field),
+                str(fragment),
+                re.I,
+            )
+            and not preservation.search(str(fragment))
+            for fragment in fragments
+        )
+    }
+    removed: dict[str, list[str]] = {}
+    kept: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes", [])],
+            ]
+        )
+        mentioned = [
+            field
+            for field in fields
+            if re.search(
+                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(field),
+                text,
+                re.I,
+            )
+        ]
+        config_write = bool(
+            len(mentioned) == 1
+            and _contains_mutation_intent(text)
+            and re.search(
+                r"config|WtxConfig|配置|\b(?:set|update|change|repair)\b|"
+                r"设置|修改|更新|修复|改为",
+                text,
+                re.I,
+            )
+        )
+        if config_write and mentioned[0] not in authorized:
+            removed[item_id] = [
+                _safe_implementation_step_id(value, fallback="")
+                for value in item.get("depends_on") or []
+            ]
+            continue
+        kept.append(item)
+    if not removed:
+        return kept
+
+    def resolve(item_id: str, seen: set[str] | None = None) -> list[str]:
+        if item_id not in removed:
+            return [item_id] if item_id else []
+        seen = set(seen or ())
+        if item_id in seen:
+            return []
+        seen.add(item_id)
+        result: list[str] = []
+        for dependency in removed[item_id]:
+            for resolved in resolve(dependency, seen):
+                if resolved not in result:
+                    result.append(resolved)
+        return result
+
+    for item in kept:
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="")
+        dependencies: list[str] = []
+        for raw in item.get("depends_on") or []:
+            for dependency in resolve(_safe_implementation_step_id(raw, fallback="")):
+                if dependency and dependency != item_id and dependency not in dependencies:
+                    dependencies.append(dependency)
+        item["depends_on"] = dependencies
+    return kept
+
+
+def _drop_unauthorized_source_mutations(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Do not turn observed repository metadata into a checkout mutation."""
+
+    semantic_fragments = [
+        semantic_step.title,
+        semantic_step.objective,
+        *semantic_step.expected_changes,
+    ]
+    source_terms = re.compile(r"\b(?:git|source|repository|revision|branch|commit)\b|源码|仓库|分支|版本", re.I)
+    source_mutation = re.compile(
+        r"\b(?:checkout|switch|pull|fetch|reset|clone|update|change)\b|"
+        r"检出|切换|拉取|重置|克隆|更新|修改",
+        re.I,
+    )
+    preservation = re.compile(
+        r"\b(?:existing|current|preserv\w*|keep|remain\w*|unchanged|untouched|using)\b|"
+        r"现有|当前|保持|保留|不变|沿用|使用",
+        re.I,
+    )
+    authorized = any(
+        source_terms.search(str(fragment))
+        and source_mutation.search(str(fragment))
+        and not preservation.search(str(fragment))
+        for fragment in semantic_fragments
+    )
+    if authorized:
+        return items
+
+    removed: dict[str, list[str]] = {}
+    kept: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if source_terms.search(text) and source_mutation.search(text):
+            removed[item_id] = [
+                _safe_implementation_step_id(value, fallback="")
+                for value in item.get("depends_on") or []
+            ]
+            continue
+        kept.append(item)
+    if not removed:
+        return kept
+
+    def resolve(item_id: str) -> list[str]:
+        if item_id not in removed:
+            return [item_id] if item_id else []
+        result: list[str] = []
+        for dependency in removed[item_id]:
+            for value in resolve(dependency):
+                if value not in result:
+                    result.append(value)
+        return result
+
+    for item in kept:
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="")
+        dependencies: list[str] = []
+        for raw in item.get("depends_on") or []:
+            for dependency in resolve(_safe_implementation_step_id(raw, fallback="")):
+                if dependency and dependency != item_id and dependency not in dependencies:
+                    dependencies.append(dependency)
+        item["depends_on"] = dependencies
+    return kept
+
+
+def _collapse_redundant_python_removal_items(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one atomic removal for the same evidenced Python symbol and file."""
+
+    kept: list[dict[str, Any]] = []
+    owner_by_key: dict[tuple[str, str], str] = {}
+    replacements: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes") or []],
+            ]
+        )
+        if not re.search(r"\b(?:remove|delete)\w*\b|移除|删除", text, re.I):
+            kept.append(item)
+            continue
+        symbols = sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", text)))
+        paths = re.findall(r"/[A-Za-z0-9._/-]+\.py\b", text)
+        if len(symbols) != 1:
+            kept.append(item)
+            continue
+        key = (paths[0] if paths else "", symbols[0])
+        owner = owner_by_key.get(key)
+        if owner is None:
+            owner_by_key[key] = item_id
+            kept.append(item)
+            continue
+        dependencies = [
+            _safe_implementation_step_id(value, fallback="")
+            for value in item.get("depends_on") or []
+        ]
+        replacements[item_id] = next(
+            (value for value in reversed(dependencies) if value and value != owner),
+            owner,
+        )
+    if not replacements:
+        return kept
+    for item in kept:
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="")
+        dependencies: list[str] = []
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            seen: set[str] = set()
+            while dependency in replacements and dependency not in seen:
+                seen.add(dependency)
+                dependency = replacements[dependency]
+            if dependency and dependency != item_id and dependency not in dependencies:
+                dependencies.append(dependency)
+        item["depends_on"] = dependencies
+    return kept
+
+
+def _drop_preservation_only_config_mutations(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Treat explicitly preserved config fields as assertions, not writes."""
+
+    attributes = (
+        "master_port", "worker_port", "public_port", "web_terminal_port",
+        "redis_port", "mysql_port", "rabbitmq_port", "master_ip",
+        "mysql_ip", "rabbitmq_ip", "celery_redis_port_db",
+        "celery_rabbitmq_port_db",
+    )
+    semantic_fragments = [
+        semantic_step.title,
+        semantic_step.objective,
+        *semantic_step.expected_changes,
+    ]
+    preserved: set[str] = set()
+    preservation = re.compile(
+        r"\b(?:preserve|keep|remain|unchanged|do not (?:change|modify))\b|"
+        r"保持|保留|不变|不修改",
+        re.I,
+    )
+    for attribute in attributes:
+        mentions = [
+            str(fragment)
+            for fragment in semantic_fragments
+            if re.search(
+                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                % re.escape(attribute),
+                str(fragment),
+                re.I,
+            )
+        ]
+        if mentions and all(preservation.search(fragment) for fragment in mentions):
+            preserved.add(attribute)
+    if not preserved:
+        return items
+
+    kept: list[dict[str, Any]] = []
+    replacement: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        text = " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes", [])],
+            ]
+        )
+        matches = [
+            attribute
+            for attribute in preserved
+            if re.search(
+                r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+                % re.escape(attribute),
+                text,
+                re.I,
+            )
+        ]
+        config_write = bool(
+            len(matches) == 1
+            and _contains_mutation_intent(text)
+            and re.search(r"config|WtxConfig|配置", text, re.I)
+        )
+        if config_write:
+            dependencies = [
+                _safe_implementation_step_id(value, fallback="")
+                for value in item.get("depends_on") or []
+            ]
+            replacement[item_id] = next(
+                (value for value in reversed(dependencies) if value), ""
+            )
+            continue
+        kept.append(item)
+    if not replacement:
+        return kept
+    for item in kept:
+        rewired: list[str] = []
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            seen: set[str] = set()
+            while dependency in replacement and dependency not in seen:
+                seen.add(dependency)
+                dependency = replacement[dependency]
+            current = _safe_implementation_step_id(item.get("id"), fallback="")
+            if dependency and dependency != current and dependency not in rewired:
+                rewired.append(dependency)
+        item["depends_on"] = rewired
+    return kept
+
+
+def _order_runtime_migration_items(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Enforce stop -> configure -> start for an in-place runtime migration."""
+
+    def text_of(item: dict[str, Any]) -> str:
+        return "%s %s" % (item.get("title") or "", item.get("objective") or "")
+
+    stops = [
+        item for item in items
+        if re.search(r"\b(?:stop|terminate)\b|停止|终止", text_of(item), re.I)
+        and (
+            re.search(
+                r"\b(?:runtime|process|instance|pid|pgid)s?\b|运行时|进程|实例",
+                text_of(item),
+                re.I,
+            )
+            or _atomic_runtime_role(str(item.get("title") or ""))
+        )
+    ]
+    configs = [
+        item for item in items
+        if (
+            re.search(
+                r"(?<![A-Za-z0-9_])(?:master_port|worker_port)(?![A-Za-z0-9_])",
+                text_of(item),
+                re.I,
+            )
+            and re.search(
+                r"\b(?:set|update|change|edit|replace)\b|设置|更新|修改|改为",
+                text_of(item),
+                re.I,
+            )
+        )
+    ]
+    starts = [
+        item for item in items
+        if re.search(
+            r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+            text_of(item),
+            re.I,
+        )
+        and _atomic_runtime_role(text_of(item))
+        and not re.search(
+            r"\b(?:stop|terminate)\w*\b|停止|终止",
+            text_of(item),
+            re.I,
+        )
+    ]
+    if not configs or not starts:
+        return items
+    selected_ids = {
+        _safe_implementation_step_id(item.get("id"), fallback="")
+        for item in [*stops, *configs, *starts]
+    }
+    remainder = [item for item in items if item not in stops + configs + starts]
+    ordered = [*stops, *configs, *starts, *remainder]
+    external_dependencies = []
+    for item in ordered:
+        for dependency in item.get("depends_on") or []:
+            normalized = _safe_implementation_step_id(dependency, fallback="")
+            if normalized and normalized not in selected_ids and normalized not in external_dependencies:
+                external_dependencies.append(normalized)
+    previous = ""
+    for item in ordered:
+        item["depends_on"] = [previous] if previous else list(external_dependencies)
+        previous = _safe_implementation_step_id(item.get("id"), fallback="")
+    return ordered
+
+
+def _order_source_runtime_recovery_items(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Compile source repair recovery as edit -> exact stop -> start -> verify."""
+
+    if not _required_runtime_recovery_roles(semantic_step):
+        return items
+
+    def text_of(item: dict[str, Any]) -> str:
+        return " ".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("objective") or ""),
+                *[str(value) for value in item.get("expected_changes") or []],
+            ]
+        )
+
+    # Port/config migrations already have their own stop -> configure -> start
+    # compiler and must not be reordered by this source-repair rule.
+    if any(
+        re.search(r"master_port|worker_port|WtxConfig|配置", text_of(item), re.I)
+        and re.search(r"\b(?:set|update|change|edit)\b|设置|更新|修改", text_of(item), re.I)
+        for item in items
+    ):
+        return items
+    stops = [
+        item for item in items
+        if _atomic_runtime_role(text_of(item))
+        and re.search(r"\b(?:stop|terminate)\w*\b|停止|终止", text_of(item), re.I)
+    ]
+    starts = [
+        item for item in items
+        if _atomic_runtime_role(text_of(item))
+        and re.search(
+            r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+            text_of(item),
+            re.I,
+        )
+        and item not in stops
+    ]
+    if not stops or not starts:
+        return items
+    verifications = [item for item in items if _implementation_item_is_verification(item)]
+    edits = [
+        item for item in items
+        if item not in stops + starts + verifications
+        and re.search(r"\b(?:edit|remove|delete|replace)\w*\b|编辑|移除|删除|替换", text_of(item), re.I)
+    ]
+    remainder = [
+        item for item in items
+        if item not in edits + stops + starts + verifications
+    ]
+    ordered = [*edits, *stops, *starts, *remainder, *verifications]
+    selected_ids = {
+        _safe_implementation_step_id(item.get("id"), fallback="")
+        for item in ordered
+    }
+    external: list[str] = []
+    for item in ordered:
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            if dependency and dependency not in selected_ids and dependency not in external:
+                external.append(dependency)
+    previous = ""
+    for item in ordered:
+        item["depends_on"] = [previous] if previous else list(external)
+        previous = _safe_implementation_step_id(item.get("id"), fallback="")
+    return ordered
+
+
+def _ensure_runtime_role_recovery_items(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Require each evidence-derived unhealthy role to have a mutation step."""
+
+    fragments = [semantic_step.objective, *semantic_step.expected_changes]
+    semantic_text = " ".join(
+        str(fragment)
+        for fragment in fragments
+        if not re.search(
+            r"\b(?:preserv\w*|keep|remain\w*|unchanged|untouched|do not (?:start|restart|"
+            r"change|modify))\b|\b(?:verify|confirm)\b.{0,40}\b(?:healthy|health)\b|"
+            r"保持|保留|不变|不修改|不要重启|无需重启|仍健康|"
+            r"验证.{0,40}健康|确认.{0,40}健康",
+            str(fragment),
+            re.I,
+        )
+    )
+    if re.match(
+        r"^\s*(?:(?:precisely|safely|only|精确|安全|仅)\s*)?"
+        r"(?:stop|terminate|停止|终止)",
+        str(semantic_step.title or ""),
+        re.I,
+    ):
+        return items
+    required: list[tuple[str, str]] = []
+    for role in ("master", "worker"):
+        exact = re.search(
+            r"\b(start missing|restart unhealthy|restart requested)\s+%s\s+role\b" % role,
+            semantic_text,
+            re.I,
+        )
+        nearby = re.search(
+            r"(?:\b(?:start|restart|restore|recover|launch|migrate)\w*\b|"
+            r"启动|重启|恢复|迁移)[^.!?。！？]{0,80}\b%s\b|"
+            r"\b%s\b[^.!?。！？]{0,80}(?:\b(?:start|restart|restore|recover|"
+            r"launch|migrate)\w*\b|启动|重启|恢复|迁移)" % (role, role),
+            semantic_text,
+            re.I,
+        )
+        if exact or nearby:
+            marker = exact.group(1) if exact else nearby.group(0)
+            verb = (
+                "Restart"
+                if re.search(r"restart|重启|migrate|迁移", marker, re.I)
+                else "Start"
+            )
+            required.append((role, verb))
+    if not required:
+        return items
+    existing_roles = set()
+    for item in items:
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if (
+            _contains_mutation_intent(text)
+            and re.search(
+                r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+                text,
+                re.I,
+            )
+            and not re.search(
+                r"\b(?:stop|terminate)\w*\b|停止|终止",
+                text,
+                re.I,
+            )
+        ):
+            role = _atomic_runtime_role(text)
+            if role:
+                existing_roles.add(role)
+    additions = []
+    previous = ""
+    for role, verb in required:
+        if role in existing_roles:
+            continue
+        item_id = "%s-recover-%s" % (semantic_step.step_id, role)
+        additions.append(
+            {
+                "id": item_id,
+                "title": "%s %s screen component" % (verb, role),
+                "objective": "%s the %s role for %s" % (
+                    verb, role, semantic_step.objective or semantic_step.title,
+                ),
+                "reason": "the running-platform evidence requires role recovery",
+                "depends_on": [previous] if previous else [],
+                "expected_changes": ["%s role is recovered" % role],
+                "success_criteria": ["%s backend health succeeds" % role],
+                "risk_suggestion": "medium",
+            }
+        )
+        previous = item_id
+    if not additions:
+        return items
+
+    # Recovery is an implementation consequence of the semantic change, not a
+    # prerequisite for that change.  In particular, a synthesized restart must
+    # run after any port/config mutations and before verification; prepending it
+    # would launch the component with stale configuration.
+    insertion_index = next(
+        (
+            index
+            for index, item in enumerate(items)
+            if _implementation_item_is_verification(item)
+        ),
+        len(items),
+    )
+    prior_id = ""
+    for item in items[:insertion_index]:
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if _contains_mutation_intent(text):
+            prior_id = _safe_implementation_step_id(item.get("id"), fallback="")
+
+    previous = prior_id
+    for addition in additions:
+        addition["depends_on"] = [previous] if previous else []
+        previous = _safe_implementation_step_id(addition.get("id"), fallback="")
+
+    following = items[insertion_index:]
+    if previous:
+        for item in following:
+            if not _implementation_item_is_verification(item):
+                continue
+            dependencies = [
+                _safe_implementation_step_id(dependency, fallback="")
+                for dependency in item.get("depends_on") or []
+            ]
+            dependencies = [
+                dependency
+                for dependency in dependencies
+                if dependency and dependency != prior_id
+            ]
+            item["depends_on"] = [previous, *dependencies]
+
+    return [*items[:insertion_index], *additions, *following]
+
+
+def _ensure_runtime_migration_stop_item(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Make an old root-owned runtime stop explicit before port migration."""
+
+    semantic_text = " ".join(
+        [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+    )
+    explicit_stop = bool(
+        re.search(r"\b(?:stop|terminate)\w*\b|停止|终止", semantic_text, re.I)
+        and re.search(r"\bworker\b|工作进程", semantic_text, re.I)
+        and re.search(r"\b(?:port|listener)\b|端口|监听", semantic_text, re.I)
+    )
+    if not re.search(
+        r"\b(?:migrate|move)\w*\b|迁移|切换.{0,20}端口",
+        semantic_text,
+        re.I,
+    ) and not explicit_stop:
+        return items
+    if semantic_step.depends_on:
+        return items
+    if any(
+        re.search(
+            r"\b(?:stop|terminate)\w*\b|停止|终止",
+            "%s %s" % (item.get("title") or "", item.get("objective") or ""),
+            re.I,
+        )
+        for item in items
+    ):
+        return items
+    root = _semantic_runtime_root(semantic_text)
+    role = next(
+        (
+            candidate
+            for candidate in ("worker", "master")
+            if re.search(
+                r"\b%s\b[^.!?。！？]{0,60}(?:restart|migrate|start|stop|"
+                r"重启|迁移|启动|停止)|"
+                r"(?:restart|migrate|start|stop|重启|迁移|启动|停止)"
+                r"[^.!?。！？]{0,60}\b%s\b"
+                % (candidate, candidate),
+                semantic_text,
+                re.I,
+            )
+        ),
+        "",
+    )
+    if not root or not role:
+        return items
+    stop_id = "%s-stop-old-%s" % (semantic_step.step_id, role)
+    return [
+        {
+            "id": stop_id,
+            "title": "Stop current %s runtime process" % role,
+            "objective": "Stop the old %s runtime owned by %s before changing its port"
+            % (role, root),
+            "reason": "release the old instance-bound listener before configuration migration",
+            "depends_on": [],
+            "expected_changes": ["old %s process for %s stops" % (role, root)],
+            "success_criteria": ["the old root-owned %s listener is released" % role],
+            "risk_suggestion": "high",
+        },
+        *items,
+    ]
+
+
+def _collapse_redundant_runtime_role_mutations(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep one start/restart mutation for each runtime role."""
+
+    kept: list[dict[str, Any]] = []
+    owner_by_key: dict[tuple[str, str], str] = {}
+    replacements: dict[str, str] = {}
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        title = str(item.get("title") or "")
+        text = "%s %s" % (title, item.get("objective") or "")
+        # Planner objectives often repeat the whole semantic goal and therefore
+        # mention both master and worker.  The atomic item title is the role
+        # authority; only fall back to the combined text when the title omits it.
+        role = _atomic_runtime_role(title) or _atomic_runtime_role(text)
+        starts = re.search(
+            r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+            text,
+            re.I,
+        )
+        stops = re.search(
+            r"\b(?:stop|terminate)\w*\b|停止|终止",
+            text,
+            re.I,
+        )
+        if not role or (not starts and not stops):
+            kept.append(item)
+            continue
+        key = ("stop" if stops else "start", role)
+        owner = owner_by_key.get(key)
+        if owner is None:
+            owner_by_key[key] = item_id
+            kept.append(item)
+            continue
+        dependencies = [
+            _safe_implementation_step_id(raw, fallback="")
+            for raw in item.get("depends_on") or []
+        ]
+        replacements[item_id] = next(
+            (dependency for dependency in reversed(dependencies) if dependency),
+            owner,
+        )
+    if not replacements:
+        return kept
+    for item in kept:
+        dependencies = []
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            while dependency in replacements:
+                dependency = replacements[dependency]
+            current = _safe_implementation_step_id(item.get("id"), fallback="")
+            if dependency and dependency != current and dependency not in dependencies:
+                dependencies.append(dependency)
+        item["depends_on"] = dependencies
+    return kept
+
+
+def _normalize_runtime_role_recovery_verbs(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Compile evidence disposition (restart unhealthy/start missing) into Action verbs."""
+
+    semantic_text = " ".join(
+        [semantic_step.objective, *semantic_step.expected_changes]
+    )
+    dispositions: dict[str, str] = {}
+    for role in ("master", "worker"):
+        if re.search(
+            r"\brestart (?:unhealthy|requested)\s+%s\s+role\b" % role,
+            semantic_text,
+            re.I,
+        ):
+            dispositions[role] = "Restart"
+        elif re.search(r"\bstart missing\s+%s\s+role\b" % role, semantic_text, re.I):
+            dispositions[role] = "Start"
+    if not dispositions:
+        return items
+    for item in items:
+        title = str(item.get("title") or "")
+        role = _atomic_runtime_role(title)
+        if role not in dispositions or not re.search(
+            r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+            title,
+            re.I,
+        ):
+            continue
+        item["title"] = "%s %s screen component" % (dispositions[role], role)
+    return items
+
+
+def _expand_unhealthy_role_restarts(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Compile an unhealthy live role into an explicit exact stop then start."""
+
+    semantic_text = " ".join(
+        [semantic_step.objective, *semantic_step.expected_changes]
+    )
+    unhealthy_roles = {
+        role
+        for role in ("master", "worker")
+        if re.search(
+            r"\brestart unhealthy\s+%s\s+role\b" % role,
+            semantic_text,
+            re.I,
+        )
+    }
+    if not unhealthy_roles:
+        return items
+    expanded = []
+    for index, item in enumerate(items, start=1):
+        title = str(item.get("title") or "")
+        role = _atomic_runtime_role(title)
+        if role not in unhealthy_roles or not re.search(
+            r"\brestart\b|重启", title, re.I
+        ):
+            expanded.append(item)
+            continue
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="restart-%s-%s" % (role, index)
+        )
+        stop_id = "%s-stop-current" % item_id
+        expanded.append(
+            {
+                "id": stop_id,
+                "title": "Stop current %s runtime process" % role,
+                "objective": "Precisely stop the unhealthy %s role for %s"
+                % (role, semantic_step.objective or semantic_step.title),
+                "reason": "the role has a frozen PID and must not be restarted by name",
+                "depends_on": list(item.get("depends_on") or []),
+                "expected_changes": ["current %s process stops" % role],
+                "success_criteria": ["the exact role-owned listener is released"],
+                "risk_suggestion": "high",
+            }
+        )
+        started = dict(item)
+        started["id"] = item_id
+        started["title"] = "Start %s screen component" % role
+        started["depends_on"] = [stop_id]
+        expanded.append(started)
+    return expanded
+
+
+def _filter_unauthorized_runtime_role_mutations(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Drop every role mutation not explicitly authorized by this semantic step."""
+
+    allowed: set[str] = set()
+    fragments = [
+        "%s %s" % (semantic_step.title, semantic_step.objective),
+        *semantic_step.expected_changes,
+    ]
+    for fragment in fragments:
+        clauses = re.split(
+            r"[.;。；！？]|\bthen\b|随后|然后|"
+            r"\band\s+(?=verify|confirm|keep|preserve)|并(?=验证|确认|保持|保留)",
+            str(fragment or ""),
+            flags=re.I,
+        )
+        for text in clauses:
+            if re.search(
+                r"\b(?:preserv\w*|keep|remain\w*|unchanged|untouched)\b|"
+                r"\b(?:verify|confirm)\b.{0,40}\b(?:healthy|health|interface|endpoint)\b|"
+                r"保持|保留|不变|不修改|仍健康|验证|确认",
+                text,
+                re.I,
+            ):
+                continue
+            if not re.search(
+                r"\b(?:start|restart|restore|recover|launch|stop|terminate)\w*\b|"
+                r"启动|重启|恢复|停止|终止",
+                text,
+                re.I,
+            ):
+                continue
+            for role, pattern in (
+                ("master", r"(?<![A-Za-z0-9_])master(?![A-Za-z0-9_])"),
+                ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
+                ("celery", r"(?<![A-Za-z0-9_])celery(?![A-Za-z0-9_])"),
+                ("web_terminal", r"web[_ -]?terminal"),
+            ):
+                if re.search(pattern, text, re.I):
+                    allowed.add(role)
+    removed: dict[str, list[str]] = {}
+    for index, item in enumerate(items, start=1):
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        role = _atomic_runtime_role(text)
+        if not role or role in allowed or not re.search(
+            r"\b(?:start|restart|restore|recover|launch|stop|terminate)\w*\b|"
+            r"启动|重启|恢复|停止|终止",
+            text,
+            re.I,
+        ):
+            continue
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        removed[item_id] = [
+            _safe_implementation_step_id(dep, fallback="")
+            for dep in item.get("depends_on") or []
+        ]
+    if not removed:
+        return items
+
+    def resolve(item_id: str) -> list[str]:
+        if item_id not in removed:
+            return [item_id] if item_id else []
+        result: list[str] = []
+        for dependency in removed[item_id]:
+            for resolved in resolve(dependency):
+                if resolved not in result:
+                    result.append(resolved)
+        return result
+
+    kept = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        if item_id in removed:
+            continue
+        dependencies: list[str] = []
+        for dependency in item.get("depends_on") or []:
+            for resolved in resolve(_safe_implementation_step_id(dependency, fallback="")):
+                if resolved and resolved != item_id and resolved not in dependencies:
+                    dependencies.append(resolved)
+        item["depends_on"] = dependencies
+        kept.append(item)
+    return kept
+
+
+def _drop_runtime_stops_covered_by_semantic_predecessor(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+    plan: PrivilegedPlan | None = None,
+) -> list[dict[str, Any]]:
+    """Do not broaden a migration stop already represented by a predecessor."""
+
+    semantic_text = "%s %s" % (semantic_step.title, semantic_step.objective)
+    has_preceding_stop = bool(semantic_step.depends_on)
+    if not has_preceding_stop and plan is not None:
+        root = _semantic_runtime_root(semantic_text)
+        for candidate in plan.steps:
+            if candidate.step_id == semantic_step.step_id:
+                break
+            candidate_text = " ".join(
+                [candidate.title, candidate.objective, *candidate.expected_changes]
+            )
+            if (
+                re.search(r"\b(?:stop|terminate)\w*\b|停止|终止", candidate_text, re.I)
+                and root
+                and root == _semantic_runtime_root(candidate_text)
+            ):
+                has_preceding_stop = True
+                break
+    if not has_preceding_stop or not re.search(
+        r"\b(?:migrate|move)\w*\b|迁移|切换.{0,20}端口",
+        semantic_text,
+        re.I,
+    ):
+        return items
+    removed: dict[str, list[str]] = {}
+    for index, item in enumerate(items, start=1):
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if not (
+            re.search(r"\b(?:stop|terminate)\w*\b|停止|终止", text, re.I)
+            and re.search(r"\b(?:runtime|process|instance)\b|运行时|进程|实例", text, re.I)
+        ):
+            continue
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        removed[item_id] = [
+            _safe_implementation_step_id(dep, fallback="")
+            for dep in item.get("depends_on") or []
+        ]
+    if not removed:
+        return items
+
+    def resolve(item_id: str) -> list[str]:
+        if item_id not in removed:
+            return [item_id] if item_id else []
+        result: list[str] = []
+        for dependency in removed[item_id]:
+            for resolved in resolve(dependency):
+                if resolved not in result:
+                    result.append(resolved)
+        return result
+
+    kept = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        if item_id in removed:
+            continue
+        dependencies: list[str] = []
+        for raw in item.get("depends_on") or []:
+            for dependency in resolve(_safe_implementation_step_id(raw, fallback="")):
+                if dependency and dependency != item_id and dependency not in dependencies:
+                    dependencies.append(dependency)
+        item["depends_on"] = dependencies
+        kept.append(item)
+    return kept
+
+
+def _drop_runtime_stops_for_roles_known_missing(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """A role proven missing has nothing left to stop before it is started."""
+
+    semantic_text = " ".join(
+        [semantic_step.objective, *semantic_step.expected_changes]
+    )
+    missing_roles = {
+        role
+        for role in ("master", "worker")
+        if re.search(
+            r"\bstart missing\s+%s\s+role\b" % role,
+            semantic_text,
+            re.I,
+        )
+    }
+    if not missing_roles:
+        return items
+    removed: dict[str, list[str]] = {}
+    for index, item in enumerate(items, start=1):
+        item_text = "%s %s" % (
+            item.get("title") or "", item.get("objective") or ""
+        )
+        role = _atomic_runtime_role(item_text)
+        if role not in missing_roles or not re.search(
+            r"\b(?:stop|terminate)\w*\b|停止|终止|清理",
+            item_text,
+            re.I,
+        ):
+            continue
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        removed[item_id] = [
+            _safe_implementation_step_id(value, fallback="")
+            for value in item.get("depends_on") or []
+        ]
+    if not removed:
+        return items
+
+    def resolve(item_id: str) -> list[str]:
+        if item_id not in removed:
+            return [item_id] if item_id else []
+        result: list[str] = []
+        for dependency in removed[item_id]:
+            for value in resolve(dependency):
+                if value not in result:
+                    result.append(value)
+        return result
+
+    kept: list[dict[str, Any]] = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(
+            item.get("id"), fallback="step-%s" % index
+        )
+        if item_id in removed:
+            continue
+        dependencies: list[str] = []
+        for raw in item.get("depends_on") or []:
+            for dependency in resolve(_safe_implementation_step_id(raw, fallback="")):
+                if dependency and dependency != item_id and dependency not in dependencies:
+                    dependencies.append(dependency)
+        item["depends_on"] = dependencies
+        kept.append(item)
+    return kept
+
+
+def _drop_runtime_stops_covered_by_same_step_restart(
+    items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Avoid a broad pre-stop when a role restart already owns that lifecycle."""
+
+    text_of = lambda item: "%s %s" % (
+        item.get("title") or "", item.get("objective") or ""
+    )
+    lifecycle_roles = {
+        role
+        for item in items
+        for role in (_atomic_runtime_role(str(item.get("title") or "")),)
+        if role
+        and re.search(r"\b(?:start|restart)\w*\b|启动|重启", text_of(item), re.I)
+        and not re.search(r"\b(?:stop|terminate)\w*\b|停止|终止", text_of(item), re.I)
+    }
+    configured_roles = {
+        role
+        for item in items
+        for role in ("master", "worker")
+        if re.search(r"(?<![A-Za-z0-9_])%s_port(?![A-Za-z0-9_])" % role, text_of(item), re.I)
+        and re.search(r"\b(?:set|update|change|edit|replace)\b|设置|更新|修改|改为", text_of(item), re.I)
+    }
+    if not lifecycle_roles:
+        return items
+    removed: dict[str, list[str]] = {}
+    kept = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        role = _atomic_runtime_role(str(item.get("title") or ""))
+        is_stop = bool(re.search(r"\b(?:stop|terminate)\w*\b|停止|终止", text_of(item), re.I))
+        if is_stop and role in lifecycle_roles and role not in configured_roles:
+            removed[item_id] = [
+                _safe_implementation_step_id(value, fallback="")
+                for value in item.get("depends_on") or []
+            ]
+            continue
+        kept.append(item)
+    if not removed:
+        return kept
+    for item in kept:
+        dependencies = []
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            seen = set()
+            while dependency in removed and dependency not in seen:
+                seen.add(dependency)
+                dependency = next((value for value in reversed(removed[dependency]) if value), "")
+            current = _safe_implementation_step_id(item.get("id"), fallback="")
+            if dependency and dependency != current and dependency not in dependencies:
+                dependencies.append(dependency)
+        item["depends_on"] = dependencies
+    return kept
+
+
+def _ground_runtime_item_roots(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> list[dict[str, Any]]:
+    """Carry the parent instance identity into every mutating atomic step."""
+
+    parent_text = " ".join(
+        [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+    )
+    root = _semantic_runtime_root(parent_text)
+    if not root:
+        return items
+    for item in items:
+        text = "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        if not _contains_mutation_intent(text) or _semantic_runtime_root(text):
+            continue
+        if re.match(r"^\s*Set\s+WtxConfig\s+", str(item.get("title") or ""), re.I):
+            suffix = "%s/vemu_config/config.py" % root.rstrip("/")
+        else:
+            suffix = root
+        item["objective"] = "%s for %s" % (
+            str(item.get("objective") or item.get("title") or "").rstrip(),
+            suffix,
+        )
+    return items
+
+
+def _drop_redundant_implementation_verifications(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Keep pre/post checks on Action and semantic contracts, not as micro nodes."""
+
+    semantic_mutates = bool(
+        semantic_step.expected_changes
+        or _contains_mutation_intent("%s %s" % (
+            semantic_step.title, semantic_step.objective,
+        ))
+    )
+    if not semantic_mutates or not semantic_step.postconditions:
+        return items
+    removed: dict[str, list[str]] = {}
+    for index, item in enumerate(items, start=1):
+        if not _implementation_item_is_verification(item):
+            continue
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        removed[item_id] = [
+            _safe_implementation_step_id(dep, fallback="")
+            for dep in item.get("depends_on") or []
+        ]
+    if not removed:
+        return items
+
+    def resolve(item_id: str) -> list[str]:
+        if item_id not in removed:
+            return [item_id] if item_id else []
+        result: list[str] = []
+        for dependency in removed[item_id]:
+            for resolved in resolve(dependency):
+                if resolved not in result:
+                    result.append(resolved)
+        return result
+
+    kept = []
+    for index, item in enumerate(items, start=1):
+        item_id = _safe_implementation_step_id(item.get("id"), fallback="step-%s" % index)
+        if item_id in removed:
+            continue
+        dependencies: list[str] = []
+        for raw in item.get("depends_on") or []:
+            for dependency in resolve(_safe_implementation_step_id(raw, fallback="")):
+                if dependency and dependency != item_id and dependency not in dependencies:
+                    dependencies.append(dependency)
+        item["depends_on"] = dependencies
+        kept.append(item)
+    return kept
 
 
 def _drop_nginx_activation_from_prepare(
@@ -2989,6 +4792,32 @@ def _implementation_item_is_verification(item: dict[str, Any]) -> bool:
     title = str(item.get("title") or "").lower().strip()
     objective = str(item.get("objective") or "").lower().strip()
     text = title or objective
+    if title and "只读" in title and re.search(
+        r"验证|校验|确认|检查|复核|验收|verify\b|validate\b|check\b|confirm\b",
+        title,
+        re.I,
+    ):
+        return not bool(re.search(
+            r"(?:并|且|然后).{0,24}(?:创建|写入|修改|修复|设置|切换|启动|停止|重启|迁移)",
+            title,
+            re.I,
+        ))
+    if title and re.match(
+        r"^(?:验证|校验|确认|检查|验收|verify\b|validate\b|check\b|confirm\b|assert\b)",
+        title,
+        re.I,
+    ):
+        compound_mutation = re.search(
+            r"(?:并|且|然后|and\b|then\b).{0,24}"
+            r"(?:创建|新增|写入|修改|修复|设置|切换|启动|停止|重启|重载|迁移|"
+            r"create\b|add\b|write\b|modify\b|repair\b|set\b|switch\b|"
+            r"start\b|stop\b|restart\b|reload\b|migrate\b)",
+            title,
+            re.I,
+        )
+        return compound_mutation is None
+    if _contains_mutation_intent(" ".join(part for part in (title, objective) if part)):
+        return False
     verifier = re.search(
         r"验证|校验|确认|检查|验收|verify\b|validate\b|check\b|confirm\b|assert\b",
         text,
@@ -3020,10 +4849,12 @@ def _semantic_step_is_observational(step: PrivilegedStep) -> bool:
     """Classify the semantic goal by its primary verb, not prerequisite prose."""
 
     title = str(step.title or "").strip()
+    objective = str(step.objective or "").strip()
+    if _contains_mutation_intent(" ".join(part for part in (title, objective) if part)):
+        return False
     if title:
         if not _implementation_item_is_verification({"title": title}):
             return False
-        objective = str(step.objective or "").strip()
         if re.search(
             r"^(?:请|需要|要|to\s+)?(?:(?:创建|新增|写入|插入|修改|修复|设置|"
             r"切换|启动|停止|重载|安装|复制|同步|删除|准备)|"
@@ -3037,6 +4868,16 @@ def _semantic_step_is_observational(step: PrivilegedStep) -> bool:
     return _implementation_item_is_verification(
         {"objective": step.objective}
     )
+
+
+def _contains_mutation_intent(text: str) -> bool:
+    return re.search(
+        r"创建|新增|写入|插入|修改|修复|恢复|设置|切换|启动|停止|重启|重载|安装|复制|同步|删除|迁移|"
+        r"\b(?:create|add|write|insert|modify|repair|recover|restore|configure|deploy|set|"
+        r"switch|start|stop|restart|reload|install|copy|sync|remove|migrate|checkout|pin)\b",
+        str(text or ""),
+        re.IGNORECASE,
+    ) is not None
 
 
 def _step_is_verification(step: PrivilegedStep) -> bool:
@@ -3079,6 +4920,8 @@ def _host_fact_is_planned_future(
         if problem.startswith("grounding_failed=install_script_not_found"):
             arg_name = "script_dir"
         elif problem.startswith("grounding_failed=project_root_missing_entries"):
+            arg_name = "project_root"
+        elif problem.startswith("grounding_failed=project_root_not_directory"):
             arg_name = "project_root"
     if arg_name is None:
         return False
@@ -3301,14 +5144,69 @@ def _validate_action_resource_bindings(
                 or step.step_id.startswith(semantic_id + "__")
             ):
                 continue
+            if resource.role == "screen_session":
+                role = _atomic_runtime_role(
+                    " ".join(
+                        [step.title, step.objective, step.reason, *step.expected_changes]
+                    )
+                )
+                suffix = {
+                    "master": "_m",
+                    "worker": "_w",
+                    "celery": "_c",
+                    "web_terminal": "_web",
+                }.get(role, "")
+                if not suffix or not str(resource.value).endswith(suffix):
+                    continue
+                semantic_root = _semantic_runtime_root(
+                    " ".join(
+                        [step.title, step.objective, step.reason, *step.expected_changes]
+                    )
+                )
+                if (
+                    "/test/" in semantic_root
+                    and not re.search(
+                        r"(?:^|[_-])test(?:$|[_-])", str(resource.value), re.I
+                    )
+                ):
+                    continue
+                observed = args.get("screen_session")
+                if not _resource_values_equal(resource, observed):
+                    raise ValueError(
+                        "resource_binding_violation=%s.screen_session must use ${%s}"
+                        % (semantic_id, resource.name)
+                    )
+                continue
             if arg_name not in args:
                 continue
+            if (
+                resource.kind == "port"
+                and resource.role in {"master_port", "worker_port"}
+                and arg_name == resource.role
+            ):
+                scoped_value = _scoped_role_port_value(
+                    step, resources, resource.role
+                )
+                if (
+                    scoped_value is not None
+                    and not _resource_values_equal(resource, scoped_value)
+                ):
+                    continue
             if resource.status == "deferred":
                 raise ValueError(
                     "deferred_plan_resource_required=%s resolve_before=%s"
                     % (resource.name, resource.resolve_before)
                 )
             observed = args.get(arg_name)
+            if (
+                action in {"start_screen_component", "restart_screen_component"}
+                and arg_name == "project_root"
+                and str(observed or "").rstrip("/") in {
+                    str(resource.value).rstrip("/") + "/mains",
+                    str(resource.value).rstrip("/") + "/vemu_uestc/mains",
+                }
+            ):
+                continue
             if not _resource_values_equal(resource, observed):
                 raise ValueError(
                     "resource_binding_violation=%s.%s must use ${%s}"
@@ -3324,6 +5222,47 @@ def _inject_frozen_resource_args(
     """Compile authoritative resource consumers into Action arguments."""
 
     compiled = dict(args)
+    runtime_role = _atomic_runtime_role(
+        " ".join(
+            [step.title, step.objective, step.reason, *step.expected_changes]
+        )
+    )
+    role_suffix = {
+        "master": "_m",
+        "worker": "_w",
+        "celery": "_c",
+        "web_terminal": "_web",
+    }.get(runtime_role, "")
+    scoped_screen = next(
+        (
+            resource
+            for resource in resources
+            if resource.status == "frozen"
+            and resource.role == "screen_session"
+            and role_suffix
+            and str(resource.value).endswith(role_suffix)
+            and not (
+                "/test/" in _semantic_runtime_root(
+                    " ".join(
+                        [step.title, step.objective, step.reason, *step.expected_changes]
+                    )
+                )
+                and not re.search(
+                    r"(?:^|[_-])test(?:$|[_-])", str(resource.value), re.I
+                )
+            )
+            and any(
+                step.step_id == str(consumer).rsplit(".", 1)[0]
+                or step.step_id.startswith(
+                    str(consumer).rsplit(".", 1)[0] + "__"
+                )
+                for consumer in resource.consumers
+            )
+        ),
+        None,
+    )
+    if scoped_screen is not None:
+        compiled["screen_session"] = scoped_screen.value
     for resource in resources:
         if resource.status != "frozen":
             continue
@@ -3332,6 +5271,8 @@ def _inject_frozen_resource_args(
             if step.step_id == semantic_id or step.step_id.startswith(
                 semantic_id + "__"
             ):
+                if resource.role == "screen_session":
+                    continue
                 compiled[arg_name] = resource.value
     return compiled
 
@@ -3389,12 +5330,52 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
 
     if _step_is_verification(step):
         return ""
-    if re.match(r"^\s*Set\s+WtxConfig\s+", step.title, re.I):
+    primary = "%s %s" % (step.title, step.objective)
+    if re.match(r"^\s*Set\s+WtxConfig\s+", step.title, re.I) or (
+        re.search(
+            r"(?<![A-Za-z0-9_])(?:master_port|worker_port)(?![A-Za-z0-9_])",
+            primary,
+            re.I,
+        )
+        and re.search(
+            r"\b(?:set|update|change|edit|replace)\b|设置|更新|修改|改为",
+            primary,
+            re.I,
+        )
+        and re.search(r"config|配置", primary, re.I)
+    ):
         return "set_python_class_attribute"
+    if re.match(r"^\s*Start\s+(?:master|worker|celery|web_terminal)\s+screen\s+component\s*$", step.title, re.I):
+        return "start_screen_component"
+    if re.match(r"^\s*Restart\s+(?:master|worker|celery|web_terminal)\s+screen\s+component\s*$", step.title, re.I):
+        return "restart_screen_component"
+    runtime_role = _atomic_runtime_role(step.title)
+    if runtime_role in {"master", "worker"} and re.match(
+        r"^\s*(?:stop|terminate|停止|终止)", step.title, re.I,
+    ) and re.search(
+        r"\b(?:runtime|process|role)\b|运行时|进程|角色", primary, re.I,
+    ):
+        return "stop_klonet_component"
+    if runtime_role and re.match(
+        r"^\s*(?:restart|restore|recover|重启|恢复)", step.title, re.I,
+    ) and re.search(r"\b(?:screen|component|process|role)\b|组件|进程|角色", primary, re.I):
+        return "restart_screen_component"
+    if runtime_role and re.match(
+        r"^\s*(?:start|launch|启动)", step.title, re.I,
+    ) and re.search(r"\b(?:screen|component|process|role)\b|组件|进程|角色", primary, re.I):
+        return "start_screen_component"
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     ).lower()
-    primary = "%s %s" % (step.title, step.objective)
+    if (
+        re.search(r"\b(?:stop|terminate)\b|停止|终止", primary, re.I)
+        and re.search(r"\b(?:runtime|instance|process)\b|运行实例|进程", text, re.I)
+        and re.search(r"/[A-Za-z0-9._/-]*vemu_uestc\b", text)
+        and not re.search(r"\bscreen\s+(?:session|component)\b|screen\s*会话", primary, re.I)
+    ):
+        if runtime_role in {"master", "worker"}:
+            return "stop_klonet_component"
+        return "stop_klonet_runtime_instance"
     if re.search(r"\b(?:clone|checkout)\b|克隆|检出", primary, re.I) and re.search(
         r"\b(?:git|repository|source)\b|仓库|源码", primary, re.I
     ):
@@ -3430,6 +5411,13 @@ def _validate_action_objective_fit(
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     ).lower()
+    primary = "%s %s" % (step.title, step.objective)
+    if action in {"stop_klonet_component", "stop_klonet_runtime_instance"} and re.match(
+        r"^\s*(?:start|restart|restore|recover|launch|启动|重启|恢复)",
+        primary,
+        re.I,
+    ):
+        return "action=%s contradicts_start_or_restart_objective" % action
     if action in {"manage_container", "start_docker_container"} and re.search(
         r"(?:create|new|previously absent|创建|新建|全新).{0,40}(?:container|容器)|"
         r"(?:container|容器).{0,40}(?:create|new|previously absent|创建|新建|全新)",
@@ -3508,6 +5496,63 @@ def _validate_action_contract_consistency(
 ) -> str:
     """Cross-check typed Action arguments against the frozen semantic objective."""
 
+    if action in {"start_screen_component", "restart_screen_component"}:
+        text = " ".join(
+            [step.title, step.objective, step.reason, *step.expected_changes]
+        )
+        expected_role = _atomic_runtime_role(text)
+        observed_role = str(args.get("component") or "").strip()
+        if expected_role and observed_role != expected_role:
+            return "screen_component_mismatch=%s expected=%s" % (
+                observed_role or "<missing>", expected_role,
+            )
+        expected_root = _semantic_runtime_root(text)
+        project_root = str(args.get("project_root") or "").rstrip("/")
+        if expected_root and not (
+            project_root == expected_root
+            or project_root.startswith(expected_root + "/")
+        ):
+            return "screen_project_root_mismatch=%s expected_under=%s" % (
+                project_root or "<missing>", expected_root,
+            )
+        if expected_root:
+            root_path = Path(expected_root)
+            observed_platform = str(args.get("platform") or "").strip()
+            test_instance = (
+                root_path.name == "vemu_uestc" and root_path.parent.name == "test"
+            )
+            expected_platform = "test-qualified" if test_instance else root_path.name
+            expected_suffix = {
+                "master": "m", "worker": "w", "celery": "c", "web_terminal": "web",
+            }.get(expected_role, "")
+            expected_session = (
+                "%s_%s" % (observed_platform, expected_suffix)
+                if expected_suffix else ""
+            )
+            observed_session = str(args.get("screen_session") or "").strip()
+            platform_matches = (
+                bool(re.search(r"(?:^|[_-])test(?:$|[_-])", observed_platform, re.I))
+                if test_instance
+                else observed_platform == expected_platform
+            )
+            if not platform_matches:
+                return "screen_platform_mismatch=%s expected=%s" % (
+                    observed_platform or "<missing>", expected_platform,
+                )
+            if expected_session and observed_session != expected_session:
+                return "screen_session_mismatch=%s expected=%s" % (
+                    observed_session or "<missing>", expected_session,
+                )
+        return ""
+    if action == "stop_screen_component":
+        text = " ".join([step.title, step.objective, *step.expected_changes])
+        named_sessions = re.findall(r"\b[A-Za-z0-9][A-Za-z0-9_.-]*_[mcwt]\b", text)
+        observed = str(args.get("screen_session") or "").strip()
+        if named_sessions and observed not in named_sessions:
+            return "screen_session_mismatch=%s expected=%s" % (
+                observed or "<missing>", named_sessions[0],
+            )
+        return ""
     if action != "create_docker_container":
         return ""
     text = " ".join(
@@ -3650,8 +5695,53 @@ def _validate_semantic_resource_coverage(
 ) -> None:
     """Ensure a backend port configuration consumes every frozen port field."""
 
+    for step in micro_steps:
+        binding = step.execution_binding
+        action = step.action or (binding.action if binding is not None else "")
+        args = step.args or (binding.args if binding is not None else {})
+        if action != "stop_klonet_component":
+            continue
+        pid = args.get("pid")
+        grounded = any(
+            resource.status == "frozen"
+            and resource.kind == "identifier"
+            and "pid" in "%s %s" % (resource.name, resource.role)
+            and any(
+                semantic_step.step_id == str(consumer).rsplit(".", 1)[0]
+                for consumer in resource.consumers
+            )
+            and (
+                _resource_values_equal(resource, pid)
+                or (
+                    isinstance(resource.value, str)
+                    and resource.value.strip().startswith("[")
+                    and str(pid) in re.findall(r"\d+", resource.value)
+                )
+            )
+            for resource in resources
+        )
+        if not grounded:
+            raise ExecutionBindingError(
+                "stop_component_pid_not_frozen_for_semantic_step=%s" % semantic_step.step_id,
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+
     text = "%s %s" % (semantic_step.title, semantic_step.objective)
     if not re.search(r"配置|端口|config|port", text, re.IGNORECASE):
+        return
+    requires_public_assignment = bool(
+        re.search(r"\bpublic_port\b|public\s+port|公开端口", text, re.I)
+        or (
+            re.search(r"\b(?:deploy|provision|create)\b|部署|新建|创建", text, re.I)
+            and re.search(
+                r"\bpublic_port\b|public\s+port|公开端口",
+                " ".join(semantic_step.expected_changes),
+                re.I,
+            )
+        )
+    )
+    if not requires_public_assignment:
         return
     has_public_port = any(
         resource.status == "frozen"
@@ -3736,6 +5826,9 @@ def _infer_structural_action_args(
     compiled = dict(args)
     if action == "set_python_class_attribute":
         attribute = str(compiled.get("attribute") or "").strip()
+        instance_root = str(compiled.get("instance_root") or "").rstrip("/")
+        if instance_root:
+            compiled["path"] = instance_root + "/vemu_config/config.py"
         frozen_ports = {
             str(resource.role or resource.name): int(resource.value)
             for resource in resources
@@ -3743,7 +5836,9 @@ def _infer_structural_action_args(
             and resource.kind == "port"
             and str(resource.value).isdigit()
         }
-        if attribute in {"master_ip", "mysql_ip", "rabbitmq_ip"}:
+        if attribute and attribute in compiled:
+            compiled["value"] = compiled[attribute]
+        elif attribute in {"master_ip", "mysql_ip", "rabbitmq_ip"}:
             compiled["value"] = "127.0.0.1"
         elif attribute in frozen_ports:
             compiled["value"] = frozen_ports[attribute]
@@ -3966,6 +6061,43 @@ def _infer_structural_action_args(
     return compiled
 
 
+def _canonical_action_preconditions(
+    action: str,
+    args: dict[str, Any],
+    checks: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Remove global/model-invented guards from root-bound Screen actions."""
+
+    if action == "set_python_class_attribute":
+        path = str(args.get("path") or "").strip()
+        return (
+            [{"checker": "file_exists", "args": {"path": path}}]
+            if path
+            else []
+        )
+    if action == "restart_screen_component":
+        # Restart supports both an existing Screen and an orphan runtime.  The
+        # registered Action resolves the exact session and root itself.
+        return []
+    if action != "start_screen_component":
+        return checks
+    session = str(args.get("screen_session") or "").strip()
+    component = str(args.get("component") or "").strip()
+    result = []
+    if session and not str(args.get("run_as_uid") or "").strip():
+        result.append({
+            "checker": "screen_session_absent",
+            "args": {"session": session},
+        })
+    raw_port = args.get("%s_port" % component)
+    if str(raw_port or "").isdigit():
+        result.append({
+            "checker": "port_not_listening",
+            "args": {"port": int(raw_port)},
+        })
+    return result
+
+
 def _canonical_action_postconditions(
     action: str,
     args: dict[str, Any],
@@ -3973,26 +6105,64 @@ def _canonical_action_postconditions(
 ) -> list[dict[str, Any]]:
     """Ground structural Action checks in the finalized, typed Action args."""
 
-    if action == "start_screen_component":
+    if action in {
+        "replace_text_in_file",
+        "insert_text_before_anchor",
+        "edit_text_file",
+        "write_ops_file",
+    }:
+        path = str(args.get("path") or "").strip()
+        if path.endswith(".py"):
+            # Importing application entrypoints executes module-level code and
+            # requires the application's complete dependency environment.  A
+            # source-edit Action can prove only the file property here; actual
+            # runtime correctness belongs to the later process/health checks.
+            checks = [
+                check
+                for check in checks
+                if str(check.get("checker") or "") != "python_import_succeeds"
+            ]
+            syntax_check = {
+                "checker": "python_file_syntax_valid",
+                "args": {"path": path},
+            }
+            if syntax_check not in checks:
+                checks.append(syntax_check)
+
+    if action == "stop_klonet_component":
+        return [
+            {
+                "checker": "process_pid_absent",
+                "args": {"pid": args.get("pid")},
+            },
+            {
+                "checker": "port_not_listening",
+                "args": {"port": args.get("port")},
+            },
+        ]
+    if action in {"start_screen_component", "restart_screen_component"}:
         session = str(args.get("screen_session") or "").strip()
         component = str(args.get("component") or "").strip()
-        checks = [
-            {
+        checks = []
+        if not str(args.get("run_as_uid") or "").strip():
+            checks.append({
                 "checker": "screen_session_exists",
                 "args": {"session": session},
-            }
-        ]
+            })
         port_key = {
             "master": "port_47001",
             "worker": "port_47002",
             "web_terminal": "port_47003",
         }.get(component)
-        if port_key and str(args.get(port_key) or "").isdigit():
+        raw_port = (
+            args.get(port_key) if port_key else None
+        ) or args.get("%s_port" % component)
+        if str(raw_port or "").isdigit():
             checks.append(
                 {
                     "checker": "port_listening",
                     "args": {
-                        "port": int(args[port_key]),
+                        "port": int(raw_port),
                         "host": "127.0.0.1",
                     },
                 }
@@ -4008,25 +6178,18 @@ def _canonical_action_postconditions(
         ]
     if action != "set_python_class_attribute":
         return checks
-    existing = next(
-        (
-            item.get("args")
-            for item in checks
-            if item.get("checker") == "python_attribute_equals"
-            and isinstance(item.get("args"), dict)
-        ),
-        {},
-    )
-    check_args = dict(existing)
+    check_args: dict[str, Any] = {}
     path = Path(str(args.get("path") or ""))
-    if not str(check_args.get("module") or "").strip() and path.suffix == ".py":
+    if path.suffix == ".py":
         check_args["module"] = "%s.%s" % (path.parent.name, path.stem)
-    if not str(check_args.get("cwd") or "").strip() and path.is_absolute():
+    if path.is_absolute():
         check_args["cwd"] = str(path.parent.parent)
     attribute = str(args.get("attribute") or "").strip()
     class_name = str(args.get("class_name") or "").strip()
     check_args["attribute"] = (
-        "%s.%s" % (class_name, attribute) if class_name else attribute
+        "%s.%s" % (class_name, attribute)
+        if class_name
+        else "PROJ_CONFIG.%s" % attribute
     )
     expected = args.get("value")
     if isinstance(expected, str):
@@ -4054,6 +6217,42 @@ def _infer_semantic_action_args(
     """Compile identifiers and service policy stated by the semantic change."""
 
     compiled = dict(args)
+    if action in {"start_screen_component", "restart_screen_component"}:
+        text = " ".join(
+            [step.title, step.objective, step.reason, *step.expected_changes]
+        )
+        role = _atomic_runtime_role(text)
+        root = _semantic_runtime_root(text)
+        if role:
+            compiled["component"] = role
+        if root:
+            compiled["project_root"] = root.rstrip("/") + "/mains"
+        platform = str(compiled.get("platform") or "").strip()
+        if root:
+            path = Path(root)
+            platform = (
+                path.parent.name
+                if path.name == "vemu_uestc" and path.parent.name == "test"
+                else path.name
+            )
+            compiled["platform"] = platform
+        suffix = {
+            "master": "m",
+            "worker": "w",
+            "celery": "c",
+            "web_terminal": "web",
+        }.get(role)
+        if platform and suffix:
+            compiled["screen_session"] = "%s_%s" % (platform, suffix)
+        return compiled
+    if action == "stop_screen_component":
+        text = " ".join([step.title, step.objective, *step.expected_changes])
+        named_sessions = re.findall(
+            r"\b[A-Za-z0-9][A-Za-z0-9_.-]*_[mcwt]\b", text
+        )
+        if named_sessions:
+            compiled["screen_session"] = named_sessions[0]
+        return compiled
     if action != "create_docker_container":
         return compiled
     text = " ".join(
@@ -4086,6 +6285,273 @@ def _infer_semantic_action_args(
     if service == "rabbitmq":
         compiled.pop("credential_source", None)
     return compiled
+
+
+def _scoped_role_port_value(
+    step: PrivilegedStep,
+    resources: list[PlanResource],
+    role: str,
+) -> Any:
+    """Prefer destination/new instance ports over source/old comparison ports."""
+
+    semantic_root = _semantic_runtime_root(
+        " ".join([step.title, step.objective, step.reason, *step.expected_changes])
+    )
+    root_hint = "test" if "/test/" in semantic_root else "formal"
+    candidates: list[tuple[int, int, Any]] = []
+    for index, resource in enumerate(resources):
+        if resource.status != "frozen" or resource.kind != "port" or resource.role != role:
+            continue
+        relevant_consumers = [
+            str(consumer)
+            for consumer in resource.consumers
+            if (
+                step.step_id == str(consumer).rsplit(".", 1)[0]
+                or step.step_id.startswith(str(consumer).rsplit(".", 1)[0] + "__")
+            )
+        ]
+        if not relevant_consumers:
+            continue
+        identity = "%s %s" % (resource.name, resource.source)
+        score = 0
+        if re.search(r"(?:^|_)(?:new|target|destination)(?:_|$)", resource.name, re.I):
+            score += 100
+        if resource.source in {"planner_decision", "compiler_selected_from_checked_free_candidates"}:
+            score += 60
+        if any(consumer.rsplit(".", 1)[-1] == role for consumer in relevant_consumers):
+            score += 40
+        if root_hint == "test" and "test" in identity.lower():
+            score += 50
+        if root_hint == "formal" and re.search(r"formal|prod", identity, re.I):
+            score += 50
+        if re.search(r"(?:^|_)(?:old|source|current)(?:_|$)", resource.name, re.I):
+            score -= 100
+        candidates.append((score, -index, resource.value))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _required_runtime_recovery_roles(step: PrivilegedStep) -> set[str]:
+    fragments = [
+        "%s %s" % (step.title, step.objective),
+        *step.expected_changes,
+    ]
+    preserved = {
+        role
+        for role in ("master", "worker")
+        if any(
+            re.search(
+                r"\b(?:preserv\w*|keep|remain\w*|unchanged|untouched)\b"
+                r"[^.!?。！？]{0,50}\b%s\b|"
+                r"(?:保持|保留|不重启)[^。！？]{0,30}%s|"
+                r"%s[^。！？]{0,30}(?:保持|保留|不重启)"
+                % (role, role, role),
+                str(fragment or ""),
+                re.I,
+            )
+            for fragment in fragments
+        )
+    }
+    required: set[str] = set()
+    for fragment in fragments:
+        text = str(fragment or "")
+        if re.search(
+            r"\b(?:preserv\w*|keep|remain\w*|unchanged|untouched)\b|"
+            r"\b(?:verify|confirm)\b.{0,40}\b(?:healthy|health)\b|"
+            r"保持|保留|不变|不修改|仍健康|验证.{0,40}健康|确认.{0,40}健康",
+            text,
+            re.I,
+        ):
+            continue
+        if not re.search(
+            r"\b(?:start|restart|restore|recover|migrate|move|healthy|health)\w*\b|"
+            r"启动|重启|恢复|迁移|健康",
+            text,
+            re.I,
+        ):
+            continue
+        for role in ("master", "worker"):
+            if role in preserved:
+                continue
+            if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role, text, re.I):
+                required.add(role)
+    return required
+
+
+def _normalize_semantic_backend_health_contract(
+    step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> None:
+    """Compile exact localhost /server_health/ checks before authorization."""
+
+    required = _required_runtime_recovery_roles(step)
+    if not required:
+        return
+    role_ports: dict[str, int] = {}
+    for role in required:
+        port = _scoped_role_port_value(step, resources, "%s_port" % role)
+        if str(port or "").isdigit():
+            role_ports[role] = int(port)
+    if not role_ports:
+        return
+    kept = []
+    for check in step.postconditions:
+        # A semantic repair step is root/role scoped.  Model-supplied HTTP
+        # checks may point at another instance (especially while an old shared
+        # port is being migrated), so discard all of them and compile only the
+        # frozen ports consumed by this step below.
+        if check.get("checker") in {"http_status", "backend_health"}:
+            continue
+        kept.append(check)
+    for role in ("master", "worker"):
+        if role not in role_ports:
+            continue
+        port = role_ports[role]
+        kept.append({
+            "checker": "backend_health",
+            "args": {
+                "url": "http://127.0.0.1:%s/server_health/" % port,
+                "expected_code": 1,
+            },
+        })
+    step.postconditions = kept
+
+
+def _validate_runtime_recovery_action_coverage(
+    semantic_step: PrivilegedStep,
+    micro_steps: list[PrivilegedStep],
+) -> None:
+    """Reject a ready plan that promises a role recovery without an Action."""
+
+    required = _required_runtime_recovery_roles(semantic_step)
+    if not required:
+        return
+    actual: set[str] = set()
+    for micro_step in micro_steps:
+        binding = micro_step.execution_binding
+        if binding is None or binding.action not in {
+            "start_screen_component", "restart_screen_component",
+        }:
+            continue
+        role = str(binding.args.get("component") or "").strip()
+        if role:
+            actual.add(role)
+    missing = sorted(required.difference(actual))
+    if missing:
+        raise ExecutionBindingError(
+            "runtime_recovery_action_missing=%s" % ",".join(missing),
+            replan_recommended=False,
+            category="implementation_contract_invalid",
+        )
+
+
+def _validate_source_mutation_action_coverage(
+    semantic_step: PrivilegedStep,
+    micro_steps: list[PrivilegedStep],
+) -> None:
+    """Reject plans that promise a Python file change but omit its Action."""
+
+    required: set[str] = set()
+    for fragment in [
+        semantic_step.title,
+        semantic_step.objective,
+        *semantic_step.expected_changes,
+    ]:
+        text = str(fragment or "")
+        if re.search(
+            r"\b(?:preserv\w*|keep|remain\w*|unchanged|untouched)\b|"
+            r"保持|保留|不变|不修改",
+            text,
+            re.I,
+        ):
+            continue
+        if not re.search(
+            r"\b(?:edit|remove|delete|replace|write|update|set)\w*\b|"
+            r"编辑|移除|删除|替换|写入|更新|设置|修改",
+            text,
+            re.I,
+        ):
+            continue
+        required.update(re.findall(r"/[A-Za-z0-9._/-]+\.py\b", text))
+    if not required:
+        return
+    file_actions = {
+        "write_ops_file", "replace_text_in_file", "insert_text_before_anchor",
+        "edit_text_file", "upsert_python_class", "set_python_config_assignment",
+        "set_python_class_attribute", "remove_python_package_entries",
+    }
+    actual = {
+        str(binding.args.get("path") or binding.args.get("file_path") or "")
+        for step in micro_steps
+        for binding in [step.execution_binding]
+        if binding is not None and binding.action in file_actions
+    }
+    missing = sorted(required.difference(actual))
+    if missing:
+        raise ExecutionBindingError(
+            "source_mutation_action_missing=%s" % ",".join(missing),
+            replan_recommended=False,
+            category="implementation_contract_invalid",
+        )
+
+
+def _atomic_runtime_role(text: str) -> str:
+    leading = re.search(
+        r"^\s*(?:start|restart|restore|recover|launch|启动|重启|恢复)\w*"
+        r"[^.!?。！？]{0,40}?\b(master|worker|celery|web[_ -]?terminal)\b",
+        str(text or ""),
+        re.I,
+    )
+    if leading is not None:
+        return leading.group(1).lower().replace("-", "_").replace(" ", "_")
+    roles = []
+    for role, pattern in (
+        ("master", r"(?<![A-Za-z0-9_])master(?![A-Za-z0-9_])"),
+        ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
+        ("celery", r"(?<![A-Za-z0-9_])celery(?![A-Za-z0-9_])"),
+        ("web_terminal", r"web[_ -]?terminal"),
+    ):
+        if re.search(pattern, str(text or ""), re.I):
+            roles.append(role)
+    return roles[0] if len(roles) == 1 else ""
+
+
+def _semantic_runtime_root(text: str) -> str:
+    candidates = re.findall(r"/[A-Za-z0-9._/-]*vemu_uestc(?:/mains)?", str(text or ""))
+    if not candidates:
+        return ""
+    candidate = candidates[0]
+    if candidate.endswith("/mains"):
+        candidate = candidate[:-len("/mains")]
+    return candidate.rstrip("/")
+
+
+def _runtime_root_from_frozen_paths(resources: list[PlanResource]) -> str:
+    """Derive an existing instance root from typed paths, including entry files."""
+
+    root_roles = {
+        "instance_root", "project_root", "platform_root",
+        "platform_runtime_root", "runtime_cwd",
+    }
+    for resource in resources:
+        if (
+            resource.status != "frozen"
+            or resource.kind != "path"
+            or not str(resource.value).startswith("/")
+        ):
+            continue
+        value = Path(str(resource.value).rstrip("/"))
+        identity = str(resource.name or resource.role)
+        if identity in root_roles:
+            candidate = value.parent if value.name == "mains" else value
+        elif value.parent.name == "mains" and value.suffix == ".py":
+            candidate = value.parent.parent
+        else:
+            continue
+        if candidate.is_dir():
+            return str(candidate)
+    return ""
 
 
 def _validate_shell_resource_bindings(
@@ -4233,6 +6699,87 @@ def _json_object_value(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _expand_grounded_python_function_removal(
+    old_text: str,
+    grounded_context: GroundedPlanContext | None,
+) -> str:
+    """Include an adjacent top-level call and only its local blank-line delta."""
+
+    match = re.search(
+        r"(?m)^def\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|$)",
+        old_text,
+    )
+    function_name = match.group(1) if match is not None else ""
+    if not function_name:
+        identifier = str(old_text or "").strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
+            function_name = identifier
+    if not function_name or grounded_context is None:
+        return old_text
+    evidence = str(grounded_context.environment_evidence or "")
+    definition_match = re.search(
+        r"(?m)^def\s+%s\s*\([^\n]*\):\n(?:[ \t]+[^\n]*(?:\n|$))+"
+        % re.escape(function_name),
+        evidence,
+    )
+    if definition_match is None:
+        return old_text
+    definition = definition_match.group(0).rstrip("\n")
+    candidates: set[str] = set()
+    for occurrence in re.finditer(re.escape(definition), evidence):
+        start = occurrence.start()
+        search_from = occurrence.end()
+        call = re.search(
+            r"\A(?P<gap>\s*?)(?P<call>%s\(\))(?P<tail>\n+)"
+            % re.escape(function_name),
+            evidence[search_from:],
+        )
+        if call is None:
+            continue
+        # The call must be the next non-whitespace statement. Preserve the two
+        # newlines before the injection and consume its trailing blank delta.
+        preceding_newlines = 0
+        cursor = start
+        while cursor > 0 and evidence[cursor - 1] == "\n":
+            preceding_newlines += 1
+            cursor -= 1
+        remove_start = start - max(0, preceding_newlines - 2)
+        remove_end = search_from + call.end()
+        while remove_end < len(evidence) and evidence[remove_end] == "\n":
+            remove_end += 1
+        candidates.add(evidence[remove_start:remove_end])
+    return next(iter(candidates)) if len(candidates) == 1 else old_text
+
+
+def _grounded_python_removal_from_semantics(
+    semantic_text: str,
+    grounded_context: GroundedPlanContext | None,
+) -> str:
+    """Compile a whole-file deletion proposal into one exact evidenced block."""
+
+    if grounded_context is None:
+        return ""
+    evidence = str(grounded_context.environment_evidence or "")
+    candidates = []
+    for name in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", semantic_text):
+        if name in candidates:
+            continue
+        if re.search(r"(?m)^def\s+%s\s*\(" % re.escape(name), evidence):
+            candidates.append(name)
+    if len(candidates) != 1:
+        return ""
+    expanded = _expand_grounded_python_function_removal(
+        "def %s" % candidates[0],
+        grounded_context,
+    )
+    if not re.search(
+        r"(?m)^def\s+%s\s*\(" % re.escape(candidates[0]),
+        expanded,
+    ):
+        return ""
+    return expanded
+
+
 def _binding_candidate_summary(data: dict[str, Any]) -> str:
     """Render protocol shape only; never print argument values or secrets."""
 
@@ -4299,4 +6846,17 @@ def _head_tail(value: Any, limit: int) -> str:
 
 
 def _progress_text(value: Any, limit: int = 80) -> str:
-    return " ".join(str(value or "").split())[:limit] or "未命名步骤"
+    text = " ".join(str(value or "").split())
+    replacements = (
+        (r"^Start master screen component$", "启动 master Screen 组件"),
+        (r"^Start worker screen component$", "启动 worker Screen 组件"),
+        (r"^Restart master screen component$", "重启 master Screen 组件"),
+        (r"^Restart worker screen component$", "重启 worker Screen 组件"),
+        (r"^Stop master backend component$", "停止 master 后端组件"),
+        (r"^Stop worker backend component$", "停止 worker 后端组件"),
+    )
+    for pattern, replacement in replacements:
+        if re.fullmatch(pattern, text, re.I):
+            text = replacement
+            break
+    return text[:limit] or "未命名步骤"

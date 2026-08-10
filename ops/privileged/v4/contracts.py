@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from pathlib import Path
 
 from klonet_agent.ops.privileged.contracts import (
     ExecutionBinding,
@@ -48,6 +49,24 @@ class ProbeRequest:
     def cache_key(self) -> str:
         payload = {"probe": self.probe.strip(), "args": self.args}
         return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def normalize_probe_request(
+    probe: str,
+    args: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Route source/config paths to the bounded operational file reader."""
+
+    normalized_probe = str(probe or "").strip()
+    normalized_args = dict(args)
+    path = str(normalized_args.get("path") or "").strip()
+    if normalized_probe == "logs" and Path(path).suffix.lower() in {
+        ".py", ".cfg", ".conf", ".ini", ".json", ".toml", ".yaml", ".yml",
+    }:
+        normalized_probe = "ops_file"
+        normalized_args.setdefault("view", "head")
+        normalized_args.setdefault("max_chars", 20000)
+    return normalized_probe, normalized_args
 
 
 @dataclass(frozen=True)

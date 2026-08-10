@@ -65,6 +65,21 @@ def test_log_reader_reports_resolved_path_mtime_and_size():
     assert "latest line" in result
 
 
+def test_log_reader_honors_bounded_extended_tail_for_startup_tracebacks(tmp_path):
+    from klonet_agent.tools.environment import read_klonet_logs
+
+    marker = 'File "/srv/app/master_main.py", line 7, in <module>\nRuntimeError: boot\n'
+    log_file = tmp_path / "master.log"
+    log_file.write_text("x" * 3000 + marker + "y" * 12000, encoding="utf-8")
+
+    default_tail = read_klonet_logs({"path": str(log_file)})
+    extended_tail = read_klonet_logs({"path": str(log_file), "max_chars": 20000})
+
+    assert marker not in default_tail
+    assert marker in extended_tail
+    assert "showing last 150" in extended_tail
+
+
 def test_environment_tools_are_registered_for_llm():
     from klonet_agent.tools.registry import TOOLS
 
@@ -1037,6 +1052,196 @@ def test_platform_instance_inspection_counts_runtime_roots_without_duplicate_ali
     assert f"project_roots={source_root}" in result
 
 
+def test_running_platform_inspection_counts_only_backend_healthy_runtime_roots(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        healthy_root = temp_dir / "vemu_uestc"
+        partial_root = temp_dir / "test" / "vemu_uestc"
+        code_only_root = temp_dir / "code_only"
+        for root, master_port, worker_port in (
+            (healthy_root, 30101, 30102),
+            (partial_root, 30201, 30202),
+            (code_only_root, 30301, 30302),
+        ):
+            config_dir = root / "vemu_config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.py").write_text(
+                "class ActiveConfig:\n"
+                f"    master_port = {master_port}\n"
+                f"    worker_port = {worker_port}\n"
+                "    public_port = 39999\n"
+                "PROJ_CONFIG = ActiveConfig()\n",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(environment, "_screen_instance_rows", lambda: [])
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {
+                    "pid": 1,
+                    "uid": 997,
+                    "executable": "/usr/bin/python3.8",
+                    "cwd": str(healthy_root / "mains"),
+                    "cmd": "python -m gunicorn -c gun.py master_main:flask_app",
+                    "platform": "vemu_uestc",
+                    "role": "master",
+                },
+                {
+                    "pid": 2,
+                    "cwd": str(healthy_root),
+                    "cmd": "python -m gunicorn -c worker_gun.py worker_main:flask_app",
+                    "platform": "vemu_uestc",
+                    "role": "worker",
+                },
+                {
+                    "pid": 3,
+                    "cwd": str(partial_root),
+                    "cmd": "python -m gunicorn -c gun.py master_main:flask_app",
+                    "platform": "vemu_uestc",
+                    "role": "master",
+                },
+            ],
+        )
+        monkeypatch.setattr(
+            environment,
+            "_probe_backend_endpoint",
+            lambda port: {
+                30101: ("healthy", 200, "code=1"),
+                30102: ("healthy", 200, "code=1"),
+                30201: ("timeout", 0, "TimeoutError"),
+            }.get(port, ("not_checked", 0, "role_not_running")),
+        )
+
+        result = environment.inspect_running_platforms(
+            {"project_roots": [str(code_only_root)]}
+        )
+
+    assert "inspect_running_platforms" in result
+    assert "runtime_candidate_count=2" in result
+    assert "healthy_count=1" in result
+    assert "abnormal_count=1" in result
+    assert "code_only_count=1" in result
+    assert result.count("platform=vemu_uestc") == 2
+    assert f"project_root={healthy_root}" in result
+    assert "backend_status=healthy" in result
+    assert "master_endpoint=healthy http_status=200" in result
+    assert "worker_endpoint=healthy http_status=200" in result
+    assert f"project_root={partial_root}" in result
+    assert "backend_status=abnormal" in result
+    assert "missing_roles=worker" in result
+    assert "worker_port=30202 worker_endpoint=not_checked reason=role_not_running" in result
+    assert f"code_only_root={code_only_root}" in result
+    assert "configured_ports=master_port:30101,worker_port:30102" in result
+    assert "master_identities=1:997:/usr/bin/python3.8" in result
+    assert "runtime_identities=1:997:/usr/bin/python3.8" in result
+
+
+def test_running_platform_inspection_uses_screen_alias_for_runtime_root(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        root = temp_dir / "klonet_v4_e2e"
+        (root / "mains").mkdir(parents=True)
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {
+                    "pid": 10,
+                    "cwd": str(root / "mains"),
+                    "cmd": "SCREEN -dmS v4e2e_m bash -lc run master_main",
+                    "platform": "mains",
+                    "role": "master",
+                }
+            ],
+        )
+        monkeypatch.setattr(environment, "_default_code_search_roots", lambda: [])
+
+        result = environment.inspect_running_platforms({})
+
+    assert "platform=v4e2e" in result
+    assert "platform=klonet_v4_e2e" not in result
+    assert "code_only_count=0" in result
+
+
+def test_process_rows_inherit_cross_user_cwd_only_through_observed_parent_chain(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    output = "\n".join([
+        "pid=100 pgid=100 ppid=1 uid=997 exe=SCREEN cwd=? "
+        "cmd=SCREEN -dmS 102_m bash -lc cd /srv/102/mains && exec python -m "
+        "gunicorn -c gun.py master_main:flask_app",
+        "pid=101 pgid=101 ppid=100 uid=997 exe=/usr/bin/python3.8 cwd=? "
+        "cmd=/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+        "pid=102 pgid=101 ppid=101 uid=997 exe=/usr/bin/python3.8 cwd=? "
+        "cmd=/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+    ])
+    monkeypatch.setattr(environment, "_probe_command", lambda name: ["probe"])
+    monkeypatch.setattr(
+        environment.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout=output, stderr="",
+        ),
+    )
+    monkeypatch.setattr(environment, "_privileged_process_cwd", lambda pid: "?")
+
+    rows = environment._process_instance_rows()
+    by_pid = {row["pid"]: row for row in rows}
+
+    assert by_pid[101]["cwd"] == "/srv/102/mains"
+    assert by_pid[102]["cwd"] == "/srv/102/mains"
+    assert by_pid[101]["platform"] == "102"
+
+
+def test_running_platform_inspection_enumerates_default_code_only_roots(monkeypatch):
+    from klonet_agent.tools import environment
+    from tests.helpers import local_temp_dir
+
+    with local_temp_dir() as temp_dir:
+        running_root = temp_dir / "running"
+        running_mains = running_root / "mains"
+        code_only_root = temp_dir / "code-only"
+        code_only_mains = code_only_root / "mains"
+        snapshot_mains = temp_dir / "knowledge" / "klonet_source" / "mains"
+        for mains in (running_mains, code_only_mains, snapshot_mains):
+            mains.mkdir(parents=True)
+            (mains / "master_main.py").write_text("# master\n", encoding="utf-8")
+            (mains / "worker_main.py").write_text("# worker\n", encoding="utf-8")
+        monkeypatch.setattr(
+            environment,
+            "_process_instance_rows",
+            lambda: [
+                {
+                    "pid": 10,
+                    "cwd": str(running_root),
+                    "cmd": "gunicorn master_main:flask_app",
+                    "platform": "running",
+                    "role": "master",
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            environment, "_default_code_search_roots", lambda: [temp_dir]
+        )
+
+        result = environment.inspect_running_platforms({})
+
+    assert "code_only_count=1" in result
+    assert "code_only_root=%s" % code_only_root in result
+    assert "code_only_root=%s" % running_root not in result
+    assert "klonet_source" not in result
+
+
 def test_executor_persists_ops_baseline_snapshot():
     from klonet_agent.memory.store import MemoryStore
     from klonet_agent.tools.executor import ToolExecutor
@@ -1574,3 +1779,23 @@ def test_executor_dispatches_screen_inspection_tool():
 
     assert result.startswith("Error:")
     assert "unsafe" in result.lower()
+
+
+def test_privilege_capability_probe_reports_verified_channels(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    monkeypatch.setattr(environment.shutil, "which", lambda name: "/usr/bin/sudo")
+    monkeypatch.setattr(
+        environment.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    output = environment.inspect_privilege_capabilities({})
+
+    assert "inspect_privilege_capabilities" in output
+    assert "sudo_noninteractive=true" in output
+    assert "capability_policy=direct_then_controlled_privilege" in output
+    assert "environment unchanged" in output

@@ -135,14 +135,17 @@ class PrivilegedPlanContextBuilder:
         self.action_registry = action_registry or configured_ops_action_registry()
         self.on_progress = on_progress
         self._probe_cache: dict[str, str] | None = None
+        self._discovered_project_roots: list[str] = []
 
     def begin_probe_session(self) -> None:
         """Cache identical read-only probes only within one planning submission."""
 
         self._probe_cache = {}
+        self._discovered_project_roots = []
 
     def end_probe_session(self) -> None:
         self._probe_cache = None
+        self._discovered_project_roots = []
 
     def build(
         self,
@@ -269,13 +272,14 @@ class PrivilegedPlanContextBuilder:
                     % (index, name or "missing")
                 )
                 continue
+            visible_purpose = _localized_probe_purpose(name, args, purpose)
             self._progress(
                 "只读补证 %s/%s：正在检查 %s%s…"
                 % (
                     index,
                     min(len(requests), 8),
                     name,
-                    "（%s）" % purpose if purpose else "",
+                    "（%s）" % visible_purpose if visible_purpose else "",
                 )
             )
             path_problem = _recovery_probe_path_problem(name, args, roots)
@@ -301,6 +305,8 @@ class PrivilegedPlanContextBuilder:
                     result = "probe unavailable: %s" % _one_line(exc)
                 if self._probe_cache is not None:
                     self._probe_cache[cache_key] = str(result)
+            self._learn_project_roots_from_probe(name, str(result))
+            roots = [Path(item).resolve() for item in self._candidate_project_roots()]
             sections.append(
                 "## recovery_probe_%s name=%s purpose=%s\n%s"
                 % (index, name, purpose or "补充失败诊断证据", _bounded(result, 7000))
@@ -310,8 +316,7 @@ class PrivilegedPlanContextBuilder:
         self._progress("关键证据：本轮只读补证完成。")
         return "\n\n".join(sections)
 
-    @staticmethod
-    def _candidate_project_roots() -> list[str]:
+    def _candidate_project_roots(self) -> list[str]:
         roots = []
         # The bundled knowledge/klonet_source tree is a searchable source
         # snapshot, not a deployment target. Only the configured upstream
@@ -323,7 +328,39 @@ class PrivilegedPlanContextBuilder:
                 resolved = str(path.resolve())
                 if resolved not in roots:
                     roots.append(resolved)
+        for candidate in self._discovered_project_roots:
+            if candidate not in roots:
+                roots.append(candidate)
         return roots
+
+    def _learn_project_roots_from_probe(self, probe: str, output: str) -> None:
+        if probe not in {
+            "running_platforms", "platform_instances", "platform_health",
+            "screen", "screen_session", "process", "process_detail",
+            "process_tree", "process_logs", "git_repository", "project_layout",
+        }:
+            return
+        candidates: list[str] = []
+        text = str(output or "")
+        for pattern in (
+            r"\bproject_root=(/[^\s,]+)",
+            r"\bgit_root(?:s)?=(/[^\s,]+)",
+            r"\brepository=(/[^\s,]+)",
+            r"\bcwd=(/[^\s,]+)",
+        ):
+            candidates.extend(re.findall(pattern, text))
+        for raw in candidates:
+            try:
+                path = Path(raw).expanduser().resolve()
+            except OSError:
+                continue
+            if not path.is_dir():
+                continue
+            if path.name == "mains" and path.parent.is_dir():
+                path = path.parent
+            value = str(path)
+            if value not in self._discovered_project_roots:
+                self._discovered_project_roots.append(value)
 
     @staticmethod
     def _inspect_environment(args: dict) -> str:
@@ -419,6 +456,42 @@ def _environment_fact_progress(facts: UnifiedEnvironmentFacts) -> str:
     )
 
 
+def _localized_probe_purpose(
+    probe: str,
+    args: dict[str, Any],
+    model_purpose: str,
+) -> str:
+    """Render a stable Chinese purpose instead of leaking model language."""
+
+    purposes = {
+        "running_platforms": "按项目根目录核验后端角色、端口和健康接口",
+        "platform_instances": "发现并区分服务器上的平台实例根目录",
+        "platform_health": "核验目标实例的后端健康状态",
+        "screen": "核对 Screen 会话及其运行目录",
+        "screen_session": "核对指定 Screen 会话和进程",
+        "process": "核对目标进程的 PID、命令和工作目录",
+        "process_detail": "核对端口或 PID 对应的进程归属",
+        "process_tree": "核对目标进程树和进程组",
+        "process_logs": "读取目标进程所属实例的日志",
+        "ports": "核对目标端口监听状态和进程归属",
+        "port_owner": "核对监听端口的 PID 和工作目录",
+        "project_layout": "确认项目布局、入口文件和运行目录",
+        "git_repository": "确认目标项目的 Git 根目录和版本状态",
+        "klonet_config_consistency": "确认活动配置类和后端端口",
+        "ops_file": "读取并脱敏检查目标运维文件",
+        "logs": "读取并脱敏检查目标日志",
+        "python_import": "验证目标解释器和模块导入路径",
+        "http_endpoint": "验证目标 HTTP 健康接口",
+        "path_permissions": "核对目标路径的属主和权限",
+        "privilege_capabilities": "确认本会话可用的受控权限通道",
+    }
+    if probe in purposes:
+        return purposes[probe]
+    # Unknown probes still get a Chinese boundary; the model text remains in
+    # trace/evidence but never becomes user-facing progress.
+    return "收集该检查项所需的只读事实"
+
+
 def _bounded(value: Any, limit: int) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -444,6 +517,7 @@ def _recovery_probe_path_problem(
         "git_repository": ("repository",),
         "python_import": ("python_executable", "cwd"),
         "path_permissions": ("paths",),
+        "process_logs": ("project_root",),
         "file_integrity": ("paths",),
         "json_file": ("path",),
         "archive_inventory": ("path",),

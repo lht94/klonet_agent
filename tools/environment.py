@@ -11,6 +11,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -654,6 +656,170 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def inspect_running_platforms(args: Optional[dict] = None) -> str:
+    """Classify runtime roots by master/worker API health, never by code presence."""
+
+    args = args or {}
+    instances: dict[str, dict] = {}
+    process_rows = _process_instance_rows()
+    root_aliases = {}
+    for row in process_rows:
+        root_text = _runtime_root_from_process_row(row)
+        screen_platform = _screen_platform_from_command(str(row.get("cmd") or ""))
+        if root_text and screen_platform:
+            root_aliases[
+                str(_canonical_runtime_root(Path(root_text)).resolve())
+            ] = screen_platform
+    for row in process_rows:
+        root_text = _runtime_root_from_process_row(row)
+        role = str(row.get("role") or "")
+        if str(row.get("executable") or "").upper() == "SCREEN":
+            # Screen is startup/session evidence, not a backend role process.
+            # The actual interpreter descendants carry the runtime identity.
+            continue
+        if not root_text or role not in {"master", "worker", "celery", "web_terminal"}:
+            continue
+        root = str(_canonical_runtime_root(Path(root_text)).resolve())
+        entry = instances.setdefault(
+            root,
+            {
+                "platform": root_aliases.get(root) or _platform_from_project_root(Path(root)),
+                "roles": set(),
+                "pids": [],
+            },
+        )
+        entry["roles"].add(role)
+        if str(row.get("pid", "")).isdigit():
+            entry["pids"].append(int(row["pid"]))
+        entry.setdefault("role_pids", {}).setdefault(role, []).append(int(row["pid"]))
+        if (
+            str(row.get("pid", "")).isdigit()
+            and str(row.get("uid", "")).isdigit()
+            and str(row.get("executable") or "").startswith("/")
+        ):
+            entry.setdefault("role_identities", {}).setdefault(role, []).append(
+                "%s:%s:%s" % (
+                    int(row["pid"]), int(row["uid"]), row["executable"],
+                )
+            )
+        if str(row.get("pgid", "")).isdigit():
+            entry.setdefault("role_pgids", {}).setdefault(role, []).append(int(row["pgid"]))
+
+    rows = []
+    healthy_count = 0
+    for root_text in sorted(instances):
+        root = Path(root_text)
+        entry = instances[root_text]
+        roles = set(entry["roles"])
+        ports = _read_config_ports_from_root(root)
+        missing_roles = sorted({"master", "worker"} - roles)
+        endpoint_fields = []
+        endpoints_healthy = True
+        for role, port_key in (("master", "master_port"), ("worker", "worker_port")):
+            port = _safe_port(ports.get(port_key))
+            if role not in roles:
+                port_field = f"{role}_port={port} " if port is not None else ""
+                endpoint_fields.append(
+                    f"{port_field}{role}_endpoint=not_checked reason=role_not_running"
+                )
+                endpoints_healthy = False
+                continue
+            if port is None:
+                endpoint_fields.append(f"{role}_endpoint=not_checked reason=config_port_missing")
+                endpoints_healthy = False
+                continue
+            endpoint_status, http_status, detail = _probe_backend_endpoint(port)
+            endpoint_fields.append(
+                f"{role}_port={port} {role}_endpoint={endpoint_status} "
+                f"http_status={http_status} detail={_single_line(detail, max_chars=160)}"
+            )
+            if endpoint_status != "healthy":
+                endpoints_healthy = False
+        backend_status = "healthy" if not missing_roles and endpoints_healthy else "abnormal"
+        if backend_status == "healthy":
+            healthy_count += 1
+        rows.append(
+            "platform=%s project_root=%s runtime_source=process roles=%s pids=%s "
+            "master_pids=%s worker_pids=%s master_pgids=%s worker_pgids=%s "
+            "master_identities=%s worker_identities=%s runtime_identities=%s "
+            "backend_status=%s missing_roles=%s configured_ports=%s %s"
+            % (
+                entry["platform"],
+                root_text,
+                ",".join(sorted(roles)) or "none",
+                ",".join(str(pid) for pid in sorted(set(entry["pids"]))) or "none",
+                ",".join(str(pid) for pid in sorted(set(entry.get("role_pids", {}).get("master", [])))) or "none",
+                ",".join(str(pid) for pid in sorted(set(entry.get("role_pids", {}).get("worker", [])))) or "none",
+                ",".join(str(pid) for pid in sorted(set(entry.get("role_pgids", {}).get("master", [])))) or "none",
+                ",".join(str(pid) for pid in sorted(set(entry.get("role_pgids", {}).get("worker", [])))) or "none",
+                ",".join(sorted(set(entry.get("role_identities", {}).get("master", [])))) or "none",
+                ",".join(sorted(set(entry.get("role_identities", {}).get("worker", [])))) or "none",
+                ",".join(sorted({
+                    identity
+                    for identities in entry.get("role_identities", {}).values()
+                    for identity in identities
+                })) or "none",
+                backend_status,
+                ",".join(missing_roles) or "none",
+                ",".join(
+                    "%s:%s" % (key, ports[key])
+                    for key in _ordered_ports(ports)
+                ) or "none",
+                " ".join(endpoint_fields),
+            )
+        )
+
+    runtime_roots = set(instances)
+    requested_roots = _requested_project_roots(args)
+    candidate_code_roots = (
+        requested_roots
+        if isinstance(args.get("project_roots"), list)
+        else _discover_klonet_code_roots(_default_code_search_roots())
+    )
+    code_only_roots = []
+    for root in candidate_code_roots:
+        canonical = str(_canonical_runtime_root(root).resolve())
+        covered_by_runtime = canonical in runtime_roots or any(
+            root.name == "vemu_uestc"
+            and str(root.parent.resolve()) == runtime_root
+            for runtime_root in runtime_roots
+        )
+        if not covered_by_runtime and canonical not in code_only_roots:
+            code_only_roots.append(canonical)
+
+    lines = [
+        "inspect_running_platforms",
+        f"runtime_candidate_count={len(rows)}",
+        f"healthy_count={healthy_count}",
+        f"abnormal_count={len(rows) - healthy_count}",
+    ]
+    lines.append(f"code_only_count={len(code_only_roots)}")
+    lines.extend(rows)
+    lines.extend(f"code_only_root={root}" for root in sorted(code_only_roots))
+    lines.append("environment unchanged")
+    return "\n".join(lines)
+
+
+def _probe_backend_endpoint(port: int) -> tuple[str, int, str]:
+    url = "http://127.0.0.1:%s/server_health/" % port
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=3) as response:
+            body = response.read(1000).decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError):
+                return "invalid_response", int(response.status), "response_not_json"
+            if int(response.status) == 200 and payload.get("code") == 1:
+                return "healthy", int(response.status), "code=1"
+            return "unhealthy", int(response.status), "code=%s" % payload.get("code")
+    except urllib.error.HTTPError as exc:
+        return "http_error", int(exc.code), exc.__class__.__name__
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        return "unreachable", 0, reason.__class__.__name__
+
+
 def inspect_platform_health(args: Optional[dict] = None) -> str:
     """Verify a Klonet platform after start/restart without modifying the host."""
 
@@ -758,7 +924,11 @@ def read_klonet_logs(args: Optional[dict] = None) -> str:
         )
     resolved_path = path.resolve()
     stat = path.stat()
-    max_chars = _safe_int(args.get("max_chars"), MAX_LOG_CHARS)
+    max_chars = _safe_int(
+        args.get("max_chars"),
+        MAX_LOG_CHARS,
+        maximum=MAX_ROOT_READ_CHARS,
+    )
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -800,7 +970,14 @@ def read_ops_file(args: Optional[dict] = None) -> str:
     except OSError:
         path_available = False
     if not path_available:
-        helper_result = _root_read_file(raw_path, max_chars=_safe_int(args.get("max_chars"), MAX_LOG_CHARS))
+        helper_result = _root_read_file(
+            raw_path,
+            max_chars=_safe_int(
+                args.get("max_chars"),
+                MAX_LOG_CHARS,
+                maximum=MAX_ROOT_READ_CHARS,
+            ),
+        )
         if helper_result:
             return helper_result.replace("read_root_file", "read_ops_file", 1)
         return _render_tool_result(
@@ -809,7 +986,11 @@ def read_ops_file(args: Optional[dict] = None) -> str:
         )
     resolved_path = path.resolve()
     stat = path.stat()
-    max_chars = _safe_int(args.get("max_chars"), MAX_LOG_CHARS)
+    max_chars = _safe_int(
+        args.get("max_chars"),
+        MAX_LOG_CHARS,
+        maximum=MAX_ROOT_READ_CHARS,
+    )
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -840,6 +1021,63 @@ def read_ops_file(args: Optional[dict] = None) -> str:
             redact_sensitive_text(snippet),
         ]
     )
+
+
+def inspect_privilege_capabilities(args: Optional[dict] = None) -> str:
+    """Report verified read-only privilege channels without exposing secrets."""
+
+    uid = os.geteuid() if hasattr(os, "geteuid") else -1
+    gid = os.getegid() if hasattr(os, "getegid") else -1
+    sudo_path = shutil.which("sudo")
+    sudo_noninteractive = False
+    if sudo_path:
+        try:
+            checked = subprocess.run(
+                [sudo_path, "-n", "true"],
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+            sudo_noninteractive = checked.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            sudo_noninteractive = False
+    helper = Path(OPS_HELPER_PATH)
+    helper_present = helper.is_file() and os.access(str(helper), os.X_OK)
+    cross_user_proc = False
+    proc_sample = "none"
+    if os.name == "posix":
+        for candidate in sorted(Path("/proc").glob("[0-9]*"))[:512]:
+            try:
+                owner = candidate.stat().st_uid
+            except OSError:
+                continue
+            if owner == uid:
+                continue
+            proc_sample = candidate.name
+            try:
+                (candidate / "cwd").resolve(strict=True)
+                cross_user_proc = True
+            except OSError:
+                cross_user_proc = False
+            break
+    return "\n".join([
+        "inspect_privilege_capabilities",
+        "current_uid=%s current_gid=%s" % (uid, gid),
+        "sudo_binary=%s sudo_noninteractive=%s" % (
+            "present" if sudo_path else "missing",
+            str(sudo_noninteractive).lower(),
+        ),
+        "ops_helper=%s helper_executable=%s" % (
+            "present" if helper_present else "missing",
+            str(helper_present).lower(),
+        ),
+        "cross_user_proc_direct=%s sample_pid=%s" % (
+            str(cross_user_proc).lower(), proc_sample,
+        ),
+        "capability_policy=direct_then_controlled_privilege",
+        "environment unchanged",
+    ])
 
 
 def inspect_nginx_routes(args: Optional[dict] = None) -> str:
@@ -1158,18 +1396,36 @@ def _process_instance_rows() -> list:
     if completed.returncode != 0:
         return []
     rows = []
+    privileged_cwds: dict[int, str] = {}
     for raw_line in (completed.stdout or "").splitlines():
-        match = re.search(r"\bpid=(\d+)\s+cwd=(\S+)\s+cmd=(.*)$", raw_line)
+        match = re.search(
+            r"\bpid=(\d+)(?:\s+pgid=(\d+))?(?:\s+ppid=(\d+))?"
+            r"(?:\s+uid=(\d+)\s+exe=(\S+))?\s+cwd=(\S+)\s+cmd=(.*)$",
+            raw_line,
+        )
         if not match:
             continue
         pid = int(match.group(1))
-        cwd = match.group(2)
-        cmd = match.group(3)
+        pgid = match.group(2)
+        ppid = match.group(3)
+        uid = match.group(4)
+        executable = match.group(5)
+        cwd = match.group(6)
+        cmd = match.group(7)
         role = _role_from_command(cmd)
         if not role:
             continue
+        if cwd == "?":
+            process_group = int(pgid) if pgid and pgid.isdigit() else pid
+            if process_group not in privileged_cwds:
+                privileged_cwds[process_group] = _privileged_process_cwd(pid)
+            cwd = privileged_cwds[process_group]
         row = {
             "pid": pid,
+            "ppid": int(ppid) if ppid and ppid.isdigit() else 0,
+            "pgid": int(pgid) if pgid and pgid.isdigit() else pid,
+            "uid": int(uid) if uid and uid.isdigit() else None,
+            "executable": executable or "",
             "cwd": cwd,
             "cmd": redact_sensitive_text(_single_line(cmd, max_chars=300)),
             "platform": "unknown",
@@ -1179,7 +1435,46 @@ def _process_instance_rows() -> list:
         if runtime_root:
             row["platform"] = _platform_from_project_root(Path(runtime_root))
         rows.append(row)
+    # Cross-user ptrace restrictions can hide a Gunicorn child's cwd even
+    # though its Screen ancestor has an exact, visible ``cd <root>/mains`` in
+    # argv. Propagate only through the observed PPID chain; never associate
+    # processes by name alone.
+    by_pid = {int(row["pid"]): row for row in rows}
+    for _attempt in range(4):
+        changed = False
+        for row in rows:
+            if _runtime_root_from_process_row(row):
+                continue
+            parent = by_pid.get(int(row.get("ppid") or 0))
+            parent_root = _runtime_root_from_process_row(parent or {})
+            if not parent_root:
+                continue
+            row["cwd"] = str(Path(parent_root) / "mains")
+            row["platform"] = _platform_from_project_root(Path(parent_root))
+            changed = True
+        if not changed:
+            break
     return rows
+
+
+def _privileged_process_cwd(pid: int) -> str:
+    """Read one already-filtered runtime cwd without requiring a helper."""
+
+    if pid <= 1 or os.name == "nt":
+        return "?"
+    try:
+        completed = subprocess.run(
+            ["sudo", "-n", "readlink", "/proc/%s/cwd" % pid],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "?"
+    value = (completed.stdout or "").strip()
+    return value if completed.returncode == 0 and value.startswith("/") else "?"
 
 
 def _requested_project_roots(args: dict) -> list:
@@ -1192,6 +1487,56 @@ def _requested_project_roots(args: dict) -> list:
         if path.exists() and path.is_dir() and not _is_sensitive_path(path):
             result.append(path)
     return result
+
+
+def _default_code_search_roots() -> list[Path]:
+    home_root = Path("/home")
+    return [home_root] if home_root.is_dir() else []
+
+
+def _discover_klonet_code_roots(search_roots: Iterable[Path]) -> list[Path]:
+    """Boundedly enumerate code roots without treating them as running."""
+
+    ignored_names = {
+        ".cache", ".config", ".git", ".local", ".tox", ".venv",
+        "__pycache__", "anaconda3", "miniconda3", "node_modules",
+        "site-packages", "venv",
+    }
+    found: list[Path] = []
+    visited = 0
+    for raw_base in search_roots:
+        base = Path(raw_base).expanduser()
+        if not base.is_dir():
+            continue
+        base_depth = len(base.parts)
+        for current, directory_names, file_names in os.walk(
+            str(base), followlinks=False
+        ):
+            visited += 1
+            if visited > 10000:
+                return sorted(found, key=str)
+            current_path = Path(current)
+            depth = len(current_path.parts) - base_depth
+            directory_names[:] = [
+                name
+                for name in directory_names
+                if name not in ignored_names
+                and not name.startswith(".")
+                and not (name == "klonet_source" and current_path.name == "knowledge")
+                and not (current_path / name).is_symlink()
+            ]
+            if depth >= 7:
+                directory_names[:] = []
+            if (
+                current_path.name == "mains"
+                and "master_main.py" in file_names
+                and "worker_main.py" in file_names
+            ):
+                root = current_path.parent.resolve()
+                if root not in found and not _is_sensitive_path(root):
+                    found.append(root)
+                directory_names[:] = []
+    return sorted(found, key=str)
 
 
 def _platform_role_from_name(name: str) -> Optional[tuple]:
@@ -2285,13 +2630,16 @@ def _posix_probe_command(name: str) -> Optional[list]:
             "-c",
             (
                 "for pid in $(pgrep -f 'vemu|klonet|gunicorn|celery|screen|"
-                "master_main|worker_main|web_terminal' 2>/dev/null | head -80); do "
+                "master_main|worker_main|web_terminal' 2>/dev/null); do "
                 "[ \"$pid\" = \"$$\" ] && continue; "
+                "meta=$(ps -o uid=,pgid=,ppid= -p $pid 2>/dev/null); "
+                "set -- $meta; uid=$1; pgid=$2; ppid=$3; "
                 "cwd=$(readlink /proc/$pid/cwd 2>/dev/null || echo '?'); "
                 "cmd=$(tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | "
                 "sed 's/[[:space:]]\\+/ /g'); "
                 "[ -n \"$cmd\" ] || cmd=$(ps -p \"$pid\" -o args= 2>/dev/null); "
-                "printf 'pid=%s cwd=%s cmd=%s\\n' \"$pid\" \"$cwd\" \"$cmd\"; "
+                "exe=${cmd%% *}; "
+                "printf 'pid=%s pgid=%s ppid=%s uid=%s exe=%s cwd=%s cmd=%s\\n' \"$pid\" \"${pgid:-$pid}\" \"${ppid:-0}\" \"$uid\" \"$exe\" \"$cwd\" \"$cmd\"; "
                 "done"
             ),
         ],
@@ -2447,12 +2795,12 @@ def _strip_helper_header(text: str) -> str:
     return "\n".join(converted)
 
 
-def _safe_int(value, default: int) -> int:
+def _safe_int(value, default: int, *, maximum: int = MAX_LOG_CHARS) -> int:
     try:
         number = int(value)
     except (TypeError, ValueError):
         return default
-    return max(1, min(number, MAX_LOG_CHARS))
+    return max(1, min(number, maximum))
 
 
 def _format_mtime(timestamp: float) -> str:

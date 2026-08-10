@@ -32,6 +32,8 @@ CHECKER_ARGUMENT_HINTS = {
     "file_exists": "path",
     "file_absent": "path",
     "file_contains": "path,text",
+    "file_not_contains": "path,text",
+    "python_file_syntax_valid": "path",
     "json_file_valid": "path",
     "service_active": "service",
     "service_inactive": "service",
@@ -53,6 +55,7 @@ CHECKER_ARGUMENT_HINTS = {
     "libvirt_domain_state": "domain,state",
     "ovs_resource_state": "resource_type,name; optional present",
     "http_status": "url; optional status or statuses",
+    "backend_health": "url; optional expected_code (default 1)",
     "git_revision": "repository,revision",
     "user_in_group": "user,group",
     "file_mode": "path,mode",
@@ -77,6 +80,8 @@ CHECKER_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "file_exists": ("path",),
     "file_absent": ("path",),
     "file_contains": ("path", "text"),
+    "file_not_contains": ("path", "text"),
+    "python_file_syntax_valid": ("path",),
     "json_file_valid": ("path",),
     "service_active": ("service",),
     "service_inactive": ("service",),
@@ -98,6 +103,7 @@ CHECKER_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "libvirt_domain_state": ("domain", "state"),
     "ovs_resource_state": ("resource_type", "name"),
     "http_status": ("url",),
+    "backend_health": ("url",),
     "git_revision": ("repository", "revision"),
     "user_in_group": ("user", "group"),
     "file_mode": ("path", "mode"),
@@ -121,6 +127,8 @@ class DefaultCheckerRegistry:
             "file_exists": self._file_exists,
             "file_absent": self._file_absent,
             "file_contains": self._file_contains,
+            "file_not_contains": self._file_not_contains,
+            "python_file_syntax_valid": self._python_file_syntax_valid,
             "json_file_valid": self._json_file_valid,
             "service_active": self._service_active,
             "service_inactive": self._service_inactive,
@@ -142,6 +150,7 @@ class DefaultCheckerRegistry:
             "libvirt_domain_state": self._libvirt_domain_state,
             "ovs_resource_state": self._ovs_resource_state,
             "http_status": self._http_status,
+            "backend_health": self._backend_health,
             "git_revision": self._git_revision,
             "user_in_group": self._user_in_group,
             "file_mode": self._file_mode,
@@ -242,6 +251,45 @@ class DefaultCheckerRegistry:
         return CheckResult(
             "file_contains", "passed" if found else "failed",
             expected=needle, observed="content matched" if found else "content missing",
+        )
+
+    def _file_not_contains(self, args, evidence):
+        del evidence
+        path = Path(str(args["path"])).expanduser()
+        needle = str(args.get("text", ""))
+        if not path.is_file():
+            return CheckResult(
+                "file_not_contains", "failed", expected="content absent",
+                observed="file missing: %s" % path,
+            )
+        found = needle in path.read_text(encoding="utf-8", errors="replace")
+        return CheckResult(
+            "file_not_contains",
+            "failed" if found else "passed",
+            expected="content absent",
+            observed="content matched" if found else "content missing",
+        )
+
+    def _python_file_syntax_valid(self, args, evidence):
+        """Validate edited Python source without importing its dependencies."""
+
+        del evidence
+        path = Path(str(args["path"])).expanduser()
+        try:
+            source = path.read_text(encoding="utf-8")
+            ast.parse(source, filename=str(path))
+        except (OSError, UnicodeError, SyntaxError) as exc:
+            return CheckResult(
+                "python_file_syntax_valid",
+                "failed",
+                expected="valid Python syntax",
+                observed="%s: %s" % (exc.__class__.__name__, exc),
+            )
+        return CheckResult(
+            "python_file_syntax_valid",
+            "passed",
+            expected="valid Python syntax",
+            observed=str(path),
         )
 
     def _json_file_valid(self, args, evidence):
@@ -580,6 +628,37 @@ class DefaultCheckerRegistry:
             observed=str(observed),
         )
 
+    def _backend_health(self, args, evidence):
+        """Require the Klonet health endpoint to return HTTP 200 and code=1."""
+
+        del evidence
+        url = str(args["url"])
+        expected_code = int(args.get("expected_code", 1))
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                status = int(response.status)
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return CheckResult(
+                "backend_health", "failed",
+                expected="http=200 code=%s" % expected_code,
+                observed="http=%s" % int(exc.code),
+            )
+        except (urllib.error.URLError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return CheckResult(
+                "backend_health", "failed",
+                expected="http=200 code=%s" % expected_code,
+                observed=exc.__class__.__name__,
+            )
+        observed_code = payload.get("code") if isinstance(payload, dict) else None
+        passed = status == 200 and observed_code == expected_code
+        return CheckResult(
+            "backend_health",
+            "passed" if passed else "failed",
+            expected="http=200 code=%s" % expected_code,
+            observed="http=%s code=%s" % (status, observed_code),
+        )
+
     def _git_revision(self, args, evidence):
         del evidence
         repository = str(args["repository"])
@@ -765,6 +844,31 @@ class DefaultCheckerRegistry:
             return _STATIC_ATTRIBUTE_UNAVAILABLE
         body = tree.body
         parts = attribute.split(".")
+        if len(parts) > 1 and parts[0] == "PROJ_CONFIG":
+            active_class = ""
+            for node in tree.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not any(
+                    isinstance(target, ast.Name) and target.id == "PROJ_CONFIG"
+                    for target in node.targets
+                ):
+                    continue
+                if (
+                    isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                    and not node.value.args
+                    and not node.value.keywords
+                ):
+                    active_class = node.value.func.id
+            classes = [
+                node for node in tree.body
+                if isinstance(node, ast.ClassDef) and node.name == active_class
+            ]
+            if len(classes) != 1:
+                return _STATIC_ATTRIBUTE_UNAVAILABLE
+            body = classes[0].body
+            parts = parts[1:]
         for name in parts[:-1]:
             classes = [
                 node for node in body

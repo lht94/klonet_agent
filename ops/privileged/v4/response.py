@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 from klonet_agent.ops.privileged.v4.contracts import EvidenceConclusion
 
@@ -12,6 +13,9 @@ class V4ResponseAgent:
         self.llm = llm
 
     def render_readonly(self, goal: str, conclusion: EvidenceConclusion) -> str:
+        runtime_inventory = self._runtime_inventory_response(goal, conclusion)
+        if runtime_inventory:
+            return runtime_inventory
         if self.llm is not None:
             try:
                 response = self.llm.complete(
@@ -41,6 +45,71 @@ class V4ResponseAgent:
             except Exception:
                 pass
         return self._fallback(conclusion)
+
+    @staticmethod
+    def _runtime_inventory_response(
+        goal: str,
+        conclusion: EvidenceConclusion,
+    ) -> str:
+        if not any(
+            marker in str(goal or "").lower()
+            for marker in ("多少", "几个", "数量", "哪些", "how many", "which")
+        ):
+            return ""
+        facts = [item.text for item in conclusion.confirmed_facts]
+        count_text = next(
+            (item for item in facts if item.startswith("runtime_inventory_counts ")),
+            "",
+        )
+        if not count_text:
+            return ""
+        counts = {
+            key: int(value)
+            for key, value in re.findall(
+                r"\b(healthy_count|abnormal_count|code_only_count)=(\d+)",
+                count_text,
+            )
+        }
+        instances = [
+            item[len("runtime_instance "):]
+            for item in facts
+            if item.startswith("runtime_instance ")
+        ]
+        healthy = [item for item in instances if "backend_status=healthy" in item]
+        abnormal = [item for item in instances if "backend_status=abnormal" in item]
+        code_only = [
+            item[len("runtime_code_only "):].partition("=")[2]
+            for item in facts
+            if item.startswith("runtime_code_only code_only_root=")
+        ]
+
+        def render_instance(line: str) -> str:
+            def field(name: str, default: str = "unknown") -> str:
+                match = re.search(r"(?:^|\s)%s=([^\s]+)" % re.escape(name), line)
+                return match.group(1) if match else default
+            return (
+                "- project_root=%s；platform=%s；backend_status=%s；"
+                "master_port=%s，master_endpoint=%s；worker_port=%s，worker_endpoint=%s"
+                % (
+                    field("project_root"), field("platform"), field("backend_status"),
+                    field("master_port"), field("master_endpoint"),
+                    field("worker_port"), field("worker_endpoint"),
+                )
+            )
+
+        lines = ["正常运行实例（%s）：" % counts.get("healthy_count", len(healthy))]
+        lines.extend(render_instance(item) for item in healthy)
+        if not healthy:
+            lines.append("- 无")
+        lines.append("后端异常的运行候选（%s）：" % counts.get("abnormal_count", len(abnormal)))
+        lines.extend(render_instance(item) for item in abnormal)
+        if not abnormal:
+            lines.append("- 无")
+        lines.append("只有代码、没有后端运行证据的目录（%s）：" % counts.get("code_only_count", len(code_only)))
+        lines.extend("- %s" % path for path in code_only)
+        if not code_only:
+            lines.append("- 无")
+        return "\n".join(lines)
 
     @staticmethod
     def _prompt(goal: str, conclusion: EvidenceConclusion) -> str:

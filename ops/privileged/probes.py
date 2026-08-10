@@ -25,6 +25,8 @@ from klonet_agent.tools.environment import (
     inspect_nginx_routes,
     inspect_platform_health,
     inspect_platform_instances,
+    inspect_privilege_capabilities,
+    inspect_running_platforms,
     inspect_process_detail,
     inspect_screen_session,
     inspect_service_health,
@@ -174,6 +176,92 @@ def _process_tree(args: dict[str, Any]) -> str:
         if pid in related or ppid in related:
             rows.append(line)
     return "inspect_process_tree\n" + ("\n".join(rows[:300]) or "no related processes")
+
+
+def _process_logs(args: dict[str, Any]) -> str:
+    pids = _int_list(args.get("pids"), maximum=16, upper=4_194_304)
+    root = _absolute_existing_directory(args.get("project_root"))
+    if not pids or root is None:
+        return "inspect_process_logs\ninvalid_pids_or_project_root"
+    sections = ["inspect_process_logs", "project_root=%s" % root]
+    seen = set()
+    for pid in pids:
+        cwd_text = _process_metadata_readlink(Path("/proc") / str(pid) / "cwd")
+        if not cwd_text:
+            sections.append("pid=%s status=unavailable_cwd" % pid)
+            continue
+        cwd = Path(cwd_text)
+        try:
+            cwd.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            sections.append("pid=%s status=refused_cwd_outside_project_root" % pid)
+            continue
+        paths = _process_log_paths(pid)
+        if not paths:
+            sections.append("pid=%s status=no_regular_stdout_stderr_log" % pid)
+            continue
+        for path in paths:
+            resolved = _resolve_process_log_path(path, root)
+            if resolved is None:
+                sections.append(
+                    "pid=%s status=refused_log_outside_project_root path=%s"
+                    % (pid, path)
+                )
+                continue
+            value = str(resolved)
+            if value in seen:
+                continue
+            seen.add(value)
+            sections.append("pid=%s fd_log=%s" % (pid, resolved))
+            sections.append(_read_process_log(resolved))
+    return "\n".join(sections)
+
+
+def _process_log_paths(pid: int) -> list[Path]:
+    paths = []
+    for fd in (1, 2):
+        raw = _process_metadata_readlink(Path("/proc") / str(pid) / "fd" / str(fd))
+        if not raw:
+            continue
+        path = Path(raw)
+        if path.suffix.lower() not in {".err", ".log", ".out", ".txt"}:
+            continue
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _resolve_process_log_path(path: Path, root: Path) -> Path | None:
+    if not path.is_absolute():
+        return None
+    lexical = Path(os.path.normpath(str(path)))
+    try:
+        lexical.relative_to(root)
+    except ValueError:
+        return None
+    output = _run(["sudo", "-n", "readlink", "-f", str(lexical)], timeout=4)
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) != 1 or not lines[0].startswith("/"):
+        return None
+    resolved = Path(lines[0])
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return None
+    return resolved
+
+
+def _read_process_log(path: Path) -> str:
+    try:
+        if path.is_file() and os.access(str(path), os.R_OK):
+            return read_klonet_logs({"path": str(path), "max_chars": 20000})
+    except OSError:
+        pass
+    output = _run(
+        ["sudo", "-n", "tail", "-c", "20000", "--", str(path)],
+        timeout=8,
+    )
+    return "read_process_log_privileged\nresolved_path=%s\n%s" % (path, output)
 
 
 def _service(args: dict[str, Any]) -> str:
@@ -699,12 +787,14 @@ def _path_permissions(args: dict[str, Any]) -> str:
 DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
     (
         ReadOnlyProbeSpec("system_environment", "操作系统、Python、磁盘和命令路径", inspect_system_environment),
+        ReadOnlyProbeSpec("privilege_capabilities", "当前账户、sudo、helper 与跨用户只读能力", inspect_privilege_capabilities),
         ReadOnlyProbeSpec("project_layout", "源码、Python 包、入口和运行根目录关系", _project_layout, ("project_roots",)),
         ReadOnlyProbeSpec("python_runtime", "Python 解释器及 Gunicorn/Celery 路径", _python_runtime),
         ReadOnlyProbeSpec("ports", "监听端口及进程摘要", _ports, ("ports",)),
         ReadOnlyProbeSpec("port_owner", "指定端口的 PID/进程所有者", inspect_process_detail, ("ports",)),
         ReadOnlyProbeSpec("process", "PID、用户、状态、命令和 cwd", _process, ("pids", "keywords")),
         ReadOnlyProbeSpec("process_tree", "指定 PID 及其子进程树", _process_tree, ("pids",)),
+        ReadOnlyProbeSpec("process_logs", "核对 PID cwd 后读取其项目根目录内 stdout/stderr 日志", _process_logs, ("pids", "project_root")),
         ReadOnlyProbeSpec("service", "指定 systemd 服务状态", _service, ("services",)),
         ReadOnlyProbeSpec("screen", "screen 列表或指定会话输出", _screen, ("session",)),
         ReadOnlyProbeSpec("docker", "Docker 容器状态", _docker, ("name",)),
@@ -740,6 +830,7 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
         # Compatibility names used by existing recovery plans.
         ReadOnlyProbeSpec("klonet_runtime", "Klonet 综合运行状态", inspect_klonet_runtime),
         ReadOnlyProbeSpec("platform_instances", "发现平台实例", inspect_platform_instances, ("project_roots",)),
+        ReadOnlyProbeSpec("running_platforms", "按项目根目录核验 Master/Worker 后端接口并统计正常运行实例", inspect_running_platforms, ("project_roots",)),
         ReadOnlyProbeSpec("platform_health", "指定平台健康状态", inspect_platform_health, ("project_root",)),
         ReadOnlyProbeSpec("service_health", "共享服务健康状态", inspect_service_health),
         ReadOnlyProbeSpec("process_detail", "端口/PID/关键词进程详情", inspect_process_detail),
@@ -837,6 +928,23 @@ def _safe_readlink(path: Path) -> str:
         return str(path.resolve())
     except OSError:
         return ""
+
+
+def _process_metadata_readlink(path: Path) -> str:
+    """Resolve the small, allowlisted subset of /proc links used by log discovery."""
+    resolved = _safe_readlink(path)
+    # Path.resolve(strict=False) can return the unresolved /proc path itself when
+    # ptrace restrictions hide a root-owned process link from the caller.
+    if resolved and resolved != str(path):
+        return resolved
+    raw_path = str(path)
+    if not re.fullmatch(r"/proc/[1-9][0-9]*/(?:cwd|fd/[12])", raw_path):
+        return ""
+    output = _run(["sudo", "-n", "readlink", "-f", raw_path], timeout=4)
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if len(lines) != 1 or not lines[0].startswith("/"):
+        return ""
+    return lines[0]
 
 
 def _proc_cmdline(pid: int) -> str:

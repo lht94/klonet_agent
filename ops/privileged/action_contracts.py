@@ -55,6 +55,16 @@ def _default_action_postconditions(
             }
         ]
     if action == "replace_text_in_file":
+        if not str(args.get("new_text") or ""):
+            return [
+                {
+                    "checker": "file_not_contains",
+                    "args": {
+                        "path": args.get("path"),
+                        "text": args.get("old_text"),
+                    },
+                }
+            ]
         return [
             {
                 "checker": "file_contains",
@@ -278,6 +288,11 @@ def _default_action_postconditions(
                 },
             }
         ] if expected else []
+    if action == "stop_klonet_component":
+        return [
+            {"checker": "process_pid_absent", "args": {"pid": args.get("pid")}},
+            {"checker": "port_not_listening", "args": {"port": args.get("port")}},
+        ]
     if action == "stop_klonet_runtime_instance":
         ports = args.get("ports")
         if not isinstance(ports, list):
@@ -694,11 +709,7 @@ def _validate_host_facts(action: str, args: dict[str, Any]) -> str:
     if action in project_actions:
         root = Path(str(args.get("project_root") or "")).expanduser()
         if not root.is_dir():
-            # A hierarchical implementation plan may create/copy this root in
-            # an earlier confirmed step. Route-level validation proves that
-            # producer relationship after every micro-step is bound; the
-            # Executor checks the real layout again at execution time.
-            return ""
+            return "grounding_failed=project_root_not_directory"
         required = (
             "gun.py",
             "master_main.py",
@@ -749,6 +760,14 @@ def _validate_host_facts(action: str, args: dict[str, Any]) -> str:
 def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
     """Reject incomplete operation variants before they become confirmable plans."""
 
+    if action in {
+        "write_ops_file",
+        "replace_text_in_file",
+        "insert_text_before_anchor",
+        "edit_text_file",
+    } and "[REDACTED]" in json.dumps(args, ensure_ascii=False, default=str):
+        return "action=%s redacted_placeholder_cannot_be_written" % action
+
     operation = str(args.get("operation") or "").strip()
     allowed_operations = {
         "edit_text_file": {
@@ -789,6 +808,22 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
                 return "action=edit_text_file anchor_required"
         elif anchor:
             return "action=edit_text_file anchor_must_be_empty"
+    if action == "replace_text_in_file":
+        old_text = str(args.get("old_text") or "")
+        new_text = str(args.get("new_text") or "")
+        if (
+            not new_text
+            and str(args.get("path") or "").endswith(".py")
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old_text.strip())
+        ):
+            return "action=replace_text_in_file ungrounded_python_identifier_deletion"
+        if not new_text and old_text.lstrip().startswith("def "):
+            try:
+                parsed = ast.parse(old_text)
+            except SyntaxError:
+                return "action=replace_text_in_file incomplete_python_function_deletion"
+            if not any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) for node in parsed.body):
+                return "action=replace_text_in_file incomplete_python_function_deletion"
     if action == "upsert_python_class":
         class_name = str(args.get("class_name") or "").strip()
         base_class = str(args.get("base_class") or "").strip()
@@ -826,6 +861,22 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
             )
         if platform and session != "%s_%s" % (platform, suffixes[component]):
             return "action=%s screen_session_mismatch" % action
+        run_as_uid = str(args.get("run_as_uid") or "").strip()
+        if run_as_uid and not re.fullmatch(r"[1-9]\d{0,9}", run_as_uid):
+            return "action=%s invalid_run_as_uid" % action
+    if action == "stop_klonet_component":
+        component = str(args.get("component") or "").strip()
+        if component not in {"master", "worker"}:
+            return "action=stop_klonet_component invalid_component=%s" % (
+                component or "missing"
+            )
+        try:
+            pid = int(args.get("pid"))
+            port = int(args.get("port"))
+        except (TypeError, ValueError):
+            return "action=stop_klonet_component invalid_pid_or_port"
+        if pid <= 1 or not 1 <= port <= 65535:
+            return "action=stop_klonet_component invalid_pid_or_port"
     if action == "manage_container" and operation == "set_restart_policy":
         if str(args.get("restart_policy") or "") not in {
             "no", "always", "unless-stopped", "on-failure",
@@ -1046,4 +1097,3 @@ def _grounding_summary(
     )
     summary["planner_source"] = planner_source
     return summary
-

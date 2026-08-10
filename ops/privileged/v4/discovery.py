@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import re
 from typing import Any, Callable
 
@@ -13,6 +14,7 @@ from klonet_agent.ops.privileged.v4.contracts import (
     EvidenceBundle,
     EvidenceRecord,
     ProbeRequest,
+    normalize_probe_request,
 )
 
 
@@ -67,10 +69,24 @@ class V4DiscoveryAgent:
         self.budget_factory = budget_factory
         self.on_progress = on_progress
 
+    def begin_probe_session(self) -> None:
+        owner = getattr(self.probe_runner, "__self__", None)
+        begin = getattr(owner, "begin_probe_session", None)
+        if begin is not None:
+            begin()
+
+    def end_probe_session(self) -> None:
+        owner = getattr(self.probe_runner, "__self__", None)
+        end = getattr(owner, "end_probe_session", None)
+        if end is not None:
+            end()
+
     def collect_requests(
         self,
         requests: list[ProbeRequest],
         bundle: EvidenceBundle,
+        *,
+        derive_traceback_sources: bool = True,
     ) -> EvidenceBundle:
         """Collect a bounded Planner-requested evidence increment."""
 
@@ -96,7 +112,7 @@ class V4DiscoveryAgent:
             fresh = fresh[:4]
         for request in fresh:
             if self.on_progress is not None:
-                self.on_progress("collecting read-only evidence: %s" % request.probe)
+                self.on_progress("正在收集只读证据：%s" % request.probe)
             try:
                 output = (
                     self.probe_runner(
@@ -113,7 +129,35 @@ class V4DiscoveryAgent:
                 EvidenceRecord.from_probe(request, output, status=status)
             )
             self._add_derived_screen_source(bundle, record)
+        if derive_traceback_sources and any(
+            request.probe in {"logs", "process_logs"} for request in fresh
+        ):
+            self.collect_traceback_source_evidence(bundle)
+        if any(request.probe == "running_platforms" for request in fresh):
+            process_log_requests = _selected_master_process_log_requests(bundle)
+            if process_log_requests:
+                self.collect_requests(process_log_requests, bundle)
+            entry_requests = _selected_master_entry_source_requests(bundle)
+            if entry_requests:
+                self.collect_requests(
+                    entry_requests,
+                    bundle,
+                    derive_traceback_sources=False,
+                )
         return bundle
+
+    def collect_traceback_source_evidence(
+        self,
+        bundle: EvidenceBundle,
+    ) -> EvidenceBundle:
+        requests = _traceback_source_requests(bundle)
+        if not requests:
+            return bundle
+        return self.collect_requests(
+            requests,
+            bundle,
+            derive_traceback_sources=False,
+        )
 
     def collect(
         self,
@@ -121,8 +165,25 @@ class V4DiscoveryAgent:
         *,
         command: str = "",
         conversation_context: str = "",
+        seed_bundle: EvidenceBundle | None = None,
+        preload_capabilities: bool = False,
     ) -> EvidenceBundle:
-        bundle = EvidenceBundle(goal=goal)
+        bundle = EvidenceBundle(
+            goal=goal,
+            records=list(getattr(seed_bundle, "records", []) or []),
+        )
+        if preload_capabilities and not any(
+            item.request.probe == "privilege_capabilities"
+            for item in bundle.records
+        ):
+            self.collect_requests(
+                [ProbeRequest(
+                    "privilege_capabilities",
+                    {},
+                    "verify controlled privilege channels before operational discovery",
+                )],
+                bundle,
+            )
         if command.strip():
             request = ProbeRequest(
                 "readonly_command",
@@ -146,6 +207,20 @@ class V4DiscoveryAgent:
             bundle.add(EvidenceRecord.from_probe(request, output, status=status))
             return bundle
 
+        if _requires_running_platform_inventory(goal):
+            self.collect_requests(
+                [
+                    ProbeRequest(
+                        "running_platforms",
+                        {},
+                        "deterministically count only runtime roots whose master and worker health APIs are usable",
+                    )
+                ],
+                bundle,
+            )
+            if _running_platform_target_choice_required(goal, bundle):
+                return bundle
+
         budget = self.budget_factory()
         messages = [
             {
@@ -158,6 +233,22 @@ class V4DiscoveryAgent:
                 % (conversation_context or "(none)", goal),
             },
         ]
+        if bundle.records:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Deterministic evidence already collected:\n%s"
+                    % "\n\n".join(
+                        "%s (%s):\n%s"
+                        % (
+                            record.evidence_id,
+                            record.request.probe,
+                            record.output[:7000],
+                        )
+                        for record in bundle.records
+                    ),
+                }
+            )
         invalid_repairs = 0
         while True:
             try:
@@ -308,9 +399,13 @@ class V4DiscoveryAgent:
             if not isinstance(item, dict):
                 continue
             requested_probe = str(item.get("probe") or "").strip()
+            normalized_probe, normalized_args = normalize_probe_request(
+                aliases.get(requested_probe, requested_probe),
+                item.get("args") if isinstance(item.get("args"), dict) else {},
+            )
             request = ProbeRequest(
-                probe=aliases.get(requested_probe, requested_probe),
-                args=item.get("args") if isinstance(item.get("args"), dict) else {},
+                probe=normalized_probe,
+                args=normalized_args,
                 purpose=str(item.get("purpose") or "collect required fact"),
             )
             if request.cache_key in known_keys:
@@ -318,3 +413,232 @@ class V4DiscoveryAgent:
             known_keys.add(request.cache_key)
             requests.append(request)
         return requests
+
+
+def _requires_running_platform_inventory(goal: str) -> bool:
+    text = str(goal or "").lower()
+    platform_requested = bool(
+        "平台" in text
+        or "platform" in text
+        or "实例" in text
+        or "instance" in text
+        or re.search(r"/[A-Za-z0-9._/-]*vemu_uestc\b", text)
+        or (
+            any(role in text for role in ("master", "worker"))
+            and bool(re.search(r"\b[A-Za-z][A-Za-z0-9_.-]*\b", text))
+        )
+    )
+    health_requested = any(
+        marker in text
+        for marker in ("正常运行", "运行的平台", "后端接口", "healthy", "running platform")
+    )
+    inventory_requested = any(
+        marker in text for marker in ("多少", "几个", "数量", "哪些", "how many", "which")
+    )
+    repair_requested = any(
+        marker in text for marker in (
+            "修复", "恢复", "排查", "重启", "启动", "停止",
+            "fix", "repair", "recover", "restart", "start", "stop",
+        )
+    )
+    return platform_requested and (health_requested or repair_requested) and (
+        inventory_requested or repair_requested
+    )
+
+
+def _running_platform_target_choice_required(
+    goal: str,
+    bundle: EvidenceBundle,
+) -> bool:
+    text = str(goal or "")
+    lowered = text.lower()
+    if not any(
+        marker in lowered for marker in ("修复", "恢复", "排查", "fix", "repair", "recover")
+    ):
+        return False
+    roots = []
+    aliases = []
+    for record in bundle.records:
+        if record.request.probe != "running_platforms":
+            continue
+        for line in record.output.splitlines():
+            if "backend_status=abnormal" not in line:
+                continue
+            match = re.search(r"\bproject_root=(/[^\s]+)", line)
+            if match and match.group(1) not in roots:
+                roots.append(match.group(1))
+            platform = re.search(r"\bplatform=([^\s]+)", line)
+            if platform and platform.group(1) not in aliases:
+                aliases.append(platform.group(1))
+    if (
+        len(roots) < 2
+        or any(root in text for root in roots)
+        or any(
+            re.search(
+                r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
+                % re.escape(alias),
+                text,
+                re.I,
+            )
+            for alias in aliases
+        )
+    ):
+        return False
+    return not any(
+        marker in lowered for marker in ("全部", "所有", "all of", "all abnormal")
+    )
+
+
+def _traceback_source_requests(bundle: EvidenceBundle) -> list[ProbeRequest]:
+    goal = str(bundle.goal or "")
+    roots = []
+    for raw in re.findall(r"/[A-Za-z0-9._/-]+", goal):
+        root = Path(raw.rstrip("/"))
+        if root not in roots:
+            roots.append(root)
+    inventory_targets = []
+    for record in bundle.records:
+        if record.request.probe != "running_platforms":
+            continue
+        for line in record.output.splitlines():
+            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+            platform_match = re.search(r"\bplatform=([^\s]+)", line)
+            if not root_match:
+                continue
+            root = Path(root_match.group(1))
+            alias = platform_match.group(1) if platform_match else ""
+            inventory_targets.append((alias, root))
+            selected = str(root) in goal or bool(
+                alias
+                and re.search(
+                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
+                    % re.escape(alias),
+                    goal,
+                    re.I,
+                )
+            )
+            if selected and root not in roots:
+                roots.append(root)
+    if not roots and len(inventory_targets) == 1:
+        roots.append(inventory_targets[0][1])
+    if not roots:
+        return []
+    candidates = []
+    for record in bundle.records:
+        if record.request.probe not in {"logs", "process_logs"} or record.status != "available":
+            continue
+        for raw in re.findall(r'File "(/[^"]+\.py)", line \d+', record.output):
+            path = Path(raw)
+            if not any(path == root or root in path.parents for root in roots):
+                continue
+            if path not in candidates:
+                candidates.append(path)
+    return [
+        ProbeRequest(
+            "ops_file",
+            {"path": str(path), "view": "head", "max_chars": 20000},
+            "inspect the target-owned Python source named by the startup traceback",
+        )
+        for path in candidates[:2]
+    ]
+
+
+def _selected_master_process_log_requests(bundle: EvidenceBundle) -> list[ProbeRequest]:
+    goal = str(bundle.goal or "")
+    lowered = goal.lower()
+    if not any(
+        marker in lowered
+        for marker in (
+            "启动", "日志", "报错", "异常", "故障", "修复",
+            "startup", "boot", "log", "error", "failure", "repair",
+        )
+    ):
+        return []
+    requests = []
+    for record in bundle.records:
+        if record.request.probe != "running_platforms":
+            continue
+        for line in record.output.splitlines():
+            if "backend_status=abnormal" not in line:
+                continue
+            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+            platform_match = re.search(r"\bplatform=([^\s]+)", line)
+            pids_match = re.search(r"\bmaster_pids=([0-9,]+)", line)
+            if not root_match or not pids_match:
+                continue
+            root = root_match.group(1)
+            alias = platform_match.group(1) if platform_match else ""
+            selected = root in goal or bool(
+                alias
+                and re.search(
+                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
+                    % re.escape(alias),
+                    goal,
+                    re.I,
+                )
+            )
+            if not selected:
+                continue
+            pids = [int(value) for value in pids_match.group(1).split(",")[:8]]
+            requests.append(ProbeRequest(
+                "process_logs",
+                {"pids": pids, "project_root": root},
+                "read the selected master process stdout/stderr logs after rechecking cwd",
+            ))
+    return requests[:1]
+
+
+def _selected_master_entry_source_requests(
+    bundle: EvidenceBundle,
+) -> list[ProbeRequest]:
+    """Read the selected failing master entry without log-path guesswork."""
+
+    goal = str(bundle.goal or "")
+    lowered = goal.lower()
+    if not any(
+        marker in lowered
+        for marker in (
+            "启动", "新增", "代码", "入口", "日志", "故障", "修复",
+            "startup", "boot", "code", "entry", "log", "failure", "repair",
+        )
+    ):
+        return []
+    requests: list[ProbeRequest] = []
+    for record in bundle.records:
+        if record.request.probe != "running_platforms":
+            continue
+        for line in record.output.splitlines():
+            if (
+                "backend_status=abnormal" not in line
+                or "master_endpoint=healthy" in line
+            ):
+                continue
+            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+            platform_match = re.search(r"\bplatform=([^\s]+)", line)
+            if root_match is None:
+                continue
+            root = Path(root_match.group(1))
+            alias = platform_match.group(1) if platform_match else ""
+            selected = str(root) in goal or bool(
+                alias
+                and re.search(
+                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
+                    % re.escape(alias),
+                    goal,
+                    re.I,
+                )
+            )
+            if not selected:
+                continue
+            candidates = (
+                root / "mains" / "master_main.py",
+                root / "master_main.py",
+                root / "vemu_uestc" / "mains" / "master_main.py",
+            )
+            path = next((item for item in candidates if item.is_file()), candidates[0])
+            requests.append(ProbeRequest(
+                "ops_file",
+                {"path": str(path), "view": "head", "max_chars": 20000},
+                "inspect the selected failing master startup entry",
+            ))
+    return requests[:1]

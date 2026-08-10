@@ -32,6 +32,7 @@ REQUIRED_ACTION_ARGS = {
     "remove_path": ("path",),
     "manage_service": ("service", "operation"),
     "manage_process": ("pid", "signal"),
+    "stop_klonet_component": ("runtime_cwd", "component", "pid", "port"),
     "stop_klonet_runtime_instance": ("runtime_cwd", "ports"),
     "manage_container": ("name", "operation"),
     "install_system_packages": ("packages",),

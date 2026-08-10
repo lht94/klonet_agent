@@ -177,7 +177,7 @@ def test_v4_readonly_turn_runs_through_staged_runtime(capsys):
         reply, _, _ = orchestrator.single_chat("inspect platforms", [], 0)
 
     assert reply == "V4 readonly response"
-    assert "Workflow Coordinator：V4 readonly response" in capsys.readouterr().out
+    assert "工作流协调器：V4 readonly response" in capsys.readouterr().out
 
 
 def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys):
@@ -208,7 +208,7 @@ def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys)
     assert history[-1] == {"role": "assistant", "content": reply}
     assert token == 0
     assert (
-        "Workflow Coordinator：privileged supervisor completed"
+        "工作流协调器：privileged supervisor completed"
         in capsys.readouterr().out
     )
 

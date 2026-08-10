@@ -34,6 +34,7 @@ class V4EvidenceSynthesizer:
             {
                 "evidence_id": item.evidence_id,
                 "probe": item.request.probe,
+                "args": item.request.args,
                 "purpose": item.request.purpose,
                 "status": item.status,
                 "output": item.output[:7000],
@@ -85,6 +86,44 @@ class V4EvidenceSynthesizer:
     ) -> EvidenceConclusion:
         promoted: list[EvidenceClaim] = []
         goal_text = str(goal or "").lower()
+        complete_runtime_inventory_ids: set[str] = set()
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "running_platforms":
+                continue
+            output = record.output
+            count_fields = {
+                key: int(match.group(1))
+                for key in (
+                    "runtime_candidate_count", "healthy_count",
+                    "abnormal_count", "code_only_count",
+                )
+                for match in [re.search(r"(?m)^%s=(\d+)" % key, output)]
+                if match is not None
+            }
+            if {"healthy_count", "abnormal_count", "code_only_count"}.issubset(count_fields):
+                complete_runtime_inventory_ids.add(record.evidence_id)
+                promoted.append(EvidenceClaim(
+                    "runtime_inventory_counts " + " ".join(
+                        "%s=%s" % (key, count_fields[key])
+                        for key in (
+                            "runtime_candidate_count", "healthy_count",
+                            "abnormal_count", "code_only_count",
+                        )
+                        if key in count_fields
+                    ),
+                    [record.evidence_id],
+                ))
+                for line in output.splitlines():
+                    if line.startswith("platform=") and " project_root=" in line:
+                        promoted.append(EvidenceClaim(
+                            "runtime_instance " + line,
+                            [record.evidence_id],
+                        ))
+                    elif line.startswith("code_only_root="):
+                        promoted.append(EvidenceClaim(
+                            "runtime_code_only " + line,
+                            [record.evidence_id],
+                        ))
         for record in bundle.records:
             if record.status != "available" or record.request.probe != "screen":
                 continue
@@ -134,6 +173,14 @@ class V4EvidenceSynthesizer:
         conclusion.confirmed_facts = [
             item for item in promoted if item.text not in existing
         ] + conclusion.confirmed_facts
+        if complete_runtime_inventory_ids and any(
+            marker in goal_text
+            for marker in ("多少", "几个", "数量", "哪些", "how many", "which")
+        ):
+            conclusion.uncertainties = [
+                item for item in conclusion.uncertainties
+                if not set(item.evidence_refs).issubset(complete_runtime_inventory_ids)
+            ]
         conclusion.validate_against(bundle)
         return conclusion
 

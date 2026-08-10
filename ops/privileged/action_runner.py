@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -67,6 +68,7 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
         "remove_path",
         "manage_service",
         "manage_process",
+        "stop_klonet_component",
         "stop_klonet_runtime_instance",
         "create_docker_container",
         "manage_container",
@@ -480,7 +482,21 @@ class DirectPrivilegedActionRunner:
         expected = "%s_%s" % (platform, _COMPONENT_SUFFIX[component])
         if session != expected:
             return self._blocked("screen_session_mismatch expected=%s" % expected)
-        if session in self._existing_screen_sessions():
+        run_as_uid = _runtime_run_as_uid(step.args)
+        if run_as_uid is None:
+            return self._blocked("invalid_run_as_uid")
+        dead_targets = self._dead_screen_session_targets(session, run_as_uid)
+        for target in dead_targets:
+            self._command(
+                _runtime_user_argv(["screen", "-wipe", target], run_as_uid),
+                timeout=20,
+            )
+        if dead_targets:
+            for _attempt in range(10):
+                if session not in self._existing_screen_sessions(run_as_uid):
+                    break
+                time.sleep(0.1)
+        if session in self._existing_screen_sessions(run_as_uid):
             return self._blocked("screen_session_already_exists=%s" % session)
         return self._start_one_component(component, session, root, step)
 
@@ -735,8 +751,76 @@ class DirectPrivilegedActionRunner:
             return self._blocked(
                 "screen_session_mismatch expected=%s" % expected
             )
-        for target in self._screen_session_targets(session) or [session]:
-            self._command(["screen", "-S", target, "-X", "quit"], timeout=20)
+        run_as_uid = _runtime_run_as_uid(step.args)
+        if run_as_uid is None:
+            return self._blocked("invalid_run_as_uid")
+        targets = self._screen_session_targets(session, run_as_uid) or [session]
+        control_rc = _runtime_screen_control_path(root, session)
+        control_check = self._command(
+            _runtime_user_argv(
+                ["test", "-f", str(control_rc)], run_as_uid,
+            ),
+            timeout=10,
+        )
+        port = _component_port_arg(step.args, component)
+        if control_check.returncode == 0 and targets:
+            target = targets[0]
+            interrupted = self._command(
+                _runtime_user_argv(
+                    ["screen", "-S", target, "-p", "0", "-X", "stuff", "\x03"],
+                    run_as_uid,
+                ),
+                timeout=20,
+            )
+            if interrupted.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "interactive_screen_interrupt_failed session=%s stderr=%s environment_changed=unknown"
+                    % (session, _one_line(interrupted.stderr)),
+                    "inspect_runtime",
+                )
+            if port and not _wait_tcp_released("127.0.0.1", port, timeout=20.0):
+                return self._blocked(
+                    "interactive_component_port_not_released=%s" % port
+                )
+            restarted = self._command(
+                _runtime_user_argv(
+                    [
+                        "screen", "-S", target, "-p", "0", "-X", "stuff",
+                        "klonet_start\n",
+                    ],
+                    run_as_uid,
+                ),
+                timeout=20,
+            )
+            if restarted.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "interactive_screen_restart_failed session=%s stderr=%s environment_changed=unknown"
+                    % (session, _one_line(restarted.stderr)),
+                    "inspect_runtime",
+                )
+            if port and not _wait_tcp_listening(
+                "127.0.0.1", port, timeout=min(float(step.timeout), 20.0),
+            ):
+                return DirectActionResult(
+                    "failed",
+                    "component_port_not_ready component=%s port=%s environment_changed=unknown"
+                    % (component, port),
+                    "inspect_runtime",
+                )
+            return DirectActionResult(
+                "completed",
+                "action=restart_screen_component component=%s session=%s "
+                "session_preserved=true environment_changed=true" % (component, session),
+            )
+        for target in targets:
+            self._command(
+                _runtime_user_argv(
+                    ["screen", "-S", target, "-X", "quit"], run_as_uid,
+                ),
+                timeout=20,
+            )
         return self._start_one_component(
             component, session, root, step
         )
@@ -874,6 +958,12 @@ class DirectPrivilegedActionRunner:
         except (OSError, UnicodeError):
             return self._blocked("replacement_target_not_readable_text")
         matches = content.count(old_text)
+        if matches == 0 and not new_text:
+            return DirectActionResult(
+                "completed",
+                "action=replace_text_in_file path=%s already_absent=true "
+                "environment_changed=false" % path,
+            )
         if matches != 1:
             return self._blocked(
                 "replacement_match_count=%s expected=1" % matches
@@ -1831,17 +1921,20 @@ class DirectPrivilegedActionRunner:
         runtime_cwd = _absolute_path(step.args.get("runtime_cwd"))
         if runtime_cwd is None or _protected_target(runtime_cwd):
             return self._blocked("invalid_runtime_cwd")
-        if runtime_cwd.name == "mains" and (runtime_cwd.parent / "vemu_config").is_dir():
-            runtime_cwd = runtime_cwd.parent.resolve()
-        if runtime_cwd.name != "vemu_uestc" or not (runtime_cwd / "vemu_config").is_dir():
+        runtime_cwd = _normalized_klonet_runtime_cwd(runtime_cwd)
+        if runtime_cwd is None:
             return self._blocked("runtime_cwd_not_klonet_backend")
         ports = _port_arg_list(step.args.get("ports"))
         if not ports:
             return self._blocked("invalid_runtime_ports")
         processes = _klonet_runtime_processes(runtime_cwd)
         if not processes:
-            if _ports_currently_listening(self, ports):
-                return self._blocked("runtime_ports_owned_by_unmatched_process")
+            owned_ports = _runtime_ports_owned_by_allowed_cwd(ports, runtime_cwd)
+            if owned_ports:
+                return self._blocked(
+                    "runtime_ports_owned_by_unmatched_process=%s"
+                    % ",".join(str(port) for port in owned_ports)
+                )
             return DirectActionResult(
                 "completed",
                 "action=stop_klonet_runtime_instance runtime_cwd=%s already_stopped=true environment_changed=false"
@@ -1905,6 +1998,87 @@ class DirectPrivilegedActionRunner:
                 ",".join(str(group["pgid"]) for group in all_groups),
                 ",".join(str(port) for port in ports),
             ),
+        )
+
+    def _action_stop_klonet_component(
+        self,
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Stop exactly one role group after rechecking PID/cwd/role/port."""
+
+        runtime_cwd = _absolute_path(step.args.get("runtime_cwd"))
+        if runtime_cwd is None or _protected_target(runtime_cwd):
+            return self._blocked("invalid_runtime_cwd")
+        runtime_cwd = _normalized_klonet_runtime_cwd(runtime_cwd)
+        if runtime_cwd is None:
+            return self._blocked("runtime_cwd_not_klonet_backend")
+        component = str(step.args.get("component") or "").strip().lower()
+        if component not in {"master", "worker"}:
+            return self._blocked("invalid_backend_component")
+        try:
+            expected_pid = int(step.args.get("pid"))
+            port = int(step.args.get("port"))
+        except (TypeError, ValueError):
+            return self._blocked("invalid_component_pid_or_port")
+        if expected_pid <= 1 or not 1 <= port <= 65535:
+            return self._blocked("invalid_component_pid_or_port")
+
+        processes = _klonet_runtime_processes(runtime_cwd)
+        target = next(
+            (proc for proc in processes if int(proc["pid"]) == expected_pid),
+            None,
+        )
+        if target is None:
+            return self._blocked("component_pid_state_drift")
+        observed_role = _klonet_component_for_command(str(target["cmdline"]))
+        if observed_role != component:
+            return self._blocked(
+                "component_role_mismatch expected=%s observed=%s"
+                % (component, observed_role or "unknown")
+            )
+        pgid = int(target["pgid"])
+        group = [proc for proc in processes if int(proc["pgid"]) == pgid]
+        if not group or any(
+            _klonet_component_for_command(str(proc["cmdline"])) != component
+            for proc in group
+        ):
+            return self._blocked("component_process_group_mixed_roles")
+        listener_pids = set(_listener_pids_for_port(port))
+        group_pids = {int(proc["pid"]) for proc in group}
+        if not listener_pids.intersection(group_pids):
+            return self._blocked("component_port_not_owned_by_pid_group")
+
+        owner_pid = next(
+            (int(proc["pid"]) for proc in group if int(proc["pid"]) == pgid),
+            min(group_pids),
+        )
+        result = self._command(
+            _kill_argv_for_owner_pid(owner_pid, "TERM", "-%s" % pgid),
+            timeout=min(step.timeout, 30),
+        )
+        if result.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "stop_component_term_failed pid=%s pgid=%s stderr=%s environment_changed=unknown"
+                % (expected_pid, pgid, _one_line(result.stderr)),
+                "inspect_process",
+            )
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            if not Path("/proc/%s" % expected_pid).exists() and not set(
+                _listener_pids_for_port(port)
+            ).intersection(group_pids):
+                return DirectActionResult(
+                    "completed",
+                    "action=stop_klonet_component component=%s pid=%s pgid=%s runtime_cwd=%s port=%s signal=TERM environment_changed=true"
+                    % (component, expected_pid, pgid, runtime_cwd, port),
+                )
+            time.sleep(0.2)
+        return DirectActionResult(
+            "failed",
+            "component_not_stopped pid=%s pgid=%s port=%s environment_changed=true"
+            % (expected_pid, pgid, port),
+            "inspect_process",
         )
 
     def _action_manage_container(
@@ -2869,6 +3043,9 @@ class DirectPrivilegedActionRunner:
             return self._blocked(
                 "runtime_python_alias_failed=%s" % exc.__class__.__name__
             )
+        run_as_uid = _runtime_run_as_uid(step.args)
+        if run_as_uid is None:
+            return self._blocked("invalid_run_as_uid")
         command = _component_commands(python)[component]
         preflight = {
             "master": [
@@ -2890,7 +3067,7 @@ class DirectPrivilegedActionRunner:
             ],
         }[component]
         checked = self._command(
-            preflight,
+            _runtime_user_argv(preflight, run_as_uid, runtime_env),
             cwd=root,
             env=runtime_env,
             timeout=min(step.timeout, 30),
@@ -2907,12 +3084,50 @@ class DirectPrivilegedActionRunner:
                 ),
                 "inspect_project_layout",
             )
-        shell_command = "cd %s && exec %s" % (
-            shlex.quote(str(root)),
-            shlex.join(command),
+        control_rc = _runtime_screen_control_path(root, session)
+        rc_content = _interactive_screen_rc(
+            root=root,
+            command=command,
+            pythonpath=str(runtime_env.get("PYTHONPATH") or ""),
+            component=component,
+            session=session,
         )
+        write_rc = self._command(
+            _runtime_user_argv(
+                [
+                    python,
+                    "-c",
+                    (
+                        "import pathlib,sys; p=pathlib.Path(sys.argv[1]); "
+                        "p.parent.mkdir(parents=True,exist_ok=True,mode=0o700); "
+                        "p.write_text(sys.argv[2],encoding='utf-8'); p.chmod(0o600)"
+                    ),
+                    str(control_rc),
+                    rc_content,
+                ],
+                run_as_uid,
+                runtime_env,
+            ),
+            cwd=root,
+            env=runtime_env,
+            timeout=min(step.timeout, 30),
+        )
+        if write_rc.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "screen_control_rc_failed component=%s stderr=%s environment_changed=false"
+                % (component, _one_line(write_rc.stderr)),
+                "inspect_runtime",
+            )
         result = self._command(
-            ["screen", "-dmS", session, "bash", "-lc", shell_command],
+            _runtime_user_argv(
+                [
+                    "screen", "-dmS", session,
+                    "bash", "--noprofile", "--rcfile", str(control_rc), "-i",
+                ],
+                run_as_uid,
+                runtime_env,
+            ),
             cwd=root,
             env=runtime_env,
             timeout=min(step.timeout, 30),
@@ -2929,38 +3144,59 @@ class DirectPrivilegedActionRunner:
             "worker": "port_47002",
             "web_terminal": "port_47003",
         }.get(component)
-        raw_port = step.args.get(port_key) if port_key else None
+        raw_port = (
+            step.args.get(port_key) if port_key else None
+        ) or step.args.get("%s_port" % component)
         if str(raw_port or "").isdigit():
-            _wait_tcp_listening(
+            ready = _wait_tcp_listening(
                 "127.0.0.1",
                 int(raw_port),
                 timeout=min(float(step.timeout), 20.0),
             )
+            if not ready:
+                return DirectActionResult(
+                    "failed",
+                    "component_port_not_ready component=%s port=%s environment_changed=unknown"
+                    % (component, raw_port),
+                    "inspect_runtime",
+                )
         return DirectActionResult(
             "completed",
-            "action=restart_screen_component component=%s session=%s environment_changed=true"
-            % (component, session),
+            "action=start_screen_component component=%s session=%s "
+            "session_mode=interactive_foreground control_rc=%s environment_changed=true"
+            % (component, session, control_rc),
         )
 
-    def _screen_ls_text(self) -> str:
-        result = self._command(["screen", "-ls"], timeout=15)
+    def _screen_ls_text(self, run_as_uid: str = "") -> str:
+        result = self._command(
+            _runtime_user_argv(["screen", "-ls"], run_as_uid), timeout=15,
+        )
         return "%s\n%s" % (result.stdout or "", result.stderr or "")
 
-    def _screen_session_targets(self, session: str) -> list[str]:
+    def _screen_session_targets(
+        self, session: str, run_as_uid: str = "",
+    ) -> list[str]:
         targets = []
         pattern = re.compile(
             r"(?:^|\s)(\d+\.%s)(?:\s|$)" % re.escape(session)
         )
-        for match in pattern.finditer(self._screen_ls_text()):
+        screen_text = (
+            self._screen_ls_text(run_as_uid)
+            if run_as_uid else self._screen_ls_text()
+        )
+        for match in pattern.finditer(screen_text):
             target = match.group(1)
             if target not in targets:
                 targets.append(target)
-        if not targets and session in self._existing_screen_sessions():
+        if not targets and session in self._existing_screen_sessions(run_as_uid):
             targets.append(session)
         return targets
 
-    def _existing_screen_sessions(self) -> set[str]:
-        text = self._screen_ls_text()
+    def _existing_screen_sessions(self, run_as_uid: str = "") -> set[str]:
+        text = (
+            self._screen_ls_text(run_as_uid)
+            if run_as_uid else self._screen_ls_text()
+        )
         sessions = set()
         for match in re.finditer(
             r"(?:^|\s)(?:\d+\.)?([A-Za-z0-9_.:-]+)(?:\s|$)",
@@ -2975,6 +3211,24 @@ class DirectPrivilegedActionRunner:
                 sessions.add(value)
         return sessions
 
+    def _dead_screen_session_targets(
+        self, session: str, run_as_uid: str = "",
+    ) -> list[str]:
+        targets = []
+        pattern = re.compile(
+            r"(?:^|\s)(\d+\.%s)\s+\(Dead" % re.escape(session),
+            re.I,
+        )
+        screen_text = (
+            self._screen_ls_text(run_as_uid)
+            if run_as_uid else self._screen_ls_text()
+        )
+        for match in pattern.finditer(screen_text):
+            target = match.group(1)
+            if target not in targets:
+                targets.append(target)
+        return targets
+
     def _write_file(
         self,
         path: Path,
@@ -2982,18 +3236,33 @@ class DirectPrivilegedActionRunner:
         timeout: int,
     ) -> DirectActionResult | None:
         parent = path.parent
+        original_stat = path.stat() if path.exists() else None
         if parent.is_dir() and os.access(parent, os.W_OK):
             temp_path = parent / (".%s.klonet-agent.tmp" % path.name)
             temp_path.write_text(content, encoding="utf-8")
+            if original_stat is not None:
+                os.chmod(temp_path, stat.S_IMODE(original_stat.st_mode))
+                try:
+                    os.chown(temp_path, original_stat.st_uid, original_stat.st_gid)
+                except PermissionError:
+                    temp_path.unlink(missing_ok=True)
+                    return self._blocked("cannot_preserve_file_ownership")
             os.replace(temp_path, path)
             return None
         temp_dir = Path(tempfile.mkdtemp(prefix="klonet-priv-write-"))
         try:
             staged = temp_dir / path.name
             staged.write_text(content, encoding="utf-8")
-            command = _sudo_if_needed(
-                ["install", "-m", "0644", str(staged), str(path)]
-            )
+            install_args = ["install"]
+            if original_stat is not None:
+                install_args.extend([
+                    "-o", str(original_stat.st_uid),
+                    "-g", str(original_stat.st_gid),
+                    "-m", "%04o" % stat.S_IMODE(original_stat.st_mode),
+                ])
+            else:
+                install_args.extend(["-m", "0644"])
+            command = _sudo_if_needed([*install_args, str(staged), str(path)])
             result = self._command(command, timeout=timeout)
             if result.returncode != 0:
                 return DirectActionResult(
@@ -3214,7 +3483,12 @@ def _platform_root(
         if all((backend / name).is_file() for name in REQUIRED_ENTRY_FILES):
             return platform, backend.resolve(), ""
         return platform, backend.resolve(), "runtime_entries_missing_in_backend"
-    return platform, root, ""
+    if all((root / name).is_file() for name in REQUIRED_ENTRY_FILES):
+        return platform, root, ""
+    for candidate in (root / "mains", root / "vemu_uestc" / "mains"):
+        if all((candidate / name).is_file() for name in REQUIRED_ENTRY_FILES):
+            return platform, candidate.resolve(), ""
+    return platform, root, "runtime_entries_missing_in_project_root"
 
 
 def _entry_sources(root: Path) -> dict[str, str]:
@@ -3242,6 +3516,14 @@ def _default_entry_source(root: Path) -> Path:
 
 def _python_executable(args: dict) -> str:
     requested = str(args.get("python_executable") or "").strip()
+    if requested:
+        requested_path = Path(requested)
+        if requested_path.is_file() and os.access(requested, os.X_OK):
+            # A frozen predecessor interpreter is part of the confirmed
+            # runtime identity.  Its module compatibility is verified by the
+            # role-specific preflight below; silently substituting another
+            # environment would violate the plan.
+            return str(requested_path.resolve())
     candidates = _python_candidates(requested)
     required = ("gunicorn", "celery", "flask")
     for raw in candidates:
@@ -3251,6 +3533,30 @@ def _python_executable(args: dict) -> str:
         if raw and Path(raw).is_file() and os.access(raw, os.X_OK):
             return str(Path(raw).resolve())
     return ""
+
+
+def _runtime_run_as_uid(args: dict) -> str | None:
+    raw = str(args.get("run_as_uid") or "").strip()
+    if not raw:
+        return ""
+    if not re.fullmatch(r"[1-9]\d{0,9}", raw):
+        return None
+    return raw
+
+
+def _runtime_user_argv(
+    argv: list[str],
+    run_as_uid: str,
+    runtime_env: dict[str, str] | None = None,
+) -> list[str]:
+    if not run_as_uid or int(run_as_uid) == os.geteuid():
+        return list(argv)
+    result = ["sudo", "-n", "-u", "#%s" % run_as_uid]
+    pythonpath = str((runtime_env or {}).get("PYTHONPATH") or "").strip()
+    if pythonpath:
+        result.extend(["env", "PYTHONPATH=%s" % pythonpath])
+    result.extend(argv)
+    return result
 
 
 def _python_candidates(requested: str) -> list[str]:
@@ -3291,7 +3597,11 @@ def _runtime_pythonpath(root: Path) -> str:
     if package_name and package_name != instance_root.name:
         digest = hashlib.sha256(str(instance_root.resolve()).encode("utf-8")).hexdigest()[:16]
         alias_root = Path(tempfile.gettempdir()) / "klonet-runtime-aliases" / digest
-        alias_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        alias_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        # The Action may deliberately switch to the frozen predecessor UID.
+        # This directory contains only a package-name symlink, not secrets;
+        # it must be traversable by that runtime account.
+        alias_root.chmod(0o755)
         alias = alias_root / package_name
         if alias.is_symlink():
             if alias.resolve() != instance_root.resolve():
@@ -3364,6 +3674,66 @@ def _component_commands(python: str) -> dict[str, list[str]]:
             "worker_main:flask_app",
         ],
     }
+
+
+def _component_port_arg(args: dict[str, Any], component: str) -> int | None:
+    raw = args.get("%s_port" % component)
+    if raw is None:
+        legacy_keys = {
+            "master": "port_47001",
+            "worker": "port_47002",
+            "web_terminal": "port_47003",
+        }
+        raw = args.get(legacy_keys.get(component, ""))
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _runtime_screen_control_path(root: Path, session: str) -> Path:
+    identity = hashlib.sha256(
+        (str(root.resolve()) + "\0" + str(session)).encode("utf-8")
+    ).hexdigest()[:16]
+    return (
+        Path(tempfile.gettempdir()) / "klonet-runtime-controls"
+        / identity / (session + ".bashrc")
+    )
+
+
+def _interactive_screen_rc(
+    *,
+    root: Path,
+    command: list[str],
+    pythonpath: str,
+    component: str,
+    session: str,
+) -> str:
+    """Build a bounded interactive shell contract for one Screen component."""
+
+    command_text = shlex.join(command)
+    return "\n".join([
+        "# Generated by Klonet Agent; runtime control only.",
+        "cd %s || return" % shlex.quote(str(root)),
+        "export PYTHONPATH=%s" % shlex.quote(pythonpath),
+        "klonet_command() { printf '%s\\n' %s; }" % (
+            "%s", shlex.quote(command_text),
+        ),
+        "klonet_status() {",
+        "  printf 'session=%s component=%s cwd=%%s\\n' \"$PWD\"" % (
+            session, component,
+        ),
+        "  jobs -l",
+        "}",
+        "klonet_start() {",
+        "  printf '启动 %s；Ctrl-C 仅停止服务并返回本 shell。\\n'" % component,
+        "  %s" % command_text,
+        "}",
+        "printf 'Klonet %s 控制台：Ctrl-A D 脱离；Ctrl-C 停止；klonet_start 重新启动。\\n'" % component,
+        "klonet_start",
+        "",
+    ])
 
 
 def _runtime_config_path(root: Path) -> Path | None:
@@ -3638,28 +4008,34 @@ def _allowed_runtime_cwds(root: Path) -> list[Path]:
 
 
 def _listener_pids_for_port(port: int) -> list[int]:
+    if not 1 <= int(port) <= 65535:
+        return []
     ss = shutil.which("ss")
     if not ss:
         return []
-    try:
-        result = subprocess.run(
-            [ss, "-ltnp"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    pids = []
-    for line in (result.stdout or "").splitlines():
-        if not re.search(rf":{port}\b", line):
+    commands = ([ss, "-ltnp"], ["sudo", "-n", ss, "-ltnp"])
+    for argv in commands:
+        try:
+            result = subprocess.run(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
             continue
-        for match in re.finditer(r"pid=(\d+)", line):
-            pid = int(match.group(1))
-            if pid not in pids:
-                pids.append(pid)
-    return pids
+        pids = []
+        for line in (result.stdout or "").splitlines():
+            if not re.search(rf":{port}\b", line):
+                continue
+            for match in re.finditer(r"pid=(\d+)", line):
+                pid = int(match.group(1))
+                if pid not in pids:
+                    pids.append(pid)
+        if pids:
+            return pids
+    return []
 
 
 def _path_is_relative_to(path: Path, parent: Path) -> bool:
@@ -3887,6 +4263,23 @@ def _klonet_runtime_processes(runtime_cwd: Path) -> list[dict[str, int | str]]:
     return processes
 
 
+def _normalized_klonet_runtime_cwd(runtime_cwd: Path) -> Path | None:
+    """Accept both package roots and instance roots with complete mains entries."""
+
+    root = runtime_cwd.resolve()
+    if root.name == "mains" and (
+        (root.parent / "vemu_config").is_dir()
+        or all((root / name).is_file() for name in REQUIRED_ENTRY_FILES)
+    ):
+        root = root.parent.resolve()
+    if root.name == "vemu_uestc" and (root / "vemu_config").is_dir():
+        return root
+    mains = root / "mains"
+    if mains.is_dir() and all((mains / name).is_file() for name in REQUIRED_ENTRY_FILES):
+        return root
+    return None
+
+
 def _runtime_process_groups(processes: list[dict[str, int | str]]) -> list[dict[str, int]]:
     groups: dict[int, int] = {}
     for proc in processes:
@@ -3910,8 +4303,10 @@ def _runtime_stopped_stably(
     stable_since: float | None = None
     while time.monotonic() < deadline:
         stopped = not _klonet_runtime_processes(runtime_cwd)
-        ports_free = not _ports_currently_listening(runner, ports)
-        if stopped and ports_free:
+        target_ports_released = not _runtime_ports_owned_by_allowed_cwd(
+            ports, runtime_cwd
+        )
+        if stopped and target_ports_released:
             if stable_since is None:
                 stable_since = time.monotonic()
             if time.monotonic() - stable_since >= stable_for:
@@ -3942,9 +4337,29 @@ def _ports_currently_listening(runner: DirectPrivilegedActionRunner, ports: list
 
 def _proc_cwd(pid: int) -> str:
     try:
-        return str((Path("/proc") / str(pid) / "cwd").resolve())
+        resolved = str((Path("/proc") / str(pid) / "cwd").resolve())
+        if resolved and resolved != str(Path("/proc") / str(pid) / "cwd"):
+            return resolved
     except OSError:
+        pass
+    if not 1 < int(pid) <= 4_194_304:
         return ""
+    try:
+        completed = subprocess.run(
+            ["sudo", "-n", "readlink", "-f", "/proc/%s/cwd" % int(pid)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if completed.returncode != 0 or len(lines) != 1 or not lines[0].startswith("/"):
+        return ""
+    return lines[0]
 
 
 def _is_klonet_runtime_command(cmdline: str) -> bool:
@@ -3965,6 +4380,21 @@ def _is_klonet_runtime_command(cmdline: str) -> bool:
             "celery_worker.celery",
         )
     )
+
+
+def _klonet_component_for_command(cmdline: str) -> str:
+    text = cmdline or ""
+    if "master_main:flask_app" in text:
+        return "master"
+    if "worker_main:flask_app" in text:
+        return "worker"
+    if "data_server_main:flask_app" in text:
+        return "data_server"
+    if "web_terminal_main.py" in text:
+        return "web_terminal"
+    if "celery_worker.celery" in text:
+        return "celery"
+    return ""
 
 
 def _proc_uid(pid: int) -> int | None:
@@ -4248,6 +4678,15 @@ def _wait_tcp_listening(host: str, port: int, *, timeout: float) -> bool:
             return True
         time.sleep(0.2)
     return _tcp_listening(host, port, timeout=0.5)
+
+
+def _wait_tcp_released(host: str, port: int, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _tcp_listening(host, port, timeout=0.5):
+            return True
+        time.sleep(0.2)
+    return not _tcp_listening(host, port, timeout=0.5)
 
 
 def _file_sha256(path: Path) -> str:

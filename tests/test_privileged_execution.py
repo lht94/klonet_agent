@@ -363,6 +363,35 @@ def test_http_status_checker_accepts_one_of_multiple_expected_codes(monkeypatch)
     assert result.status == "passed"
 
 
+def test_backend_health_checker_requires_http_200_and_code_one(monkeypatch):
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return b'{"code": 1}'
+
+    monkeypatch.setattr(
+        "klonet_agent.ops.privileged.checkers.urllib.request.urlopen",
+        lambda *args, **kwargs: Response(),
+    )
+
+    result = DefaultCheckerRegistry().run({
+        "checker": "backend_health",
+        "args": {"url": "http://127.0.0.1:45551/server_health/"},
+    })
+
+    assert result.status == "passed"
+    assert result.observed == "http=200 code=1"
+
+
 def test_python_import_checker_uses_requested_interpreter_and_cwd(tmp_path):
     import sys
 
@@ -400,6 +429,30 @@ def test_python_import_checker_uses_requested_interpreter_and_cwd(tmp_path):
 
     assert found.status == "passed"
     assert missing.status == "failed"
+
+
+def test_python_file_syntax_checker_does_not_import_application_dependencies(tmp_path):
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    source = tmp_path / "entry.py"
+    source.write_text(
+        "import dependency_not_installed_in_agent\nVALUE = 1\n",
+        encoding="utf-8",
+    )
+
+    result = DefaultCheckerRegistry().run({
+        "checker": "python_file_syntax_valid",
+        "args": {"path": str(source)},
+    })
+
+    assert result.status == "passed"
+
+    source.write_text("def broken(:\n", encoding="utf-8")
+    result = DefaultCheckerRegistry().run({
+        "checker": "python_file_syntax_valid",
+        "args": {"path": str(source)},
+    })
+    assert result.status == "failed"
 
 
 def test_python_attribute_checker_compares_grounded_class_value(tmp_path):
@@ -463,6 +516,36 @@ def test_python_attribute_checker_falls_back_to_static_literal_when_import_fails
 
     assert result.status == "passed"
     assert result.observed == '"127.0.0.1" (static literal)'
+
+
+def test_python_attribute_static_fallback_resolves_active_proj_config(tmp_path):
+    import sys
+
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    package = tmp_path / "demo_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "config.py").write_text(
+        "import dependency_that_is_not_installed\n"
+        "class WtxConfig:\n"
+        "    master_port = 45554\n"
+        "PROJ_CONFIG = WtxConfig()\n",
+        encoding="utf-8",
+    )
+    result = DefaultCheckerRegistry().run({
+        "checker": "python_attribute_equals",
+        "args": {
+            "module": "demo_pkg.config",
+            "attribute": "PROJ_CONFIG.master_port",
+            "expected": 45554,
+            "python_executable": sys.executable,
+            "cwd": str(tmp_path),
+        },
+    })
+
+    assert result.status == "passed"
+    assert result.observed == "45554 (static literal)"
 
 
 def test_checker_bug_is_reported_unavailable_instead_of_escaping():
