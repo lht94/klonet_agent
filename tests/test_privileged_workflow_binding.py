@@ -565,7 +565,7 @@ def test_python_class_attribute_postcondition_is_canonicalized_from_action_args(
     checks = _canonical_action_postconditions(
         "set_python_class_attribute",
         {
-            "path": "/srv/v4/vemu_config/config.py",
+            "path": "/srv/app/vemu_config/config.py",
             "class_name": "WtxConfig",
             "attribute": "master_port",
             "value": "47001",
@@ -577,7 +577,7 @@ def test_python_class_attribute_postcondition_is_canonicalized_from_action_args(
                     "module": "vemu_config.config",
                     "attribute": "master_port",
                     "expected": "47001",
-                    "cwd": "/srv/v4",
+                    "cwd": "/srv/app",
                 },
             }
         ],
@@ -590,7 +590,7 @@ def test_python_class_attribute_postcondition_is_canonicalized_from_action_args(
                 "module": "vemu_config.config",
                 "attribute": "WtxConfig.master_port",
                 "expected": 47001,
-                "cwd": "/srv/v4",
+                "cwd": "/srv/app",
             },
         }
     ]
@@ -1918,7 +1918,7 @@ def test_explicit_restart_requested_compiles_to_restart_screen_actions():
     semantic = PrivilegedStep(
         step_id="restart-backend-roles",
         title="重启 v4e2e 的后端角色",
-        objective="按项目根目录 /home/lzl/klonet_v4_e2e 重启 master 和 worker",
+        objective="按项目根目录 /home/lzl/klonet_workflow_e2e 重启 master 和 worker",
         risk="medium",
         expected_changes=[
             "restart requested master role at 47001 and backend health succeeds",
@@ -2606,14 +2606,14 @@ def test_runtime_migration_orders_stop_before_config_and_component_starts():
 
 
 def _plan():
-    from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
 
-    return ChangePlanV4(
-        plan_id="priv-v4-bind",
+    return ChangePlan(
+        plan_id="priv-ops-bind",
         goal="deploy isolated instance",
         risk="high",
         steps=[
-            ChangeStepV4(
+            ChangeStep(
                 step_id="deploy",
                 title="deploy instance",
                 objective="deploy an isolated instance",
@@ -2636,9 +2636,9 @@ class FakeLegacyBinder:
         return plan
 
 
-def test_v4_binder_maps_direct_registered_action_back_to_change_plan():
+def test_workflow_binder_maps_direct_registered_action_back_to_change_plan():
     from klonet_agent.ops.privileged.contracts import ExecutionBinding
-    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBinder
 
     def apply(plan):
         plan.steps[0].execution_binding = ExecutionBinding(
@@ -2652,7 +2652,7 @@ def test_v4_binder_maps_direct_registered_action_back_to_change_plan():
     legacy = FakeLegacyBinder(apply)
     plan = _plan()
 
-    bound = V4ChangeBinder(legacy).bind(plan)
+    bound = ChangeBinder(legacy).bind(plan)
 
     assert legacy.received.schema_version == 3
     assert bound is plan
@@ -2661,14 +2661,14 @@ def test_v4_binder_maps_direct_registered_action_back_to_change_plan():
     assert bound.status == "awaiting_confirmation"
 
 
-def test_v4_binder_preserves_action_shell_hierarchical_implementation():
+def test_workflow_binder_preserves_action_shell_hierarchical_implementation():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
         ImplementationPlan,
         PrivilegedStep,
         ShellArtifact,
     )
-    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBinder
 
     def apply(plan):
         action = PrivilegedStep(
@@ -2709,7 +2709,7 @@ def test_v4_binder_preserves_action_shell_hierarchical_implementation():
             status="awaiting_confirmation",
         )
 
-    plan = V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+    plan = ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
 
     implementation = plan.steps[0].implementation_plan
     assert implementation is not None
@@ -2721,13 +2721,13 @@ def test_v4_binder_preserves_action_shell_hierarchical_implementation():
     assert restored.steps[0].implementation_plan.steps[1].step_id == "deploy-2"
 
 
-def test_v4_binder_rejects_direct_verification_only_as_a_change_implementation():
+def test_workflow_binder_rejects_direct_verification_only_as_a_change_implementation():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
         ImplementationPlan,
         PrivilegedStep,
     )
-    from klonet_agent.ops.privileged.v4.binding import V4BindingError, V4ChangeBinder
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError, ChangeBinder
 
     def apply(plan):
         binding = ExecutionBinding(
@@ -2737,17 +2737,17 @@ def test_v4_binder_rejects_direct_verification_only_as_a_change_implementation()
         )
         plan.steps[0].execution_binding = binding
 
-    with pytest.raises(V4BindingError, match="verification_only"):
-        V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+    with pytest.raises(ChangeBindingError, match="verification_only"):
+        ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
 
 
-def test_v4_binder_lifts_hierarchical_verification_out_of_execution_plan():
+def test_workflow_binder_lifts_hierarchical_verification_out_of_execution_plan():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
         ImplementationPlan,
         PrivilegedStep,
     )
-    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBinder
 
     def apply(plan):
         plan.steps[0].implementation_plan = ImplementationPlan(
@@ -2783,7 +2783,7 @@ def test_v4_binder_lifts_hierarchical_verification_out_of_execution_plan():
             ],
         )
 
-    plan = V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+    plan = ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
 
     assert [
         item.step_id for item in plan.steps[0].implementation_plan.steps
@@ -2794,13 +2794,13 @@ def test_v4_binder_lifts_hierarchical_verification_out_of_execution_plan():
     }
 
 
-def test_v4_binder_rewires_precondition_verification_without_lifting_it():
+def test_workflow_binder_rewires_precondition_verification_without_lifting_it():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
         ImplementationPlan,
         PrivilegedStep,
     )
-    from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBinder
 
     def apply(plan):
         plan.steps[0].implementation_plan = ImplementationPlan(
@@ -2840,7 +2840,7 @@ def test_v4_binder_rewires_precondition_verification_without_lifting_it():
             ],
         )
 
-    plan = V4ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
+    plan = ChangeBinder(FakeLegacyBinder(apply)).bind(_plan())
 
     implementation = plan.steps[0].implementation_plan
     assert [item.step_id for item in implementation.steps] == ["create"]
@@ -2851,13 +2851,13 @@ def test_v4_binder_rewires_precondition_verification_without_lifting_it():
     )
 
 
-def test_v4_binder_translates_shared_binding_failure_to_v4_boundary():
+def test_workflow_binder_translates_shared_binding_failure_to_workflow_boundary():
     from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
-    from klonet_agent.ops.privileged.v4.binding import V4BindingError, V4ChangeBinder
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError, ChangeBinder
 
     class FailingSharedBinder:
         def prepare_plan(self, plan, *, grounded_context):
             raise ExecutionBindingError("clone target could not be grounded")
 
-    with pytest.raises(V4BindingError, match="clone target could not be grounded"):
-        V4ChangeBinder(FailingSharedBinder()).bind(_plan())
+    with pytest.raises(ChangeBindingError, match="clone target could not be grounded"):
+        ChangeBinder(FailingSharedBinder()).bind(_plan())

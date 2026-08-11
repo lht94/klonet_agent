@@ -1,4 +1,4 @@
-"""Top-level routing for the staged Ops-Privilege V4 workflow."""
+"""Top-level routing for the staged Ops-Privilege workflow."""
 
 from __future__ import annotations
 
@@ -6,17 +6,16 @@ from dataclasses import dataclass
 import inspect
 from pathlib import Path
 import re
-from types import SimpleNamespace
 from typing import Any
 
 from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
-from klonet_agent.ops.privileged.v4.context_store import (
+from klonet_agent.ops.privileged.workflow.operational_context import (
     OperationalContextSnapshot,
 )
 
 
 @dataclass
-class V4WorkflowResult:
+class WorkflowResult:
     handled: bool
     kind: str
     message: str = ""
@@ -25,7 +24,7 @@ class V4WorkflowResult:
     verification: Any | None = None
 
 
-class PrivilegedOpsV4Coordinator:
+class PrivilegedOpsCoordinator:
     def __init__(
         self,
         *,
@@ -34,18 +33,18 @@ class PrivilegedOpsV4Coordinator:
         synthesis: Any,
         response: Any,
         mutation_workflow: Any,
+        verifier: Any,
         goal_guard: GoalSafetyGuard | None = None,
         context_store: Any | None = None,
-        diagnostic_planner: Any | None = None,
     ) -> None:
         self.classifier = classifier
         self.discovery = discovery
         self.synthesis = synthesis
         self.response = response
         self.mutation_workflow = mutation_workflow
+        self.verifier = verifier
         self.goal_guard = goal_guard or GoalSafetyGuard()
         self.context_store = context_store
-        self.diagnostic_planner = diagnostic_planner
 
     def handle(
         self,
@@ -53,11 +52,11 @@ class PrivilegedOpsV4Coordinator:
         *,
         environment_context: str = "",
         conversation_context: str = "",
-    ) -> V4WorkflowResult:
+    ) -> WorkflowResult:
         normalized = str(text or "").lstrip("\ufeff\u200b").strip()
         safety = self.goal_guard.check(normalized)
         if safety.denied:
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "denied",
                 "请求被安全策略拒绝；本轮没有执行任何操作。原因：%s"
@@ -71,7 +70,6 @@ class PrivilegedOpsV4Coordinator:
                 if (
                     control.kind == "paused"
                     and control.plan is not None
-                    and self.diagnostic_planner is not None
                 ):
                     return self._recover_paused_change(
                         control,
@@ -84,13 +82,13 @@ class PrivilegedOpsV4Coordinator:
             conversation_context=conversation_context,
         )
         if decision.intent == "classifier_error":
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "blocked",
                 "意图识别失败，已安全停止；本轮没有执行任何操作。",
             )
         if bool(getattr(decision, "should_clarify", False)):
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "clarification",
                 str(getattr(decision, "clarification_question", "") or "请补充说明目标实例和操作。"),
@@ -99,7 +97,7 @@ class PrivilegedOpsV4Coordinator:
         if decision.intent == "conversation" and not (
             snapshot is not None and snapshot.resolved_goal and continuation
         ):
-            return V4WorkflowResult(False, "conversation")
+            return WorkflowResult(False, "conversation")
         resolved_goal = normalized
         effective_intent = decision.intent
         if snapshot is not None and snapshot.resolved_goal:
@@ -110,7 +108,7 @@ class PrivilegedOpsV4Coordinator:
                 resolved_goal = snapshot.resolved_goal
                 effective_intent = "readonly_action"
         elif decision.intent == "resume_plan":
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "clarification",
                 "当前会话没有可继续的运维目标或计划，请重新说明目标实例和操作。",
@@ -156,7 +154,7 @@ class PrivilegedOpsV4Coordinator:
                 )
             target_question = _ambiguous_abnormal_target_question(resolved_goal, bundle)
             if target_question:
-                return V4WorkflowResult(
+                return WorkflowResult(
                     True,
                     "clarification",
                     target_question,
@@ -167,7 +165,7 @@ class PrivilegedOpsV4Coordinator:
                 bundle,
             )
             if already_satisfied:
-                return V4WorkflowResult(
+                return WorkflowResult(
                     True,
                     "completed",
                     already_satisfied,
@@ -202,23 +200,8 @@ class PrivilegedOpsV4Coordinator:
         collection_goal: str,
         bundle: Any,
         conclusion: Any,
-    ) -> V4WorkflowResult:
+    ) -> WorkflowResult:
         """Continue safe evidence collection until the requested result exists."""
-
-        if self.diagnostic_planner is None:
-            result = V4WorkflowResult(
-                True,
-                "completed",
-                self.response.render_readonly(collection_goal, conclusion),
-                evidence=bundle,
-            )
-            self._save_context(
-                previous,
-                resolved_goal=resolved_goal,
-                bundle=bundle,
-                phase="completed",
-            )
-            return result
 
         decision, bundle, conclusion = self._advance_diagnostic_evidence(
             collection_goal, bundle, conclusion,
@@ -235,14 +218,14 @@ class PrivilegedOpsV4Coordinator:
             phase=phase,
         )
         if status == "achieved":
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "completed",
                 self.response.render_readonly(collection_goal, conclusion),
                 evidence=bundle,
             )
         if status == "needs_user_decision":
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "clarification",
                 str(getattr(decision, "user_question", "") or (
@@ -250,7 +233,7 @@ class PrivilegedOpsV4Coordinator:
                 )),
                 evidence=bundle,
             )
-        return V4WorkflowResult(
+        return WorkflowResult(
             True,
             "blocked",
             "已穷尽当前安全的只读诊断路径，仍无法取得完成目标所需的关键证据。"
@@ -267,6 +250,8 @@ class PrivilegedOpsV4Coordinator:
         goal: str,
         bundle: Any,
         conclusion: Any,
+        *,
+        phase: str = "readonly",
     ) -> tuple[Any, Any, Any]:
         attempted_keys = {
             item.request.cache_key for item in getattr(bundle, "records", [])
@@ -274,18 +259,22 @@ class PrivilegedOpsV4Coordinator:
         max_cycles = 8
         for cycle in range(1, max_cycles + 1):
             assess_kwargs: dict[str, Any] = {}
-            parameters = inspect.signature(self.diagnostic_planner.assess).parameters
+            parameters = inspect.signature(self.verifier.verify_goal).parameters
             if "attempted_keys" in parameters:
                 assess_kwargs["attempted_keys"] = set(attempted_keys)
-            decision = self.diagnostic_planner.assess(
+            if "phase" in parameters:
+                assess_kwargs["phase"] = phase
+            decision = self.verifier.verify_goal(
                 goal, bundle, conclusion, **assess_kwargs,
             )
             status = str(getattr(decision, "status", "") or "")
-            if status in {"achieved", "needs_user_decision", "blocked"}:
+            if status in {
+                "achieved", "need_replan", "needs_user_decision", "blocked",
+            }:
                 return decision, bundle, conclusion
-            if status != "continue":
+            if status != "need_evidence":
                 raise ValueError("invalid diagnostic loop decision")
-            requests = list(getattr(decision, "probe_requests", []) or [])
+            requests = list(getattr(decision, "evidence_requests", []) or [])
             before = len(getattr(bundle, "records", []))
             progress = getattr(self.discovery, "on_progress", None)
             if progress is not None:
@@ -303,21 +292,23 @@ class PrivilegedOpsV4Coordinator:
             if len(getattr(bundle, "records", [])) <= before:
                 continue
             conclusion = self.synthesis.synthesize(goal, bundle)
-        return SimpleNamespace(
+        from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+        return GoalOutcome(
             status="blocked",
-            reason="诊断补证循环达到安全上限。",
+            reason="目标验证补证循环达到安全上限。",
         ), bundle, conclusion
 
     def _recover_paused_change(
         self,
-        control: V4WorkflowResult,
+        control: WorkflowResult,
         *,
         snapshot: OperationalContextSnapshot | None,
         conversation_context: str,
-    ) -> V4WorkflowResult:
+    ) -> WorkflowResult:
         """Diagnose a failed approved plan and replan without another nudge."""
 
-        from klonet_agent.ops.privileged.v4.contracts import (
+        from klonet_agent.ops.privileged.workflow.contracts import (
             EvidenceBundle, EvidenceRecord, ProbeRequest,
         )
 
@@ -356,14 +347,14 @@ class PrivilegedOpsV4Coordinator:
             bundle = self.discovery.collect(recovery_goal, **kwargs)
             conclusion = self.synthesis.synthesize(recovery_goal, bundle)
             decision, bundle, conclusion = self._advance_diagnostic_evidence(
-                recovery_goal, bundle, conclusion,
+                recovery_goal, bundle, conclusion, phase="post_execution",
             )
         finally:
             if end is not None:
                 end()
         status = str(getattr(decision, "status", "") or "")
         if status == "needs_user_decision":
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "clarification",
                 str(getattr(decision, "user_question", "") or (
@@ -372,8 +363,16 @@ class PrivilegedOpsV4Coordinator:
                 plan=plan,
                 evidence=bundle,
             )
-        if status != "achieved":
-            return V4WorkflowResult(
+        if status == "achieved":
+            return WorkflowResult(
+                True,
+                "completed",
+                "重新验证后，原目标当前已经满足，无需生成恢复计划。",
+                plan=plan,
+                evidence=bundle,
+            )
+        if status != "need_replan":
+            return WorkflowResult(
                 True,
                 "blocked",
                 "已自动诊断执行失败，但尚未取得足以安全重规划的根因证据。",
@@ -435,7 +434,7 @@ class PrivilegedOpsV4Coordinator:
         *,
         environment_context: str = "",
         conversation_context: str = "",
-    ) -> V4WorkflowResult:
+    ) -> WorkflowResult:
         return self.handle(
             text,
             environment_context=environment_context,
@@ -524,7 +523,7 @@ def _platform_alias_for_root(bundle: Any, root: str) -> str:
     return ""
 
 
-def _localized_result(result: V4WorkflowResult) -> V4WorkflowResult:
+def _localized_result(result: WorkflowResult) -> WorkflowResult:
     """Keep internal English diagnostics out of the user-facing channel."""
 
     if result.kind != "blocked":
@@ -544,7 +543,7 @@ def _localized_result(result: V4WorkflowResult) -> V4WorkflowResult:
             "执行绑定校正后仍未形成可审批计划；本轮没有执行任何变更。",
         ),
         (
-            "V4 binding replan budget exhausted",
+            "binding replan budget exhausted",
             "实现绑定经过有限次数校正后仍未满足安全合同；本轮没有执行任何变更。",
         ),
         (
@@ -559,7 +558,7 @@ def _localized_result(result: V4WorkflowResult) -> V4WorkflowResult:
     translated = [replacement for marker, replacement in mappings if marker in message]
     if not translated:
         translated = ["内部安全校验未通过；本轮没有执行任何变更。"]
-    return V4WorkflowResult(
+    return WorkflowResult(
         result.handled,
         result.kind,
         " ".join(dict.fromkeys(translated)),
@@ -569,7 +568,7 @@ def _localized_result(result: V4WorkflowResult) -> V4WorkflowResult:
     )
 
 
-def _paused_plan_evidence(result: V4WorkflowResult) -> str:
+def _paused_plan_evidence(result: WorkflowResult) -> str:
     """Render persisted execution state as bounded replanning evidence."""
 
     plan = result.plan
@@ -744,7 +743,7 @@ def _collect_traceback_source_evidence(text: str, bundle: Any, discovery: Any) -
                 candidates.append(candidate)
     if not candidates:
         return
-    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
 
     collect_requests(
         [

@@ -4,7 +4,7 @@ import pytest
 
 
 def test_probe_request_cache_key_is_stable_across_argument_order():
-    from klonet_agent.ops.privileged.v4.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
 
     left = ProbeRequest("ports", {"ports": [45551], "host": "127.0.0.1"}, "check")
     right = ProbeRequest("ports", {"host": "127.0.0.1", "ports": [45551]}, "again")
@@ -13,7 +13,7 @@ def test_probe_request_cache_key_is_stable_across_argument_order():
 
 
 def test_evidence_bundle_reuses_identical_probe_result():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
@@ -31,7 +31,7 @@ def test_evidence_bundle_reuses_identical_probe_result():
 
 
 def test_evidence_conclusion_rejects_unknown_evidence_reference():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceClaim,
         EvidenceConclusion,
@@ -46,7 +46,7 @@ def test_evidence_conclusion_rejects_unknown_evidence_reference():
 
 
 def test_discovery_budget_rejects_too_many_or_repeated_rounds():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         DiscoveryBudget,
         DiscoveryBudgetExceeded,
         ProbeRequest,
@@ -69,10 +69,10 @@ def test_discovery_budget_rejects_too_many_or_repeated_rounds():
     ],
 )
 def test_change_step_requires_a_real_host_change(risk, expected_changes, message):
-    from klonet_agent.ops.privileged.v4.contracts import ChangeStepV4
+    from klonet_agent.ops.privileged.workflow.contracts import ChangeStep
 
     with pytest.raises(ValueError, match=message):
-        ChangeStepV4(
+        ChangeStep(
             step_id="change-config",
             title="change config",
             objective="change config",
@@ -83,10 +83,10 @@ def test_change_step_requires_a_real_host_change(risk, expected_changes, message
 
 
 def test_change_step_requires_observable_postconditions():
-    from klonet_agent.ops.privileged.v4.contracts import ChangeStepV4
+    from klonet_agent.ops.privileged.workflow.contracts import ChangeStep
 
     with pytest.raises(ValueError, match="postconditions"):
-        ChangeStepV4(
+        ChangeStep(
             step_id="change-config",
             title="change config",
             objective="change config",
@@ -96,20 +96,45 @@ def test_change_step_requires_observable_postconditions():
         )
 
 
-def test_v4_package_exports_mutation_workflow_components():
-    from klonet_agent.ops.privileged.v4 import (
-        V4ChangeBinder,
-        V4ChangePlannerAgent,
-        V4MutationWorkflow,
-        V4PlanStore,
+def test_workflow_package_exports_mutation_workflow_components():
+    from klonet_agent.ops.privileged.workflow import (
+        ChangeBinder,
+        ChangePlannerAgent,
+        MutationWorkflow,
+        ChangePlanStore,
     )
 
     assert all(
         item is not None
         for item in (
-            V4ChangeBinder,
-            V4ChangePlannerAgent,
-            V4MutationWorkflow,
-            V4PlanStore,
+            ChangeBinder,
+            ChangePlannerAgent,
+            MutationWorkflow,
+            ChangePlanStore,
+        )
+    )
+
+
+def test_canonical_workflow_has_no_versioned_public_api():
+    import importlib.util
+
+    from klonet_agent.ops.privileged.workflow import (
+        ChangeBinder,
+        ChangePlanStore,
+        ChangePlannerAgent,
+        MutationWorkflow,
+    )
+
+    retired_package = "klonet_agent.ops.privileged." + "v" + str(4)
+    retired_marker = "V" + str(4)
+
+    assert importlib.util.find_spec(retired_package) is None
+    assert all(
+        retired_marker not in component.__name__
+        for component in (
+            ChangeBinder,
+            ChangePlanStore,
+            ChangePlannerAgent,
+            MutationWorkflow,
         )
     )

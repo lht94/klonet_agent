@@ -20,7 +20,7 @@ class FakeLLM:
 
 
 def _bundle_and_conclusion():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceClaim,
         EvidenceConclusion,
@@ -48,12 +48,12 @@ def _bundle_and_conclusion():
 
 
 def test_runtime_repair_plan_covers_every_unhealthy_backend_role():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair two runtimes")
     bundle.add(
@@ -102,7 +102,7 @@ def test_runtime_repair_plan_covers_every_unhealthy_backend_role():
         }],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
 
     change = data["changes"][0]
     combined = " ".join([change["objective"], *change["expected_changes"]])
@@ -122,15 +122,15 @@ def test_runtime_repair_plan_covers_every_unhealthy_backend_role():
 
 
 def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="帮我重启 v4e2e 的 master 和 worker")
     bundle.add(EvidenceRecord.from_probe(
         ProbeRequest("running_platforms", {}, "runtime inventory"),
-        "platform=v4e2e project_root=/home/lzl/klonet_v4_e2e "
+        "platform=v4e2e project_root=/home/lzl/klonet_workflow_e2e "
         "backend_status=abnormal master_pids=none worker_pids=none "
         "master_identities=none worker_identities=none "
         "master_port=47001 master_endpoint=not_checked reason=role_not_running "
@@ -138,7 +138,7 @@ def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
     ))
     bundle.add(EvidenceRecord.from_probe(
         ProbeRequest("process", {"keywords": ["v4e2e"]}, "runtime identity"),
-        "pid=2031141 cwd=/home/lzl/klonet_v4_e2e/mains "
+        "pid=2031141 cwd=/home/lzl/klonet_workflow_e2e/mains "
         "cmdline=/home/lzl/miniconda3/envs/klonet-py38/bin/python3.8 -m celery",
     ))
     bundle.add(EvidenceRecord.from_probe(
@@ -147,7 +147,7 @@ def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
     ))
     llm = FakeLLM([])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
+    outcome = ChangePlannerAgent(llm).plan(
         bundle.goal, bundle, EvidenceConclusion(),
     )
 
@@ -165,10 +165,10 @@ def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
 
 
 def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="帮我重启 v4e2e 的 master 和 worker")
     bundle.add(EvidenceRecord.from_probe(
@@ -176,7 +176,7 @@ def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
         "platform=102 project_root=/srv/102 runtime_identities="
         "10:0:/usr/bin/python3.8 master_port=10001 master_endpoint=healthy "
         "worker_port=10002 worker_endpoint=healthy\n"
-        "platform=v4e2e project_root=/home/lzl/klonet_v4_e2e roles=celery "
+        "platform=v4e2e project_root=/home/lzl/klonet_workflow_e2e roles=celery "
         "master_pids=none worker_pids=none master_identities=none "
         "worker_identities=none runtime_identities="
         "2031141:1000:/home/lzl/miniconda3/envs/klonet-py38/bin/python3.8 "
@@ -184,7 +184,7 @@ def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
         "worker_port=47002 worker_endpoint=not_checked reason=role_not_running",
     ))
 
-    outcome = V4ChangePlannerAgent(FakeLLM([])).plan(
+    outcome = ChangePlannerAgent(FakeLLM([])).plan(
         bundle.goal, bundle, EvidenceConclusion(),
     )
 
@@ -198,10 +198,10 @@ def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
 
 
 def test_runtime_repair_replaces_legacy_http_checks_with_backend_health_contract():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair formal")
     bundle.add(EvidenceRecord.from_probe(
@@ -224,7 +224,7 @@ def test_runtime_repair_replaces_legacy_http_checks_with_backend_health_contract
         }],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
 
     health = [
         item for item in data["changes"][0]["postconditions"]
@@ -237,10 +237,10 @@ def test_runtime_repair_replaces_legacy_http_checks_with_backend_health_contract
 
 
 def test_runtime_repair_freezes_pid_for_unhealthy_live_role():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair /srv/102")
     bundle.add(
@@ -268,7 +268,7 @@ def test_runtime_repair_freezes_pid_for_unhealthy_live_role():
         ],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
 
     pid = next(item for item in data["resources"] if item["role"] == "master_pid")
     assert pid["value"] == 1239000
@@ -286,10 +286,10 @@ def test_runtime_repair_freezes_pid_for_unhealthy_live_role():
 
 
 def test_authoritative_healthy_worker_restart_is_compiled_to_verification():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair 102 master and verify worker")
     bundle.add(EvidenceRecord.from_probe(
@@ -311,7 +311,7 @@ def test_authoritative_healthy_worker_restart_is_compiled_to_verification():
         },
     ]}
 
-    V4ChangePlannerAgent._normalize_healthy_runtime_role_changes(data, bundle)
+    ChangePlannerAgent._normalize_healthy_runtime_role_changes(data, bundle)
 
     worker = data["changes"][1]
     assert worker["title"] == "Verify healthy worker backend"
@@ -328,7 +328,7 @@ def test_authoritative_healthy_worker_restart_is_compiled_to_verification():
 
 def test_migrated_healthy_worker_is_rechecked_on_its_new_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"changes": [{
         "step_id": "migrate",
@@ -348,7 +348,7 @@ def test_migrated_healthy_worker_is_rechecked_on_its_new_port():
         PlanResource("test_worker", "port", "frozen", "worker_port", 45555, "planner", consumers=["migrate.worker_port"]),
     ]
 
-    V4ChangePlannerAgent._normalize_backend_role_health_contracts(data, resources)
+    ChangePlannerAgent._normalize_backend_role_health_contracts(data, resources)
 
     assert data["changes"][0]["postconditions"] == [
         {"checker": "backend_health", "args": {"url": "http://127.0.0.1:45554/server_health/", "expected_code": 1}},
@@ -358,7 +358,7 @@ def test_migrated_healthy_worker_is_rechecked_on_its_new_port():
 
 def test_verify_only_worker_http_check_uses_backend_health_contract():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"changes": [{
         "step_id": "repair-master",
@@ -380,7 +380,7 @@ def test_verify_only_worker_http_check_uses_backend_health_contract():
         ),
     ]
 
-    V4ChangePlannerAgent._normalize_backend_role_health_contracts(data, resources)
+    ChangePlannerAgent._normalize_backend_role_health_contracts(data, resources)
 
     assert data["changes"][0]["postconditions"] == [{
         "checker": "backend_health",
@@ -393,18 +393,18 @@ def test_verify_only_worker_http_check_uses_backend_health_contract():
 
 def test_change_plan_authorization_hash_covers_resources_steps_and_bindings():
     from klonet_agent.ops.privileged.contracts import ExecutionBinding, PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
 
-    step = ChangeStepV4(
+    step = ChangeStep(
         step_id="clone",
         title="clone source",
         objective="clone source into isolated root",
         risk="high",
-        expected_changes=["/srv/v4e2e is created"],
-        postconditions=[{"checker": "git_repository", "args": {"repository": "/srv/v4e2e"}}],
+        expected_changes=["/srv/appe2e is created"],
+        postconditions=[{"checker": "git_repository", "args": {"repository": "/srv/appe2e"}}],
     )
-    plan = ChangePlanV4(
-        plan_id="priv-v4-test",
+    plan = ChangePlan(
+        plan_id="priv-ops-test",
         goal="deploy",
         risk="high",
         steps=[step],
@@ -414,7 +414,7 @@ def test_change_plan_authorization_hash_covers_resources_steps_and_bindings():
                 kind="path",
                 status="frozen",
                 role="instance_root",
-                value="/srv/v4e2e",
+                value="/srv/appe2e",
                 source="user_input",
             )
         ],
@@ -426,28 +426,28 @@ def test_change_plan_authorization_hash_covers_resources_steps_and_bindings():
         kind="registered_action",
         risk="high",
         action="git_operation",
-        args={"operation": "clone", "repository": "/srv/v4e2e", "url": "gitee:x/y.git"},
+        args={"operation": "clone", "repository": "/srv/appe2e", "url": "gitee:x/y.git"},
         postconditions=step.postconditions,
     )
     assert plan.is_authorized is False
 
 
 def test_container_plan_requires_docker_image_discovery_before_binding():
-    from klonet_agent.ops.privileged.v4.contracts import (
-        ChangePlanV4,
-        ChangeStepV4,
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan,
+        ChangeStep,
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    plan = ChangePlanV4(
-        plan_id="priv-v4-images",
+    plan = ChangePlan(
+        plan_id="priv-ops-images",
         goal="deploy isolated redis",
         risk="high",
         steps=[
-            ChangeStepV4(
+            ChangeStep(
                 step_id="redis",
                 title="Provision isolated stateful containers",
                 objective="Create the new MySQL, Redis, and RabbitMQ containers",
@@ -461,7 +461,7 @@ def test_container_plan_requires_docker_image_discovery_before_binding():
     )
     bundle = EvidenceBundle(goal=plan.goal)
 
-    missing = V4ChangePlannerAgent.finalize_candidate(plan, bundle)
+    missing = ChangePlannerAgent.finalize_candidate(plan, bundle)
 
     assert missing.status == "need_evidence"
     assert missing.probe_requests[0].probe == "docker_images"
@@ -471,28 +471,28 @@ def test_container_plan_requires_docker_image_discovery_before_binding():
             "inspect_docker_images\nredis latest sha256:a sha256:b now 1MB",
         )
     )
-    assert V4ChangePlannerAgent.finalize_candidate(plan, bundle).status == "ready"
+    assert ChangePlannerAgent.finalize_candidate(plan, bundle).status == "ready"
 
 
 def test_container_candidate_batches_port_and_image_discovery():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
-        ChangePlanV4,
-        ChangeStepV4,
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan,
+        ChangeStep,
         EvidenceBundle,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     port = PlanResource(
         "redis_port", "port", "frozen", "redis_port", 45557, "planner_choice"
     )
-    plan = ChangePlanV4(
-        plan_id="priv-v4-batch",
+    plan = ChangePlan(
+        plan_id="priv-ops-batch",
         goal="deploy isolated containers",
         risk="high",
         resources=[port],
         steps=[
-            ChangeStepV4(
+            ChangeStep(
                 step_id="stateful",
                 title="Provision isolated stateful containers",
                 objective="Create new MySQL, Redis, and RabbitMQ containers",
@@ -503,7 +503,7 @@ def test_container_candidate_batches_port_and_image_discovery():
         ],
     )
 
-    outcome = V4ChangePlannerAgent.finalize_candidate(
+    outcome = ChangePlannerAgent.finalize_candidate(
         plan, EvidenceBundle(goal=plan.goal)
     )
 
@@ -512,16 +512,16 @@ def test_container_candidate_batches_port_and_image_discovery():
     }
 
 
-def test_v4_store_uses_separate_directory_and_recovers_without_reexecution(tmp_path):
-    from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
-    from klonet_agent.ops.privileged.v4.store import V4PlanStore
+def test_workflow_store_uses_separate_directory_and_recovers_without_reexecution(tmp_path):
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
 
-    plan = ChangePlanV4(
-        plan_id="priv-v4-recover",
+    plan = ChangePlan(
+        plan_id="priv-ops-recover",
         goal="deploy",
         risk="medium",
         steps=[
-            ChangeStepV4(
+            ChangeStep(
                 step_id="write",
                 title="write config",
                 objective="write config",
@@ -533,25 +533,25 @@ def test_v4_store_uses_separate_directory_and_recovers_without_reexecution(tmp_p
         ],
         status="executing",
     )
-    store = V4PlanStore(tmp_path, user_id="u", project_id="p")
+    store = ChangePlanStore(tmp_path, user_id="u", project_id="p")
 
     store.save(plan)
     recovered = store.recover(plan.plan_id)
 
-    assert "privileged_ops_plans_v4" in str(store.plan_dir)
+    assert "privileged_ops_plans" in str(store.plan_dir)
     assert recovered.status == "paused"
     assert recovered.steps[0].status == "execution_unknown"
     assert recovered.steps[0].execution_attempts == 0
 
 
-def test_v4_store_recovers_interrupted_hierarchical_step_without_reexecution(tmp_path):
+def test_workflow_store_recovers_interrupted_hierarchical_step_without_reexecution(tmp_path):
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding,
         ImplementationPlan,
         PrivilegedStep,
     )
-    from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
-    from klonet_agent.ops.privileged.v4.store import V4PlanStore
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
 
     micro = PrivilegedStep(
         step_id="deploy-1",
@@ -567,12 +567,12 @@ def test_v4_store_recovers_interrupted_hierarchical_step_without_reexecution(tmp
             postconditions=[{"checker": "exit_code_zero"}],
         ),
     )
-    plan = ChangePlanV4(
-        plan_id="priv-v4-nested",
+    plan = ChangePlan(
+        plan_id="priv-ops-nested",
         goal="deploy",
         risk="high",
         steps=[
-            ChangeStepV4(
+            ChangeStep(
                 step_id="deploy",
                 title="deploy",
                 objective="deploy",
@@ -591,7 +591,7 @@ def test_v4_store_recovers_interrupted_hierarchical_step_without_reexecution(tmp
         ],
         status="executing",
     )
-    store = V4PlanStore(tmp_path, user_id="u", project_id="p")
+    store = ChangePlanStore(tmp_path, user_id="u", project_id="p")
     store.save(plan)
 
     recovered = store.recover(plan.plan_id)
@@ -603,7 +603,7 @@ def test_v4_store_recovers_interrupted_hierarchical_step_without_reexecution(tmp
 
 
 def test_change_planner_returns_structured_evidence_gap_without_plan():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, _ = _bundle_and_conclusion()
     llm = FakeLLM(
@@ -623,7 +623,7 @@ def test_change_planner_returns_structured_evidence_gap_without_plan():
         ]
     )
 
-    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
 
     assert outcome.status == "need_evidence"
     assert outcome.plan is None
@@ -631,12 +631,12 @@ def test_change_planner_returns_structured_evidence_gap_without_plan():
 
 
 def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="use Screen prefix vemu_uestc as source")
     bundle.add(
@@ -651,7 +651,7 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             ),
         )
     )
-    assert V4ChangePlannerAgent._authoritative_screen_source_roots(
+    assert ChangePlannerAgent._authoritative_screen_source_roots(
         "use the selected Screen source",
         bundle,
     ) == {"/home/lzl/vemu_uestc"}
@@ -666,7 +666,7 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             ),
         )
     )
-    assert V4ChangePlannerAgent._authoritative_screen_source_roots(
+    assert ChangePlannerAgent._authoritative_screen_source_roots(
         section_only.goal,
         section_only,
     ) == {"/home/lzl/vemu_uestc"}
@@ -681,13 +681,13 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             "inside_work_tree=true remote=gitee:example/vemu.git branch=develop",
         )
     )
-    assert V4ChangePlannerAgent._authoritative_screen_source_roots(
+    assert ChangePlannerAgent._authoritative_screen_source_roots(
         derived_only.goal,
         derived_only,
     ) == {"/home/lzl/vemu_uestc"}
 
     with pytest.raises(ValueError, match="authoritative Screen source evidence"):
-        V4ChangePlannerAgent(None)._outcome(
+        ChangePlannerAgent(None)._outcome(
             {
                 "status": "need_evidence",
                 "probe_requests": [
@@ -701,7 +701,7 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             bundle.goal,
             bundle,
         )
-    mixed = V4ChangePlannerAgent(None)._outcome(
+    mixed = ChangePlannerAgent(None)._outcome(
         {
             "status": "need_evidence",
             "probe_requests": [
@@ -724,7 +724,7 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
 
 
 def test_change_planner_builds_only_mutating_change_steps():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     llm = FakeLLM(
@@ -740,7 +740,7 @@ def test_change_planner_builds_only_mutating_change_steps():
                             "kind": "path",
                             "status": "frozen",
                             "role": "instance_root",
-                            "value": "/srv/v4e2e",
+                            "value": "/srv/appe2e",
                             "source": "user_input",
                             "consumers": ["clone.repository"],
                         },
@@ -785,16 +785,16 @@ def test_change_planner_builds_only_mutating_change_steps():
                         {
                             "step_id": "clone",
                             "title": "clone source",
-                            "objective": "clone source into /srv/v4e2e",
+                            "objective": "clone source into /srv/appe2e",
                             "reason": "isolated deployment",
                             "evidence_refs": [evidence_id],
                             "depends_on": [],
                             "risk": "high",
-                            "expected_changes": ["/srv/v4e2e is created"],
+                            "expected_changes": ["/srv/appe2e is created"],
                             "postconditions": [
                                 {
                                     "checker": "file_exists",
-                                    "args": {"path": "/srv/v4e2e/.git"},
+                                    "args": {"path": "/srv/appe2e/.git"},
                                 }
                             ],
                         }
@@ -804,7 +804,7 @@ def test_change_planner_builds_only_mutating_change_steps():
         ]
     )
 
-    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
 
     assert outcome.status == "ready"
     assert outcome.plan.schema_version == 4
@@ -813,7 +813,7 @@ def test_change_planner_builds_only_mutating_change_steps():
 
 
 def test_change_planner_rejects_readonly_or_summary_step_safely():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     payload = {
@@ -836,14 +836,14 @@ def test_change_planner_rejects_readonly_or_summary_step_safely():
     }
     llm = FakeLLM([json.dumps(payload), json.dumps(payload)])
 
-    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
 
     assert outcome.status == "blocked"
     assert "cannot be readonly" in outcome.reason
 
 
 def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     invalid = json.dumps(
@@ -865,7 +865,7 @@ def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint
     )
     llm = FakeLLM([invalid, invalid])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
+    outcome = ChangePlannerAgent(llm).plan(
         "restart isolated service", bundle, conclusion
     )
 
@@ -877,7 +877,7 @@ def test_change_planner_exhausted_schema_repair_returns_blocked_with_strict_hint
 
 
 def test_change_planner_repairs_blocked_discoverable_implementation_details():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     invalid_block = json.dumps(
@@ -911,7 +911,7 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
                     "postconditions": [
                         {
                             "checker": "file_exists",
-                            "args": {"path": "/srv/v4e2e"},
+                            "args": {"path": "/srv/appe2e"},
                         }
                     ],
                 }
@@ -920,7 +920,7 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
     )
     llm = FakeLLM([invalid_block, ready])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
+    outcome = ChangePlannerAgent(llm).plan(
         "restart isolated service", bundle, conclusion
     )
 
@@ -931,7 +931,7 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
 
 
 def test_change_planner_allows_three_bounded_contract_repairs():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     invalid = json.dumps(
@@ -965,7 +965,7 @@ def test_change_planner_allows_three_bounded_contract_repairs():
     )
     llm = FakeLLM([invalid, invalid, invalid, ready])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
+    outcome = ChangePlannerAgent(llm).plan(
         "restart isolated service", bundle, conclusion
     )
 
@@ -974,7 +974,7 @@ def test_change_planner_allows_three_bounded_contract_repairs():
 
 
 def test_change_planner_repairs_impossible_logs_request_for_missing_process():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     invalid = {
@@ -1006,7 +1006,7 @@ def test_change_planner_repairs_impossible_logs_request_for_missing_process():
     }
     llm = FakeLLM([json.dumps(invalid), json.dumps(ready)])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
+    outcome = ChangePlannerAgent(llm).plan(
         "start missing master", bundle, conclusion
     )
 
@@ -1015,12 +1015,12 @@ def test_change_planner_repairs_impossible_logs_request_for_missing_process():
 
 def test_existing_runtime_role_port_overrides_source_literal_for_repair():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair 102 master and verify worker")
     bundle.add(EvidenceRecord.from_probe(
@@ -1060,7 +1060,7 @@ def test_existing_runtime_role_port_overrides_source_literal_for_repair():
         consumers=["repair.worker_port"],
     )
 
-    V4ChangePlannerAgent._compile_existing_runtime_role_ports(
+    ChangePlannerAgent._compile_existing_runtime_role_ports(
         data,
         [resource],
         bundle,
@@ -1074,8 +1074,8 @@ def test_existing_runtime_role_port_overrides_source_literal_for_repair():
 
 
 def test_change_planner_repairs_recheck_of_confirmed_missing_role():
-    from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceRecord, ProbeRequest
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     bundle.add(
@@ -1113,7 +1113,7 @@ def test_change_planner_repairs_recheck_of_confirmed_missing_role():
     }
     llm = FakeLLM([json.dumps(invalid), json.dumps(ready)])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
+    outcome = ChangePlannerAgent(llm).plan(
         "start missing master", bundle, conclusion
     )
 
@@ -1122,7 +1122,7 @@ def test_change_planner_repairs_recheck_of_confirmed_missing_role():
 
 
 def test_change_planner_bounds_model_output_and_omits_runaway_repair_context():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, _evidence_id = _bundle_and_conclusion()
     runaway = '{"status":"ready","assumptions":[' + ("x" * 40000)
@@ -1135,7 +1135,7 @@ def test_change_planner_bounds_model_output_and_omits_runaway_repair_context():
     )
     llm = FakeLLM([runaway, blocked])
 
-    outcome = V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    outcome = ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
 
     assert outcome.status == "blocked"
     assert len(llm.calls) == 2
@@ -1149,7 +1149,7 @@ def test_change_planner_bounds_model_output_and_omits_runaway_repair_context():
 
 
 def test_change_planner_compacts_multi_root_repairs_before_first_generation():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, _evidence_id = _bundle_and_conclusion()
     blocked = json.dumps(
@@ -1161,7 +1161,7 @@ def test_change_planner_compacts_multi_root_repairs_before_first_generation():
     )
     llm = FakeLLM([blocked])
 
-    V4ChangePlannerAgent(llm).plan(
+    ChangePlannerAgent(llm).plan(
         "repair /home/lzl/vemu_uestc and /home/lzl/test/vemu_uestc",
         bundle,
         conclusion,
@@ -1173,13 +1173,13 @@ def test_change_planner_compacts_multi_root_repairs_before_first_generation():
 
 
 def test_change_planner_stops_after_compact_retry_is_still_oversized():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, _evidence_id = _bundle_and_conclusion()
     runaway = '{"status":"ready","changes":[' + ("x" * 40000)
     llm = FakeLLM([runaway, runaway, runaway])
 
-    outcome = V4ChangePlannerAgent(llm).plan("repair /srv/a and /srv/b", bundle, conclusion)
+    outcome = ChangePlannerAgent(llm).plan("repair /srv/a and /srv/b", bundle, conclusion)
 
     assert outcome.status == "blocked"
     assert "bounded output" in outcome.reason
@@ -1187,7 +1187,7 @@ def test_change_planner_stops_after_compact_retry_is_still_oversized():
 
 
 def test_change_planner_forces_bounded_function_schema():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, _evidence_id = _bundle_and_conclusion()
     llm = FakeLLM(
@@ -1202,15 +1202,15 @@ def test_change_planner_forces_bounded_function_schema():
         ]
     )
 
-    V4ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
+    ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
 
     call = llm.calls[0]
     assert call["kwargs"]["tool_choice"] == {
         "type": "function",
-        "function": {"name": "submit_v4_change_plan"},
+        "function": {"name": "submit_change_plan"},
     }
     function = call["tools"][0]["function"]
-    assert function["name"] == "submit_v4_change_plan"
+    assert function["name"] == "submit_change_plan"
     properties = function["parameters"]["properties"]
     assert properties["assumptions"]["maxItems"] == 12
     assert properties["assumptions"]["items"]["maxLength"] == 500
@@ -1220,7 +1220,7 @@ def test_change_planner_forces_bounded_function_schema():
 
 def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -1235,34 +1235,34 @@ def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
                     },
                     {
                         "checker": "git_revision",
-                        "args": {"path": "/srv/v4e2e", "revision": "abc"},
+                        "args": {"path": "/srv/appe2e", "revision": "abc"},
                     },
                     {
                         "checker": "file_contains",
-                        "args": {"path": "/srv/v4e2e/config.py", "pattern": "x"},
+                        "args": {"path": "/srv/appe2e/config.py", "pattern": "x"},
                     },
                 ],
             }
         ]
     }
     resources = [
-        PlanResource("root", "path", "frozen", "instance_root", "/srv/v4e2e"),
+        PlanResource("root", "path", "frozen", "instance_root", "/srv/appe2e"),
         PlanResource("remote", "identifier", "frozen", "source_remote", "g:x/y"),
         PlanResource("branch", "identifier", "frozen", "source_branch", "develop"),
     ]
 
-    V4ChangePlannerAgent._normalize_postcondition_args(data)
-    V4ChangePlannerAgent._normalize_core_resource_consumers(data, resources)
+    ChangePlannerAgent._normalize_postcondition_args(data)
+    ChangePlannerAgent._normalize_core_resource_consumers(data, resources)
 
     assert data["changes"][0]["postconditions"][0]["args"] == {
         "container": "v4e2e-mysql"
     }
     assert data["changes"][0]["postconditions"][1]["args"] == {
-        "repository": "/srv/v4e2e",
+        "repository": "/srv/appe2e",
         "revision": "abc",
     }
     assert data["changes"][0]["postconditions"][2]["args"] == {
-        "path": "/srv/v4e2e/config.py",
+        "path": "/srv/appe2e/config.py",
         "text": "x",
     }
     assert resources[0].consumers == ["clone-source.repository"]
@@ -1272,7 +1272,7 @@ def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
 
 def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -1288,13 +1288,13 @@ def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
             "evidence", consumers=["change-99.listen"],
         ),
         PlanResource(
-            "instance_root", "path", "frozen", "instance_root", "/srv/v4e2e",
+            "instance_root", "path", "frozen", "instance_root", "/srv/appe2e",
             "user_input", consumers=["change-99.instance_root"],
         ),
     ]
 
-    V4ChangePlannerAgent._normalize_semantic_dependencies(data)
-    V4ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
+    ChangePlannerAgent._normalize_semantic_dependencies(data)
+    ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
 
     by_id = {item["step_id"]: item for item in data["changes"]}
     assert by_id["redis"]["depends_on"] == ["clone"]
@@ -1306,19 +1306,19 @@ def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
 
 def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_steps():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
             {
                 "step_id": "change-1",
                 "title": "Clone source",
-                "objective": "Clone into /home/lzl/klonet_v4_e2e",
+                "objective": "Clone into /home/lzl/klonet_workflow_e2e",
             },
             {
                 "step_id": "change-3",
                 "title": "Configure application",
-                "objective": "Edit /home/lzl/klonet_v4_e2e/vemu_config/config.py",
+                "objective": "Edit /home/lzl/klonet_workflow_e2e/vemu_config/config.py",
             },
             {
                 "step_id": "change-5",
@@ -1335,7 +1335,7 @@ def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_ste
         ),
         PlanResource(
             "config_path", "path", "frozen", "config_path",
-            "/home/lzl/klonet_v4_e2e/vemu_config/config.py", "derived",
+            "/home/lzl/klonet_workflow_e2e/vemu_config/config.py", "derived",
             consumers=["change-5.path", "change-6.path"],
         ),
         PlanResource(
@@ -1345,7 +1345,7 @@ def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_ste
         ),
     ]
 
-    V4ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
+    ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
 
     assert resources[0].consumers == ["change-1.instance_name"]
     assert resources[1].consumers == ["change-3.path"]
@@ -1354,7 +1354,7 @@ def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_ste
 
 def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [
@@ -1395,28 +1395,28 @@ def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
         ],
     }
 
-    V4ChangePlannerAgent._normalize_instance_container_names(data)
+    ChangePlannerAgent._normalize_instance_container_names(data)
     resources = [
         PlanResource.from_dict(item) for item in data["resources"]
     ] + [
         PlanResource(
             "instance_root", "path", "frozen", "instance_root",
-            "/home/lzl/klonet_v4_e2e", "user_input",
+            "/home/lzl/klonet_workflow_e2e", "user_input",
         )
     ]
-    resources = V4ChangePlannerAgent._normalize_derived_resources(data, resources)
+    resources = ChangePlannerAgent._normalize_derived_resources(data, resources)
 
     assert data["resources"][1]["value"] == "v4e2e-mysql"
     assert data["changes"][0]["postconditions"][0]["args"]["name"] == "v4e2e-mysql"
     mains = next(item for item in resources if item.role == "runtime_mains_root")
-    assert mains.value == "/home/lzl/klonet_v4_e2e/mains"
+    assert mains.value == "/home/lzl/klonet_workflow_e2e/mains"
     assert mains.consumers == ["master.project_root"]
 
 
 def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
@@ -1441,7 +1441,7 @@ def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
             )
         ]
 
-        normalized = V4ChangePlannerAgent._normalize_derived_resources(
+        normalized = ChangePlannerAgent._normalize_derived_resources(
             data, resources
         )
 
@@ -1452,7 +1452,7 @@ def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
 
 def test_planner_derives_config_path_after_checker_path_normalization():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -1475,14 +1475,14 @@ def test_planner_derives_config_path_after_checker_path_normalization():
     }
     root = PlanResource(
         "instance_root", "path", "frozen", "instance_root",
-        "/home/lzl/klonet_v4_e2e", "user_input",
+        "/home/lzl/klonet_workflow_e2e", "user_input",
         consumers=["clone.repository"],
     )
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [root])
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, [root])
 
     config = next(item for item in normalized if item.role == "config_path")
-    assert config.value == "/home/lzl/klonet_v4_e2e/vemu_config/config.py"
+    assert config.value == "/home/lzl/klonet_workflow_e2e/vemu_config/config.py"
     assert config.consumers == ["config.path"]
 
 
@@ -1506,11 +1506,11 @@ def test_ports_probe_explicitly_reports_checked_occupied_and_available(monkeypat
 
 
 def test_planner_compiles_python_checker_aliases_and_drops_dependency_install():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [
-            {"value": "/srv/v4e2e/vemu_config/config.py"},
+            {"value": "/srv/appe2e/vemu_config/config.py"},
         ],
         "changes": [
             {"step_id": "clone", "depends_on": [], "postconditions": []},
@@ -1529,22 +1529,22 @@ def test_planner_compiles_python_checker_aliases_and_drops_dependency_install():
                     {
                         "checker": "python_attribute_equals",
                         "args": {
-                            "path": "/srv/v4e2e/vemu_config/config.py",
+                            "path": "/srv/appe2e/vemu_config/config.py",
                             "attribute": "master_port",
                             "value": 47001,
                         },
                     },
                     {
                         "checker": "python_import_succeeds",
-                        "args": {"path": "/srv/v4e2e/vemu_config/config.py"},
+                        "args": {"path": "/srv/appe2e/vemu_config/config.py"},
                     },
                 ],
             },
         ],
     }
 
-    V4ChangePlannerAgent._normalize_ungrounded_dependency_installs(data)
-    V4ChangePlannerAgent._normalize_postcondition_args(data)
+    ChangePlannerAgent._normalize_ungrounded_dependency_installs(data)
+    ChangePlannerAgent._normalize_postcondition_args(data)
 
     assert [item["step_id"] for item in data["changes"]] == ["clone", "config"]
     assert data["changes"][1]["depends_on"] == ["clone"]
@@ -1560,9 +1560,9 @@ def test_planner_compiles_python_checker_aliases_and_drops_dependency_install():
 
 @pytest.mark.parametrize("alias", ["candidates", "candidate_ports"])
 def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    requests = V4ChangePlannerAgent._probe_requests(
+    requests = ChangePlannerAgent._probe_requests(
         [
             {
                 "probe": "ports",
@@ -1576,9 +1576,9 @@ def test_planner_canonicalizes_port_probe_candidate_aliases(alias):
 
 
 def test_planner_bounds_port_probe_candidates():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    requests = V4ChangePlannerAgent._probe_requests(
+    requests = ChangePlannerAgent._probe_requests(
         [
             {
                 "probe": "ports",
@@ -1592,9 +1592,9 @@ def test_planner_bounds_port_probe_candidates():
 
 
 def test_planner_routes_python_source_log_request_to_ops_file():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    requests = V4ChangePlannerAgent._probe_requests([{
+    requests = ChangePlannerAgent._probe_requests([{
         "probe": "logs",
         "args": {"path": "/srv/102/mains/master_main.py"},
         "purpose": "inspect startup entry source",
@@ -1607,12 +1607,12 @@ def test_planner_routes_python_source_log_request_to_ops_file():
 
 def test_planner_reassigns_occupied_host_port_from_probed_free_candidates():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="deploy")
     bundle.add(
@@ -1648,7 +1648,7 @@ def test_planner_reassigns_occupied_host_port_from_probed_free_candidates():
         ),
     ]
 
-    V4ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
+    ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
 
     assert resources[0].value == 5011
     assert resources[1].value == 45552
@@ -1658,12 +1658,12 @@ def test_planner_reassigns_occupied_host_port_from_probed_free_candidates():
 
 def test_planner_never_reassigns_observed_old_runtime_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="migrate test worker")
     bundle.add(EvidenceRecord.from_probe(
@@ -1690,7 +1690,7 @@ def test_planner_never_reassigns_observed_old_runtime_port():
         consumers=["stop-test.test_worker_old_port"],
     )
 
-    V4ChangePlannerAgent._normalize_occupied_host_ports(
+    ChangePlannerAgent._normalize_occupied_host_ports(
         data, [resource], bundle,
     )
 
@@ -1702,12 +1702,12 @@ def test_planner_never_reassigns_observed_old_runtime_port():
 
 def test_planner_preserves_occupied_ports_owned_by_repaired_runtime_root():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair formal")
     bundle.add(
@@ -1746,8 +1746,8 @@ def test_planner_preserves_occupied_ports_owned_by_repaired_runtime_root():
         ),
     ]
 
-    V4ChangePlannerAgent._mark_existing_runtime_ports(data, resources, bundle)
-    V4ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
+    ChangePlannerAgent._mark_existing_runtime_ports(data, resources, bundle)
+    ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
 
     assert [resource.value for resource in resources] == [45551, 45552]
     assert {resource.source for resource in resources} == {"existing_runtime"}
@@ -1756,10 +1756,10 @@ def test_planner_preserves_occupied_ports_owned_by_repaired_runtime_root():
 
 def test_generic_derived_port_matching_repaired_root_is_existing_runtime():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair formal")
     bundle.add(EvidenceRecord.from_probe(
@@ -1782,8 +1782,8 @@ def test_generic_derived_port_matching_repaired_root_is_existing_runtime():
         "derived", consumers=["formal.port_45551"],
     )
 
-    V4ChangePlannerAgent._mark_existing_runtime_ports(data, [resource], bundle)
-    V4ChangePlannerAgent._normalize_occupied_host_ports(data, [resource], bundle)
+    ChangePlannerAgent._mark_existing_runtime_ports(data, [resource], bundle)
+    ChangePlannerAgent._normalize_occupied_host_ports(data, [resource], bundle)
 
     assert resource.value == 45551
     assert resource.source == "existing_runtime"
@@ -1792,12 +1792,12 @@ def test_generic_derived_port_matching_repaired_root_is_existing_runtime():
 
 def test_planner_reassigns_new_port_that_collides_with_another_active_config_role():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="isolate test")
     bundle.add(EvidenceRecord.from_probe(
@@ -1834,8 +1834,8 @@ def test_planner_reassigns_new_port_that_collides_with_another_active_config_rol
         ),
     ]
 
-    V4ChangePlannerAgent._mark_existing_config_ports(data, resources, bundle)
-    V4ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
+    ChangePlannerAgent._mark_existing_config_ports(data, resources, bundle)
+    ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
 
     assert resources[0].value == 45554
     assert resources[1].value == 45553
@@ -1845,7 +1845,7 @@ def test_planner_reassigns_new_port_that_collides_with_another_active_config_rol
 
 
 def test_runtime_stop_scope_preserves_non_worker_roles_and_recovery_targets_later_start():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"changes": [
         {
@@ -1864,7 +1864,7 @@ def test_runtime_stop_scope_preserves_non_worker_roles_and_recovery_targets_late
         },
     ]}
 
-    V4ChangePlannerAgent._normalize_runtime_stop_scope(data)
+    ChangePlannerAgent._normalize_runtime_stop_scope(data)
 
     stop = data["changes"][0]
     assert "only worker processes" in stop["objective"]
@@ -1875,10 +1875,10 @@ def test_runtime_stop_scope_preserves_non_worker_roles_and_recovery_targets_late
 
 
 def test_runtime_stop_scope_uses_authoritative_goal_root_and_worker_port():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     goal = (
         "repair /home/lzl/vemu_uestc and /home/lzl/test/vemu_uestc; "
@@ -1910,7 +1910,7 @@ def test_runtime_stop_scope_uses_authoritative_goal_root_and_worker_port():
         }],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_stop_scope(data, goal, bundle)
+    ChangePlannerAgent._normalize_runtime_stop_scope(data, goal, bundle)
 
     stop = data["changes"][0]
     assert stop["title"] == "Stop root-bound worker on port 45552"
@@ -1933,10 +1933,10 @@ def test_runtime_stop_scope_uses_authoritative_goal_root_and_worker_port():
 
 
 def test_combined_migration_freezes_worker_pgid_from_running_inventory():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     goal = "stop /home/lzl/test/vemu_uestc worker on 45552 then move it to 45555"
     bundle = EvidenceBundle(goal=goal)
@@ -1959,7 +1959,7 @@ def test_combined_migration_freezes_worker_pgid_from_running_inventory():
         }],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_stop_scope(data, goal, bundle)
+    ChangePlannerAgent._normalize_runtime_stop_scope(data, goal, bundle)
 
     assert data["changes"][0]["title"] == "Repair test worker: stop old worker, set port, start worker"
     assert "45555" in data["changes"][0]["objective"]
@@ -1972,12 +1972,12 @@ def test_combined_migration_freezes_worker_pgid_from_running_inventory():
 
 
 def test_runtime_health_recovery_is_attached_to_later_start_not_stop_step():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="repair test")
     bundle.add(EvidenceRecord.from_probe(
@@ -2007,17 +2007,17 @@ def test_runtime_health_recovery_is_attached_to_later_start_not_stop_step():
         ],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
 
     assert all("restart unhealthy" not in item for item in data["changes"][0]["expected_changes"])
     assert any("restart unhealthy master role at 45555" in item for item in data["changes"][1]["expected_changes"])
 
 
 def test_generic_healthy_outcome_does_not_hide_restart_unhealthy_disposition():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="restore formal")
     bundle.add(EvidenceRecord.from_probe(
@@ -2037,7 +2037,7 @@ def test_generic_healthy_outcome_does_not_hide_restart_unhealthy_disposition():
         }],
     }
 
-    V4ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
 
     expected = data["changes"][0]["expected_changes"]
     assert any("restart unhealthy master role at 45551" in item for item in expected)
@@ -2045,7 +2045,7 @@ def test_generic_healthy_outcome_does_not_hide_restart_unhealthy_disposition():
 
 
 def test_same_root_master_worker_recovery_changes_are_merged():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [{
@@ -2075,7 +2075,7 @@ def test_same_root_master_worker_recovery_changes_are_merged():
         ],
     }
 
-    V4ChangePlannerAgent._collapse_redundant_runtime_repair_changes(data)
+    ChangePlannerAgent._collapse_redundant_runtime_repair_changes(data)
 
     assert [item["step_id"] for item in data["changes"]] == ["test", "worker"]
     assert "master restarts" in data["changes"][1]["expected_changes"]
@@ -2083,7 +2083,7 @@ def test_same_root_master_worker_recovery_changes_are_merged():
 
 
 def test_same_root_duplicate_stop_is_folded_into_recovery_owner():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [{
@@ -2111,7 +2111,7 @@ def test_same_root_duplicate_stop_is_folded_into_recovery_owner():
         ],
     }
 
-    V4ChangePlannerAgent._collapse_redundant_runtime_repair_changes(data)
+    ChangePlannerAgent._collapse_redundant_runtime_repair_changes(data)
 
     assert [item["step_id"] for item in data["changes"]] == ["repair"]
     assert "PID 1234 stops" in data["changes"][0]["expected_changes"]
@@ -2120,7 +2120,7 @@ def test_same_root_duplicate_stop_is_folded_into_recovery_owner():
 
 def test_backend_port_availability_uses_explicit_existing_source():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     existing = PlanResource(
         "worker_port", "port", "frozen", "worker_port", 27695,
@@ -2131,12 +2131,12 @@ def test_backend_port_availability_uses_explicit_existing_source():
         "planner_decision", consumers=["migrate.worker_port"],
     )
 
-    assert not V4ChangePlannerAgent._requires_host_port_availability(existing)
-    assert V4ChangePlannerAgent._requires_host_port_availability(allocated)
+    assert not ChangePlannerAgent._requires_host_port_availability(existing)
+    assert ChangePlannerAgent._requires_host_port_availability(allocated)
 
 
 def test_health_url_only_port_is_derived_as_observation_not_allocation():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"changes": [{
         "step_id": "repair",
@@ -2152,17 +2152,17 @@ def test_health_url_only_port_is_derived_as_observation_not_allocation():
         }],
     }]}
 
-    resources = V4ChangePlannerAgent._normalize_derived_resources(data, [])
+    resources = ChangePlannerAgent._normalize_derived_resources(data, [])
     by_value = {int(item.value): item for item in resources if item.kind == "port"}
 
     assert by_value[27694].role == "selected_host_port"
     assert by_value[27695].role == "observed_endpoint_port"
     assert by_value[27695].source == "derived_observation"
-    assert not V4ChangePlannerAgent._requires_host_port_availability(by_value[27695])
+    assert not ChangePlannerAgent._requires_host_port_availability(by_value[27695])
 
 
 def test_same_root_recovery_changes_merge_for_arbitrary_project_name():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [
@@ -2188,7 +2188,7 @@ def test_same_root_recovery_changes_merge_for_arbitrary_project_name():
         ],
     }
 
-    V4ChangePlannerAgent._collapse_redundant_runtime_repair_changes(data)
+    ChangePlannerAgent._collapse_redundant_runtime_repair_changes(data)
 
     assert [item["step_id"] for item in data["changes"]] == ["edit"]
     assert "master starts" in data["changes"][0]["expected_changes"]
@@ -2197,7 +2197,7 @@ def test_same_root_recovery_changes_merge_for_arbitrary_project_name():
 
 def test_instance_root_consumers_are_grounded_to_the_exact_sibling_change():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"changes": [
         {"step_id": "test", "objective": "Repair /home/lzl/test/vemu_uestc"},
@@ -2215,21 +2215,21 @@ def test_instance_root_consumers_are_grounded_to_the_exact_sibling_change():
         ),
     ]
 
-    V4ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
+    ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
 
     assert resources[0].consumers == ["test.instance_root"]
     assert resources[1].consumers == ["formal.instance_root"]
 
 
 def test_instance_prefixed_port_roles_are_canonicalized_before_health_coverage():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"resources": [
         {"name": "test_master_port", "kind": "port", "role": "test_master_port", "value": 45555},
         {"name": "prod_worker_port", "kind": "port", "role": "worker_port", "value": 45552},
     ]}
 
-    V4ChangePlannerAgent._normalize_port_resource_roles(data)
+    ChangePlannerAgent._normalize_port_resource_roles(data)
 
     assert [item["role"] for item in data["resources"]] == [
         "master_port", "worker_port",
@@ -2237,7 +2237,7 @@ def test_instance_prefixed_port_roles_are_canonicalized_before_health_coverage()
 
 
 def test_new_destination_port_role_is_canonicalized():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"resources": [{
         "name": "test_master_new_port",
@@ -2246,13 +2246,13 @@ def test_new_destination_port_role_is_canonicalized():
         "value": 45555,
     }]}
 
-    V4ChangePlannerAgent._normalize_port_resource_roles(data)
+    ChangePlannerAgent._normalize_port_resource_roles(data)
 
     assert data["resources"][0]["role"] == "master_port"
 
 
 def test_destination_port_suffix_role_is_canonicalized():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"resources": [{
         "name": "test_worker_port_new",
@@ -2261,14 +2261,14 @@ def test_destination_port_suffix_role_is_canonicalized():
         "value": 45555,
     }]}
 
-    V4ChangePlannerAgent._normalize_port_resource_roles(data)
+    ChangePlannerAgent._normalize_port_resource_roles(data)
 
     assert data["resources"][0]["role"] == "worker_port"
 
 
 def test_config_resource_is_rebound_to_existing_instance_config():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
@@ -2291,7 +2291,7 @@ def test_config_resource_is_rebound_to_existing_instance_config():
             ),
         ]
 
-        V4ChangePlannerAgent._normalize_existing_config_paths(data, resources)
+        ChangePlannerAgent._normalize_existing_config_paths(data, resources)
 
         assert resources[1].value == str(config)
         assert resources[1].source == "derived_from_existing_instance_root"
@@ -2299,7 +2299,7 @@ def test_config_resource_is_rebound_to_existing_instance_config():
 
 def test_worker_gun_path_is_not_used_as_platform_port_config_path():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
@@ -2318,7 +2318,7 @@ def test_worker_gun_path_is_not_used_as_platform_port_config_path():
             PlanResource("test_worker_gun", "path", "frozen", "worker_gun", str(worker_gun), consumers=["change-1.path"]),
         ]
 
-        V4ChangePlannerAgent._normalize_existing_config_paths(data, resources)
+        ChangePlannerAgent._normalize_existing_config_paths(data, resources)
 
         assert resources[1].consumers == ["change-1.worker_gun"]
         assert any(
@@ -2330,27 +2330,27 @@ def test_worker_gun_path_is_not_used_as_platform_port_config_path():
 
 
 def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     invalid = {
         "status": "ready",
-        "goal": "deploy isolated instance to /srv/v4e2e",
+        "goal": "deploy isolated instance to /srv/appe2e",
         "resources": [],
         "changes": [
             {
                 "step_id": "deploy",
                 "title": "deploy",
-                "objective": "clone into /srv/v4e2e",
+                "objective": "clone into /srv/appe2e",
                 "reason": "deploy",
                 "evidence_refs": [evidence_id],
                 "depends_on": [],
                 "risk": "high",
-                "expected_changes": ["/srv/v4e2e is created"],
+                "expected_changes": ["/srv/appe2e is created"],
                 "postconditions": [
                     {
                         "checker": "file_contains",
-                        "args": {"path": "/srv/v4e2e/config.py", "content": "x"},
+                        "args": {"path": "/srv/appe2e/config.py", "content": "x"},
                     }
                 ],
             }
@@ -2364,7 +2364,7 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
                 "kind": "path",
                 "status": "frozen",
                 "role": "instance_root",
-                "value": "/srv/v4e2e",
+                "value": "/srv/appe2e",
                 "source": "user_input",
                 "consumers": ["deploy.repository"],
             },
@@ -2400,7 +2400,7 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
                 "kind": "path",
                 "status": "frozen",
                 "role": "instance_config_path",
-                "value": "/srv/v4e2e/config.py",
+                "value": "/srv/appe2e/config.py",
                 "source": "derived_from_evidence",
                 "consumers": ["deploy.path"],
             },
@@ -2420,7 +2420,7 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
                 "postconditions": [
                     {
                         "checker": "file_contains",
-                        "args": {"path": "/srv/v4e2e/config.py", "text": "x"},
+                        "args": {"path": "/srv/appe2e/config.py", "text": "x"},
                     }
                 ],
             }
@@ -2428,8 +2428,8 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
     }
     llm = FakeLLM([json.dumps(invalid), json.dumps(valid)])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
-        "deploy isolated instance to /srv/v4e2e",
+    outcome = ChangePlannerAgent(llm).plan(
+        "deploy isolated instance to /srv/appe2e",
         bundle,
         conclusion,
     )
@@ -2449,12 +2449,12 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
 
 def test_deployment_contract_preserves_fixed_names_from_original_goal():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, _, _ = _bundle_and_conclusion()
     resources = [
         PlanResource(
-            "instance_root", "path", "frozen", "instance_root", "/srv/v4e2e",
+            "instance_root", "path", "frozen", "instance_root", "/srv/appe2e",
             "user_input", consumers=["deploy.repository"],
         ),
         PlanResource(
@@ -2488,17 +2488,17 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
                 "risk": "high",
                 "expected_changes": ["created"],
                 "postconditions": [
-                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e"}}
+                    {"checker": "file_exists", "args": {"path": "/srv/appe2e"}}
                 ],
             }
         ],
         "assumptions": [],
     }
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         data,
         (
-            "deploy isolated instance to /srv/v4e2e; "
+            "deploy isolated instance to /srv/appe2e; "
             "实例名固定为 v4e2e，Nginx 配置名固定为 klonet-v4-e2e"
         ),
         resources,
@@ -2513,12 +2513,12 @@ def test_deployment_contract_preserves_fixed_names_from_original_goal():
 
 def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic_steps():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, _, _ = _bundle_and_conclusion()
     resources = [
         PlanResource(
-            "instance_root", "path", "frozen", "instance_root", "/srv/v4e2e",
+            "instance_root", "path", "frozen", "instance_root", "/srv/appe2e",
             "user_input", consumers=["clone.repository"],
         ),
         PlanResource(
@@ -2539,7 +2539,7 @@ def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic
         ),
         PlanResource(
             "config_path", "path", "frozen", "config_file_path",
-            "/srv/v4e2e/config.py", "derived", consumers=["configure.path"],
+            "/srv/appe2e/config.py", "derived", consumers=["configure.path"],
         ),
     ]
     data = {
@@ -2551,7 +2551,7 @@ def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic
                 "step_id": "clone", "risk": "medium",
                 "expected_changes": ["clone repository"],
                 "postconditions": [
-                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/.git"}}
+                    {"checker": "file_exists", "args": {"path": "/srv/appe2e/.git"}}
                 ],
             },
             {
@@ -2560,8 +2560,8 @@ def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic
                     "Set master_port to 47001", "Set worker_port to 47002"
                 ],
                 "postconditions": [
-                    {"checker": "file_contains", "args": {"path": "/srv/v4e2e/config.py", "text": "master_port = 47001"}},
-                    {"checker": "file_contains", "args": {"path": "/srv/v4e2e/config.py", "text": "worker_port = 47002"}},
+                    {"checker": "file_contains", "args": {"path": "/srv/appe2e/config.py", "text": "master_port = 47001"}},
+                    {"checker": "file_contains", "args": {"path": "/srv/appe2e/config.py", "text": "worker_port = 47002"}},
                 ],
             },
             {
@@ -2576,9 +2576,9 @@ def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic
         "assumptions": [],
     }
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         data,
-        "deploy isolated instance to /srv/v4e2e; instance name fixed as v4e2e",
+        "deploy isolated instance to /srv/appe2e; instance name fixed as v4e2e",
         resources,
         bundle,
     )
@@ -2590,7 +2590,7 @@ def test_deployment_contract_rejects_unfrozen_ports_but_allows_cohesive_semantic
 
 def test_change_planner_rejects_resource_consumer_with_multiple_owners():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, _, _ = _bundle_and_conclusion()
     resources = [
@@ -2614,7 +2614,7 @@ def test_change_planner_rejects_resource_consumer_with_multiple_owners():
         ),
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"changes": [], "assumptions": []},
         "configure deployment",
         resources,
@@ -2629,7 +2629,7 @@ def test_change_planner_rejects_resource_consumer_with_multiple_owners():
 
 def test_change_planner_normalizes_ambiguous_consumer_owners_by_resource_role():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     resources = [
         PlanResource(
@@ -2637,7 +2637,7 @@ def test_change_planner_normalizes_ambiguous_consumer_owners_by_resource_role():
             "path",
             "frozen",
             "instance_root",
-            "/srv/v4e2e",
+            "/srv/appe2e",
             "user_input",
             consumers=["change-2.config", "change-3.config_name"],
         ),
@@ -2661,7 +2661,7 @@ def test_change_planner_normalizes_ambiguous_consumer_owners_by_resource_role():
         ),
     ]
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(
+    normalized = ChangePlannerAgent._normalize_derived_resources(
         {"changes": []}, resources
     )
     consumers = {
@@ -2683,7 +2683,7 @@ def test_change_planner_normalizes_ambiguous_consumer_owners_by_resource_role():
 
 
 def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -2691,11 +2691,11 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
                 "postconditions": [
                     {
                         "checker": "git_revision",
-                        "args": {"path": "/srv/v4e2e", "revision": "abc123"},
+                        "args": {"path": "/srv/appe2e", "revision": "abc123"},
                     },
                     {
                         "checker": "file_contains",
-                        "args": {"path": "/srv/v4e2e/config.py", "content": "47001"},
+                        "args": {"path": "/srv/appe2e/config.py", "content": "47001"},
                     },
                     {
                         "checker": "screen_session_exists",
@@ -2710,15 +2710,15 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
         ]
     }
 
-    V4ChangePlannerAgent._normalize_postcondition_args(data)
+    ChangePlannerAgent._normalize_postcondition_args(data)
 
     checks = data["changes"][0]["postconditions"]
     assert checks[0]["args"] == {
-        "repository": "/srv/v4e2e",
+        "repository": "/srv/appe2e",
         "revision": "abc123",
     }
     assert checks[1]["args"] == {
-        "path": "/srv/v4e2e/config.py",
+        "path": "/srv/appe2e/config.py",
         "text": "47001",
     }
     assert checks[2]["args"] == {"session": "v4e2e_web"}
@@ -2727,7 +2727,7 @@ def test_change_planner_normalizes_unambiguous_checker_argument_aliases():
 
 def test_change_planner_derives_frozen_source_revision_for_clone_binding():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     resources = [
         PlanResource(
@@ -2735,7 +2735,7 @@ def test_change_planner_derives_frozen_source_revision_for_clone_binding():
             "path",
             "frozen",
             "instance_root",
-            "/srv/v4e2e",
+            "/srv/appe2e",
             "user_input",
             consumers=["clone.repository"],
         )
@@ -2751,7 +2751,7 @@ def test_change_planner_derives_frozen_source_revision_for_clone_binding():
                     {
                         "checker": "git_revision",
                         "args": {
-                            "repository": "/srv/v4e2e",
+                            "repository": "/srv/appe2e",
                             "revision": "a" * 40,
                         },
                     }
@@ -2760,7 +2760,7 @@ def test_change_planner_derives_frozen_source_revision_for_clone_binding():
         ]
     }
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, resources)
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, resources)
 
     revision = next(item for item in normalized if item.role == "source_revision")
     assert revision.value == "a" * 40
@@ -2768,9 +2768,9 @@ def test_change_planner_derives_frozen_source_revision_for_clone_binding():
 
 
 def test_change_planner_derives_fixed_nginx_name_from_site_path():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(
+    normalized = ChangePlannerAgent._normalize_derived_resources(
         {
             "changes": [
                 {
@@ -2801,7 +2801,7 @@ def test_change_planner_derives_fixed_nginx_name_from_site_path():
 
 def test_complete_klonet_deployment_contract_requires_all_runtime_components_and_ports():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     resources = [
         PlanResource(
@@ -2843,7 +2843,7 @@ def test_complete_klonet_deployment_contract_requires_all_runtime_components_and
         ],
     }
 
-    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+    errors = ChangePlannerAgent._complete_klonet_contract_errors(
         data, resources
     )
 
@@ -2854,7 +2854,7 @@ def test_complete_klonet_deployment_contract_requires_all_runtime_components_and
 
 def test_complete_klonet_deployment_contract_requires_config_fields_and_master_nginx_upstream():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     resources = [
         PlanResource(
@@ -2904,7 +2904,7 @@ def test_complete_klonet_deployment_contract_requires_config_fields_and_master_n
         ],
     }
 
-    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
+    errors = ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
 
     assert (
         "complete Klonet configuration missing attributes="
@@ -2917,13 +2917,13 @@ def test_complete_klonet_deployment_contract_requires_config_fields_and_master_n
 
 def test_complete_klonet_deployment_contract_rejects_unsupported_data_server_component():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     resource = PlanResource(
         "data_server_port", "port", "frozen", "data_server_port", 47004,
         "planner_choice", consumers=["config.data_server_port"],
     )
-    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+    errors = ChangePlannerAgent._complete_klonet_contract_errors(
         {
             "goal": "deploy a complete isolated Klonet platform instance",
             "changes": [
@@ -2943,9 +2943,9 @@ def test_complete_klonet_deployment_contract_rejects_unsupported_data_server_com
 
 
 def test_complete_klonet_deployment_contract_rejects_invented_database_migration():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+    errors = ChangePlannerAgent._complete_klonet_contract_errors(
         {
             "goal": "deploy a complete isolated Klonet platform instance",
             "changes": [
@@ -2968,9 +2968,9 @@ def test_complete_klonet_deployment_contract_rejects_invented_database_migration
 
 
 def test_complete_klonet_contract_allows_create_all_during_application_start():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+    errors = ChangePlannerAgent._complete_klonet_contract_errors(
         {
             "goal": "deploy a complete isolated Klonet platform instance",
             "changes": [{
@@ -2989,9 +2989,9 @@ def test_complete_klonet_contract_allows_create_all_during_application_start():
 
 
 def test_complete_klonet_deployment_rejects_ungrounded_dependency_install_step():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    errors = V4ChangePlannerAgent._complete_klonet_contract_errors(
+    errors = ChangePlannerAgent._complete_klonet_contract_errors(
         {
             "goal": "deploy a complete isolated Klonet platform instance",
             "changes": [{
@@ -3007,7 +3007,7 @@ def test_complete_klonet_deployment_rejects_ungrounded_dependency_install_step()
 
 def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     resources = [
         PlanResource(
@@ -3034,7 +3034,7 @@ def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
         ]
     }
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(
+    normalized = ChangePlannerAgent._normalize_derived_resources(
         data, resources
     )
 
@@ -3045,7 +3045,7 @@ def test_change_planner_does_not_rederive_explicit_internal_port_as_host_port():
 
 
 def test_http_success_status_is_not_derived_as_a_host_port():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {"changes": [{
         "step_id": "recover",
@@ -3055,13 +3055,13 @@ def test_http_success_status_is_not_derived_as_a_host_port():
         "postconditions": [],
     }]}
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [])
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, [])
 
     assert not any(item.kind == "port" and item.value == 200 for item in normalized)
 
 
 def test_change_planner_freezes_standard_stateful_container_internal_ports():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -3075,7 +3075,7 @@ def test_change_planner_freezes_standard_stateful_container_internal_ports():
         ]
     }
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [])
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, [])
     internal = {
         item.value: item
         for item in normalized
@@ -3090,14 +3090,14 @@ def test_change_planner_freezes_standard_stateful_container_internal_ports():
 
 def test_change_planner_freezes_multiple_future_paths_with_unique_consumers():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     root = PlanResource(
         "instance_root",
         "path",
         "frozen",
         "instance_root",
-        "/srv/v4e2e",
+        "/srv/appe2e",
         "user_input",
         consumers=["change-1.repository"],
     )
@@ -3106,15 +3106,15 @@ def test_change_planner_freezes_multiple_future_paths_with_unique_consumers():
             {
                 "step_id": "change-2",
                 "postconditions": [
-                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/a.py"}},
-                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/b.py"}},
+                    {"checker": "file_exists", "args": {"path": "/srv/appe2e/a.py"}},
+                    {"checker": "file_exists", "args": {"path": "/srv/appe2e/b.py"}},
                 ],
             }
         ]
     }
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, [root])
-    derived = [item for item in normalized if item.value in {"/srv/v4e2e/a.py", "/srv/v4e2e/b.py"}]
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, [root])
+    derived = [item for item in normalized if item.value in {"/srv/appe2e/a.py", "/srv/appe2e/b.py"}]
 
     assert len(derived) == 2
     assert {item.consumers[0] for item in derived} == {
@@ -3124,22 +3124,22 @@ def test_change_planner_freezes_multiple_future_paths_with_unique_consumers():
 
 
 def test_isolation_contract_distinguishes_negated_and_positive_reuse_claims():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    negative = V4ChangePlannerAgent._ready_contract_errors(
+    negative = ChangePlannerAgent._ready_contract_errors(
         {"changes": [], "assumptions": ["Never reuse or share existing containers."]},
         "deploy an isolated instance",
         [],
         _bundle_and_conclusion()[0],
     )
-    positive = V4ChangePlannerAgent._ready_contract_errors(
+    positive = ChangePlannerAgent._ready_contract_errors(
         {"changes": [], "assumptions": ["Use the existing shared Redis container."]},
         "deploy an isolated instance",
         [],
         _bundle_and_conclusion()[0],
     )
 
-    comparative = V4ChangePlannerAgent._ready_contract_errors(
+    comparative = ChangePlannerAgent._ready_contract_errors(
         {
             "changes": [],
             "assumptions": [
@@ -3157,9 +3157,9 @@ def test_isolation_contract_distinguishes_negated_and_positive_reuse_claims():
 
 
 def test_isolation_contract_does_not_classify_celery_consumer_as_stateful_provisioning():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {
             "changes": [
                 {
@@ -3187,7 +3187,7 @@ def test_isolation_contract_does_not_classify_celery_consumer_as_stateful_provis
 
 
 def test_isolated_application_start_must_depend_on_stateful_provisioning():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     changes = [
         {
@@ -3212,7 +3212,7 @@ def test_isolated_application_start_must_depend_on_stateful_provisioning():
         },
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
         "deploy a new isolated instance without interfering with existing services",
         [],
@@ -3226,7 +3226,7 @@ def test_isolated_application_start_must_depend_on_stateful_provisioning():
 
 
 def test_isolated_stateful_services_must_use_new_named_containers():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     changes = [
         {
@@ -3241,7 +3241,7 @@ def test_isolated_stateful_services_must_use_new_named_containers():
         }
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
         "deploy a new isolated instance without reusing existing services",
         [],
@@ -3252,7 +3252,7 @@ def test_isolated_stateful_services_must_use_new_named_containers():
 
 
 def test_celery_start_is_not_misclassified_as_stateful_service_provisioning():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     changes = [
         {
@@ -3269,7 +3269,7 @@ def test_celery_start_is_not_misclassified_as_stateful_service_provisioning():
         }
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
         "deploy a new isolated instance",
         [],
@@ -3280,7 +3280,7 @@ def test_celery_start_is_not_misclassified_as_stateful_service_provisioning():
 
 
 def test_runtime_start_after_stateful_dependencies_is_not_stateful_provisioning():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     changes = [{
         "step_id": "runtime",
@@ -3293,7 +3293,7 @@ def test_runtime_start_after_stateful_dependencies_is_not_stateful_provisioning(
         "expected_changes": ["four Screen sessions start"],
     }]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
         "deploy a new isolated instance",
         [],
@@ -3304,7 +3304,7 @@ def test_runtime_start_after_stateful_dependencies_is_not_stateful_provisioning(
 
 
 def test_isolated_nginx_must_depend_on_started_application():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     changes = [
         {
@@ -3327,7 +3327,7 @@ def test_isolated_nginx_must_depend_on_started_application():
         },
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
         "deploy a new isolated instance",
         [],
@@ -3338,7 +3338,7 @@ def test_isolated_nginx_must_depend_on_started_application():
 
 
 def test_change_planner_topologically_orders_forward_semantic_dependencies():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -3348,7 +3348,7 @@ def test_change_planner_topologically_orders_forward_semantic_dependencies():
         ]
     }
 
-    V4ChangePlannerAgent._normalize_change_order(data)
+    ChangePlannerAgent._normalize_change_order(data)
 
     assert [item["step_id"] for item in data["changes"]] == [
         "clone", "state", "start"
@@ -3356,7 +3356,7 @@ def test_change_planner_topologically_orders_forward_semantic_dependencies():
 
 
 def test_change_planner_rejects_verification_only_semantic_change():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     changes = [
         {
@@ -3371,7 +3371,7 @@ def test_change_planner_rejects_verification_only_semantic_change():
         }
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": changes, "assumptions": []},
         "deploy a new isolated instance",
         [],
@@ -3387,7 +3387,7 @@ def test_change_planner_rejects_verification_only_semantic_change():
 
 
 def test_change_planner_moves_leaf_verification_into_predecessor_postconditions():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [
@@ -3422,7 +3422,7 @@ def test_change_planner_moves_leaf_verification_into_predecessor_postconditions(
         ],
     }
 
-    V4ChangePlannerAgent._normalize_verification_changes(data)
+    ChangePlannerAgent._normalize_verification_changes(data)
 
     assert [item["step_id"] for item in data["changes"]] == ["nginx"]
     assert data["changes"][0]["postconditions"][-1]["checker"] == "http_status"
@@ -3431,7 +3431,7 @@ def test_change_planner_moves_leaf_verification_into_predecessor_postconditions(
 
 def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     change = {
         "step_id": "nginx",
@@ -3448,13 +3448,13 @@ def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
         "planner_choice", consumers=["nginx.listen_port"],
     )
 
-    missing = V4ChangePlannerAgent._ready_contract_errors(
+    missing = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy v4e2e", "changes": [change], "assumptions": []},
         "deploy a new isolated instance",
         [],
         _bundle_and_conclusion()[0],
     )
-    explicit = V4ChangePlannerAgent._ready_contract_errors(
+    explicit = ChangePlannerAgent._ready_contract_errors(
         {
             "goal": "deploy v4e2e",
             "changes": [{
@@ -3470,7 +3470,7 @@ def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
         [port],
         _bundle_and_conclusion()[0],
     )
-    shared = V4ChangePlannerAgent._ready_contract_errors(
+    shared = ChangePlannerAgent._ready_contract_errors(
         {
             "goal": "deploy v4e2e",
             "changes": [
@@ -3507,7 +3507,7 @@ def test_isolated_nginx_requires_explicit_frozen_dedicated_listen_port():
 
 def test_isolated_nginx_allows_prepare_before_app_and_activation_after_app():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     port = PlanResource(
         "nginx_listen_port", "port", "frozen", "nginx_listen_port", 47008,
@@ -3550,7 +3550,7 @@ def test_isolated_nginx_allows_prepare_before_app_and_activation_after_app():
         },
     ]
 
-    errors = V4ChangePlannerAgent._ready_contract_errors(
+    errors = ChangePlannerAgent._ready_contract_errors(
         {"goal": "deploy isolated instance", "changes": changes, "assumptions": []},
         "deploy isolated instance",
         [port],
@@ -3563,7 +3563,7 @@ def test_isolated_nginx_allows_prepare_before_app_and_activation_after_app():
 
 def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -3584,7 +3584,7 @@ def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
         )
     ]
 
-    V4ChangePlannerAgent._normalize_nginx_postconditions(data, resources)
+    ChangePlannerAgent._normalize_nginx_postconditions(data, resources)
 
     assert data["changes"][0]["postconditions"][-1] == {
         "checker": "http_status",
@@ -3594,7 +3594,7 @@ def test_change_planner_adds_http_check_for_frozen_nginx_listen_port():
 
 def test_nginx_health_check_moves_from_prepare_to_activation():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -3623,7 +3623,7 @@ def test_nginx_health_check_moves_from_prepare_to_activation():
         )
     ]
 
-    V4ChangePlannerAgent._normalize_nginx_postconditions(data, resources)
+    ChangePlannerAgent._normalize_nginx_postconditions(data, resources)
 
     assert all(
         check["checker"] not in {"http_status", "port_listening"}
@@ -3636,7 +3636,7 @@ def test_nginx_health_check_moves_from_prepare_to_activation():
 
 
 def test_http_observation_does_not_claim_a_listening_port():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -3663,15 +3663,15 @@ def test_http_observation_does_not_claim_a_listening_port():
         ]
     }
 
-    assert V4ChangePlannerAgent._declared_listening_ports_by_step(data) == {
+    assert ChangePlannerAgent._declared_listening_ports_by_step(data) == {
         "verify": set(),
         "server": {47009},
     }
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
-    from klonet_agent.ops.privileged.v4.contracts import EvidenceRecord, ProbeRequest
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceRecord, ProbeRequest
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     payload = {
@@ -3680,7 +3680,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
         "resources": [
             {
                 "name": "instance_root", "kind": "path", "status": "frozen",
-                "role": "instance_root", "value": "/srv/v4e2e",
+                "role": "instance_root", "value": "/srv/appe2e",
                 "source": "user_input", "consumers": ["deploy.repository"],
             },
             {
@@ -3715,15 +3715,15 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
                 "reason": "deploy", "evidence_refs": [evidence_id], "depends_on": [],
                 "risk": "high", "expected_changes": ["created"],
                 "postconditions": [
-                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e"}}
+                    {"checker": "file_exists", "args": {"path": "/srv/appe2e"}}
                 ],
             }
         ],
     }
     llm = FakeLLM([json.dumps(payload)])
 
-    outcome = V4ChangePlannerAgent(llm).plan(
-        "deploy v4e2e to /srv/v4e2e", bundle, conclusion
+    outcome = ChangePlannerAgent(llm).plan(
+        "deploy v4e2e to /srv/appe2e", bundle, conclusion
     )
 
     assert outcome.status == "need_evidence"
@@ -3731,7 +3731,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
         ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability")
     ]
     assert outcome.candidate_plan is not None
-    assert outcome.candidate_plan.goal == "deploy v4e2e to /srv/v4e2e"
+    assert outcome.candidate_plan.goal == "deploy v4e2e to /srv/appe2e"
     assert next(
         item for item in outcome.candidate_plan.resources if item.kind == "port"
     ).value == 47002
@@ -3743,7 +3743,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
             "inspect_ports\nno matching listeners",
         )
     )
-    finalized = V4ChangePlannerAgent.finalize_candidate(
+    finalized = ChangePlannerAgent.finalize_candidate(
         outcome.candidate_plan,
         bundle,
     )
@@ -3753,7 +3753,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
 
 
 def test_planner_normalizes_derived_config_path_and_hidden_selected_port():
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
     payload = {
@@ -3762,7 +3762,7 @@ def test_planner_normalizes_derived_config_path_and_hidden_selected_port():
         "resources": [
             {
                 "name": "instance_root", "kind": "path", "status": "frozen",
-                "role": "instance_root", "value": "/srv/v4e2e",
+                "role": "instance_root", "value": "/srv/appe2e",
                 "source": "user_input", "consumers": ["clone.repository"],
             },
             {
@@ -3787,7 +3787,7 @@ def test_planner_normalizes_derived_config_path_and_hidden_selected_port():
                 "reason": "clone", "evidence_refs": [evidence_id], "depends_on": [],
                 "risk": "medium", "expected_changes": ["clone repository"],
                 "postconditions": [
-                    {"checker": "file_exists", "args": {"path": "/srv/v4e2e/.git"}}
+                    {"checker": "file_exists", "args": {"path": "/srv/appe2e/.git"}}
                 ],
             },
             {
@@ -3796,27 +3796,27 @@ def test_planner_normalizes_derived_config_path_and_hidden_selected_port():
                 "evidence_refs": [evidence_id], "depends_on": ["clone"],
                 "risk": "medium", "expected_changes": ["Set master_port to 47009"],
                 "postconditions": [
-                    {"checker": "file_contains", "args": {"path": "/srv/v4e2e/config.py", "text": "master_port = 47009"}}
+                    {"checker": "file_contains", "args": {"path": "/srv/appe2e/config.py", "text": "master_port = 47009"}}
                 ],
             },
         ],
         "assumptions": [],
     }
 
-    outcome = V4ChangePlannerAgent(FakeLLM([json.dumps(payload)])).plan(
-        "deploy isolated v4e2e to /srv/v4e2e", bundle, conclusion
+    outcome = ChangePlannerAgent(FakeLLM([json.dumps(payload)])).plan(
+        "deploy isolated v4e2e to /srv/appe2e", bundle, conclusion
     )
 
     assert outcome.status == "need_evidence"
     assert outcome.probe_requests[0].args == {"ports": [47009]}
     resources = outcome.candidate_plan.resources
     assert any(item.kind == "port" and item.value == 47009 for item in resources)
-    assert any(item.kind == "path" and item.value == "/srv/v4e2e/config.py" for item in resources)
+    assert any(item.kind == "path" and item.value == "/srv/appe2e/config.py" for item in resources)
 
 
 def test_derived_runtime_roots_are_scoped_per_same_named_instance():
     from klonet_agent.ops.privileged.contracts import PlanResource
-    from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "changes": [
@@ -3849,7 +3849,7 @@ def test_derived_runtime_roots_are_scoped_per_same_named_instance():
         ),
     ]
 
-    normalized = V4ChangePlannerAgent._normalize_derived_resources(data, resources)
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, resources)
     mains = {
         str(item.value): set(item.consumers)
         for item in normalized

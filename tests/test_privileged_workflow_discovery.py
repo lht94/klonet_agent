@@ -35,7 +35,7 @@ def test_user_visible_probe_purpose_is_chinese_even_when_model_purpose_is_englis
 
 
 def test_discovery_runs_registered_probes_and_reuses_duplicate_request():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM(
         [
@@ -77,7 +77,7 @@ def test_discovery_runs_registered_probes_and_reuses_duplicate_request():
         probe_calls.append(requests)
         return "evidence for %s" % requests[0]["probe"]
 
-    bundle = V4DiscoveryAgent(llm, probe_runner=run_probes).collect(
+    bundle = DiscoveryAgent(llm, probe_runner=run_probes).collect(
         "检查有哪些平台"
     )
 
@@ -93,8 +93,8 @@ def test_discovery_runs_registered_probes_and_reuses_duplicate_request():
 
 
 def test_discovery_marks_budget_exhaustion_instead_of_replanning_forever():
-    from klonet_agent.ops.privileged.v4.contracts import DiscoveryBudget
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.contracts import DiscoveryBudget
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM(
         [
@@ -116,7 +116,7 @@ def test_discovery_marks_budget_exhaustion_instead_of_replanning_forever():
             ),
         ]
     )
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: "ok",
         budget_factory=lambda: DiscoveryBudget(max_rounds=1),
@@ -128,7 +128,7 @@ def test_discovery_marks_budget_exhaustion_instead_of_replanning_forever():
 
 
 def test_discovery_normalizes_screen_evidence_section_aliases_to_registered_probe():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM(
         [
@@ -149,7 +149,7 @@ def test_discovery_normalizes_screen_evidence_section_aliases_to_registered_prob
         ]
     )
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests) or "screen evidence",
     ).collect("inspect Screen source")
@@ -159,18 +159,18 @@ def test_discovery_normalizes_screen_evidence_section_aliases_to_registered_prob
 
 
 def test_discovery_collect_requests_adds_only_fresh_registered_evidence():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     existing = ProbeRequest("screen", {}, "existing")
     bundle = EvidenceBundle(goal="deploy")
     bundle.add(EvidenceRecord.from_probe(existing, "screen evidence"))
     calls = []
-    agent = V4DiscoveryAgent(
+    agent = DiscoveryAgent(
         FakeLLM([]),
         probe_runner=lambda requests: calls.append(requests) or "port evidence",
     )
@@ -187,9 +187,9 @@ def test_discovery_collect_requests_adds_only_fresh_registered_evidence():
 
 
 def test_discovery_routes_python_source_log_request_to_ops_file():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
-    requests = V4DiscoveryAgent._requests([{
+    requests = DiscoveryAgent._requests([{
         "probe": "logs",
         "args": {"path": "/srv/102/mains/master_main.py"},
         "purpose": "inspect startup entry source",
@@ -204,7 +204,7 @@ def test_discovery_routes_python_source_log_request_to_ops_file():
 
 
 def test_discovery_derives_structured_git_record_from_unique_screen_source():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM(
         [
@@ -226,7 +226,7 @@ def test_discovery_derives_structured_git_record_from_unique_screen_source():
         "remotes=origin\tgitee:example/vemu.git (fetch)"
     )
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests) or output,
     ).collect("use Screen prefix vemu_uestc as source")
@@ -242,11 +242,11 @@ def test_discovery_derives_structured_git_record_from_unique_screen_source():
 
 
 def test_discovery_preloads_running_platform_inventory_for_healthy_count_goal():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM([json.dumps({"status": "ready"})])
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests)
         or "inspect_running_platforms\nhealthy_count=2",
@@ -260,11 +260,11 @@ def test_discovery_preloads_running_platform_inventory_for_healthy_count_goal():
 
 
 def test_discovery_preloads_running_platform_inventory_before_repairing_abnormal_platforms():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM([json.dumps({"status": "ready"})])
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests)
         or (
@@ -280,11 +280,11 @@ def test_discovery_preloads_running_platform_inventory_before_repairing_abnormal
 
 
 def test_named_platform_alias_continues_discovery_with_multiple_abnormal_roots():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM([json.dumps({"status": "ready"})])
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests)
         or (
@@ -389,12 +389,12 @@ def test_screen_and_process_evidence_ground_their_verified_project_root(
 
 
 def test_planner_requested_log_derives_target_traceback_source_probe():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     bundle = EvidenceBundle(goal="修复 102 平台启动异常")
     bundle.add(EvidenceRecord.from_probe(
@@ -416,7 +416,7 @@ def test_planner_requested_log_derives_target_traceback_source_probe():
         assert request["probe"] == "ops_file"
         return "read_ops_file\nraise RuntimeError('boot failure')"
 
-    discovery = V4DiscoveryAgent(FakeLLM([]), probe_runner=run)
+    discovery = DiscoveryAgent(FakeLLM([]), probe_runner=run)
     discovery.collect_requests(
         [ProbeRequest("logs", {"path": "/home/klonet-agent/102/logs/master.log"}, "log")],
         bundle,
@@ -428,8 +428,8 @@ def test_planner_requested_log_derives_target_traceback_source_probe():
 
 
 def test_selected_abnormal_master_inventory_collects_bound_process_log_and_source():
-    from klonet_agent.ops.privileged.v4.contracts import EvidenceBundle, ProbeRequest
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle, ProbeRequest
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     bundle = EvidenceBundle(goal="102 平台启动异常，请检查日志并修复")
     calls = []
@@ -455,7 +455,7 @@ def test_selected_abnormal_master_inventory_collects_bound_process_log_and_sourc
         assert request["probe"] == "ops_file"
         return "read_ops_file\nraise RuntimeError('boot failed')"
 
-    discovery = V4DiscoveryAgent(FakeLLM([]), probe_runner=run)
+    discovery = DiscoveryAgent(FakeLLM([]), probe_runner=run)
     discovery.collect_requests(
         [ProbeRequest("running_platforms", {}, "inventory")],
         bundle,
@@ -469,8 +469,8 @@ def test_selected_abnormal_master_inventory_collects_bound_process_log_and_sourc
 
 
 def test_selected_abnormal_master_reads_entry_when_process_log_has_no_traceback():
-    from klonet_agent.ops.privileged.v4.contracts import EvidenceBundle, ProbeRequest
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle, ProbeRequest
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     bundle = EvidenceBundle(goal="102 平台新增代码后无法启动，请修复")
     calls = []
@@ -490,7 +490,7 @@ def test_selected_abnormal_master_reads_entry_when_process_log_has_no_traceback(
         assert request["args"]["path"] == "/home/klonet-agent/102/mains/master_main.py"
         return "def KLONET_E2E_FAILURE():\n    raise RuntimeError('boom')"
 
-    discovery = V4DiscoveryAgent(FakeLLM([]), probe_runner=run)
+    discovery = DiscoveryAgent(FakeLLM([]), probe_runner=run)
     discovery.collect_requests(
         [ProbeRequest("running_platforms", {}, "inventory")],
         bundle,
@@ -502,11 +502,11 @@ def test_selected_abnormal_master_reads_entry_when_process_log_has_no_traceback(
 
 
 def test_discovery_preloads_inventory_for_explicit_platform_repair_without_health_words():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM([json.dumps({"status": "ready"})])
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests)
         or "inspect_running_platforms\nabnormal_count=2",
@@ -519,11 +519,11 @@ def test_discovery_preloads_inventory_for_explicit_platform_repair_without_healt
 
 
 def test_discovery_preloads_inventory_when_continuing_partial_instance_recovery():
-    from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     llm = FakeLLM([json.dumps({"status": "ready"})])
     calls = []
-    bundle = V4DiscoveryAgent(
+    bundle = DiscoveryAgent(
         llm,
         probe_runner=lambda requests: calls.append(requests)
         or "inspect_running_platforms\nabnormal_count=2",
@@ -536,12 +536,12 @@ def test_discovery_preloads_inventory_when_continuing_partial_instance_recovery(
 
 
 def test_synthesis_repairs_unknown_evidence_reference_once():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
+    from klonet_agent.ops.privileged.workflow.evidence_synthesis import EvidenceSynthesizer
 
     bundle = EvidenceBundle(goal="inspect")
     record = bundle.add(
@@ -571,19 +571,19 @@ def test_synthesis_repairs_unknown_evidence_reference_once():
         ]
     )
 
-    conclusion = V4EvidenceSynthesizer(llm).synthesize("inspect", bundle)
+    conclusion = EvidenceSynthesizer(llm).synthesize("inspect", bundle)
 
     assert conclusion.confirmed_facts[0].text == "one platform"
     assert len(llm.calls) == 2
 
 
 def test_synthesis_includes_probe_arguments_for_instance_attribution():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
+    from klonet_agent.ops.privileged.workflow.evidence_synthesis import EvidenceSynthesizer
 
     bundle = EvidenceBundle(goal="inspect")
     record = bundle.add(
@@ -610,19 +610,19 @@ def test_synthesis_includes_probe_arguments_for_instance_attribution():
         ]
     )
 
-    V4EvidenceSynthesizer(llm).synthesize("inspect", bundle)
+    EvidenceSynthesizer(llm).synthesize("inspect", bundle)
 
     payload = llm.calls[0]["messages"][1]["content"]
     assert '"args": {"url": "http://127.0.0.1:47001/server_health/"}' in payload
 
 
 def test_synthesis_promotes_user_selected_screen_git_mapping_deterministically():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
+    from klonet_agent.ops.privileged.workflow.evidence_synthesis import EvidenceSynthesizer
 
     bundle = EvidenceBundle(goal="use Screen prefix vemu_uestc as source")
     record = bundle.add(
@@ -644,7 +644,7 @@ def test_synthesis_promotes_user_selected_screen_git_mapping_deterministically()
         [json.dumps({"confirmed_facts": [], "uncertainties": [], "missing_decisions": []})]
     )
 
-    conclusion = V4EvidenceSynthesizer(llm).synthesize(bundle.goal, bundle)
+    conclusion = EvidenceSynthesizer(llm).synthesize(bundle.goal, bundle)
 
     fact = conclusion.confirmed_facts[0]
     assert "/home/lzl/vemu_uestc" in fact.text
@@ -654,18 +654,18 @@ def test_synthesis_promotes_user_selected_screen_git_mapping_deterministically()
 
 
 def test_response_fallback_reports_facts_and_uncertainty_without_llm():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceClaim,
         EvidenceConclusion,
     )
-    from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
+    from klonet_agent.ops.privileged.workflow.response import ResponseAgent
 
     conclusion = EvidenceConclusion(
         confirmed_facts=[EvidenceClaim("确认 vemu_uestc 正在运行", ["ev-1"])],
         uncertainties=[EvidenceClaim("agent102 证据不足", ["ev-2"])],
     )
 
-    message = V4ResponseAgent(None).render_readonly("检查平台", conclusion)
+    message = ResponseAgent(None).render_readonly("检查平台", conclusion)
 
     assert "确认 vemu_uestc 正在运行" in message
     assert "agent102 证据不足" in message

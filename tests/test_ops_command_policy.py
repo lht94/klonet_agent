@@ -328,7 +328,7 @@ def test_command_policy_allows_frozen_branch_clone_and_detached_revision_checkou
         {
             "program": "git",
             "argv": ["checkout", "--detach", "a" * 40],
-            "cwd": "/srv/v4e2e",
+            "cwd": "/srv/appe2e",
         }
     )
 

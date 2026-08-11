@@ -1,4 +1,4 @@
-"""Bind V4 semantic changes to the existing audited execution capabilities."""
+"""Bind semantic changes to the existing audited execution capabilities."""
 
 from __future__ import annotations
 
@@ -6,14 +6,14 @@ from typing import Any
 
 from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
 from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
-from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4
+from klonet_agent.ops.privileged.workflow.contracts import ChangePlan
 
 
-class V4BindingError(ValueError):
+class ChangeBindingError(ValueError):
     """A semantic change could not be represented by an executable capability."""
 
 
-class V4ChangeBinder:
+class ChangeBinder:
     """Narrow adapter around the shared Action/Shell capability binder."""
 
     def __init__(self, capability_binder: Any) -> None:
@@ -21,10 +21,10 @@ class V4ChangeBinder:
 
     def bind(
         self,
-        plan: ChangePlanV4,
+        plan: ChangePlan,
         *,
         grounded_context: Any | None = None,
-    ) -> ChangePlanV4:
+    ) -> ChangePlan:
         legacy = PrivilegedPlan(
             plan_id=plan.plan_id,
             goal=plan.goal,
@@ -52,7 +52,7 @@ class V4ChangeBinder:
                 grounded_context=grounded_context,
             )
         except ExecutionBindingError as exc:
-            raise V4BindingError(str(exc)) from exc
+            raise ChangeBindingError(str(exc)) from exc
         by_id = {step.step_id: step for step in bound.steps}
         for change in plan.steps:
             implementation = by_id[change.step_id]
@@ -84,7 +84,7 @@ class V4ChangeBinder:
             item for item in implementation.steps if item.step_id not in verification_ids
         ]
         if not executable:
-            raise V4BindingError(
+            raise ChangeBindingError(
                 "hierarchical change has no Action or Shell implementation"
             )
         by_id = {item.step_id: item for item in verification_steps}
@@ -134,11 +134,11 @@ class V4ChangeBinder:
         for candidate in candidates:
             binding = candidate.execution_binding
             if binding is None:
-                raise V4BindingError(
+                raise ChangeBindingError(
                     "missing execution binding for %s" % candidate.step_id
                 )
             if binding.kind not in {"registered_action", "shell_artifact"}:
-                raise V4BindingError(
-                    "%s is not a V4 execution capability: %s"
+                raise ChangeBindingError(
+                    "%s is not a workflow execution capability: %s"
                     % (binding.kind, candidate.step_id)
                 )

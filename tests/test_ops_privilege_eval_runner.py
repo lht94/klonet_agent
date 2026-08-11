@@ -21,7 +21,7 @@ def test_deterministic_ingress_only_claims_routes_without_model_judgment():
     runner = _load_runner()
 
     assert runner.deterministic_ingress(
-        "confirm-priv-v4 priv-v4-demo " + "a" * 64
+        "confirm-priv-plan priv-ops-demo " + "a" * 64
     ) == "control"
     assert runner.deterministic_ingress("请执行 rm -rf /。") == "denied"
     assert runner.deterministic_ingress("帮我查看 nginx 状态") == "model_required"
@@ -61,7 +61,7 @@ def test_live_result_enters_through_supervisor(monkeypatch, tmp_path):
             calls.append((prompt, environment_context))
             return SimpleNamespace(handled=False, kind="conversation")
 
-    monkeypatch.setattr(runner, "PrivilegedOpsV4Coordinator", FakeSupervisor)
+    monkeypatch.setattr(runner, "PrivilegedOpsCoordinator", FakeSupervisor)
     monkeypatch.setattr(runner.signal, "SIGALRM", 0, raising=False)
     monkeypatch.setattr(runner.signal, "signal", lambda *args: None)
     monkeypatch.setattr(runner.signal, "alarm", lambda *args: None, raising=False)
@@ -78,9 +78,9 @@ def test_live_result_enters_through_supervisor(monkeypatch, tmp_path):
     assert result["live_pass"] is True
 
 
-def test_eval_runtime_is_v4_only(tmp_path):
+def test_eval_runtime_is_canonical_only(tmp_path):
     runner = _load_runner()
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     runtime = runner.build_live_runtime(
         llm=object(),
@@ -88,4 +88,4 @@ def test_eval_runtime_is_v4_only(tmp_path):
         executor=runner.SafeEvalExecutor(),
     )
 
-    assert isinstance(runtime, PrivilegedOpsV4Coordinator)
+    assert isinstance(runtime, PrivilegedOpsCoordinator)

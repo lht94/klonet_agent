@@ -1,4 +1,4 @@
-"""High-level contracts for the staged Ops-Privilege V4 workflow."""
+"""High-level contracts for the staged Ops-Privilege workflow."""
 
 from __future__ import annotations
 
@@ -147,6 +147,38 @@ class EvidenceConclusion:
                 )
 
 
+GOAL_OUTCOME_STATUSES = {
+    "achieved",
+    "need_evidence",
+    "need_plan",
+    "need_execution",
+    "need_verification",
+    "need_replan",
+    "needs_user_decision",
+    "blocked",
+}
+
+
+@dataclass(frozen=True)
+class GoalOutcome:
+    """The sole goal-level completion and next-transition contract."""
+
+    status: str
+    reason: str = ""
+    evidence_requests: list[ProbeRequest] = field(default_factory=list)
+    user_question: str = ""
+    failed_criteria: list[str] = field(default_factory=list)
+    next_objective: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in GOAL_OUTCOME_STATUSES:
+            raise ValueError("invalid goal outcome status: %s" % self.status)
+        if self.status == "need_evidence" and not self.evidence_requests:
+            raise ValueError("need_evidence requires evidence_requests")
+        if self.status == "needs_user_decision" and not self.user_question:
+            raise ValueError("needs_user_decision requires user_question")
+
+
 class DiscoveryBudgetExceeded(RuntimeError):
     """A bounded Discovery workflow exhausted its safe request budget."""
 
@@ -180,7 +212,7 @@ class DiscoveryBudget:
 
 
 @dataclass
-class ChangeStepV4:
+class ChangeStep:
     step_id: str
     title: str
     objective: str
@@ -201,14 +233,14 @@ class ChangeStepV4:
         if self.risk not in RISK_LEVELS:
             raise ValueError("invalid risk: %s" % self.risk)
         if self.risk == "readonly":
-            raise ValueError("ChangeStepV4 cannot be readonly")
+            raise ValueError("ChangeStep cannot be readonly")
         if not self.expected_changes:
-            raise ValueError("ChangeStepV4 requires expected_changes")
+            raise ValueError("ChangeStep requires expected_changes")
         if not self.postconditions:
-            raise ValueError("ChangeStepV4 requires postconditions")
+            raise ValueError("ChangeStep requires postconditions")
         if self.execution_binding is not None and self.implementation_plan is not None:
             raise ValueError(
-                "ChangeStepV4 cannot have both a direct binding and implementation plan"
+                "ChangeStep cannot have both a direct binding and implementation plan"
             )
 
     def executable_dict(self) -> dict[str, Any]:
@@ -246,7 +278,7 @@ class ChangeStepV4:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ChangeStepV4":
+    def from_dict(cls, data: dict[str, Any]) -> "ChangeStep":
         values = dict(data)
         values["execution_binding"] = ExecutionBinding.from_dict(
             values.get("execution_binding")
@@ -258,7 +290,7 @@ class ChangeStepV4:
         return cls(**values)
 
 
-V4_PLAN_STATUSES = {
+CHANGE_PLAN_STATUSES = {
     "draft",
     "awaiting_confirmation",
     "approved",
@@ -273,11 +305,11 @@ V4_PLAN_STATUSES = {
 
 
 @dataclass
-class ChangePlanV4:
+class ChangePlan:
     plan_id: str
     goal: str
     risk: str
-    steps: list[ChangeStepV4]
+    steps: list[ChangeStep]
     resources: list[PlanResource] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
     schema_version: int = 4
@@ -287,16 +319,16 @@ class ChangePlanV4:
     updated_at: str = field(default_factory=_utc_now)
 
     def __post_init__(self) -> None:
-        if not self.plan_id.startswith("priv-v4-"):
-            raise ValueError("V4 plan id must start with priv-v4-")
+        if not self.plan_id.startswith("priv-ops-"):
+            raise ValueError("change plan id must start with priv-ops-")
         if self.schema_version != 4:
-            raise ValueError("V4 plan schema_version must be 4")
+            raise ValueError("change plan schema_version must be 4")
         if self.risk not in RISK_LEVELS or self.risk == "readonly":
-            raise ValueError("V4 change plan requires mutating risk")
+            raise ValueError("change plan requires mutating risk")
         if not self.steps:
-            raise ValueError("V4 change plan requires steps")
-        if self.status not in V4_PLAN_STATUSES:
-            raise ValueError("invalid V4 plan status: %s" % self.status)
+            raise ValueError("change plan requires steps")
+        if self.status not in CHANGE_PLAN_STATUSES:
+            raise ValueError("invalid change plan status: %s" % self.status)
 
     @classmethod
     def new(
@@ -304,12 +336,12 @@ class ChangePlanV4:
         *,
         goal: str,
         risk: str,
-        steps: list[ChangeStepV4],
+        steps: list[ChangeStep],
         resources: list[PlanResource] | None = None,
         assumptions: list[str] | None = None,
-    ) -> "ChangePlanV4":
+    ) -> "ChangePlan":
         return cls(
-            plan_id="priv-v4-" + uuid.uuid4().hex[:10],
+            plan_id="priv-ops-" + uuid.uuid4().hex[:10],
             goal=goal,
             risk=risk,
             steps=steps,
@@ -354,13 +386,13 @@ class ChangePlanV4:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ChangePlanV4":
+    def from_dict(cls, data: dict[str, Any]) -> "ChangePlan":
         return cls(
             plan_id=str(data.get("plan_id") or ""),
             goal=str(data.get("goal") or ""),
             risk=str(data.get("risk") or ""),
             steps=[
-                ChangeStepV4.from_dict(item)
+                ChangeStep.from_dict(item)
                 for item in data.get("steps", [])
                 if isinstance(item, dict)
             ],

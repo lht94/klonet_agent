@@ -1,4 +1,4 @@
-"""Bounded read-only evidence collection for Ops-Privilege V4."""
+"""Bounded read-only evidence collection for Ops-Privilege."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import re
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
-from klonet_agent.ops.privileged.v4.contracts import (
+from klonet_agent.ops.privileged.workflow.contracts import (
     DiscoveryBudget,
     DiscoveryBudgetExceeded,
     EvidenceBundle,
@@ -19,7 +19,7 @@ from klonet_agent.ops.privileged.v4.contracts import (
 
 
 DISCOVERY_SYSTEM_PROMPT = """
-You are the Klonet Ops-Privilege V4 Discovery Agent.
+You are the Klonet Ops-Privilege Discovery Agent.
 You may request only registered read-only probes. Never propose actions, shell,
 configuration changes, plans, or user confirmation.
 
@@ -53,7 +53,7 @@ def parse_json_object(content: str) -> dict[str, Any]:
     return value
 
 
-class V4DiscoveryAgent:
+class DiscoveryAgent:
     def __init__(
         self,
         llm: Any,

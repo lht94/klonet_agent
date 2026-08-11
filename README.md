@@ -517,9 +517,8 @@ Runbook 和统一服务器环境事实决定“做什么、为什么做、怎样
 对应能力时，才生成内容、工作目录、用户、环境、超时、哈希和有效期全部固定的一次性
 Shell Artifact。Verifier 根据执行证据、Checker 和必要的只读探测判断目标状态。
 
-修改计划先使用 `confirm-priv <plan_id>` 整体确认。注册 Action 随已确认计划自动执行；
-一次性 Shell 还必须使用 `confirm-priv-step <plan_id> <step_id>` 审核固定脚本后逐步
-确认。脚本只能执行一次，内容、环境指纹或有效期变化都会失效；解析器会拒绝命令替换、
+修改计划使用内容哈希绑定的 `confirm-priv-plan <plan_id> <sha256>` 精确确认。
+计划 ID、内容、环境指纹或有效期发生变化都会使确认失效；解析器会拒绝命令替换、
 嵌套 Shell、网络外传、敏感凭据、修改 Agent 安全边界和无边界删除。执行始终使用
 `shell=False` 的固定 argv。普通 `ops` 模式仍使用 OperationPlan/helper/sudoers 链路。
 
@@ -536,26 +535,22 @@ Shell Artifact。Verifier 根据执行证据、Checker 和必要的只读探测�
 - `ShellArtifactPolicy`：当注册 Action 无法覆盖时，对一次性原生 Shell 做 AST、
   语法、敏感信息、环境、目标范围和不可变哈希校验，并强制逐步人工确认。
 
-高权限计划控制命令：
+高权限变更计划确认命令：
 
 ```text
-list-priv
-show-priv <plan_id>
-confirm-priv <plan_id>
-confirm-priv-step <plan_id> <step_id>
-resume-priv <plan_id>
-abort-priv <plan_id>
+confirm-priv-plan <plan_id> <sha256>
 ```
 
-V3 计划、执行绑定、Shell Artifact、授权哈希、步骤状态、探测证据和检查结果保存在当前 user/project 的
+当前唯一的 Ops-Privilege 工作流位于 `ops/privileged/workflow/`。计划、执行绑定、
+Shell Artifact、授权哈希、步骤状态、探测证据和检查结果保存在当前 user/project 的
 `memory/sessions/.../privileged_ops_plans/` 下。进程中断时，原来处于
-`running`/`verifying` 的步骤会变成 `execution_unknown`；`resume-priv` 只验证当前
-状态，绝不自动重放该步骤。
+`running`/`verifying` 的步骤会变成 `execution_unknown`；恢复流程先验证当前状态，
+绝不自动重放结果未知的步骤。
 
 步骤失败后会立即停止后续变更，把真实执行绑定、输出、Checker、Verifier 反思、
 已发生变化、已完成和剩余步骤组成 Failure Packet，交回同一个 Planner 自主重新规划。
-新计划必须重新确认；相同失败证据不会无限循环，最多自动重规划三轮。旧 V2 计划会
-清除授权，旧原始命令只保留为审计记录，绝不会直接执行。
+新计划必须重新确认；相同失败证据不会无限循环。旧版本计划不进入当前存储目录，
+不能沿用原授权哈希，需要按当前环境重新生成。
 
 部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
 `KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。

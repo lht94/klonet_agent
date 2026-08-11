@@ -61,17 +61,16 @@ from klonet_agent.ops.privileged.execution_agent import (
 from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
 from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
-from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
-from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
-from klonet_agent.ops.privileged.v4.context_store import OperationalContextStore
-from klonet_agent.ops.privileged.v4.diagnosis import V4DiagnosticPlannerAgent
-from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
-from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
-from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
-from klonet_agent.ops.privileged.v4.runtime import ValidatedReadonlyCommandRunner
-from klonet_agent.ops.privileged.v4.store import V4PlanStore
-from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
-from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+from klonet_agent.ops.privileged.workflow.change_binding import ChangeBinder
+from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+from klonet_agent.ops.privileged.workflow.operational_context import OperationalContextStore
+from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+from klonet_agent.ops.privileged.workflow.response import ResponseAgent
+from klonet_agent.ops.privileged.workflow.readonly_runtime import ValidatedReadonlyCommandRunner
+from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+from klonet_agent.ops.privileged.workflow.evidence_synthesis import EvidenceSynthesizer
+from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 from klonet_agent.ops.routing import OpsRoute, route_ops_request
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
@@ -207,16 +206,16 @@ class AgentOrchestrator:
                 self.llm,
                 probe_runner=probe_runner,
             )
-            discovery = V4DiscoveryAgent(
+            discovery = DiscoveryAgent(
                 planner_llm,
                 probe_runner=probe_runner,
                 readonly_command_runner=ValidatedReadonlyCommandRunner(executor),
                 on_progress=privileged_progress("Discovery"),
             )
-            synthesis = V4EvidenceSynthesizer(self.llm)
-            mutation_workflow = V4MutationWorkflow(
-                planner=V4ChangePlannerAgent(planner_llm),
-                binder=V4ChangeBinder(
+            synthesis = EvidenceSynthesizer(self.llm)
+            mutation_workflow = MutationWorkflow(
+                planner=ChangePlannerAgent(planner_llm),
+                binder=ChangeBinder(
                     PrivilegedExecutionAgent(
                         planner_llm,
                         probe_runner=probe_runner,
@@ -225,7 +224,7 @@ class AgentOrchestrator:
                         ),
                     )
                 ),
-                store=V4PlanStore(
+                store=ChangePlanStore(
                     MEMORY_DIR,
                     user_id=self.session.user_id,
                     project_id=self.session.project_id,
@@ -236,13 +235,13 @@ class AgentOrchestrator:
                 synthesis=synthesis,
             )
             self.privileged_workflow = mutation_workflow
-            self.privileged_supervisor = PrivilegedOpsV4Coordinator(
+            self.privileged_supervisor = PrivilegedOpsCoordinator(
                 classifier=PrivilegedIntentClassifier(classifier_llm),
                 discovery=discovery,
                 synthesis=synthesis,
-                response=V4ResponseAgent(self.llm),
+                response=ResponseAgent(self.llm),
                 mutation_workflow=mutation_workflow,
-                diagnostic_planner=V4DiagnosticPlannerAgent(planner_llm),
+                verifier=verifier,
                 context_store=OperationalContextStore(
                     MEMORY_DIR,
                     user_id=self.session.user_id,

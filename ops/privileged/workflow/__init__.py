@@ -1,8 +1,8 @@
-"""Ops-Privilege V4 staged workflow."""
+"""Ops-Privilege staged workflow."""
 
-from .binding import V4ChangeBinder
+from .change_binding import ChangeBinder
 from .contracts import (
-    ChangeStepV4,
+    ChangeStep,
     DiscoveryBudget,
     DiscoveryBudgetExceeded,
     EvidenceBundle,
@@ -11,12 +11,12 @@ from .contracts import (
     EvidenceRecord,
     ProbeRequest,
 )
-from .planner import V4ChangePlannerAgent
-from .store import V4PlanStore
-from .workflow import V4MutationWorkflow
+from .change_planner import ChangePlannerAgent
+from .plan_store import ChangePlanStore
+from .mutation import MutationWorkflow
 
 __all__ = [
-    "ChangeStepV4",
+    "ChangeStep",
     "DiscoveryBudget",
     "DiscoveryBudgetExceeded",
     "EvidenceBundle",
@@ -24,8 +24,8 @@ __all__ = [
     "EvidenceConclusion",
     "EvidenceRecord",
     "ProbeRequest",
-    "V4ChangeBinder",
-    "V4ChangePlannerAgent",
-    "V4MutationWorkflow",
-    "V4PlanStore",
+    "ChangeBinder",
+    "ChangePlannerAgent",
+    "MutationWorkflow",
+    "ChangePlanStore",
 ]

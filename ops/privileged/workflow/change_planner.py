@@ -1,4 +1,4 @@
-"""Mutation-only Change Planner for Ops-Privilege V4."""
+"""Mutation-only Change Planner for Ops-Privilege."""
 
 from __future__ import annotations
 
@@ -14,16 +14,16 @@ from klonet_agent.ops.privileged.checkers import (
     CHECKER_REQUIRED_ARGS,
     DefaultCheckerRegistry,
 )
-from klonet_agent.ops.privileged.v4.contracts import (
-    ChangePlanV4,
-    ChangeStepV4,
+from klonet_agent.ops.privileged.workflow.contracts import (
+    ChangePlan,
+    ChangeStep,
     EvidenceBundle,
     EvidenceConclusion,
     EvidenceRecord,
     ProbeRequest,
     normalize_probe_request,
 )
-from klonet_agent.ops.privileged.v4.discovery import parse_json_object
+from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
 
 
 def _inventory_missing_runtime_roles(
@@ -90,7 +90,7 @@ def _request_rechecks_confirmed_missing_role(
 
 
 CHANGE_PLANNER_SYSTEM_PROMPT = """
-You are the Klonet Ops-Privilege V4 Change Planner.
+You are the Klonet Ops-Privilege Change Planner.
 Plan only real host state changes. Discovery, inspection, evidence aggregation,
 summaries, reports, answers and verification are separate workflow phases and
 must never appear as changes. Do not select Action names or emit commands.
@@ -207,7 +207,7 @@ proved independently. Do not rename the web-terminal port to a generic
 `web_port`, and do not spell Screen suffixes as `_master` or `_worker`.
 The currently registered complete-runtime capability does not start a separate
 data-server component, so do not add `data_server_port`, a data-server Screen,
-or a fifth application component to this V4 deployment contract.
+or a fifth application component to this workflow deployment contract.
 The discovered source initializes empty database tables during application
 startup (`app_factory` calls `create_all`); do not invent a separate migration,
 seed, or database-initialization ChangeStep without explicit contrary evidence.
@@ -232,16 +232,16 @@ DISCOVERABLE_IMPLEMENTATION_MARKERS = (
 
 
 @dataclass
-class V4PlanningOutcome:
+class PlanningOutcome:
     status: str
-    plan: ChangePlanV4 | None = None
-    candidate_plan: ChangePlanV4 | None = None
+    plan: ChangePlan | None = None
+    candidate_plan: ChangePlan | None = None
     probe_requests: list[ProbeRequest] = field(default_factory=list)
     reason: str = ""
     missing_decisions: list[str] = field(default_factory=list)
 
 
-class V4ChangePlannerAgent:
+class ChangePlannerAgent:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
 
@@ -252,7 +252,7 @@ class V4ChangePlannerAgent:
         conclusion: EvidenceConclusion,
         *,
         binding_feedback: str = "",
-    ) -> V4PlanningOutcome:
+    ) -> PlanningOutcome:
         deterministic = self._deterministic_runtime_restart(goal, bundle)
         if deterministic is not None:
             try:
@@ -375,7 +375,7 @@ class V4ChangePlannerAgent:
                 if isinstance(exc, IndexError) and last_error is not None:
                     break
                 last_error = exc
-        return V4PlanningOutcome(
+        return PlanningOutcome(
             status="blocked",
             reason=(
                 "Change Planner output invalid after bounded repairs: %s"
@@ -552,7 +552,7 @@ class V4ChangePlannerAgent:
         tool = self._planner_tool()
         choice = {
             "type": "function",
-            "function": {"name": "submit_v4_change_plan"},
+            "function": {"name": "submit_change_plan"},
         }
         try:
             return self.llm.complete(
@@ -578,9 +578,9 @@ class V4ChangePlannerAgent:
         return {
             "type": "function",
             "function": {
-                "name": "submit_v4_change_plan",
+                "name": "submit_change_plan",
                 "description": (
-                    "Submit one bounded semantic V4 planning outcome. This is the "
+                    "Submit one bounded semantic change planning outcome. This is the "
                     "only accepted Change Planner response channel."
                 ),
                 "parameters": {
@@ -747,7 +747,7 @@ class V4ChangePlannerAgent:
             function = getattr(calls[0], "function", None)
             name = getattr(function, "name", None)
             arguments = getattr(function, "arguments", None)
-            if str(name or "") != "submit_v4_change_plan":
+            if str(name or "") != "submit_change_plan":
                 raise ValueError("unexpected planner function call")
             if isinstance(arguments, dict):
                 data = arguments
@@ -758,7 +758,7 @@ class V4ChangePlannerAgent:
             return data, json.dumps(data, ensure_ascii=False)
 
         # Compatibility for lightweight test doubles which predate tool calls.
-        # The production request above always forces submit_v4_change_plan.
+        # The production request above always forces submit_change_plan.
         content = getattr(message, "content", None) or ""
         return parse_json_object(content), content
 
@@ -767,7 +767,7 @@ class V4ChangePlannerAgent:
         data: dict[str, Any],
         goal: str,
         bundle: EvidenceBundle,
-    ) -> V4PlanningOutcome:
+    ) -> PlanningOutcome:
         assumptions = data.get("assumptions", [])
         if not isinstance(assumptions, list):
             raise ValueError("planner assumptions must be an array")
@@ -850,7 +850,7 @@ class V4ChangePlannerAgent:
                         "requesting duplicate source probes"
                     )
                 requests = fresh_requests
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status=status,
                 probe_requests=requests,
             )
@@ -870,7 +870,7 @@ class V4ChangePlannerAgent:
                     "blocked cannot offload discoverable implementation details; "
                     "Discovery or Binding must resolve them"
                 )
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status=status,
                 reason=str(data.get("reason") or "planning blocked"),
                 missing_decisions=missing_items,
@@ -928,7 +928,7 @@ class V4ChangePlannerAgent:
                 key=lambda item: RISK_LEVELS.index(item.risk),
             ).risk
             candidate_assumptions = data.get("assumptions")
-            candidate_plan = ChangePlanV4.new(
+            candidate_plan = ChangePlan.new(
                 goal=goal,
                 risk=candidate_risk,
                 steps=candidate_steps,
@@ -937,7 +937,7 @@ class V4ChangePlannerAgent:
                 if isinstance(candidate_assumptions, list)
                 else [],
             )
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status="need_evidence",
                 candidate_plan=candidate_plan,
                 probe_requests=self._candidate_evidence_requests(
@@ -949,7 +949,7 @@ class V4ChangePlannerAgent:
         steps = self._steps(data.get("changes"), bundle)
         risk = max(steps, key=lambda item: RISK_LEVELS.index(item.risk)).risk
         assumptions = data.get("assumptions")
-        plan = ChangePlanV4.new(
+        plan = ChangePlan.new(
             goal=goal,
             risk=risk,
             steps=steps,
@@ -959,7 +959,7 @@ class V4ChangePlannerAgent:
             else [],
         )
         if self._plan_needs_docker_images(plan) and not self._has_docker_images(bundle):
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status="need_evidence",
                 candidate_plan=plan,
                 probe_requests=[
@@ -970,7 +970,7 @@ class V4ChangePlannerAgent:
                     )
                 ],
             )
-        return V4PlanningOutcome(status="ready", plan=plan)
+        return PlanningOutcome(status="ready", plan=plan)
 
     @staticmethod
     def _normalize_postcondition_args(data: dict[str, Any]) -> None:
@@ -1301,7 +1301,7 @@ class V4ChangePlannerAgent:
                     grounded.append("%s.path" % step_id)
             resource.consumers = list(dict.fromkeys(grounded))
 
-        V4ChangePlannerAgent._normalize_consumer_owners(resources)
+        ChangePlannerAgent._normalize_consumer_owners(resources)
 
     @staticmethod
     def _normalize_core_resource_consumers(
@@ -1385,7 +1385,7 @@ class V4ChangePlannerAgent:
                 for resource in resources
                 if resource.status == "frozen"
                 and resource.kind == "port"
-                and V4ChangePlannerAgent._requires_host_port_availability(resource)
+                and ChangePlannerAgent._requires_host_port_availability(resource)
                 and "nginx" in (
                     "%s %s" % (resource.name, resource.role)
                 ).lower()
@@ -1500,7 +1500,7 @@ class V4ChangePlannerAgent:
         host_resources = [
             resource
             for resource in resources
-            if V4ChangePlannerAgent._requires_host_port_availability(resource)
+            if ChangePlannerAgent._requires_host_port_availability(resource)
         ]
         busy_selected = []
         busy_resources = []
@@ -2675,24 +2675,24 @@ class V4ChangePlannerAgent:
 
     @staticmethod
     def finalize_candidate(
-        candidate: ChangePlanV4,
+        candidate: ChangePlan,
         bundle: EvidenceBundle,
-    ) -> V4PlanningOutcome:
-        unproven = V4ChangePlannerAgent._unproven_port_resources(
+    ) -> PlanningOutcome:
+        unproven = ChangePlannerAgent._unproven_port_resources(
             candidate.resources,
             bundle,
         )
         if unproven:
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
-                probe_requests=V4ChangePlannerAgent._candidate_evidence_requests(
+                probe_requests=ChangePlannerAgent._candidate_evidence_requests(
                     candidate, bundle, unproven
                 ),
             )
         occupied = []
         for resource in candidate.resources:
-            if not V4ChangePlannerAgent._requires_host_port_availability(resource):
+            if not ChangePlannerAgent._requires_host_port_availability(resource):
                 continue
             port = int(resource.value)
             relevant = [
@@ -2704,17 +2704,17 @@ class V4ChangePlannerAgent:
             if any(re.search(r":%s\b" % port, record.output) for record in relevant):
                 occupied.append(port)
         if occupied:
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status="blocked",
                 candidate_plan=candidate,
                 reason="candidate ports became occupied: %s"
                 % ",".join(str(item) for item in occupied),
             )
         if (
-            V4ChangePlannerAgent._plan_needs_docker_images(candidate)
-            and not V4ChangePlannerAgent._has_docker_images(bundle)
+            ChangePlannerAgent._plan_needs_docker_images(candidate)
+            and not ChangePlannerAgent._has_docker_images(bundle)
         ):
-            return V4PlanningOutcome(
+            return PlanningOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
                 probe_requests=[
@@ -2725,10 +2725,10 @@ class V4ChangePlannerAgent:
                     )
                 ],
             )
-        return V4PlanningOutcome(status="ready", plan=candidate)
+        return PlanningOutcome(status="ready", plan=candidate)
 
     @staticmethod
-    def _plan_needs_docker_images(plan: ChangePlanV4) -> bool:
+    def _plan_needs_docker_images(plan: ChangePlan) -> bool:
         return any(
             re.search(
                 r"\b(?:docker\s+)?containers?\b|容器",
@@ -2740,7 +2740,7 @@ class V4ChangePlannerAgent:
 
     @staticmethod
     def _candidate_evidence_requests(
-        candidate: ChangePlanV4,
+        candidate: ChangePlan,
         bundle: EvidenceBundle,
         unproven_ports: list[PlanResource],
     ) -> list[ProbeRequest]:
@@ -2754,8 +2754,8 @@ class V4ChangePlannerAgent:
                 )
             )
         if (
-            V4ChangePlannerAgent._plan_needs_docker_images(candidate)
-            and not V4ChangePlannerAgent._has_docker_images(bundle)
+            ChangePlannerAgent._plan_needs_docker_images(candidate)
+            and not ChangePlannerAgent._has_docker_images(bundle)
         ):
             requests.append(
                 ProbeRequest(
@@ -2802,7 +2802,7 @@ class V4ChangePlannerAgent:
                 if not isinstance(change, dict):
                     continue
                 if str(change.get("risk") or "").strip() == "readonly":
-                    errors.append("ChangeStepV4 cannot be readonly")
+                    errors.append("ChangeStep cannot be readonly")
                 if not change.get("expected_changes"):
                     errors.append(
                         "change[%s] requires expected_changes" % step_index
@@ -2880,7 +2880,7 @@ class V4ChangePlannerAgent:
                 for role in roles
             ),
             "port": any(
-                V4ChangePlannerAgent._requires_host_port_availability(item)
+                ChangePlannerAgent._requires_host_port_availability(item)
                 for item in frozen
             ),
         }
@@ -2970,7 +2970,7 @@ class V4ChangePlannerAgent:
                 if not isinstance(change, dict):
                     continue
                 step_id = str(change.get("step_id") or "")
-                used_ports = V4ChangePlannerAgent._used_ports_by_step(data).get(
+                used_ports = ChangePlannerAgent._used_ports_by_step(data).get(
                     step_id,
                     set(),
                 )
@@ -3071,7 +3071,7 @@ class V4ChangePlannerAgent:
             str(source_branch.value) in record.output for record in bundle.records
         ):
             errors.append("source_branch is not grounded in evidence")
-        for port_resource in V4ChangePlannerAgent._unproven_port_resources(
+        for port_resource in ChangePlannerAgent._unproven_port_resources(
             frozen,
             bundle,
         ):
@@ -3081,7 +3081,7 @@ class V4ChangePlannerAgent:
         for port_resource in (
             item
             for item in frozen
-            if V4ChangePlannerAgent._requires_host_port_availability(item)
+            if ChangePlannerAgent._requires_host_port_availability(item)
         ):
             port = int(port_resource.value)
             relevant = [
@@ -3102,7 +3102,7 @@ class V4ChangePlannerAgent:
             },
             ensure_ascii=False,
         ).lower()
-        isolation_payload = V4ChangePlannerAgent._strip_negated_reuse_claims(
+        isolation_payload = ChangePlannerAgent._strip_negated_reuse_claims(
             isolation_payload
         )
         if isolation_requested and re.search(
@@ -3285,10 +3285,10 @@ class V4ChangePlannerAgent:
             frozen_host_ports = {
                 int(item.value): item
                 for item in frozen
-                if V4ChangePlannerAgent._requires_host_port_availability(item)
+                if ChangePlannerAgent._requires_host_port_availability(item)
             }
             used_ports_by_step = (
-                V4ChangePlannerAgent._declared_listening_ports_by_step(data)
+                ChangePlannerAgent._declared_listening_ports_by_step(data)
             )
             nginx_ids = {
                 str(change.get("step_id") or "") for change in nginx_changes
@@ -3322,7 +3322,7 @@ class V4ChangePlannerAgent:
                     "listen port=%s" % ",".join(sorted(nginx_ids))
                 )
         errors.extend(
-            V4ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
+            ChangePlannerAgent._complete_klonet_contract_errors(data, resources)
         )
         return errors
 
@@ -3656,14 +3656,14 @@ class V4ChangePlannerAgent:
         by_port = {
             int(item.value): item
             for item in normalized
-            if V4ChangePlannerAgent._requires_host_port_availability(item)
+            if ChangePlannerAgent._requires_host_port_availability(item)
         }
         explicit_internal_ports = {
             int(item.value)
             for item in normalized
             if item.status == "frozen"
             and item.kind == "port"
-            and not V4ChangePlannerAgent._requires_host_port_availability(item)
+            and not ChangePlannerAgent._requires_host_port_availability(item)
         }
         changes = data.get("changes")
         if isinstance(changes, list):
@@ -3697,7 +3697,7 @@ class V4ChangePlannerAgent:
                             if item.status == "frozen"
                             and item.kind == "port"
                             and int(item.value) == port
-                            and not V4ChangePlannerAgent._requires_host_port_availability(item)
+                            and not ChangePlannerAgent._requires_host_port_availability(item)
                         ),
                         None,
                     )
@@ -3761,8 +3761,8 @@ class V4ChangePlannerAgent:
                             consumers=[consumer],
                         )
                     )
-        declared_listeners = V4ChangePlannerAgent._declared_listening_ports_by_step(data)
-        for step_id, ports in V4ChangePlannerAgent._used_ports_by_step(data).items():
+        declared_listeners = ChangePlannerAgent._declared_listening_ports_by_step(data)
+        for step_id, ports in ChangePlannerAgent._used_ports_by_step(data).items():
             for port in sorted(ports):
                 consumer = "%s.port_%s" % (step_id, port)
                 existing = by_port.get(port)
@@ -3832,10 +3832,10 @@ class V4ChangePlannerAgent:
             in {"instance_root", "target_root", "deployment_root"}
         ]
         if not roots:
-            return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
+            return ChangePlannerAgent._normalize_consumer_owners(normalized)
         changes = data.get("changes")
         if not isinstance(changes, list):
-            return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
+            return ChangePlannerAgent._normalize_consumer_owners(normalized)
 
         def changes_for_root(root: PlanResource) -> list[dict[str, Any]]:
             if len(roots) == 1:
@@ -4021,7 +4021,7 @@ class V4ChangePlannerAgent:
                             consumers=[consumer],
                         )
                     )
-        return V4ChangePlannerAgent._normalize_consumer_owners(normalized)
+        return ChangePlannerAgent._normalize_consumer_owners(normalized)
 
     @staticmethod
     def _normalize_consumer_owners(
@@ -4041,7 +4041,7 @@ class V4ChangePlannerAgent:
             semantic_id, field = consumer.rsplit(".", 1)
             scored = sorted(
                 (
-                    V4ChangePlannerAgent._consumer_owner_score(owner, field),
+                    ChangePlannerAgent._consumer_owner_score(owner, field),
                     index,
                     owner,
                 )
@@ -4212,7 +4212,7 @@ class V4ChangePlannerAgent:
     ) -> list[PlanResource]:
         unproven = []
         for resource in resources:
-            if not V4ChangePlannerAgent._requires_host_port_availability(resource):
+            if not ChangePlannerAgent._requires_host_port_availability(resource):
                 continue
             port = int(resource.value)
             if not any(
@@ -4247,7 +4247,7 @@ class V4ChangePlannerAgent:
         )
 
     @staticmethod
-    def _steps(value: Any, bundle: EvidenceBundle) -> list[ChangeStepV4]:
+    def _steps(value: Any, bundle: EvidenceBundle) -> list[ChangeStep]:
         if not isinstance(value, list) or not value:
             raise ValueError("ready Change Planner output requires changes")
         known = bundle.evidence_ids
@@ -4263,7 +4263,7 @@ class V4ChangePlannerAgent:
             dependencies = [str(dep) for dep in item.get("depends_on", [])]
             if any(dep not in known_step_ids for dep in dependencies):
                 raise ValueError("change dependency must reference an earlier step")
-            step = ChangeStepV4(
+            step = ChangeStep(
                 step_id=str(item.get("step_id") or ""),
                 title=str(item.get("title") or ""),
                 objective=str(item.get("objective") or ""),

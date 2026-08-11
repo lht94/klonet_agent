@@ -1,4 +1,4 @@
-"""Shared action-contract validation for Ops-Privilege V4."""
+"""Shared action-contract validation for Ops-Privilege."""
 
 from __future__ import annotations
 

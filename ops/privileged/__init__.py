@@ -1,4 +1,4 @@
-"""Shared contracts and safety primitives for Ops-Privilege V4."""
+"""Shared contracts and safety primitives for Ops-Privilege."""
 
 from klonet_agent.ops.privileged.contracts import (
     CheckResult,

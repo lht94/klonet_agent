@@ -104,10 +104,10 @@ class AnswerLLM:
         )
 
 
-def test_orchestrator_builds_v4_as_the_only_privileged_runtime():
+def test_orchestrator_builds_workflow_as_the_only_privileged_runtime():
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
     from klonet_agent.orchestrator import AgentOrchestrator
     from klonet_agent.session import AgentSession
 
@@ -120,11 +120,11 @@ def test_orchestrator_builds_v4_as_the_only_privileged_runtime():
         )
 
     assert not hasattr(orchestrator, "privileged_workflow_version")
-    assert isinstance(orchestrator.privileged_supervisor, PrivilegedOpsV4Coordinator)
+    assert isinstance(orchestrator.privileged_supervisor, PrivilegedOpsCoordinator)
     assert orchestrator.privileged_workflow is orchestrator.privileged_supervisor.mutation_workflow
 
 
-def test_v4_readonly_turn_runs_through_staged_runtime(capsys):
+def test_workflow_readonly_turn_runs_through_staged_runtime(capsys):
     import json
 
     from klonet_agent.agents import get_profile
@@ -154,7 +154,7 @@ def test_v4_readonly_turn_runs_through_staged_runtime(capsys):
                         "missing_decisions": [],
                     }
                 ),
-                "V4 readonly response",
+                "readonly response",
             ]
 
         def complete(self, messages, tools=None, **kwargs):
@@ -176,8 +176,8 @@ def test_v4_readonly_turn_runs_through_staged_runtime(capsys):
         )
         reply, _, _ = orchestrator.single_chat("inspect platforms", [], 0)
 
-    assert reply == "V4 readonly response"
-    assert "工作流协调器：V4 readonly response" in capsys.readouterr().out
+    assert reply == "readonly response"
+    assert "工作流协调器：readonly response" in capsys.readouterr().out
 
 
 def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys):

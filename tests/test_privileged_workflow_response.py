@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from klonet_agent.ops.privileged.v4.contracts import EvidenceConclusion
-from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
+from klonet_agent.ops.privileged.workflow.contracts import EvidenceConclusion
+from klonet_agent.ops.privileged.workflow.response import ResponseAgent
 
 
 class FakeLLM:
@@ -25,7 +25,7 @@ class FakeLLM:
 def test_readonly_response_preserves_model_layout_with_one_call():
     llm = FakeLLM("\n结论：已发现平台。\n\n1. 平台 A\n2. 平台 B\n")
 
-    result = V4ResponseAgent(llm).render_readonly(
+    result = ResponseAgent(llm).render_readonly(
         "检查平台",
         EvidenceConclusion(),
     )
@@ -38,7 +38,7 @@ def test_readonly_response_preserves_model_layout_with_one_call():
 
 
 def test_runtime_inventory_response_preserves_project_root_identity():
-    from klonet_agent.ops.privileged.v4.contracts import EvidenceClaim
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceClaim
 
     conclusion = EvidenceConclusion(confirmed_facts=[
         EvidenceClaim(
@@ -56,7 +56,7 @@ def test_runtime_inventory_response_preserves_project_root_identity():
         EvidenceClaim("runtime_code_only code_only_root=/srv/code-only", ["ev-1"]),
     ])
 
-    result = V4ResponseAgent(FakeLLM("should not be used")).render_readonly(
+    result = ResponseAgent(FakeLLM("should not be used")).render_readonly(
         "检查有多少正常运行的平台", conclusion,
     )
 

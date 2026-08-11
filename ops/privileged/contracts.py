@@ -187,7 +187,7 @@ class CheckResult:
 @dataclass
 class VerificationDecision:
     status: str
-    goal_achieved: bool = False
+    step_achieved: bool = False
     verification_level: str = "none"
     failures: list[str] = field(default_factory=list)
     missing_evidence: list[str] = field(default_factory=list)
@@ -758,7 +758,7 @@ def _migrate_legacy_plan_values(
                 step.status = "blocked"
                 step.observation = (
                     "旧版原始命令计划已迁移为只读审计记录，不能执行；"
-                    "请重新生成 Ops-Privilege V4 计划。"
+                    "请重新生成 Ops-Privilege 计划。"
                 )
     values["schema_version"] = 3
     grounding = dict(values.get("grounding") or {})

@@ -1,4 +1,4 @@
-"""Session-isolated persistence for Ops-Privilege V4 change plans."""
+"""Session-isolated persistence for Ops-Privilege change plans."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import os
 import re
 from pathlib import Path
 
-from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, _utc_now
+from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, _utc_now
 
 
 def _safe_component(value: str) -> str:
@@ -15,17 +15,17 @@ def _safe_component(value: str) -> str:
     return cleaned or "default"
 
 
-class V4PlanStore:
+class ChangePlanStore:
     def __init__(self, memory_root: Path, *, user_id: str, project_id: str) -> None:
         self.plan_dir = (
             Path(memory_root)
             / "sessions"
             / _safe_component(user_id)
             / _safe_component(project_id)
-            / "privileged_ops_plans_v4"
+            / "privileged_ops_plans"
         )
 
-    def save(self, plan: ChangePlanV4) -> None:
+    def save(self, plan: ChangePlan) -> None:
         self._validate_id(plan.plan_id)
         self.plan_dir.mkdir(parents=True, exist_ok=True)
         plan.updated_at = _utc_now()
@@ -37,23 +37,23 @@ class V4PlanStore:
         )
         os.replace(str(temporary), str(destination))
 
-    def load(self, plan_id: str) -> ChangePlanV4:
+    def load(self, plan_id: str) -> ChangePlan:
         self._validate_id(plan_id)
         path = self.plan_dir / (plan_id + ".json")
         if not path.is_file():
-            raise KeyError("unknown V4 privileged plan: %s" % plan_id)
-        return ChangePlanV4.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            raise KeyError("unknown privileged plan: %s" % plan_id)
+        return ChangePlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
-    def list(self) -> list[ChangePlanV4]:
+    def list(self) -> list[ChangePlan]:
         if not self.plan_dir.exists():
             return []
         plans = [
-            ChangePlanV4.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            for path in self.plan_dir.glob("priv-v4-*.json")
+            ChangePlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            for path in self.plan_dir.glob("priv-ops-*.json")
         ]
         return sorted(plans, key=lambda item: item.updated_at, reverse=True)
 
-    def recover(self, plan_id: str) -> ChangePlanV4:
+    def recover(self, plan_id: str) -> ChangePlan:
         plan = self.load(plan_id)
         interrupted = False
         for step in plan.steps:
@@ -82,5 +82,5 @@ class V4PlanStore:
 
     @staticmethod
     def _validate_id(plan_id: str) -> None:
-        if not re.fullmatch(r"priv-v4-[A-Za-z0-9_-]{1,64}", str(plan_id or "")):
-            raise ValueError("invalid V4 privileged plan id")
+        if not re.fullmatch(r"priv-ops-[A-Za-z0-9_-]{1,64}", str(plan_id or "")):
+            raise ValueError("invalid privileged plan id")

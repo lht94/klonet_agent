@@ -65,6 +65,216 @@ def _plan_with_step(step):
     )
 
 
+def _diagnostic_goal_state():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle,
+        EvidenceClaim,
+        EvidenceConclusion,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="检查 v4e2e 启动报错")
+    record = bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("screen_session", {"session": "v4e2e_m"}, "traceback"),
+        "Traceback truncated",
+    ))
+    conclusion = EvidenceConclusion(
+        confirmed_facts=[EvidenceClaim("发现截断堆栈", [record.evidence_id])],
+        uncertainties=[EvidenceClaim("底层异常未知", [record.evidence_id])],
+    )
+    return bundle, conclusion
+
+
+def test_verifier_goal_requests_registered_evidence_for_discoverable_gap():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    llm = FakeLLM([json.dumps({
+        "status": "need_evidence",
+        "reason": "需要完整日志",
+        "evidence_requests": [{
+            "probe": "logs",
+            "args": {"path": "/srv/app/logs/master.log"},
+            "purpose": "读取底层异常",
+        }],
+    }, ensure_ascii=False)])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion,
+    )
+
+    assert outcome.status == "need_evidence"
+    assert outcome.evidence_requests[0].probe == "logs"
+    assert outcome.user_question == ""
+
+
+def test_verifier_goal_requires_causal_evidence_before_achieved():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    llm = FakeLLM([
+        json.dumps({"status": "achieved", "reason": "发现异常"}),
+        json.dumps({
+            "status": "need_evidence",
+            "reason": "尚未确认根因",
+            "evidence_requests": [{
+                "probe": "process_logs",
+                "args": {"pids": [1234], "project_root": "/srv/app"},
+                "purpose": "获取完整异常",
+            }],
+        }, ensure_ascii=False),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion,
+    )
+
+    assert outcome.status == "need_evidence"
+    assert len(llm.calls) == 2
+
+
+def test_verifier_goal_rejects_offloading_logs_to_user():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    llm = FakeLLM([
+        json.dumps({
+            "status": "needs_user_decision",
+            "user_question": "请提供完整日志和异常堆栈。",
+        }, ensure_ascii=False),
+        json.dumps({
+            "status": "need_evidence",
+            "evidence_requests": [{
+                "probe": "process_logs",
+                "args": {"pids": [1234], "project_root": "/srv/app"},
+                "purpose": "自行获取完整日志",
+            }],
+        }, ensure_ascii=False),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion,
+    )
+
+    assert outcome.status == "need_evidence"
+    assert len(llm.calls) == 2
+
+
+def test_verifier_goal_allows_only_a_genuine_user_choice():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    llm = FakeLLM([json.dumps({
+        "status": "needs_user_decision",
+        "user_question": "检测到两个同名实例，请指定项目根目录。",
+    }, ensure_ascii=False)])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion,
+    )
+
+    assert outcome.status == "needs_user_decision"
+    assert "项目根目录" in outcome.user_question
+
+
+def test_verifier_goal_does_not_repeat_attempted_evidence_request():
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    repeated = ProbeRequest(
+        "logs", {"path": "/srv/app/logs/master.log"}, "读取底层异常",
+    )
+    llm = FakeLLM([
+        json.dumps({
+            "status": "need_evidence",
+            "evidence_requests": [{
+                "probe": repeated.probe,
+                "args": repeated.args,
+                "purpose": repeated.purpose,
+            }],
+        }, ensure_ascii=False),
+        json.dumps({
+            "status": "need_evidence",
+            "evidence_requests": [{
+                "probe": "ops_file",
+                "args": {"path": "/srv/app/mains/gun.py", "view": "head"},
+                "purpose": "检查失败点源码",
+            }],
+        }, ensure_ascii=False),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal,
+        bundle,
+        conclusion,
+        attempted_keys={repeated.cache_key},
+    )
+
+    assert [item.probe for item in outcome.evidence_requests] == ["ops_file"]
+    assert len(llm.calls) == 2
+
+
+def test_verifier_goal_decides_replan_after_supported_execution_failure():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceClaim, EvidenceConclusion,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, _ = _diagnostic_goal_state()
+    conclusion = EvidenceConclusion(confirmed_facts=[EvidenceClaim(
+        "原计划未达到目标，根因是日志目录不存在",
+        [bundle.records[0].evidence_id],
+    )])
+    llm = FakeLLM([json.dumps({
+        "status": "need_replan",
+        "reason": "根因已确认，需要修订未完成步骤",
+    }, ensure_ascii=False)])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        "修复 v4e2e master",
+        bundle,
+        conclusion,
+        phase="post_execution",
+    )
+
+    assert outcome.status == "need_replan"
+
+
+def test_verifier_goal_prioritizes_referenced_evidence_with_a_bounded_payload():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceClaim, EvidenceConclusion, EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle = EvidenceBundle(goal="检查启动报错根因")
+    for index in range(12):
+        bundle.add(EvidenceRecord.from_probe(
+            ProbeRequest("process", {"keywords": [str(index)]}, "noise"),
+            "irrelevant-process-output-" + ("x" * 10000),
+        ))
+    causal = bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("screen_session", {"session": "target"}, "traceback"),
+        "FileNotFoundError: /srv/app/logs/.__access.lock",
+    ))
+    conclusion = EvidenceConclusion(confirmed_facts=[EvidenceClaim(
+        "根因是日志目录不存在，导致日志处理器无法创建锁文件",
+        [causal.evidence_id],
+    )])
+    llm = FakeLLM([json.dumps({"status": "achieved", "reason": "根因已确认"})])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion,
+    )
+
+    payload = llm.calls[0]["messages"][1]["content"]
+    assert outcome.status == "achieved"
+    assert "FileNotFoundError" in payload
+    assert len(payload) < 50000
+
+
 def test_verifier_uses_agent_when_exit_code_is_the_only_evidence():
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
@@ -88,7 +298,7 @@ def test_verifier_uses_agent_when_exit_code_is_the_only_evidence():
     decision = PrivilegedVerifierAgent(llm).verify_step(_plan_with_step(step), step)
 
     assert decision.status == "passed"
-    assert decision.goal_achieved is True
+    assert decision.step_achieved is True
     assert len(llm.calls) == 1
 
 
@@ -151,7 +361,7 @@ def test_verifier_trusts_passed_state_checker_without_calling_llm(tmp_path):
     )
 
     assert decision.status == "passed"
-    assert decision.goal_achieved is True
+    assert decision.step_achieved is True
     assert decision.reason == "all deterministic state checks passed"
     assert llm.calls == []
 
@@ -182,7 +392,7 @@ def test_verifier_can_mark_exit_code_only_evidence_inconclusive():
     )
 
     assert decision.status == "inconclusive"
-    assert decision.goal_achieved is False
+    assert decision.step_achieved is False
     assert len(llm.calls) == 1
 
 
@@ -194,7 +404,7 @@ def test_verifier_never_allows_llm_passed_to_override_nonzero_exit():
             json.dumps(
                 {
                     "status": "passed",
-                    "goal_achieved": True,
+                    "step_achieved": True,
                     "reason": "looks fine",
                     "next_action": "",
                 }
@@ -206,7 +416,7 @@ def test_verifier_never_allows_llm_passed_to_override_nonzero_exit():
     decision = PrivilegedVerifierAgent(llm).verify_step(_plan_with_step(step), step)
 
     assert decision.status == "failed"
-    assert decision.goal_achieved is False
+    assert decision.step_achieved is False
     assert "return_code=9" in decision.failures
 
 
@@ -218,7 +428,7 @@ def test_verifier_never_allows_zero_exit_to_hide_failed_state_check(tmp_path):
             json.dumps(
                 {
                     "status": "passed",
-                    "goal_achieved": True,
+                    "step_achieved": True,
                     "reason": "command returned zero",
                     "next_action": "",
                 }
@@ -235,7 +445,7 @@ def test_verifier_never_allows_zero_exit_to_hide_failed_state_check(tmp_path):
     decision = PrivilegedVerifierAgent(llm).verify_step(_plan_with_step(step), step)
 
     assert decision.status == "failed"
-    assert decision.goal_achieved is False
+    assert decision.step_achieved is False
     assert decision.failures == ["file_exists"]
 
 
@@ -249,7 +459,7 @@ def test_verifier_treats_required_unavailable_checker_as_inconclusive():
     decision = PrivilegedVerifierAgent(None).verify_step(_plan_with_step(step), step)
 
     assert decision.status == "inconclusive"
-    assert decision.goal_achieved is False
+    assert decision.step_achieved is False
     assert decision.missing_evidence == ["unknown-required-checker"]
 
 

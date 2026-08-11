@@ -1,4 +1,4 @@
-"""Runtime adapters shared by V4 production and evaluation assembly."""
+"""Runtime adapters shared by workflow production and evaluation assembly."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class ValidatedReadonlyCommandRunner:
                 "command is not deterministically read-only: %s" % reason
             )
         step = PrivilegedStep(
-            step_id="v4-readonly-command",
+            step_id="readonly-command",
             title="deterministic read-only inspection",
             command=command,
             risk="readonly",

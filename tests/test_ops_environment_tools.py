@@ -986,7 +986,7 @@ def test_platform_instance_inspection_counts_runtime_roots_without_duplicate_ali
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        target_root = temp_dir / "klonet_v4_e2e"
+        target_root = temp_dir / "klonet_workflow_e2e"
         source_root = temp_dir / "vemu_uestc"
         (target_root / "mains").mkdir(parents=True)
         (source_root / "mains").mkdir(parents=True)
@@ -1145,7 +1145,7 @@ def test_running_platform_inspection_uses_screen_alias_for_runtime_root(monkeypa
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        root = temp_dir / "klonet_v4_e2e"
+        root = temp_dir / "klonet_workflow_e2e"
         (root / "mains").mkdir(parents=True)
         monkeypatch.setattr(
             environment,
@@ -1165,7 +1165,7 @@ def test_running_platform_inspection_uses_screen_alias_for_runtime_root(monkeypa
         result = environment.inspect_running_platforms({})
 
     assert "platform=v4e2e" in result
-    assert "platform=klonet_v4_e2e" not in result
+    assert "platform=klonet_workflow_e2e" not in result
     assert "code_only_count=0" in result
 
 

@@ -18,15 +18,15 @@ from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
-from klonet_agent.ops.privileged.v4.binding import V4ChangeBinder
-from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
-from klonet_agent.ops.privileged.v4.discovery import V4DiscoveryAgent
-from klonet_agent.ops.privileged.v4.planner import V4ChangePlannerAgent
-from klonet_agent.ops.privileged.v4.response import V4ResponseAgent
-from klonet_agent.ops.privileged.v4.runtime import ValidatedReadonlyCommandRunner
-from klonet_agent.ops.privileged.v4.store import V4PlanStore
-from klonet_agent.ops.privileged.v4.synthesis import V4EvidenceSynthesizer
-from klonet_agent.ops.privileged.v4.workflow import V4MutationWorkflow
+from klonet_agent.ops.privileged.workflow.change_binding import ChangeBinder
+from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+from klonet_agent.ops.privileged.workflow.response import ResponseAgent
+from klonet_agent.ops.privileged.workflow.readonly_runtime import ValidatedReadonlyCommandRunner
+from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+from klonet_agent.ops.privileged.workflow.evidence_synthesis import EvidenceSynthesizer
+from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
 
 class CaseTimeout(RuntimeError):
@@ -81,7 +81,7 @@ def deterministic_ingress(prompt):
     """Evaluate only the routing decisions that do not require the classifier."""
 
     if re.fullmatch(
-        r"confirm-priv-v4\s+priv-v4-[A-Za-z0-9_-]{1,64}\s+[0-9a-f]{64}",
+        r"confirm-priv-plan\s+priv-ops-[A-Za-z0-9_-]{1,64}\s+[0-9a-f]{64}",
         str(prompt or "").strip(),
     ):
         return "control"
@@ -144,33 +144,38 @@ def _run_registered_probes(requests):
 
 
 def build_live_runtime(*, llm, root, executor):
-    discovery = V4DiscoveryAgent(
+    discovery = DiscoveryAgent(
         llm,
         probe_runner=_run_registered_probes,
         readonly_command_runner=ValidatedReadonlyCommandRunner(executor),
     )
-    synthesis = V4EvidenceSynthesizer(llm)
-    workflow = V4MutationWorkflow(
-        planner=V4ChangePlannerAgent(llm),
-        binder=V4ChangeBinder(
+    synthesis = EvidenceSynthesizer(llm)
+    verifier = PrivilegedVerifierAgent(
+        llm,
+        probe_runner=_run_registered_probes,
+    )
+    workflow = MutationWorkflow(
+        planner=ChangePlannerAgent(llm),
+        binder=ChangeBinder(
             PrivilegedExecutionAgent(llm, probe_runner=_run_registered_probes)
         ),
-        store=V4PlanStore(
+        store=ChangePlanStore(
             root,
             user_id="history-eval",
             project_id="shared",
         ),
         executor=executor,
-        verifier=PrivilegedVerifierAgent(llm, probe_runner=_run_registered_probes),
+        verifier=verifier,
         discovery=discovery,
         synthesis=synthesis,
     )
-    return PrivilegedOpsV4Coordinator(
+    return PrivilegedOpsCoordinator(
         classifier=PrivilegedIntentClassifier(llm),
         discovery=discovery,
         synthesis=synthesis,
-        response=V4ResponseAgent(llm),
+        response=ResponseAgent(llm),
         mutation_workflow=workflow,
+        verifier=verifier,
     )
 
 

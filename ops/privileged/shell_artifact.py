@@ -65,7 +65,7 @@ HARD_DENIED_PATTERNS = (
         r"(?i)(?:/home/klonet-agent/klonet_agent/)?ops/privileged/"
     ),
     re.compile(r"(?i)(?:/home/klonet-agent/)?\.codex/"),
-    re.compile(r"(?i)privileged_ops_plans_v4/"),
+    re.compile(r"(?i)privileged_ops_plans/"),
     re.compile(
         r"(?i)\b(?:password|passwd|token|secret|api[_-]?key|private[_-]?key)"
         r"\s*=\s*[^\s'\"]+"

@@ -49,6 +49,18 @@ class StubResponse:
         return "发现 3 个候选平台。"
 
 
+class StubGoalVerifier:
+    def __init__(self, outcome=None):
+        self.outcome = outcome
+        self.calls = []
+
+    def verify_goal(self, goal, bundle, conclusion, attempted_keys=None):
+        from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+        self.calls.append((goal, bundle, conclusion, attempted_keys))
+        return self.outcome or GoalOutcome("achieved")
+
+
 class NoMutationWorkflow:
     def __init__(self):
         self.calls = []
@@ -68,7 +80,7 @@ class RecordingMutationWorkflow:
 
 
 def _evidence():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceClaim,
         EvidenceConclusion,
@@ -90,7 +102,7 @@ def _evidence():
 
 
 def test_readonly_without_command_uses_discovery_synthesis_and_response_only():
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle, conclusion = _evidence()
     classifier = StubClassifier("readonly_action")
@@ -98,12 +110,13 @@ def test_readonly_without_command_uses_discovery_synthesis_and_response_only():
     synthesis = StubSynthesis(conclusion)
     response = StubResponse()
     mutation = NoMutationWorkflow()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=classifier,
         discovery=discovery,
         synthesis=synthesis,
         response=response,
         mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("检查下现在服务器上有哪些平台")
@@ -118,12 +131,12 @@ def test_readonly_without_command_uses_discovery_synthesis_and_response_only():
 
 
 def test_readonly_diagnosis_automatically_collects_discoverable_gaps_until_achieved():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceClaim, EvidenceConclusion, EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
-    from klonet_agent.ops.privileged.v4.diagnosis import DiagnosticDecision
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
 
     bundle = EvidenceBundle(goal="检查 v4e2e 报错")
     first = bundle.add(EvidenceRecord.from_probe(
@@ -144,7 +157,7 @@ def test_readonly_diagnosis_automatically_collects_discoverable_gaps_until_achie
             self.followups.append(requests)
             target.add(EvidenceRecord.from_probe(
                 requests[0],
-                "PermissionError: /srv/v4/logs/master.log is not writable",
+                "PermissionError: /srv/app/logs/master.log is not writable",
             ))
             return target
 
@@ -162,33 +175,33 @@ def test_readonly_diagnosis_automatically_collects_discoverable_gaps_until_achie
                 [newest.evidence_id],
             )])
 
-    class DiagnosticPlanner:
+    class GoalVerifier:
         def __init__(self):
             self.calls = 0
 
-        def assess(self, goal, target, conclusion):
+        def verify_goal(self, goal, target, conclusion):
             self.calls += 1
             if self.calls == 1:
-                return DiagnosticDecision(
-                    "continue",
-                    probe_requests=[ProbeRequest(
-                        "logs", {"path": "/srv/v4/logs/master.log"},
+                return GoalOutcome(
+                    "need_evidence",
+                    evidence_requests=[ProbeRequest(
+                        "logs", {"path": "/srv/app/logs/master.log"},
                         "获取完整底层异常",
                     )],
                 )
-            return DiagnosticDecision("achieved")
+            return GoalOutcome("achieved")
 
     discovery = LoopDiscovery(bundle)
     synthesis = LoopSynthesis()
-    diagnosis = DiagnosticPlanner()
+    verifier = GoalVerifier()
     response = StubResponse()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("readonly_action"),
         discovery=discovery,
         synthesis=synthesis,
         response=response,
         mutation_workflow=NoMutationWorkflow(),
-        diagnostic_planner=diagnosis,
+        verifier=verifier,
     )
 
     result = coordinator.handle("检查 v4e2e 为什么报错")
@@ -196,31 +209,31 @@ def test_readonly_diagnosis_automatically_collects_discoverable_gaps_until_achie
     assert result.kind == "completed"
     assert len(discovery.followups) == 1
     assert synthesis.calls == 2
-    assert diagnosis.calls == 2
+    assert verifier.calls == 2
     assert len(response.calls) == 1
     assert "根因" in response.calls[0][1].confirmed_facts[0].text
 
 
 def test_diagnostic_loop_pauses_only_for_a_real_user_decision():
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
-    from klonet_agent.ops.privileged.v4.diagnosis import DiagnosticDecision
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
 
     bundle, conclusion = _evidence()
 
-    class DiagnosticPlanner:
-        def assess(self, goal, target, synthesized):
-            return DiagnosticDecision(
+    class GoalVerifier:
+        def verify_goal(self, goal, target, synthesized):
+            return GoalOutcome(
                 "needs_user_decision",
                 user_question="检测到两个同名实例，请指定项目根目录。",
             )
 
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("readonly_action"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(conclusion),
         response=StubResponse(),
         mutation_workflow=NoMutationWorkflow(),
-        diagnostic_planner=DiagnosticPlanner(),
+        verifier=GoalVerifier(),
     )
 
     result = coordinator.handle("检查报错")
@@ -230,16 +243,17 @@ def test_diagnostic_loop_pauses_only_for_a_real_user_decision():
 
 
 def test_readonly_command_is_collected_as_evidence_not_executed_as_plan():
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle, conclusion = _evidence()
     discovery = StubDiscovery(bundle)
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("readonly_action", command="python3 -V"),
         discovery=discovery,
         synthesis=StubSynthesis(conclusion),
         response=StubResponse(),
         mutation_workflow=NoMutationWorkflow(),
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("查看 Python 版本")
@@ -249,16 +263,17 @@ def test_readonly_command_is_collected_as_evidence_not_executed_as_plan():
 
 
 def test_conversation_bypasses_privileged_discovery_and_execution():
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle, conclusion = _evidence()
     discovery = StubDiscovery(bundle)
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("conversation"),
         discovery=discovery,
         synthesis=StubSynthesis(conclusion),
         response=StubResponse(),
         mutation_workflow=NoMutationWorkflow(),
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("什么是 Klonet？")
@@ -268,10 +283,10 @@ def test_conversation_bypasses_privileged_discovery_and_execution():
     assert discovery.calls == []
 
 
-def test_v4_coordinator_handles_exact_control_before_classifier_or_discovery():
-    from klonet_agent.ops.privileged.v4.coordinator import (
-        PrivilegedOpsV4Coordinator,
-        V4WorkflowResult,
+def test_workflow_coordinator_handles_exact_control_before_classifier_or_discovery():
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator,
+        WorkflowResult,
     )
 
     class NoCall:
@@ -284,38 +299,39 @@ def test_v4_coordinator_handles_exact_control_before_classifier_or_discovery():
 
         def handle_control(self, text):
             self.calls.append(text)
-            return V4WorkflowResult(True, "completed", "confirmed")
+            return WorkflowResult(True, "completed", "confirmed")
 
     controls = Controls()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=NoCall(),
         discovery=NoCall(),
         synthesis=NoCall(),
         response=NoCall(),
         mutation_workflow=controls,
+        verifier=NoCall(),
     )
 
     result = coordinator.handle_with_context(
-        "confirm-priv-v4 priv-v4-flow " + "a" * 64,
+        "confirm-priv-plan priv-ops-flow " + "a" * 64,
         environment_context="ignored",
         conversation_context="recent",
     )
 
     assert result.kind == "completed"
-    assert controls.calls == ["confirm-priv-v4 priv-v4-flow " + "a" * 64]
+    assert controls.calls == ["confirm-priv-plan priv-ops-flow " + "a" * 64]
 
 
 def test_paused_confirm_result_automatically_diagnoses_and_replans():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import (
-        PrivilegedOpsV4Coordinator, V4WorkflowResult,
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator, WorkflowResult,
     )
-    from klonet_agent.ops.privileged.v4.diagnosis import DiagnosticDecision
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
 
     failed_plan = SimpleNamespace(
-        plan_id="priv-v4-failed",
+        plan_id="priv-ops-failed",
         goal="修复 v4e2e master",
         status="paused",
         steps=[],
@@ -326,13 +342,13 @@ def test_paused_confirm_result_automatically_diagnoses_and_replans():
             self.submits = []
 
         def handle_control(self, text):
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True, "paused", "master health check failed", plan=failed_plan,
             )
 
         def submit(self, goal, **kwargs):
             self.submits.append((goal, kwargs))
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True, "awaiting_confirmation", "recovery plan",
             )
 
@@ -348,23 +364,27 @@ def test_paused_confirm_result_automatically_diagnoses_and_replans():
         def collect_requests(self, requests, bundle):
             raise AssertionError("diagnosis is already complete")
 
-    class Diagnosis:
-        def assess(self, goal, bundle, conclusion, attempted_keys=None):
-            return DiagnosticDecision("achieved")
+    class GoalVerifier:
+        def verify_goal(
+            self, goal, bundle, conclusion, attempted_keys=None,
+            phase="readonly",
+        ):
+            assert phase == "post_execution"
+            return GoalOutcome("need_replan")
 
     workflow = Workflow()
     discovery = Discovery()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("conversation"),
         discovery=discovery,
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=workflow,
-        diagnostic_planner=Diagnosis(),
+        verifier=GoalVerifier(),
     )
 
     result = coordinator.handle(
-        "confirm-priv-v4 priv-v4-failed " + "a" * 64,
+        "confirm-priv-plan priv-ops-failed " + "a" * 64,
     )
 
     assert result.kind == "awaiting_confirmation"
@@ -375,19 +395,20 @@ def test_paused_confirm_result_automatically_diagnoses_and_replans():
     assert "自动诊断" in discovery.goal
 
 
-def test_v4_coordinator_applies_goal_guard_before_any_discovery():
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+def test_workflow_coordinator_applies_goal_guard_before_any_discovery():
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     class NoCall:
         def __getattr__(self, name):
             raise AssertionError("component must not be called: %s" % name)
 
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=NoCall(),
         discovery=NoCall(),
         synthesis=NoCall(),
         response=NoCall(),
         mutation_workflow=NoCall(),
+        verifier=NoCall(),
     )
 
     result = coordinator.handle("rm -rf / and delete all system files")
@@ -397,13 +418,13 @@ def test_v4_coordinator_applies_goal_guard_before_any_discovery():
 
 
 def test_mutation_clarifies_multiple_abnormal_runtime_roots_before_planning():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceConclusion,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle = EvidenceBundle(goal="repair")
     bundle.add(
@@ -421,12 +442,13 @@ def test_mutation_clarifies_multiple_abnormal_runtime_roots_before_planning():
         )
     )
     mutation = RecordingMutationWorkflow()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("mutating_action"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("帮我修复后端不正常运行的平台")
@@ -440,13 +462,13 @@ def test_mutation_clarifies_multiple_abnormal_runtime_roots_before_planning():
 
 
 def test_mutation_with_explicit_abnormal_roots_enters_planning():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceConclusion,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle = EvidenceBundle(goal="repair")
     bundle.add(
@@ -457,12 +479,13 @@ def test_mutation_with_explicit_abnormal_roots_enters_planning():
         )
     )
     mutation = RecordingMutationWorkflow()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("mutating_action"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle(
@@ -474,13 +497,13 @@ def test_mutation_with_explicit_abnormal_roots_enters_planning():
 
 
 def test_mutation_with_explicit_roots_already_healthy_completes_without_plan():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceConclusion,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle = EvidenceBundle(goal="repair")
     bundle.add(
@@ -502,12 +525,13 @@ def test_mutation_with_explicit_roots_already_healthy_completes_without_plan():
         )
     )
     mutation = NoMutationWorkflow()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("mutating_action"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle(
@@ -526,13 +550,13 @@ def test_mutation_with_explicit_roots_already_healthy_completes_without_plan():
 
 
 def test_named_platform_alias_selects_one_abnormal_root_without_clarification():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceConclusion,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle = EvidenceBundle(goal="repair 102")
     bundle.add(EvidenceRecord.from_probe(
@@ -541,12 +565,13 @@ def test_named_platform_alias_selects_one_abnormal_root_without_clarification():
         "platform=klonet project_root=/home/lzl/xxy/klonet backend_status=abnormal",
     ))
     mutation = RecordingMutationWorkflow()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("mutating_action"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("修复 102 平台，其他实例不要修改")
@@ -556,13 +581,13 @@ def test_named_platform_alias_selects_one_abnormal_root_without_clarification():
 
 
 def test_startup_traceback_collects_target_source_before_synthesis():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceConclusion,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle = EvidenceBundle(goal="repair")
     bundle.add(EvidenceRecord.from_probe(
@@ -588,12 +613,13 @@ def test_startup_traceback_collects_target_source_before_synthesis():
 
     discovery = SourceDiscovery(bundle)
     synthesis = StubSynthesis(EvidenceConclusion())
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("mutating_action"),
         discovery=discovery,
         synthesis=synthesis,
         response=StubResponse(),
         mutation_workflow=RecordingMutationWorkflow(),
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("只修复 /home/klonet-agent/102 的启动异常")
@@ -611,13 +637,13 @@ def test_startup_traceback_collects_target_source_before_synthesis():
 
 
 def test_named_platform_alias_scopes_traceback_source_collection():
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
         EvidenceConclusion,
         EvidenceRecord,
         ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     bundle = EvidenceBundle(goal="repair 102")
     bundle.add(EvidenceRecord.from_probe(
@@ -643,12 +669,13 @@ def test_named_platform_alias_scopes_traceback_source_collection():
             return evidence
 
     discovery = SourceDiscovery(bundle)
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("mutating_action"),
         discovery=discovery,
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=RecordingMutationWorkflow(),
+        verifier=StubGoalVerifier(),
     )
 
     result = coordinator.handle("修复 102 平台启动异常，其他实例不要修改")
@@ -660,15 +687,15 @@ def test_named_platform_alias_scopes_traceback_source_collection():
 
 
 def test_submit_previous_restart_goal_reuses_static_evidence_and_refreshes_runtime():
-    from klonet_agent.ops.privileged.v4.context_store import OperationalContextSnapshot
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.operational_context import OperationalContextSnapshot
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     previous = EvidenceBundle(goal="restart")
     previous.add(EvidenceRecord.from_probe(
-        ProbeRequest("ops_file", {"path": "/srv/v4/mains/gun.py"}, "startup"),
+        ProbeRequest("ops_file", {"path": "/srv/app/mains/gun.py"}, "startup"),
         "bind=47001",
     ))
     previous.add(EvidenceRecord.from_probe(
@@ -677,7 +704,7 @@ def test_submit_previous_restart_goal_reuses_static_evidence_and_refreshes_runti
     ))
     snapshot = OperationalContextSnapshot(
         resolved_goal="帮我重启 v4e2e 的 master 和 worker",
-        target_roots=["/srv/v4"],
+        target_roots=["/srv/app"],
         phase="draft_ready",
         evidence=previous,
     )
@@ -701,7 +728,7 @@ def test_submit_previous_restart_goal_reuses_static_evidence_and_refreshes_runti
             assert [item.request.probe for item in seed_bundle.records] == ["ops_file"]
             seed_bundle.add(EvidenceRecord.from_probe(
                 ProbeRequest("running_platforms", {}, "refresh runtime"),
-                "platform=v4e2e project_root=/srv/v4 backend_status=abnormal "
+                "platform=v4e2e project_root=/srv/app backend_status=abnormal "
                 "master_port=47001 master_endpoint=not_checked reason=role_not_running "
                 "worker_port=47002 worker_endpoint=not_checked reason=role_not_running",
             ))
@@ -710,12 +737,13 @@ def test_submit_previous_restart_goal_reuses_static_evidence_and_refreshes_runti
     discovery = SeedDiscovery()
     mutation = RecordingMutationWorkflow()
     store = ContextStore()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("conversation"),
         discovery=discovery,
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
         context_store=store,
     )
 
@@ -728,15 +756,15 @@ def test_submit_previous_restart_goal_reuses_static_evidence_and_refreshes_runti
 
 
 def test_self_directed_followup_reuses_previous_diagnostic_goal():
-    from klonet_agent.ops.privileged.v4.context_store import OperationalContextSnapshot
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.operational_context import OperationalContextSnapshot
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion,
     )
-    from klonet_agent.ops.privileged.v4.coordinator import PrivilegedOpsV4Coordinator
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
 
     snapshot = OperationalContextSnapshot(
         resolved_goal="检查 v4e2e_m 为什么报错",
-        target_roots=["/home/lzl/klonet_v4_e2e"],
+        target_roots=["/home/lzl/klonet_workflow_e2e"],
         phase="diagnosing",
         evidence=EvidenceBundle(goal="检查 v4e2e_m 为什么报错"),
     )
@@ -760,12 +788,13 @@ def test_self_directed_followup_reuses_previous_diagnostic_goal():
             return seed_bundle or EvidenceBundle(goal=goal)
 
     discovery = Discovery()
-    coordinator = PrivilegedOpsV4Coordinator(
+    coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("conversation"),
         discovery=discovery,
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
         mutation_workflow=NoMutationWorkflow(),
+        verifier=StubGoalVerifier(),
         context_store=Store(),
     )
 
@@ -780,20 +809,20 @@ def test_self_directed_followup_reuses_previous_diagnostic_goal():
 def test_operational_context_persists_goal_locale_and_only_reuses_static_evidence(
     tmp_path,
 ):
-    from klonet_agent.ops.privileged.v4.context_store import (
+    from klonet_agent.ops.privileged.workflow.operational_context import (
         OperationalContextSnapshot, OperationalContextStore,
     )
-    from klonet_agent.ops.privileged.v4.contracts import (
+    from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
 
     bundle = EvidenceBundle(goal="重启 v4e2e")
     bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("project_layout", {"root": "/srv/v4"}, "layout"),
-        "project_root=/srv/v4",
+        ProbeRequest("project_layout", {"root": "/srv/app"}, "layout"),
+        "project_root=/srv/app",
     ))
     bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("process", {"keywords": ["v4"]}, "runtime"),
+        ProbeRequest("process", {"keywords": ["app"]}, "runtime"),
         "pid=stale",
     ))
     store = OperationalContextStore(
@@ -802,7 +831,7 @@ def test_operational_context_persists_goal_locale_and_only_reuses_static_evidenc
     store.save(OperationalContextSnapshot(
         resolved_goal="帮我重启 v4e2e 的 master 和 worker",
         output_locale="zh-CN",
-        target_roots=["/srv/v4"],
+        target_roots=["/srv/app"],
         phase="draft_ready",
         evidence=bundle,
     ))
@@ -812,17 +841,17 @@ def test_operational_context_persists_goal_locale_and_only_reuses_static_evidenc
     assert restored is not None
     assert restored.resolved_goal == "帮我重启 v4e2e 的 master 和 worker"
     assert restored.output_locale == "zh-CN"
-    assert restored.target_roots == ["/srv/v4"]
+    assert restored.target_roots == ["/srv/app"]
     reusable = restored.reusable_evidence(restored.resolved_goal)
     assert [item.request.probe for item in reusable.records] == ["project_layout"]
 
 
 def test_internal_planner_contract_error_is_localized_before_display():
-    from klonet_agent.ops.privileged.v4.coordinator import (
-        V4WorkflowResult, _localized_result,
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        WorkflowResult, _localized_result,
     )
 
-    result = _localized_result(V4WorkflowResult(
+    result = _localized_result(WorkflowResult(
         True,
         "blocked",
         "Change Planner output invalid after bounded repairs: blocked cannot "
@@ -835,11 +864,11 @@ def test_internal_planner_contract_error_is_localized_before_display():
 
 
 def test_unknown_internal_block_reason_is_not_leaked_in_english():
-    from klonet_agent.ops.privileged.v4.coordinator import (
-        V4WorkflowResult, _localized_result,
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        WorkflowResult, _localized_result,
     )
 
-    result = _localized_result(V4WorkflowResult(
+    result = _localized_result(WorkflowResult(
         True,
         "blocked",
         "resource_binding_violation=restart.platform must use instance_identifier",
@@ -850,7 +879,7 @@ def test_unknown_internal_block_reason_is_not_leaked_in_english():
 
 
 def test_self_directed_diagnosis_phrase_resumes_the_previous_goal():
-    from klonet_agent.ops.privileged.v4.coordinator import _continuation_kind
+    from klonet_agent.ops.privileged.workflow.coordinator import _continuation_kind
 
     for text in ("你自己定位啊", "继续查清楚", "别问我，自己查", "接着排查"):
         assert _continuation_kind(text) == "diagnose"

@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from klonet_agent.ops.privileged.v4.contracts import (
+from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceRecord,
     ProbeRequest,

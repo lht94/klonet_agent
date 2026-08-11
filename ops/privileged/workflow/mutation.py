@@ -1,4 +1,4 @@
-"""Confirmation-gated mutation workflow for Ops-Privilege V4."""
+"""Confirmation-gated mutation workflow for Ops-Privilege."""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
 from klonet_agent.ops.privileged.execution_agent import (
     _canonical_action_postconditions,
 )
-from klonet_agent.ops.privileged.v4.coordinator import V4WorkflowResult
-from klonet_agent.ops.privileged.v4.binding import V4BindingError
-from klonet_agent.ops.privileged.v4.contracts import ChangePlanV4, ChangeStepV4
+from klonet_agent.ops.privileged.workflow.coordinator import WorkflowResult
+from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
+from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
 from klonet_agent.tools.environment import redact_sensitive_text
 
 
@@ -25,7 +25,7 @@ def _head_tail(value: Any, limit: int) -> str:
     return text[:half] + "\n...[evidence compacted]...\n" + text[-half:]
 
 
-class V4MutationWorkflow:
+class MutationWorkflow:
     def __init__(
         self,
         *,
@@ -56,21 +56,21 @@ class V4MutationWorkflow:
         evidence_bundle: Any,
         evidence_conclusion: Any,
         conversation_context: str = "",
-    ) -> V4WorkflowResult:
+    ) -> WorkflowResult:
         outcome = self.planner.plan(goal, evidence_bundle, evidence_conclusion)
         replanning_rounds = 0
         candidate_replans = 0
         while True:
             if outcome.status == "need_evidence":
                 if replanning_rounds >= self.max_replanning_rounds:
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "blocked",
                         "Planner-to-Discovery evidence budget exhausted.",
                         evidence=evidence_bundle,
                     )
                 if self.discovery is None or self.synthesis is None:
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "blocked",
                         "Planner requested evidence but Discovery is unavailable.",
@@ -118,7 +118,7 @@ class V4MutationWorkflow:
                 continue
             break
         if outcome.status != "ready" or outcome.plan is None:
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 outcome.status,
                 outcome.reason or "change planning did not produce an executable plan",
@@ -131,7 +131,7 @@ class V4MutationWorkflow:
                 outcome.plan,
                 grounded_context=grounded_context,
             )
-        except V4BindingError as exc:
+        except ChangeBindingError as exc:
             outcome = self.planner.plan(
                 goal,
                 evidence_bundle,
@@ -139,7 +139,7 @@ class V4MutationWorkflow:
                 binding_feedback=str(exc),
             )
             if outcome.status != "ready" or outcome.plan is None:
-                return V4WorkflowResult(
+                return WorkflowResult(
                     True,
                     "blocked",
                     outcome.reason or "binding replan did not produce a ready plan",
@@ -151,20 +151,20 @@ class V4MutationWorkflow:
                     outcome.plan,
                     grounded_context=grounded_context,
                 )
-            except V4BindingError as final_error:
+            except ChangeBindingError as final_error:
                 outcome.plan.status = "blocked"
                 self.store.save(outcome.plan)
-                return V4WorkflowResult(
+                return WorkflowResult(
                     True,
                     "blocked",
-                    "V4 binding replan budget exhausted: %s" % final_error,
+                    "binding replan budget exhausted: %s" % final_error,
                     plan=outcome.plan,
                     evidence=evidence_bundle,
                 )
         plan.status = "awaiting_confirmation"
         plan.authorized_hash = ""
         self.store.save(plan)
-        return V4WorkflowResult(
+        return WorkflowResult(
             True,
             "awaiting_confirmation",
             self._confirmation_message(plan),
@@ -208,29 +208,29 @@ class V4MutationWorkflow:
         if not sections:
             return None
         return GroundedPlanContext(
-            knowledge_evidence="V4 Binding uses the frozen semantic plan contract.",
+            knowledge_evidence="Change Binding uses the frozen semantic plan contract.",
             environment_evidence=_head_tail(
                 redact_sensitive_text("\n\n".join(sections)),
                 24000,
             ),
-            action_catalog="V4 audited Action/Shell registry",
+            action_catalog="audited Action/Shell registry",
         )
-    def confirm(self, plan_id: str, content_hash: str) -> V4WorkflowResult:
+    def confirm(self, plan_id: str, content_hash: str) -> WorkflowResult:
         plan = self.store.load(plan_id)
         if content_hash != plan.content_hash:
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "confirmation_rejected",
-                "V4 confirmation hash or plan state does not match; nothing executed.",
+                "confirmation hash or plan state does not match; nothing executed.",
                 plan=plan,
             )
         if plan.status == "paused" and plan.is_authorized:
             return self._resume_verified_state(plan)
         if plan.status != "awaiting_confirmation":
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True,
                 "confirmation_rejected",
-                "V4 confirmation hash or plan state does not match; nothing executed.",
+                "confirmation hash or plan state does not match; nothing executed.",
                 plan=plan,
             )
         self._approve_shell_artifacts(plan)
@@ -238,7 +238,7 @@ class V4MutationWorkflow:
         self.store.save(plan)
         return self._execute(plan)
 
-    def _resume_verified_state(self, plan: ChangePlanV4) -> V4WorkflowResult:
+    def _resume_verified_state(self, plan: ChangePlan) -> WorkflowResult:
         """Resume an authorized plan only after checking paused effects in place."""
 
         verification_plan = self._verification_plan(plan)
@@ -266,7 +266,7 @@ class V4MutationWorkflow:
                     )
                     change.status = plan.status = "paused"
                     self.store.save(plan)
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "paused",
                         step.observation,
@@ -331,18 +331,18 @@ class V4MutationWorkflow:
             and all(item.status == "failed" for item in state_checks)
         )
 
-    def handle_control(self, text: str) -> V4WorkflowResult | None:
+    def handle_control(self, text: str) -> WorkflowResult | None:
         match = re.fullmatch(
-            r"confirm-priv-v4\s+(priv-v4-[A-Za-z0-9_-]{1,64})\s+([0-9a-f]{64})",
+            r"confirm-priv-plan\s+(priv-ops-[A-Za-z0-9_-]{1,64})\s+([0-9a-f]{64})",
             str(text or "").strip(),
         )
         if match is None:
             return None
         return self.confirm(match.group(1), match.group(2))
 
-    def _execute(self, plan: ChangePlanV4) -> V4WorkflowResult:
+    def _execute(self, plan: ChangePlan) -> WorkflowResult:
         if not plan.is_authorized:
-            return V4WorkflowResult(
+            return WorkflowResult(
                 True, "confirmation_rejected", "plan is not exactly authorized", plan=plan
             )
         verification_plan = self._verification_plan(plan)
@@ -353,7 +353,7 @@ class V4MutationWorkflow:
                 if step.status == "execution_unknown":
                     change.status = plan.status = "paused"
                     self.store.save(plan)
-                    return V4WorkflowResult(True, "paused", step.observation, plan=plan)
+                    return WorkflowResult(True, "paused", step.observation, plan=plan)
                 plan.status = "executing"
                 change.status = "running"
                 step.status = "running"
@@ -371,7 +371,7 @@ class V4MutationWorkflow:
                 if step.status == "execution_unknown":
                     change.status = plan.status = "paused"
                     self.store.save(plan)
-                    return V4WorkflowResult(True, "paused", "execution outcome unknown", plan=plan)
+                    return WorkflowResult(True, "paused", "execution outcome unknown", plan=plan)
                 try:
                     verification_step = self._verification_step(step)
                     decision = self.verifier.verify_step(
@@ -384,7 +384,7 @@ class V4MutationWorkflow:
                     step.observation = "Verifier or Checker failed safely: %s" % exc
                     change.status = plan.status = "paused"
                     self.store.save(plan)
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "paused",
                         step.observation,
@@ -395,7 +395,7 @@ class V4MutationWorkflow:
                     step.observation = str(getattr(decision, "reason", "verification failed"))
                     change.status = plan.status = "paused"
                     self.store.save(plan)
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "paused",
                         step.observation,
@@ -418,7 +418,7 @@ class V4MutationWorkflow:
                         "Semantic Verifier or Checker failed safely: %s" % exc
                     )
                     self.store.save(plan)
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "paused",
                         change.observation,
@@ -434,7 +434,7 @@ class V4MutationWorkflow:
                         )
                     )
                     self.store.save(plan)
-                    return V4WorkflowResult(
+                    return WorkflowResult(
                         True,
                         "paused",
                         change.observation,
@@ -447,10 +447,10 @@ class V4MutationWorkflow:
             self.store.save(plan)
         plan.status = "completed"
         self.store.save(plan)
-        return V4WorkflowResult(True, "completed", "变更计划已执行并通过验证。", plan=plan)
+        return WorkflowResult(True, "completed", "变更计划已执行并通过验证。", plan=plan)
 
     @staticmethod
-    def _execution_steps(change: ChangeStepV4) -> Iterable[PrivilegedStep]:
+    def _execution_steps(change: ChangeStep) -> Iterable[PrivilegedStep]:
         if change.implementation_plan is not None:
             return change.implementation_plan.steps
         return [
@@ -487,7 +487,7 @@ class V4MutationWorkflow:
         return candidate
 
     @staticmethod
-    def _semantic_verification_step(change: ChangeStepV4) -> PrivilegedStep:
+    def _semantic_verification_step(change: ChangeStep) -> PrivilegedStep:
         """Compose hierarchical verification from its authorized atomic bindings."""
 
         implementation = change.implementation_plan
@@ -526,7 +526,7 @@ class V4MutationWorkflow:
             postconditions = filtered
             for step in config_steps:
                 postconditions.extend(
-                    V4MutationWorkflow._verification_step(step).postconditions
+                    MutationWorkflow._verification_step(step).postconditions
                 )
             first_args = config_steps[0].execution_binding.args
             path = str(first_args.get("path") or "").strip()
@@ -554,10 +554,10 @@ class V4MutationWorkflow:
         )
 
     @staticmethod
-    def _verification_plan(plan: ChangePlanV4) -> PrivilegedPlan:
+    def _verification_plan(plan: ChangePlan) -> PrivilegedPlan:
         steps = []
         for change in plan.steps:
-            steps.extend(V4MutationWorkflow._execution_steps(change))
+            steps.extend(MutationWorkflow._execution_steps(change))
         return PrivilegedPlan(
             plan_id=plan.plan_id,
             goal=plan.goal,
@@ -570,9 +570,9 @@ class V4MutationWorkflow:
         )
 
     @staticmethod
-    def _approve_shell_artifacts(plan: ChangePlanV4) -> None:
+    def _approve_shell_artifacts(plan: ChangePlan) -> None:
         for change in plan.steps:
-            for step in V4MutationWorkflow._execution_steps(change):
+            for step in MutationWorkflow._execution_steps(change):
                 binding = step.execution_binding
                 if binding is None or binding.shell_artifact is None:
                     continue
@@ -581,9 +581,9 @@ class V4MutationWorkflow:
                 artifact.status = "approved"
 
     @staticmethod
-    def _confirmation_message(plan: ChangePlanV4) -> str:
+    def _confirmation_message(plan: ChangePlan) -> str:
         lines = [
-            "V4 变更计划 %s" % plan.plan_id,
+            "变更计划 %s" % plan.plan_id,
             "目标：%s" % plan.goal,
             "风险：%s" % plan.risk,
         ]
@@ -617,7 +617,7 @@ class V4MutationWorkflow:
                     for item in change.postconditions
                 )
             )
-            for step in V4MutationWorkflow._execution_steps(change):
+            for step in MutationWorkflow._execution_steps(change):
                 binding = step.execution_binding
                 if binding is None:
                     lines.append("  执行绑定：缺失")
@@ -649,7 +649,7 @@ class V4MutationWorkflow:
             [
                 "精确计划哈希：%s" % plan.content_hash,
                 "请使用以下命令确认这份精确计划：",
-                "confirm-priv-v4 %s %s" % (plan.plan_id, plan.content_hash),
+                "confirm-priv-plan %s %s" % (plan.plan_id, plan.content_hash),
             ]
         )
         return "\n".join(lines)

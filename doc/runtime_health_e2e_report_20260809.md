@@ -521,3 +521,136 @@ FileNotFoundError:
 ```
 
 `git diff --check` 和相关模块 `py_compile` 均通过。最终运行态复核中，27694、27695、47001、47002、45551、45552、45554、45555 的 `/server_health/` 全部返回 HTTP 200、`code=1`，没有造成其他实例状态回退。
+
+## 10. 将诊断旁路收敛到现有 Verifier
+
+上一轮为只读诊断新增了 `DiagnosticDecision` 和 `V4DiagnosticPlannerAgent`。虽然解决了自动补证问题，但它与 Planner、Replan、Verifier 形成了第二套目标完成判断。本轮按“一个目标只能有一个完成判据”重构，不再保留该过渡设计。
+
+### 10.1 最终职责边界
+
+- `PrivilegedVerifierAgent.verify_step()` 只判断单个执行步骤，返回 `VerificationDecision.step_achieved`；原来容易误解为整个目标完成的 `goal_achieved` 字段已删除。
+- `PrivilegedVerifierAgent.verify_goal()` 是唯一的目标级判断入口，返回现有 contracts 中的 `GoalOutcome`。
+- `GoalOutcome` 只是返回合同，不是新的 Agent 或控制模块。它表达 `achieved`、`need_evidence`、`need_replan`、`needs_user_decision`、`blocked` 等工作流状态。
+- Coordinator 不再判断“证据是否足够”，只消费 `GoalOutcome` 并调度 Discovery、Planner、审批或最终回答。
+- Replan 不再自行判断任务是否完成：Verifier 返回 `need_replan` 后，Planner 才负责生成新的计划。
+- Synthesis 只组织带引用的证据，不拥有终止权。
+
+生产调用链现在是：
+
+```text
+Discovery / Executor / Step checks
+                ↓
+   PrivilegedVerifierAgent.verify_goal
+                ↓
+           GoalOutcome
+      ┌─────────┼───────────┐
+need_evidence need_replan achieved / user decision / blocked
+      ↓          ↓             ↓
+  Discovery    Planner      返回或暂停
+```
+
+`ops/privileged/v4/diagnosis.py` 和 `tests/test_privileged_v4_diagnosis.py` 已删除；`orchestrator.py`、真实运行器和历史评测运行器都向 MutationWorkflow 与 Coordinator 传递同一个 Verifier 实例。
+
+### 10.2 真实测试发现并修复的统一合同问题
+
+第一次真实回归没有通过：Verifier 连续补证 8 轮后达到安全上限。保存的证据实际上已经包含完整因果链，但目标验证 payload 把大量进程输出排列在综合结论之前，随轮次增长变得过长；同时 Synthesis 把未来“选择哪种修复方式”误列为当前诊断必须解决的决策。
+
+本轮没有恢复诊断旁路，而是在统一合同内修复：
+
+- Verifier 输入先放综合结论，再放证据；
+- 优先携带被 confirmed facts 和 uncertainties 引用的 EvidenceRecord；
+- 单条证据和总证据都有固定字符预算，大输出保留头尾；
+- 诊断已形成“现象 → 失败点 → 根因”的证据链后，历史时间和未来修复方式不再阻止 `achieved`；
+- Synthesis 只报告回答当前目标所必需的缺失决策，并在证据充分时明确生成带全部引用的因果结论。
+
+新增回归构造了 12 条每条 10,000 字符的无关进程输出，验证目标 Verifier 的 payload 仍保持有界、根因证据优先且能正确返回 `achieved`。
+
+### 10.3 最终真实 Agent 回答
+
+全新会话中只输入一次：
+
+```text
+检查 v4e2e_m 当前 Screen 里为什么报错，你自己持续定位到根因
+```
+
+Agent 没有要求用户再次输入“继续”，最终原始回答为：
+
+```text
+工作流协调器：根据已确认事实，根因如下：
+
+1. 直接原因：concurrent_log_handler 在创建锁文件
+   /home/lzl/klonet_v4_e2e/mains/vemu_uestc/logs/.__access.lock 时，
+   因父目录 /home/lzl/klonet_v4_e2e/mains/vemu_uestc/logs 不存在，
+   导致 open() 调用抛出 FileNotFoundError。
+
+2. 根本原因：v4e2e_m 进程的日志配置引用了不存在的目录
+   /home/lzl/klonet_v4_e2e/mains/vemu_uestc/logs，而该目录未被创建。
+
+3. 缺失决策：
+   - 日志目录应由应用启动代码自动创建，还是由部署流程预先创建。
+   - 日志目录路径是否应修正为已存在的目录。
+
+当前问题定位完成，根因明确。
+```
+
+最终 Linux 全量回归：
+
+```text
+1011 passed in 44.73s
+```
+
+## 11. 退役工作流版本命名
+
+代码审计确认旧 V3 的 Planner、Supervisor、Workflow、Store 和 Summarizer 上层实现已经不在仓库中；当前根包中的 Action、Checker、Probe、Executor、Verifier 和安全合同是现行工作流复用的基础能力，不属于 V3。原 `ops/privileged/v4` 已经是唯一生产实现，因此继续保留版本号只会制造错误的双轨印象。
+
+本轮将唯一实现提升为规范包：
+
+```text
+ops/privileged/workflow/
+├── change_binding.py
+├── change_planner.py
+├── contracts.py
+├── coordinator.py
+├── discovery.py
+├── evidence_synthesis.py
+├── mutation.py
+├── operational_context.py
+├── plan_store.py
+├── readonly_runtime.py
+└── response.py
+```
+
+公开类型同步收敛：
+
+```text
+V4ChangeBinder             → ChangeBinder
+V4ChangePlannerAgent       → ChangePlannerAgent
+V4PlanningOutcome          → PlanningOutcome
+ChangePlanV4               → ChangePlan
+ChangeStepV4               → ChangeStep
+V4MutationWorkflow         → MutationWorkflow
+V4WorkflowResult           → WorkflowResult
+PrivilegedOpsV4Coordinator → PrivilegedOpsCoordinator
+V4DiscoveryAgent           → DiscoveryAgent
+V4EvidenceSynthesizer      → EvidenceSynthesizer
+V4ResponseAgent            → ResponseAgent
+V4PlanStore                → ChangePlanStore
+```
+
+运行合同也改为无版本命名：
+
+```text
+plan_id prefix: priv-ops-
+confirmation:   confirm-priv-plan <plan_id> <sha256>
+plan directory: privileged_ops_plans/
+```
+
+旧计划不会隐式迁移或继承授权哈希；如需继续旧的待确认操作，必须按当前环境重新发现并生成计划。历史设计文档、历史会话和真实平台标识 `v4e2e`/`klonet-v4-e2e` 保持不变，其中的 `v4` 是业务实例名称，不是工作流版本。
+
+验收结果：
+
+- 旧包路径不可导入；
+- 生产 Python 代码中没有工作流 V4 类名、导入路径、计划前缀、确认命令或存储目录；
+- 296 项工作流定向测试通过；
+- Linux 全量回归 `1012 passed in 45.57s`；
+- 真实 ops-privilege CLI 从新包路径启动，并完成 `running_platforms` 只读探测与回答。

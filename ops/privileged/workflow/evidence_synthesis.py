@@ -1,4 +1,4 @@
-"""In-memory evidence synthesis for Ops-Privilege V4."""
+"""In-memory evidence synthesis for Ops-Privilege."""
 
 from __future__ import annotations
 
@@ -6,24 +6,28 @@ import json
 import re
 from typing import Any
 
-from klonet_agent.ops.privileged.v4.contracts import (
+from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceClaim,
     EvidenceConclusion,
 )
-from klonet_agent.ops.privileged.v4.discovery import parse_json_object
+from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
 
 
 SYNTHESIS_SYSTEM_PROMPT = """
-You are the Klonet Ops-Privilege V4 Evidence Synthesizer.
+You are the Klonet Ops-Privilege Evidence Synthesizer.
 Use only the supplied read-only evidence. Never request tools, propose commands,
 write files, or claim facts without evidence references.
 Return one JSON object with confirmed_facts, uncertainties, missing_decisions.
 Each fact is {"text":"...","evidence_refs":["ev-..."]}.
+When evidence supports a causal chain, include one explicit confirmed fact that
+states the root cause and references every supporting link. Uncertainties and
+missing_decisions must be necessary to answer the supplied goal. Do not list
+future repair choices when the current goal only asks for diagnosis.
 """.strip()
 
 
-class V4EvidenceSynthesizer:
+class EvidenceSynthesizer:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
 

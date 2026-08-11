@@ -15,7 +15,7 @@ class FakeReadonlyExecutor:
 
 
 def test_validated_readonly_runner_converts_safe_command_to_argv():
-    from klonet_agent.ops.privileged.v4.runtime import ValidatedReadonlyCommandRunner
+    from klonet_agent.ops.privileged.workflow.readonly_runtime import ValidatedReadonlyCommandRunner
 
     executor = FakeReadonlyExecutor()
     output = ValidatedReadonlyCommandRunner(executor)("systemctl status nginx")
@@ -26,7 +26,7 @@ def test_validated_readonly_runner_converts_safe_command_to_argv():
 
 
 def test_validated_readonly_runner_refuses_mutation_before_executor():
-    from klonet_agent.ops.privileged.v4.runtime import ValidatedReadonlyCommandRunner
+    from klonet_agent.ops.privileged.workflow.readonly_runtime import ValidatedReadonlyCommandRunner
 
     executor = FakeReadonlyExecutor()
 

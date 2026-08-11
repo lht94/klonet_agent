@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 import json
+import re
 
 from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
 from klonet_agent.ops.privileged.contracts import (
@@ -13,6 +14,13 @@ from klonet_agent.ops.privileged.contracts import (
 )
 from klonet_agent.ops.privileged.action_contracts import _parse_json_object
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+from klonet_agent.ops.privileged.workflow.contracts import (
+    EvidenceBundle,
+    EvidenceConclusion,
+    GoalOutcome,
+    ProbeRequest,
+    normalize_probe_request,
+)
 
 
 VERIFIER_SYSTEM_PROMPT = """
@@ -41,6 +49,49 @@ Never request mutation, invent facts, or expose secrets.
 MAX_VERIFICATION_PROBE_ROUNDS = 2
 
 
+GOAL_VERIFIER_SYSTEM_PROMPT = """
+You are the single goal-level outcome Verifier for Klonet Ops-Privilege.
+Evaluate whether the user's requested outcome has actually been obtained and
+select the next workflow transition. Do not generate or execute mutations.
+
+Return exactly one JSON object:
+{
+  "status": "achieved|need_evidence|need_replan|needs_user_decision|blocked",
+  "reason": "short reason in Chinese",
+  "user_question": "only for a genuine user choice",
+  "evidence_requests": [
+    {"probe":"registered probe","args":{},"purpose":"..."}
+  ]
+}
+
+Rules:
+- `achieved` requires evidence that directly answers the whole user goal. For
+  diagnosis, require a supported causal chain from symptom to failure point to
+  underlying cause; a list of uncertainties is not a diagnosis.
+- Once that causal chain is supported, uncertainties about historical timing
+  or which future fix to choose do not prevent a diagnostic goal from being
+  achieved. Those are separate change decisions, not missing diagnosis facts.
+- `need_evidence` whenever a missing fact can be obtained with registered
+  read-only probes. Reading logs/source/config, locating files, checking
+  process state, reconstructing a traceback, and comparing repository changes
+  are technical work, never user decisions.
+- `needs_user_decision` only for an actual target, scope, product, or
+  authorization choice that cannot be inferred from evidence. Never ask the
+  user to perform a probe.
+- `blocked` only when evidence proves every safe registered route required for
+  the goal is unavailable. One refused path or failed probe is insufficient
+  when another registered route can find the same fact.
+- `need_replan` is valid only in `post_execution` phase, after evidence proves
+  the approved plan did not achieve the goal and identifies enough cause to
+  safely revise only the unmet effects.
+- Request at most four probes and never repeat an attempted probe key.
+- Use only registered probes. Write user-visible text in Chinese.
+
+Registered probes:
+%s
+""".strip()
+
+
 class PrivilegedVerifierAgent:
     def __init__(
         self,
@@ -51,6 +102,222 @@ class PrivilegedVerifierAgent:
         self.llm = llm
         self.registry = registry or DefaultCheckerRegistry()
         self.probe_runner = probe_runner
+
+    def verify_goal(
+        self,
+        goal: str,
+        bundle: EvidenceBundle,
+        conclusion: EvidenceConclusion,
+        *,
+        attempted_keys: set[str] | None = None,
+        phase: str = "readonly",
+    ) -> GoalOutcome:
+        """Evaluate the whole user goal, independently of any single step."""
+
+        attempted_keys = set(attempted_keys or set())
+        if (
+            phase == "readonly"
+            and
+            not _is_causal_diagnosis_goal(goal)
+            and not conclusion.uncertainties
+            and not conclusion.missing_decisions
+        ):
+            return GoalOutcome("achieved")
+        if self.llm is None:
+            return self._goal_fallback(conclusion)
+        payload = {
+            "goal": goal,
+            "conclusion": {
+                "confirmed_facts": [
+                    {"text": item.text, "evidence_refs": item.evidence_refs}
+                    for item in conclusion.confirmed_facts
+                ],
+                "uncertainties": [
+                    {"text": item.text, "evidence_refs": item.evidence_refs}
+                    for item in conclusion.uncertainties
+                ],
+                "missing_decisions": list(conclusion.missing_decisions),
+            },
+            "evidence": self._goal_evidence_payload(bundle, conclusion),
+            "attempted_probe_keys": sorted(attempted_keys),
+            "workflow_phase": phase,
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": GOAL_VERIFIER_SYSTEM_PROMPT
+                % DEFAULT_READONLY_PROBES.render(),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        last_error: Exception | None = None
+        for attempt in range(2):
+            content = ""
+            try:
+                response = self.llm.complete(
+                    messages=messages,
+                    tools=None,
+                    reasoning_effort="low",
+                    temperature=0,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                content = response.choices[0].message.content or ""
+                return self._goal_outcome(
+                    _parse_json_object(content),
+                    attempted_keys,
+                    goal=goal,
+                    conclusion=conclusion,
+                    phase=phase,
+                )
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    messages.extend([
+                        {"role": "assistant", "content": content},
+                        {
+                            "role": "user",
+                            "content": (
+                                "修复 GoalOutcome JSON 合同，不要改变证据事实。错误：%s"
+                                % type(exc).__name__
+                            ),
+                        },
+                    ])
+        fallback = self._goal_fallback(conclusion)
+        if fallback.status == "achieved":
+            return fallback
+        return GoalOutcome(
+            "blocked",
+            reason="Verifier 无法形成有效的目标级补证合同：%s"
+            % type(last_error).__name__,
+        )
+
+    @staticmethod
+    def _goal_outcome(
+        data: dict[str, Any],
+        attempted_keys: set[str],
+        *,
+        goal: str,
+        conclusion: EvidenceConclusion,
+        phase: str,
+    ) -> GoalOutcome:
+        status = str(data.get("status") or "").strip().lower()
+        question = str(data.get("user_question") or "").strip()
+        if status == "achieved" and _is_causal_diagnosis_goal(goal):
+            facts = " ".join(item.text for item in conclusion.confirmed_facts)
+            if not re.search(
+                r"根因|原因(?:是|为)|导致|由于|caused by|due to|root cause|"
+                r"未发现.{0,20}(?:报错|异常|故障|error|failure)",
+                facts,
+                re.I,
+            ):
+                raise ValueError("diagnostic goal lacks causal evidence")
+        if status == "needs_user_decision":
+            if _question_offloads_discoverable_work(question):
+                raise ValueError("discoverable technical work cannot be offloaded")
+            if not re.search(
+                r"目标|范围|实例|项目根目录|哪个|哪一个|选择|授权|是否允许|"
+                r"target|scope|instance|project root|choose|authorize",
+                question,
+                re.I,
+            ):
+                raise ValueError("needs_user_decision lacks a genuine choice")
+        if status == "need_replan":
+            if phase != "post_execution":
+                raise ValueError("need_replan is only valid after execution")
+            facts = " ".join(item.text for item in conclusion.confirmed_facts)
+            if not re.search(
+                r"失败|未达到|根因|原因(?:是|为)|导致|由于|failed|unmet|"
+                r"caused by|due to|root cause",
+                facts,
+                re.I,
+            ):
+                raise ValueError("need_replan lacks supported failure evidence")
+        requests: list[ProbeRequest] = []
+        for raw in (data.get("evidence_requests") or [])[:4]:
+            if not isinstance(raw, dict):
+                continue
+            probe, args = normalize_probe_request(
+                str(raw.get("probe") or ""),
+                dict(raw.get("args") or {}),
+            )
+            if DEFAULT_READONLY_PROBES.get(probe) is None:
+                continue
+            request = ProbeRequest(
+                probe,
+                args,
+                str(raw.get("purpose") or "补齐目标证据"),
+            )
+            if request.cache_key not in attempted_keys:
+                requests.append(request)
+        return GoalOutcome(
+            status,
+            reason=str(data.get("reason") or "").strip(),
+            evidence_requests=requests,
+            user_question=question,
+            failed_criteria=[
+                str(item) for item in data.get("failed_criteria", [])
+                if str(item).strip()
+            ],
+            next_objective=str(data.get("next_objective") or "").strip(),
+        )
+
+    @staticmethod
+    def _goal_fallback(conclusion: EvidenceConclusion) -> GoalOutcome:
+        if not conclusion.uncertainties and not conclusion.missing_decisions:
+            return GoalOutcome("achieved")
+        return GoalOutcome(
+            "blocked",
+            reason="仍存在未解决的目标证据缺口，且 Verifier 不可用。",
+        )
+
+    @staticmethod
+    def _goal_evidence_payload(
+        bundle: EvidenceBundle,
+        conclusion: EvidenceConclusion,
+        *,
+        output_budget: int = 32000,
+    ) -> list[dict[str, Any]]:
+        """Keep goal evidence bounded and prioritize synthesized references."""
+
+        referenced = {
+            evidence_id
+            for claim in [
+                *conclusion.confirmed_facts,
+                *conclusion.uncertainties,
+            ]
+            for evidence_id in claim.evidence_refs
+        }
+        ordered = [
+            record for record in bundle.records
+            if record.evidence_id in referenced
+        ] + [
+            record for record in reversed(bundle.records)
+            if record.evidence_id not in referenced
+        ]
+        result: list[dict[str, Any]] = []
+        remaining = max(1000, int(output_budget))
+        for item in ordered:
+            if remaining <= 0:
+                break
+            output = str(item.output or "")
+            limit = min(6000, remaining)
+            if len(output) > limit:
+                half = max(1, (limit - 48) // 2)
+                output = (
+                    output[:half]
+                    + "\n...[goal evidence compacted]...\n"
+                    + output[-half:]
+                )
+            remaining -= len(output)
+            result.append({
+                "evidence_id": item.evidence_id,
+                "probe": item.request.probe,
+                "args": item.request.args,
+                "status": item.status,
+                "collected_at": item.collected_at,
+                "output": output,
+            })
+        return result
 
     def verify_step(
         self,
@@ -69,7 +336,7 @@ class PrivilegedVerifierAgent:
         if self._has_strong_deterministic_success(step):
             return VerificationDecision(
                 status="passed",
-                goal_achieved=True,
+                step_achieved=True,
                 verification_level=plan.verification_level,
                 reason="all deterministic state checks passed",
                 confirmed_facts=[
@@ -85,7 +352,7 @@ class PrivilegedVerifierAgent:
             )
         return VerificationDecision(
             status="passed",
-            goal_achieved=True,
+            step_achieved=True,
             verification_level=plan.verification_level,
             reason=(
                 "execution completed and all configured deterministic checks passed"
@@ -144,7 +411,7 @@ class PrivilegedVerifierAgent:
             except Exception:
                 decision = deterministic_floor or VerificationDecision(
                     status="inconclusive",
-                    goal_achieved=False,
+                    step_achieved=False,
                     verification_level=plan.verification_level,
                     missing_evidence=["Verifier Agent response unavailable"],
                     reason=(
@@ -162,7 +429,7 @@ class PrivilegedVerifierAgent:
                 ):
                     decision = deterministic_floor or VerificationDecision(
                         status="inconclusive",
-                        goal_achieved=False,
+                        step_achieved=False,
                         verification_level=plan.verification_level,
                         missing_evidence=[
                             "Verifier requested unavailable additional evidence"
@@ -208,7 +475,7 @@ class PrivilegedVerifierAgent:
                 status = deterministic_floor.status
             return VerificationDecision(
                 status=status,
-                goal_achieved=status == "passed",
+                step_achieved=status == "passed",
                 verification_level=plan.verification_level,
                 failures=(
                     list(deterministic_floor.failures)
@@ -230,7 +497,7 @@ class PrivilegedVerifierAgent:
             )
         return deterministic_floor or VerificationDecision(
             status="inconclusive",
-            goal_achieved=False,
+            step_achieved=False,
             verification_level=plan.verification_level,
             reason="Verifier Agent did not reach a conclusion",
             probe_history=probe_history,
@@ -301,7 +568,7 @@ class PrivilegedVerifierAgent:
             return deterministic
         return VerificationDecision(
             status="passed",
-            goal_achieved=True,
+            step_achieved=True,
             verification_level=plan.verification_level,
             reason="all deterministic checks passed",
         )
@@ -322,7 +589,7 @@ class PrivilegedVerifierAgent:
         if not usable:
             return VerificationDecision(
                 status="blocked",
-                goal_achieved=False,
+                step_achieved=False,
                 missing_evidence=["postcondition independent of exit code"],
                 reason="interrupted step has no current-state checker",
                 next_action="inspect current state; do not auto-reexecute",
@@ -335,7 +602,7 @@ class PrivilegedVerifierAgent:
         if failures:
             return VerificationDecision(
                 status="failed",
-                goal_achieved=False,
+                step_achieved=False,
                 failures=failures,
                 reason="current state does not satisfy recovered postconditions",
                 next_action="create a new plan; do not replay the interrupted step",
@@ -343,14 +610,14 @@ class PrivilegedVerifierAgent:
         if unavailable:
             return VerificationDecision(
                 status="inconclusive",
-                goal_achieved=False,
+                step_achieved=False,
                 missing_evidence=unavailable,
                 reason="current-state checker unavailable",
                 next_action="inspect current state; do not auto-reexecute",
             )
         return VerificationDecision(
             status="passed",
-            goal_achieved=True,
+            step_achieved=True,
             verification_level="recovered-current-state",
             reason="current state satisfies all independent postconditions",
         )
@@ -363,7 +630,7 @@ class PrivilegedVerifierAgent:
         if evidence is None:
             return VerificationDecision(
                 status="blocked",
-                goal_achieved=False,
+                step_achieved=False,
                 failures=["missing execution evidence"],
                 reason="step has no execution evidence",
                 next_action="inspect current state; do not auto-reexecute",
@@ -371,7 +638,7 @@ class PrivilegedVerifierAgent:
         if evidence.timed_out or evidence.return_code is None:
             return VerificationDecision(
                 status="blocked",
-                goal_achieved=False,
+                step_achieved=False,
                 failures=["execution outcome unknown"],
                 reason="execution timed out or was interrupted",
                 next_action="inspect current state; do not auto-reexecute",
@@ -393,7 +660,7 @@ class PrivilegedVerifierAgent:
         if failures:
             return VerificationDecision(
                 status="failed",
-                goal_achieved=False,
+                step_achieved=False,
                 failures=failures,
                 reason="execution or required checks failed",
                 next_action="diagnose evidence and create a revised plan",
@@ -401,7 +668,7 @@ class PrivilegedVerifierAgent:
         if unavailable:
             return VerificationDecision(
                 status="inconclusive",
-                goal_achieved=False,
+                step_achieved=False,
                 missing_evidence=unavailable,
                 reason="required checker unavailable",
                 next_action="install or select a deterministic checker",
@@ -417,3 +684,25 @@ def _strings(value: Any) -> list[str]:
         for item in value[:20]
         if str(item).strip()
     ]
+
+
+def _is_causal_diagnosis_goal(goal: str) -> bool:
+    return bool(re.search(
+        r"为什么|根因|报错|异常|故障|诊断|排查|why|root cause|error|"
+        r"failure|diagnos|troubleshoot",
+        str(goal or ""),
+        re.I,
+    ))
+
+
+def _question_offloads_discoverable_work(question: str) -> bool:
+    return bool(re.search(
+        r"(?:提供|获取|读取|查看|检查|确认).{0,30}"
+        r"(?:日志|堆栈|源码|配置|PID|进程|端口|Screen|文件)|"
+        r"(?:日志|堆栈|源码|配置|PID|进程|端口|Screen|文件).{0,30}"
+        r"(?:提供|获取|读取|查看|检查|确认)|"
+        r"provide|fetch|read|inspect|check.{0,30}"
+        r"(?:log|traceback|source|config|process|port|file)",
+        str(question or ""),
+        re.I,
+    ))

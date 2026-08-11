@@ -1,14 +1,14 @@
-"""User-facing response rendering for Ops-Privilege V4."""
+"""User-facing response rendering for Ops-Privilege."""
 
 from __future__ import annotations
 
 from typing import Any
 import re
 
-from klonet_agent.ops.privileged.v4.contracts import EvidenceConclusion
+from klonet_agent.ops.privileged.workflow.contracts import EvidenceConclusion
 
 
-class V4ResponseAgent:
+class ResponseAgent:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
 
@@ -23,7 +23,7 @@ class V4ResponseAgent:
                         {
                             "role": "system",
                             "content": (
-                                "你是 Klonet Ops-Privilege V4 回答器。只根据已确认事实和"
+                                "你是 Klonet Ops-Privilege 回答器。只根据已确认事实和"
                                 "不确定项回答中文，不输出内部证据 ID，不建议或执行变更。"
                                 "保持事实、顺序和含义不变；使用合理分段，列表项分别换行，"
                                 "不要输出多余空行。"
