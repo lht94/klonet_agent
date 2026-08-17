@@ -228,6 +228,11 @@ class FakeVerifier:
         self.steps.append("recovered:" + step.step_id)
         return SimpleNamespace(status=self.status, reason=self.status)
 
+    def verify_execution_outcome(self, plan):
+        from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+        return GoalOutcome("achieved", reason="verified")
+
 
 class RaisingVerifier:
     def verify_step(self, plan, step):
@@ -253,10 +258,29 @@ def _workflow(tmp_path, plan, *, verifier_status="passed"):
     return workflow, planner, binder, store, executor, verifier
 
 
+def _submit(workflow, goal, *, evidence_bundle, evidence_conclusion, **kwargs):
+    """Exercise the Coordinator-owned Plan/Replan loop with real mutation stages."""
+
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator,
+    )
+
+    coordinator = object.__new__(PrivilegedOpsCoordinator)
+    coordinator.mutation_workflow = workflow
+    coordinator.discovery = workflow.discovery
+    coordinator.synthesis = workflow.synthesis
+    return coordinator._submit_mutation(
+        goal,
+        evidence_bundle=evidence_bundle,
+        evidence_conclusion=evidence_conclusion,
+        intent_context=kwargs.get("intent_context"),
+    )
+
+
 def test_submit_binds_and_persists_but_never_executes_before_confirmation(tmp_path):
     workflow, planner, binder, store, executor, _ = _workflow(tmp_path, _change_plan())
 
-    result = workflow.submit("deploy", evidence_bundle=object(), evidence_conclusion=object())
+    result = _submit(workflow, "deploy", evidence_bundle=object(), evidence_conclusion=object())
 
     assert result.kind == "awaiting_confirmation"
     assert planner.calls == binder.calls == 1
@@ -288,7 +312,7 @@ def test_submit_passes_collected_discovery_evidence_to_binding(tmp_path):
         )
     )
 
-    workflow.submit("deploy", evidence_bundle=bundle, evidence_conclusion=object())
+    _submit(workflow, "deploy", evidence_bundle=bundle, evidence_conclusion=object())
 
     context = binder.kwargs[0]["grounded_context"]
     assert "inspect_docker_images" in context.environment_evidence
@@ -296,7 +320,7 @@ def test_submit_passes_collected_discovery_evidence_to_binding(tmp_path):
 
 def test_confirmation_rejects_stale_hash_without_execution(tmp_path):
     workflow, _, _, _, executor, _ = _workflow(tmp_path, _change_plan())
-    submitted = workflow.submit("deploy", evidence_bundle=object(), evidence_conclusion=object())
+    submitted = _submit(workflow, "deploy", evidence_bundle=object(), evidence_conclusion=object())
 
     result = workflow.confirm(submitted.plan.plan_id, "stale")
 
@@ -310,7 +334,7 @@ def test_exact_confirmation_executes_then_verifies_and_completes(tmp_path, hiera
     workflow, _, _, store, executor, verifier = _workflow(
         tmp_path, _change_plan(hierarchical=hierarchical)
     )
-    submitted = workflow.submit("deploy", evidence_bundle=object(), evidence_conclusion=object())
+    submitted = _submit(workflow, "deploy", evidence_bundle=object(), evidence_conclusion=object())
 
     result = workflow.confirm(submitted.plan.plan_id, submitted.plan.content_hash)
 
@@ -330,7 +354,7 @@ def test_failed_verification_pauses_without_retrying_execution(tmp_path):
     workflow, _, _, store, executor, _ = _workflow(
         tmp_path, _change_plan(), verifier_status="failed"
     )
-    submitted = workflow.submit("deploy", evidence_bundle=object(), evidence_conclusion=object())
+    submitted = _submit(workflow, "deploy", evidence_bundle=object(), evidence_conclusion=object())
 
     result = workflow.confirm(submitted.plan.plan_id, submitted.plan.content_hash)
 
@@ -344,7 +368,7 @@ def test_exact_reconfirmation_returns_failure_decision_without_reexecuting(tmp_p
     workflow, _, _, store, executor, verifier = _workflow(
         tmp_path, _change_plan(hierarchical=True), verifier_status="failed"
     )
-    submitted = workflow.submit(
+    submitted = _submit(workflow,
         "deploy", evidence_bundle=object(), evidence_conclusion=object()
     )
     plan_id = submitted.plan.plan_id
@@ -386,6 +410,11 @@ def test_exact_reconfirmation_never_retries_even_conclusive_no_change_failure(tm
             status = "failed" if self.verify_calls == 1 else "passed"
             return SimpleNamespace(status=status, reason=status)
 
+        def verify_execution_outcome(self, plan):
+            from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+            return GoalOutcome("achieved", reason="verified")
+
         def verify_recovered_step(self, plan, step):
             return SimpleNamespace(status="failed", reason="target still absent")
 
@@ -399,7 +428,7 @@ def test_exact_reconfirmation_never_retries_even_conclusive_no_change_failure(tm
         executor=executor,
         verifier=SequenceVerifier(),
     )
-    submitted = workflow.submit(
+    submitted = _submit(workflow,
         "deploy", evidence_bundle=object(), evidence_conclusion=object()
     )
     plan_id = submitted.plan.plan_id
@@ -531,7 +560,7 @@ def test_semantic_config_verification_is_composed_from_atomic_bindings():
 
 def test_control_command_requires_exact_workflow_syntax(tmp_path):
     workflow, _, _, _, executor, _ = _workflow(tmp_path, _change_plan())
-    submitted = workflow.submit("deploy", evidence_bundle=object(), evidence_conclusion=object())
+    submitted = _submit(workflow, "deploy", evidence_bundle=object(), evidence_conclusion=object())
 
     ignored = workflow.handle_control(
         "please confirm-priv-plan %s %s" % (
@@ -585,7 +614,7 @@ def test_planner_evidence_gap_returns_to_discovery_then_replans(tmp_path):
         max_replanning_rounds=2,
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=bundle, evidence_conclusion=SimpleNamespace()
     )
 
@@ -638,7 +667,7 @@ def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path
         synthesis=synthesis,
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
     )
 
@@ -694,7 +723,7 @@ def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
         ),
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
     )
 
@@ -731,7 +760,7 @@ def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
         max_replanning_rounds=4,
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
     )
 
@@ -766,7 +795,7 @@ def test_default_discovery_budget_allows_four_rounds_then_ready(tmp_path):
         ),
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=SimpleNamespace(), evidence_conclusion=SimpleNamespace()
     )
 
@@ -787,7 +816,7 @@ def test_verifier_exception_is_persisted_as_pause_after_single_execution(tmp_pat
         executor=executor,
         verifier=RaisingVerifier(),
     )
-    submitted = workflow.submit(
+    submitted = _submit(workflow,
         "deploy", evidence_bundle=object(), evidence_conclusion=object()
     )
 
@@ -829,7 +858,7 @@ def test_binder_failure_replans_at_most_once_then_succeeds(tmp_path):
         verifier=FakeVerifier(),
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=object(), evidence_conclusion=object()
     )
 
@@ -863,7 +892,7 @@ def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_pat
         verifier=FakeVerifier(),
     )
 
-    result = workflow.submit(
+    result = _submit(workflow,
         "deploy", evidence_bundle=object(), evidence_conclusion=object()
     )
 
@@ -893,7 +922,7 @@ def test_failure_control_persists_choice_and_never_executes_old_plan(tmp_path):
         ]),
         binder=Binder(), store=store, executor=executor, verifier=FakeVerifier(),
     )
-    failed = workflow.submit(
+    failed = _submit(workflow,
         "帮我重启 v4_e2e 平台",
         evidence_bundle=object(), evidence_conclusion=object(),
     )

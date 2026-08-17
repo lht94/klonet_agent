@@ -68,7 +68,7 @@ class NoMutationWorkflow:
     def __init__(self):
         self.calls = []
 
-    def submit(self, *args, **kwargs):
+    def plan_once(self, *args, **kwargs):
         self.calls.append((args, kwargs))
         raise AssertionError("readonly request must not enter mutation workflow")
 
@@ -77,9 +77,20 @@ class RecordingMutationWorkflow:
     def __init__(self):
         self.calls = []
 
-    def submit(self, *args, **kwargs):
+    def plan_once(self, *args, **kwargs):
+        from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
         self.calls.append((args, kwargs))
-        return SimpleNamespace(handled=True, kind="awaiting_confirmation", message="plan")
+        return GoalOutcome(
+            "need_execution", plan=SimpleNamespace(status="draft"),
+        )
+
+    def bind_once(self, plan, *, evidence_bundle):
+        from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+        return GoalOutcome(
+            "needs_user_decision", user_question="plan", plan=plan,
+        )
 
 
 def _evidence():
@@ -391,10 +402,17 @@ def test_paused_confirm_result_automatically_diagnoses_and_replans():
                 True, "paused", "master health check failed", plan=failed_plan,
             )
 
-        def submit(self, goal, **kwargs):
+        def plan_once(self, goal, **kwargs):
+            from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
             self.submits.append((goal, kwargs))
-            return WorkflowResult(
-                True, "awaiting_confirmation", "recovery plan",
+            return GoalOutcome(
+                "need_execution", plan=SimpleNamespace(status="draft"),
+            )
+
+        def bind_once(self, plan, *, evidence_bundle):
+            return GoalOutcome(
+                "needs_user_decision", user_question="recovery plan", plan=plan,
             )
 
     class Discovery:
@@ -975,17 +993,26 @@ def test_failure_option_reenters_discovery_and_creates_new_component_plan():
                 True, "failure_option_selected", "selected", failure=failure,
             )
 
-        def submit(
+        def plan_once(
             self, submitted_goal, *, evidence_bundle, evidence_conclusion,
-            conversation_context="", intent_context=None,
+            intent_context=None, binding_feedback="",
         ):
+            from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
             self.submissions.append(
                 (submitted_goal, evidence_bundle, dict(intent_context or {}))
             )
-            return WorkflowResult(
-                True, "awaiting_confirmation", "new plan", plan=SimpleNamespace(
+            return GoalOutcome(
+                "need_execution", plan=SimpleNamespace(
                     plan_id="priv-ops-new", content_hash="new-hash"
                 ),
+            )
+
+        def bind_once(self, plan, *, evidence_bundle):
+            from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+            return GoalOutcome(
+                "needs_user_decision", user_question="new plan", plan=plan,
             )
 
     class RefreshDiscovery:

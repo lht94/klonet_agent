@@ -107,6 +107,47 @@ class PrivilegedVerifierAgent:
         self.registry = registry or DefaultCheckerRegistry()
         self.probe_runner = probe_runner
 
+    @staticmethod
+    def verify_execution_outcome(plan: Any) -> GoalOutcome:
+        """Convert fully verified execution evidence into the goal transition."""
+
+        incomplete: list[str] = []
+        failed: list[str] = []
+        for change in getattr(plan, "steps", ()) or ():
+            if str(getattr(change, "status", "")) != "completed":
+                incomplete.append(str(getattr(change, "step_id", "unknown")))
+            implementation = getattr(change, "implementation_plan", None)
+            execution_steps = (
+                getattr(implementation, "steps", ())
+                if implementation is not None else (change,)
+            )
+            for step in execution_steps:
+                step_id = str(getattr(step, "step_id", "unknown"))
+                if str(getattr(step, "status", "")) != "completed":
+                    incomplete.append(step_id)
+                evidence = getattr(step, "evidence", None)
+                if evidence is not None and (
+                    getattr(evidence, "return_code", None) != 0
+                    or bool(getattr(evidence, "timed_out", False))
+                ):
+                    failed.append(step_id)
+                if any(
+                    str(getattr(check, "status", "")) == "failed"
+                    for check in getattr(step, "checks", ()) or ()
+                ):
+                    failed.append(step_id)
+        if incomplete or failed:
+            criteria = sorted(set([*incomplete, *failed]))
+            return GoalOutcome(
+                "need_replan",
+                reason="执行计划尚未形成全部通过的验证证据。",
+                failed_criteria=criteria,
+            )
+        return GoalOutcome(
+            "achieved",
+            reason="全部已审批变更及其后置条件均已通过验证。",
+        )
+
     def verify_goal(
         self,
         goal: str,

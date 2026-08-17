@@ -554,3 +554,48 @@ def test_verifier_marks_timeout_blocked_and_does_not_reexecute():
 
     assert decision.status == "blocked"
     assert decision.next_action == "inspect current state; do not auto-reexecute"
+
+
+def test_goal_completion_is_issued_only_for_fully_verified_execution():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    step = SimpleNamespace(
+        step_id="restart-worker",
+        status="completed",
+        evidence=SimpleNamespace(return_code=0, timed_out=False),
+        checks=[SimpleNamespace(status="passed")],
+    )
+    change = SimpleNamespace(
+        step_id="recover-runtime",
+        status="completed",
+        implementation_plan=SimpleNamespace(steps=[step]),
+    )
+
+    outcome = PrivilegedVerifierAgent.verify_execution_outcome(
+        SimpleNamespace(steps=[change]),
+    )
+
+    assert outcome.status == "achieved"
+
+
+def test_goal_completion_rejects_incomplete_or_failed_execution_evidence():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    step = SimpleNamespace(
+        step_id="restart-worker",
+        status="paused",
+        evidence=SimpleNamespace(return_code=1, timed_out=False),
+        checks=[SimpleNamespace(status="failed")],
+    )
+    change = SimpleNamespace(
+        step_id="recover-runtime",
+        status="paused",
+        implementation_plan=SimpleNamespace(steps=[step]),
+    )
+
+    outcome = PrivilegedVerifierAgent.verify_execution_outcome(
+        SimpleNamespace(steps=[change]),
+    )
+
+    assert outcome.status == "need_replan"
+    assert set(outcome.failed_criteria) == {"recover-runtime", "restart-worker"}

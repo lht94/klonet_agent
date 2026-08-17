@@ -238,17 +238,11 @@ class PrivilegedOpsCoordinator:
                 intent_context["resolved_project_root"] = (
                     resolved_identity.project_root
                 )
-            submit_kwargs = {
-                "evidence_bundle": bundle,
-                "evidence_conclusion": conclusion,
-                "conversation_context": conversation_context,
-            }
-            if "intent_context" in inspect.signature(
-                self.mutation_workflow.submit
-            ).parameters:
-                submit_kwargs["intent_context"] = intent_context
-            result = self.mutation_workflow.submit(
-                resolved_goal, **submit_kwargs,
+            result = self._submit_mutation(
+                resolved_goal,
+                evidence_bundle=bundle,
+                evidence_conclusion=conclusion,
+                intent_context=intent_context,
             )
             self._save_context(
                 snapshot,
@@ -265,6 +259,145 @@ class PrivilegedOpsCoordinator:
         finally:
             if end_probe_session is not None:
                 end_probe_session()
+
+    def _submit_mutation(
+        self,
+        goal: str,
+        *,
+        evidence_bundle: Any,
+        evidence_conclusion: Any,
+        intent_context: dict[str, Any] | None = None,
+    ) -> WorkflowResult:
+        """Own the single bounded Plan/Replan transition loop."""
+
+        workflow = self.mutation_workflow
+
+        def plan(*, feedback: str = "") -> Any:
+            return workflow.plan_once(
+                goal,
+                evidence_bundle=evidence_bundle,
+                evidence_conclusion=evidence_conclusion,
+                intent_context=intent_context,
+                binding_feedback=feedback,
+            )
+
+        outcome = plan()
+        replanning_rounds = 0
+        candidate_replans = 0
+        while True:
+            if outcome.status == "need_evidence":
+                if replanning_rounds >= workflow.max_replanning_rounds:
+                    return WorkflowResult(
+                        True, "blocked",
+                        "Planner-to-Discovery evidence budget exhausted.",
+                        evidence=evidence_bundle,
+                    )
+                if self.discovery is None or self.synthesis is None:
+                    return WorkflowResult(
+                        True, "blocked",
+                        "Planner requested evidence but Discovery is unavailable.",
+                        evidence=evidence_bundle,
+                    )
+                evidence_bundle = self.discovery.collect_requests(
+                    outcome.evidence_requests,
+                    evidence_bundle,
+                )
+                evidence_conclusion = self.synthesis.synthesize(
+                    goal, evidence_bundle,
+                )
+                replanning_rounds += 1
+                finalize_candidate = getattr(
+                    workflow.planner, "finalize_candidate", None,
+                )
+                if outcome.candidate_plan is not None and finalize_candidate is not None:
+                    outcome = finalize_candidate(
+                        outcome.candidate_plan, evidence_bundle,
+                    )
+                else:
+                    outcome = plan()
+                continue
+            occupied_candidate = (
+                outcome.status == "blocked"
+                and str(outcome.reason or "").startswith(
+                    "candidate ports became occupied:"
+                )
+            )
+            if (
+                occupied_candidate
+                and candidate_replans < workflow.max_candidate_replans
+            ):
+                candidate_replans += 1
+                outcome = plan(feedback=(
+                    "%s. Select different ports that are not reported as occupied, "
+                    "freeze them, and preserve every other grounded decision."
+                    % outcome.reason
+                ))
+                continue
+            break
+        if outcome.status != "need_execution" or outcome.plan is None:
+            return workflow._failure_result(
+                stage="planning",
+                category="planning_contract_unresolved",
+                summary="变更规划在有限次数校正后仍未形成安全、可审批的计划。",
+                technical_reason=(
+                    outcome.reason
+                    or "change planning did not produce an executable plan"
+                ),
+                goal=goal,
+                attempted_recoveries=["补充计划证据", "有限次数重新规划"],
+                evidence=evidence_bundle,
+            )
+
+        first_binding_error = ""
+        for binding_attempt in range(2):
+            binding = workflow.bind_once(
+                outcome.plan,
+                evidence_bundle=evidence_bundle,
+            )
+            if binding.status == "needs_user_decision" and binding.plan is not None:
+                return WorkflowResult(
+                    True,
+                    "awaiting_confirmation",
+                    binding.user_question,
+                    plan=binding.plan,
+                    evidence=evidence_bundle,
+                )
+            if binding.status != "need_replan":
+                raise ValueError("invalid binding transition")
+            if binding_attempt == 0:
+                first_binding_error = binding.reason
+                outcome = plan(feedback=binding.reason)
+                if outcome.status == "need_execution" and outcome.plan is not None:
+                    continue
+                return workflow._failure_result(
+                    stage="binding",
+                    category="binding_replan_unresolved",
+                    summary="实施绑定发现计划缺少安全落地所需的实例或动作约束。",
+                    technical_reason="%s; replan=%s" % (
+                        binding.reason,
+                        outcome.reason
+                        or "binding replan did not produce a ready plan",
+                    ),
+                    goal=goal,
+                    attempted_recoveries=["首次实施绑定", "保持目标不变局部重建"],
+                    evidence=evidence_bundle,
+                )
+            failed_plan = binding.candidate_plan or outcome.plan
+            failed_plan.status = "blocked"
+            workflow.store.save(failed_plan)
+            return workflow._failure_result(
+                stage="binding",
+                category="binding_contract_invalid",
+                summary="实施绑定无法证明动作只作用于目标实例，已安全拒绝。",
+                technical_reason="first_binding=%s; final_binding=%s" % (
+                    first_binding_error, binding.reason,
+                ),
+                goal=goal,
+                plan=failed_plan,
+                attempted_recoveries=["首次实施绑定", "局部重新规划", "第二次实施绑定"],
+                evidence=evidence_bundle,
+            )
+        raise AssertionError("unreachable binding loop")
 
     def _run_readonly_goal_loop(
         self,
@@ -464,11 +597,10 @@ class PrivilegedOpsCoordinator:
                 plan=plan,
                 evidence=bundle,
             )
-        result = self.mutation_workflow.submit(
+        result = self._submit_mutation(
             goal,
             evidence_bundle=bundle,
             evidence_conclusion=conclusion,
-            conversation_context=conversation_context,
         )
         self._save_context(
             snapshot,
@@ -533,16 +665,12 @@ class PrivilegedOpsCoordinator:
             if identity is not None:
                 intent_context.update(identity.to_dict())
                 intent_context["resolved_project_root"] = identity.project_root
-            submit_kwargs = {
-                "evidence_bundle": bundle,
-                "evidence_conclusion": conclusion,
-                "conversation_context": conversation_context,
-            }
-            if "intent_context" in inspect.signature(
-                self.mutation_workflow.submit
-            ).parameters:
-                submit_kwargs["intent_context"] = intent_context
-            result = self.mutation_workflow.submit(goal, **submit_kwargs)
+            result = self._submit_mutation(
+                goal,
+                evidence_bundle=bundle,
+                evidence_conclusion=conclusion,
+                intent_context=intent_context,
+            )
             self._save_context(
                 snapshot,
                 resolved_goal=goal,
