@@ -108,6 +108,47 @@ def test_change_step_requires_observable_postconditions():
         )
 
 
+def test_goal_outcome_is_the_only_user_level_transition_contract():
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+    assert GoalOutcome("achieved").status == "achieved"
+    with pytest.raises(ValueError, match="need_execution requires plan"):
+        GoalOutcome("need_execution")
+    with pytest.raises(ValueError, match="needs_user_decision requires"):
+        GoalOutcome("needs_user_decision")
+
+
+def test_change_plan_does_not_duplicate_user_decision_state():
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    step = ChangeStep(
+        step_id="restart-component",
+        title="restart component",
+        objective="restart one component",
+        risk="medium",
+        expected_changes=["component restarts"],
+        postconditions=[{"checker": "process_running", "args": {"pattern": "worker"}}],
+    )
+
+    with pytest.raises(ValueError, match="invalid change plan status"):
+        ChangePlan(
+            plan_id="priv-ops-invariant",
+            goal="restart worker",
+            risk="medium",
+            steps=[step],
+            status="awaiting_user_decision",
+        )
+
+
+def test_component_port_contract_is_role_generic_without_fixed_port_aliases():
+    from klonet_agent.ops.privileged.contracts import component_port_arg
+
+    assert component_port_arg({"future_role_port": "54321"}, "future_role") == 54321
+    assert component_port_arg({"master_port": 45551}, "master") == 45551
+    assert component_port_arg({"port_47001": 47001}, "master") is None
+    assert component_port_arg({"future_role_port": 70000}, "future_role") is None
+
+
 def test_workflow_package_exports_mutation_workflow_components():
     from klonet_agent.ops.privileged.workflow import (
         ChangeBinder,
