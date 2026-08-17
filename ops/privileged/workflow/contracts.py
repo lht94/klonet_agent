@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from pathlib import Path
+import re
 
 from klonet_agent.ops.privileged.contracts import (
     ExecutionBinding,
@@ -69,6 +70,35 @@ def normalize_probe_request(
     return normalized_probe, normalized_args
 
 
+def normalize_instance_alias(value: str) -> str:
+    """Normalize display aliases without weakening project-root identity."""
+
+    normalized = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    return normalized[6:] if normalized.startswith("klonet") else normalized
+
+
+@dataclass(frozen=True)
+class ResolvedPlatformIdentity:
+    project_root: str
+    primary_alias: str
+    aliases: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not Path(self.project_root).is_absolute():
+            raise ValueError("resolved platform root must be absolute")
+        if not self.primary_alias or not self.evidence_refs:
+            raise ValueError("resolved platform identity requires alias and evidence")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "project_root": self.project_root,
+            "primary_alias": self.primary_alias,
+            "aliases": list(self.aliases),
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
 @dataclass(frozen=True)
 class EvidenceRecord:
     evidence_id: str
@@ -118,6 +148,85 @@ class EvidenceBundle:
     def evidence_ids(self) -> set[str]:
         return {item.evidence_id for item in self.records}
 
+    @property
+    def knowledge_records(self) -> list[EvidenceRecord]:
+        return [
+            item for item in self.records
+            if item.request.probe == "klonet_knowledge"
+        ]
+
+
+@dataclass(frozen=True)
+class RuntimeLayoutSpec:
+    project_root: str
+    source_root: str
+    startup_cwd: str
+    entry_files: tuple[str, ...]
+    source_sha256s: dict[str, str] = field(default_factory=dict)
+    instance_alias: str = ""
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        roots = [Path(value).expanduser() for value in (
+            self.project_root, self.source_root, self.startup_cwd,
+        )]
+        if not all(path.is_absolute() for path in roots):
+            raise ValueError("runtime layout paths must be absolute")
+        if roots[2] != roots[0]:
+            raise ValueError("runtime startup cwd must equal project root")
+        if roots[1].parent != roots[0]:
+            raise ValueError("runtime source root must be directly under project root")
+        if not self.entry_files:
+            raise ValueError("runtime layout requires entry files")
+
+
+@dataclass(frozen=True)
+class RuntimeComponentSpec:
+    name: str
+    category: str = "application"
+    managed: bool = True
+    default_restart: bool = True
+    screen_suffix: str = ""
+    command_argv: tuple[str, ...] = ()
+    preflight_argv: tuple[str, ...] = ()
+    ports: tuple[int, ...] = ()
+    health_checks: tuple[dict[str, Any], ...] = ()
+    start_after: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", self.name):
+            raise ValueError("invalid runtime component name")
+        if self.category not in {"application", "shared_dependency"}:
+            raise ValueError("invalid runtime component category")
+        if not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", self.screen_suffix,
+        ):
+            raise ValueError("invalid runtime component screen suffix")
+        if any(not 1 <= int(port) <= 65535 for port in self.ports):
+            raise ValueError("invalid runtime component port")
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any], *, evidence_refs: tuple[str, ...] = (),
+    ) -> "RuntimeComponentSpec":
+        return cls(
+            name=str(data.get("name") or ""),
+            category=str(data.get("category") or "application"),
+            managed=bool(data.get("managed", True)),
+            default_restart=bool(data.get("default_restart", True)),
+            screen_suffix=str(data.get("screen_suffix") or data.get("name") or ""),
+            command_argv=tuple(str(item) for item in data.get("command_argv") or []),
+            preflight_argv=tuple(str(item) for item in data.get("preflight_argv") or []),
+            ports=tuple(int(item) for item in data.get("ports") or []),
+            health_checks=tuple(
+                dict(item) for item in data.get("health_checks") or []
+                if isinstance(item, dict)
+            ),
+            start_after=tuple(str(item) for item in data.get("start_after") or []),
+            evidence_refs=evidence_refs,
+        )
+
 
 @dataclass(frozen=True)
 class EvidenceClaim:
@@ -131,11 +240,49 @@ class EvidenceClaim:
             raise ValueError("evidence claim requires evidence_refs")
 
 
+DIAGNOSIS_STATUSES = {
+    "not_applicable",
+    "incomplete",
+    "symptom_confirmed",
+    "cause_confirmed",
+    "no_failure_confirmed",
+}
+
+
+@dataclass(frozen=True)
+class DiagnosisAssessment:
+    """Structured diagnostic progress; completion is never inferred from prose."""
+
+    status: str = "not_applicable"
+    symptom: str = ""
+    failure_point: str = ""
+    root_cause: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.status not in DIAGNOSIS_STATUSES:
+            raise ValueError("invalid diagnosis status: %s" % self.status)
+        if self.status == "symptom_confirmed" and not self.symptom.strip():
+            raise ValueError("symptom_confirmed requires symptom")
+        if self.status == "cause_confirmed":
+            if not self.symptom.strip():
+                raise ValueError("cause_confirmed requires symptom")
+            if not self.failure_point.strip():
+                raise ValueError("cause_confirmed requires failure_point")
+            if not self.root_cause.strip():
+                raise ValueError("cause_confirmed requires root_cause")
+        if self.status in {
+            "symptom_confirmed", "cause_confirmed", "no_failure_confirmed",
+        } and not self.evidence_refs:
+            raise ValueError("confirmed diagnosis requires evidence_refs")
+
+
 @dataclass
 class EvidenceConclusion:
     confirmed_facts: list[EvidenceClaim] = field(default_factory=list)
     uncertainties: list[EvidenceClaim] = field(default_factory=list)
     missing_decisions: list[str] = field(default_factory=list)
+    diagnosis: DiagnosisAssessment = field(default_factory=DiagnosisAssessment)
 
     def validate_against(self, bundle: EvidenceBundle) -> None:
         known = bundle.evidence_ids
@@ -145,6 +292,14 @@ class EvidenceConclusion:
                 raise ValueError(
                     "unknown evidence reference: %s" % ", ".join(unknown)
                 )
+        unknown_diagnosis_refs = [
+            ref for ref in self.diagnosis.evidence_refs if ref not in known
+        ]
+        if unknown_diagnosis_refs:
+            raise ValueError(
+                "unknown diagnosis evidence reference: %s"
+                % ", ".join(unknown_diagnosis_refs)
+            )
 
 
 GOAL_OUTCOME_STATUSES = {
@@ -301,7 +456,138 @@ CHANGE_PLAN_STATUSES = {
     "blocked",
     "failed",
     "aborted",
+    "awaiting_user_decision",
 }
+
+
+@dataclass(frozen=True)
+class RecoveryOption:
+    option_id: str
+    label: str
+    description: str
+    action: str
+    recommended: bool = False
+    requires_new_approval: bool = True
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", self.option_id):
+            raise ValueError("invalid recovery option id")
+        if self.action not in {
+            "component_restart", "collect_more_evidence", "retry_planning",
+            "provide_direction", "cancel",
+        }:
+            raise ValueError("invalid recovery option action")
+        if not self.label.strip() or not self.description.strip():
+            raise ValueError("recovery option requires label and description")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "option_id": self.option_id,
+            "label": self.label,
+            "description": self.description,
+            "action": self.action,
+            "recommended": self.recommended,
+            "requires_new_approval": self.requires_new_approval,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RecoveryOption":
+        return cls(
+            option_id=str(data.get("option_id") or ""),
+            label=str(data.get("label") or ""),
+            description=str(data.get("description") or ""),
+            action=str(data.get("action") or ""),
+            recommended=bool(data.get("recommended", False)),
+            requires_new_approval=bool(data.get("requires_new_approval", True)),
+        )
+
+
+@dataclass
+class FailureOutcome:
+    failure_id: str
+    stage: str
+    category: str
+    summary: str
+    technical_reason: str
+    environment_changed: str = "false"
+    failed_step: str = ""
+    completed_steps: list[str] = field(default_factory=list)
+    skipped_steps: list[str] = field(default_factory=list)
+    failed_checks: list[str] = field(default_factory=list)
+    attempted_recoveries: list[str] = field(default_factory=list)
+    automatic_recovery_exhausted: bool = True
+    options: list[RecoveryOption] = field(default_factory=list)
+    selected_option_id: str = ""
+    created_at: str = field(default_factory=_utc_now)
+    goal: str = ""
+    plan_id: str = ""
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"failure-[A-Za-z0-9_-]{1,64}", self.failure_id):
+            raise ValueError("invalid failure id")
+        if self.stage not in {
+            "discovery", "synthesis", "planning", "binding", "execution",
+            "verification",
+        }:
+            raise ValueError("invalid failure stage")
+        if self.environment_changed not in {"true", "false", "unknown"}:
+            raise ValueError("invalid environment_changed state")
+        if not self.summary.strip() or not self.technical_reason.strip():
+            raise ValueError("failure outcome requires reasons")
+        if not self.options:
+            raise ValueError("failure outcome requires recovery options")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "failure_id": self.failure_id,
+            "stage": self.stage,
+            "category": self.category,
+            "summary": self.summary,
+            "technical_reason": self.technical_reason,
+            "environment_changed": self.environment_changed,
+            "failed_step": self.failed_step,
+            "completed_steps": list(self.completed_steps),
+            "skipped_steps": list(self.skipped_steps),
+            "failed_checks": list(self.failed_checks),
+            "attempted_recoveries": list(self.attempted_recoveries),
+            "automatic_recovery_exhausted": self.automatic_recovery_exhausted,
+            "options": [item.to_dict() for item in self.options],
+            "selected_option_id": self.selected_option_id,
+            "created_at": self.created_at,
+            "goal": self.goal,
+            "plan_id": self.plan_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "FailureOutcome | None":
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            failure_id=str(data.get("failure_id") or ""),
+            stage=str(data.get("stage") or ""),
+            category=str(data.get("category") or ""),
+            summary=str(data.get("summary") or ""),
+            technical_reason=str(data.get("technical_reason") or ""),
+            environment_changed=str(data.get("environment_changed") or "false"),
+            failed_step=str(data.get("failed_step") or ""),
+            completed_steps=[str(item) for item in data.get("completed_steps") or []],
+            skipped_steps=[str(item) for item in data.get("skipped_steps") or []],
+            failed_checks=[str(item) for item in data.get("failed_checks") or []],
+            attempted_recoveries=[
+                str(item) for item in data.get("attempted_recoveries") or []
+            ],
+            automatic_recovery_exhausted=bool(
+                data.get("automatic_recovery_exhausted", True)
+            ),
+            options=[
+                RecoveryOption.from_dict(item) for item in data.get("options") or []
+                if isinstance(item, dict)
+            ],
+            selected_option_id=str(data.get("selected_option_id") or ""),
+            created_at=str(data.get("created_at") or _utc_now()),
+            goal=str(data.get("goal") or ""),
+            plan_id=str(data.get("plan_id") or ""),
+        )
 
 
 @dataclass
@@ -317,6 +603,7 @@ class ChangePlan:
     authorized_hash: str = ""
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
+    failure: FailureOutcome | None = None
 
     def __post_init__(self) -> None:
         if not self.plan_id.startswith("priv-ops-"):
@@ -383,6 +670,7 @@ class ChangePlan:
             "authorized_hash": self.authorized_hash,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "failure": self.failure.to_dict() if self.failure is not None else None,
         }
 
     @classmethod
@@ -407,4 +695,5 @@ class ChangePlan:
             authorized_hash=str(data.get("authorized_hash") or ""),
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
+            failure=FailureOutcome.from_dict(data.get("failure")),
         )

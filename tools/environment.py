@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import os
 import platform
@@ -569,7 +570,9 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
         root = _runtime_root_from_process_row(row)
         screen_platform = _screen_platform_from_command(str(row.get("cmd") or ""))
         if root and screen_platform:
-            root_aliases[root] = screen_platform
+            current = root_aliases.get(root, "")
+            if not current or len(screen_platform) < len(current):
+                root_aliases[root] = screen_platform
             screen_roots[screen_platform] = root
     for row in screen_rows:
         root = screen_roots.get(row["platform"], "")
@@ -667,9 +670,10 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         root_text = _runtime_root_from_process_row(row)
         screen_platform = _screen_platform_from_command(str(row.get("cmd") or ""))
         if root_text and screen_platform:
-            root_aliases[
-                str(_canonical_runtime_root(Path(root_text)).resolve())
-            ] = screen_platform
+            canonical = str(_canonical_runtime_root(Path(root_text)).resolve())
+            current = root_aliases.get(canonical, "")
+            if not current or len(screen_platform) < len(current):
+                root_aliases[canonical] = screen_platform
     for row in process_rows:
         root_text = _runtime_root_from_process_row(row)
         role = str(row.get("role") or "")
@@ -677,7 +681,7 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
             # Screen is startup/session evidence, not a backend role process.
             # The actual interpreter descendants carry the runtime identity.
             continue
-        if not root_text or role not in {"master", "worker", "celery", "web_terminal"}:
+        if not root_text or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", role):
             continue
         root = str(_canonical_runtime_root(Path(root_text)).resolve())
         entry = instances.setdefault(
@@ -742,7 +746,8 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
             "platform=%s project_root=%s runtime_source=process roles=%s pids=%s "
             "master_pids=%s worker_pids=%s master_pgids=%s worker_pgids=%s "
             "master_identities=%s worker_identities=%s runtime_identities=%s "
-            "backend_status=%s missing_roles=%s configured_ports=%s %s"
+            "backend_status=%s missing_roles=%s configured_ports=%s "
+            "managed_components=%s component_specs_b64=%s %s"
             % (
                 entry["platform"],
                 root_text,
@@ -765,6 +770,17 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                     "%s:%s" % (key, ports[key])
                     for key in _ordered_ports(ports)
                 ) or "none",
+                ",".join(
+                    spec["name"] for spec in _runtime_component_specs(root, roles)
+                    if spec.get("category") == "application"
+                    and spec.get("managed")
+                    and spec.get("default_restart")
+                ) or "none",
+                base64.urlsafe_b64encode(json.dumps(
+                    _runtime_component_specs(root, roles),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).decode("ascii"),
                 " ".join(endpoint_fields),
             )
         )
@@ -1412,6 +1428,8 @@ def _process_instance_rows() -> list:
         executable = match.group(5)
         cwd = match.group(6)
         cmd = match.group(7)
+        if not _is_runtime_process_executable(executable or "", cmd):
+            continue
         role = _role_from_command(cmd)
         if not role:
             continue
@@ -1455,6 +1473,26 @@ def _process_instance_rows() -> list:
         if not changed:
             break
     return rows
+
+
+def _is_runtime_process_executable(executable: str, command: str) -> bool:
+    """Reject observer shells whose argv merely mentions runtime keywords."""
+
+    name = Path(str(executable or "")).name.lower()
+    if name == "screen" or str(command or "").lstrip().startswith("SCREEN "):
+        return True
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", name):
+        return True
+    if name in {"gunicorn", "celery"}:
+        return True
+    # Cross-user probes can hide exe.  Accept only an argv whose executable
+    # token itself is a recognized runtime, never a shell containing keywords.
+    first = str(command or "").strip().split(None, 1)[0] if str(command or "").strip() else ""
+    first_name = Path(first).name.lower()
+    return bool(
+        re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", first_name)
+        or first_name in {"gunicorn", "celery", "screen"}
+    )
 
 
 def _privileged_process_cwd(pid: int) -> str:
@@ -1563,7 +1601,113 @@ def _role_from_command(command: str) -> str:
         return "master"
     if "celery" in lowered:
         return "celery"
+    generic = re.search(
+        r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,48})_main"
+        r"(?:\.py|:|\b)",
+        command or "",
+        re.I,
+    )
+    if generic is not None:
+        return generic.group(1).lower().replace("-", "_")
     return ""
+
+
+def _runtime_component_specs(root: Path, running_roles: set[str]) -> list[dict]:
+    builtins = [
+        {"name": "master", "category": "application", "managed": True,
+         "default_restart": True, "screen_suffix": "m", "start_after": []},
+        {"name": "celery", "category": "application", "managed": True,
+         "default_restart": True, "screen_suffix": "c", "start_after": ["master"]},
+        {"name": "web_terminal", "category": "application", "managed": True,
+         "default_restart": True, "screen_suffix": "web", "start_after": ["celery"]},
+        {"name": "worker", "category": "application", "managed": True,
+         "default_restart": True, "screen_suffix": "w", "start_after": ["web_terminal"]},
+    ]
+    by_name = {item["name"]: item for item in builtins}
+    manifest = root / ".klonet" / "runtime_components.json"
+    try:
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        raw = {}
+    items = raw.get("components") if isinstance(raw, dict) else []
+    for item in items if isinstance(items, list) else []:
+        normalized = _safe_runtime_component_manifest_item(item)
+        if normalized and normalized["name"] not in by_name:
+            by_name[normalized["name"]] = normalized
+    for role in sorted(running_roles):
+        if role not in by_name:
+            by_name[role] = {
+                "name": role,
+                "category": "application",
+                "managed": True,
+                "default_restart": False,
+                "screen_suffix": role,
+                "start_after": [],
+                "discovery_status": "command_contract_missing",
+            }
+    return list(by_name.values())
+
+
+def _safe_runtime_component_manifest_item(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    name = str(value.get("name") or "").strip().lower().replace("-", "_")
+    suffix = str(value.get("screen_suffix") or name).strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
+        return {}
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", suffix):
+        return {}
+    command = value.get("command_argv")
+    preflight = value.get("preflight_argv")
+    if not _safe_runtime_component_argv(command) or not _safe_runtime_component_argv(preflight):
+        return {}
+    serialized = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if redact_sensitive_text(serialized) != serialized:
+        return {}
+    ports = []
+    for item in value.get("ports") or []:
+        try:
+            port = int(item)
+        except (TypeError, ValueError):
+            return {}
+        if not 1 <= port <= 65535:
+            return {}
+        ports.append(port)
+    checks = [
+        dict(item) for item in value.get("health_checks") or []
+        if isinstance(item, dict)
+    ]
+    return {
+        "name": name,
+        "category": (
+            "shared_dependency"
+            if value.get("category") == "shared_dependency"
+            else "application"
+        ),
+        "managed": bool(value.get("managed", True)),
+        "default_restart": bool(value.get("default_restart", True)),
+        "screen_suffix": suffix,
+        "command_argv": [str(item) for item in command],
+        "preflight_argv": [str(item) for item in preflight],
+        "ports": ports,
+        "health_checks": checks,
+        "start_after": [
+            str(item) for item in value.get("start_after") or []
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", str(item))
+        ],
+    }
+
+
+def _safe_runtime_component_argv(value) -> bool:
+    return bool(
+        isinstance(value, list)
+        and 1 <= len(value) <= 64
+        and all(
+            str(item) and len(str(item)) <= 2000
+            and "\x00" not in str(item) and "\n" not in str(item)
+            for item in value
+        )
+    )
 
 
 def _platform_from_cwd(cwd: str) -> str:

@@ -242,7 +242,7 @@ def test_forced_start_compiles_new_screen_from_frozen_project_root(tmp_path):
     assert binding.args["component"] == "master"
     assert binding.args["platform"] == "102"
     assert binding.args["screen_session"] == "102_m"
-    assert binding.args["project_root"] == str(mains)
+    assert binding.args["project_root"] == str(root)
 
 
 def test_start_consumes_frozen_predecessor_uid_and_python(tmp_path):
@@ -1134,10 +1134,10 @@ def test_plural_screen_start_is_split_into_one_step_per_component():
 
     assert [item["id"] for item in result[:3]] == [
         "start-runtime-master",
-        "start-runtime-worker",
         "start-runtime-web-terminal",
+        "start-runtime-worker",
     ]
-    assert result[3]["depends_on"] == ["start-runtime-web-terminal"]
+    assert result[3]["depends_on"] == ["start-runtime-worker"]
 
 
 def test_screen_action_contract_must_match_role_and_runtime_root():
@@ -1216,7 +1216,7 @@ def test_screen_action_args_are_compiled_from_atomic_role_and_runtime_root():
 
     assert args["component"] == "worker"
     assert args["screen_session"] == "vemu_uestc_w"
-    assert args["project_root"] == "/home/lzl/vemu_uestc/mains"
+    assert args["project_root"] == "/home/lzl/vemu_uestc"
 
 
 def test_test_instance_root_overrides_ambiguous_global_screen_identity():
@@ -1243,7 +1243,7 @@ def test_test_instance_root_overrides_ambiguous_global_screen_identity():
 
     assert args["platform"] == "test"
     assert args["screen_session"] == "test_m"
-    assert args["project_root"] == "/home/lzl/test/vemu_uestc/mains"
+    assert args["project_root"] == "/home/lzl/test/vemu_uestc"
 
 
 def test_forced_screen_start_compiles_new_session_without_existing_session_evidence():
@@ -1274,10 +1274,10 @@ def test_forced_screen_start_compiles_new_session_without_existing_session_evide
     assert binding.args["platform"] == "test"
     assert binding.args["component"] == "worker"
     assert binding.args["screen_session"] == "test_w"
-    assert binding.args["project_root"] == "/home/lzl/test/vemu_uestc/mains"
+    assert binding.args["project_root"] == "/home/lzl/test/vemu_uestc"
 
 
-def test_frozen_screen_consumer_wins_after_semantic_fallback_in_binding():
+def test_frozen_entry_source_never_overrides_screen_runtime_root():
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
 
@@ -1311,7 +1311,7 @@ def test_frozen_screen_consumer_wins_after_semantic_fallback_in_binding():
             status="frozen",
             role="runtime_mains_root",
             value="/home/lzl/test/vemu_uestc/mains",
-            consumers=["change-2.project_root"],
+            consumers=["change-2.source_root"],
         ),
     ]
 
@@ -1330,9 +1330,10 @@ def test_frozen_screen_consumer_wins_after_semantic_fallback_in_binding():
         resources,
     )
 
-    assert binding.args["component"] == "worker"
+    assert binding.args["project_root"] == "/home/lzl/test/vemu_uestc"
     assert binding.args["screen_session"] == "test_vemu_uestc_w"
-    assert binding.args["project_root"] == "/home/lzl/test/vemu_uestc/mains"
+
+    assert binding.args["component"] == "worker"
 
 
 def test_screen_start_falls_back_to_frozen_instance_root_and_real_mains(tmp_path):
@@ -1374,7 +1375,7 @@ def test_screen_start_falls_back_to_frozen_instance_root_and_real_mains(tmp_path
 
     assert binding.args["platform"] == "102"
     assert binding.args["screen_session"] == "102_m"
-    assert binding.args["project_root"] == str(mains)
+    assert binding.args["project_root"] == str(instance)
 
 
 def test_screen_start_keeps_frozen_instance_identifier_after_canonicalization(
@@ -1426,7 +1427,132 @@ def test_screen_start_keeps_frozen_instance_identifier_after_canonicalization(
 
     assert binding.args["platform"] == "v4e2e"
     assert binding.args["screen_session"] == "v4e2e_m"
-    assert binding.args["project_root"] == str(mains)
+    assert binding.args["project_root"] == str(instance)
+
+
+def test_runtime_start_inserts_explicit_entry_preparation_before_screen(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+    from klonet_agent.ops.privileged.execution_agent import (
+        _ensure_runtime_entry_preparation_items,
+    )
+
+    instance = tmp_path / "v4e2e"
+    mains = instance / "mains"
+    mains.mkdir(parents=True)
+    for name in REQUIRED_ENTRY_FILES:
+        (mains / name).write_text("# %s\n" % name, encoding="utf-8")
+    semantic = PrivilegedStep(
+        step_id="restart",
+        title="Restart v4e2e master",
+        objective="Restart master from the frozen instance root",
+        expected_changes=["master restarts"],
+        risk="medium",
+    )
+    resources = [PlanResource(
+        "instance_root", "path", "frozen", "instance_root",
+        str(instance), "running_platforms", consumers=["restart.project_root"],
+    )]
+    items = [
+        {
+            "id": "stop-master",
+            "title": "Stop master runtime",
+            "objective": "Stop master",
+            "depends_on": [],
+        },
+        {
+            "id": "start-master",
+            "title": "Start master screen component",
+            "objective": "Start master",
+            "depends_on": ["stop-master"],
+        },
+    ]
+
+    result = _ensure_runtime_entry_preparation_items(items, semantic, resources)
+
+    assert [item["id"] for item in result] == [
+        "stop-master", "prepare-runtime-entries", "start-master",
+    ]
+    assert "source_root=%s" % mains in result[1]["objective"]
+    assert "project_root=%s" % instance in result[1]["objective"]
+    assert result[1]["depends_on"] == ["stop-master"]
+    assert result[2]["depends_on"] == ["prepare-runtime-entries"]
+
+
+def test_runtime_restart_keeps_explicit_preparation_when_entries_already_match(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+    from klonet_agent.ops.privileged.execution_agent import (
+        _ensure_runtime_entry_preparation_items,
+        _forced_registered_action_for_step,
+    )
+
+    instance = tmp_path / "v4e2e"
+    mains = instance / "mains"
+    mains.mkdir(parents=True)
+    for name in REQUIRED_ENTRY_FILES:
+        content = "# %s\n" % name
+        (mains / name).write_text(content, encoding="utf-8")
+        (instance / name).write_text(content, encoding="utf-8")
+    semantic = PrivilegedStep(
+        step_id="restart", title="重启 v4e2e 平台",
+        objective="从冻结的项目根目录重启全部应用组件",
+        expected_changes=["重启 master、celery、web_terminal、worker"],
+        risk="medium",
+    )
+    resources = [PlanResource(
+        "instance_root", "path", "frozen", "instance_root",
+        str(instance), "running_platforms", consumers=["restart.project_root"],
+    )]
+
+    result = _ensure_runtime_entry_preparation_items(
+        [{"id": "master", "title": "重启 master Screen 组件", "objective": "重启 master"}],
+        semantic,
+        resources,
+    )
+
+    assert result[0]["title"] == "准备项目根目录入口文件"
+    prepare_step = PrivilegedStep(
+        step_id="prepare", title=result[0]["title"], objective=result[0]["objective"],
+    )
+    assert _forced_registered_action_for_step(prepare_step) == "prepare_project_files"
+
+
+def test_entry_preparation_binding_freezes_source_hashes(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    instance = tmp_path / "v4e2e"
+    mains = instance / "mains"
+    mains.mkdir(parents=True)
+    for name in REQUIRED_ENTRY_FILES:
+        (mains / name).write_text("# %s\n" % name, encoding="utf-8")
+    step = PrivilegedStep(
+        step_id="restart__prepare-runtime-entries",
+        title="Prepare project root entry files",
+        objective=(
+            "Copy canonical entries; source_root=%s project_root=%s"
+            % (mains, instance)
+        ),
+        expected_changes=["root entries match mains"],
+        risk="medium",
+    )
+
+    binding = PrivilegedExecutionAgent(None)._registered_binding(
+        {"action": "prepare_project_files", "args": {}},
+        step,
+        None,
+        [],
+    )
+
+    assert binding.args["project_root"] == str(instance)
+    assert binding.args["source_root"] == str(mains)
+    assert set(binding.args["entry_sha256s"]) == set(REQUIRED_ENTRY_FILES)
+    assert all(
+        check["checker"] == "file_sha256"
+        for check in binding.postconditions
+    )
 
 
 def test_runtime_binding_progress_titles_are_presented_in_chinese():
@@ -2322,8 +2448,91 @@ def test_unhealthy_live_role_restart_expands_to_exact_stop_then_start():
     ]
     assert result[0]["title"] == "Stop current master runtime process"
     assert result[0]["depends_on"] == ["edit-source"]
-    assert result[1]["title"] == "Start master screen component"
+    assert result[1]["title"] == "启动 master Screen 组件"
     assert result[1]["depends_on"] == ["restart-master-stop-current"]
+
+
+def test_runtime_component_dispositions_cover_dynamic_managed_roles():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _normalize_runtime_role_recovery_verbs,
+        _split_multi_component_runtime_items,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="restart-runtime",
+        title="Restart application components",
+        objective="Restart application components for /srv/v4e2e",
+        expected_changes=[
+            "restart requested master role at 47001 and backend health succeeds",
+            "restart requested celery role and process readiness succeeds",
+            "start missing web_terminal role at 47003 and listener readiness succeeds",
+            "restart requested managed component metrics and component readiness succeeds",
+            "restart requested worker role at 47002 and backend health succeeds",
+        ],
+        risk="medium",
+    )
+    items = [{
+        "id": "runtime",
+        "title": "Restart platform runtime components",
+        "objective": "Restore every requested runtime role",
+        "depends_on": [],
+        "expected_changes": ["application components recover"],
+    }]
+
+    result = _split_multi_component_runtime_items(items, semantic)
+    result = _normalize_runtime_role_recovery_verbs(result, semantic)
+
+    assert [item["title"] for item in result] == [
+        "Restart master screen component",
+        "Restart celery screen component",
+        "Start web_terminal screen component",
+        "Restart worker screen component",
+        "Restart metrics screen component",
+    ]
+
+
+def test_dynamic_component_progress_and_plan_text_are_localized_generically():
+    from klonet_agent.ops.privileged.execution_agent import _progress_text
+    from klonet_agent.ops.privileged.workflow.mutation import _localized_plan_text
+
+    assert _progress_text("Restart metrics screen component") == "重启 metrics Screen 组件"
+    assert _progress_text("Start audit_sink screen component") == "启动 audit_sink Screen 组件"
+    assert _localized_plan_text("Restart metrics screen component") == "重启 metrics Screen 组件"
+    assert _localized_plan_text("Start audit_sink screen component") == "启动 audit_sink Screen 组件"
+
+
+def test_runtime_binding_rejects_weak_rag_even_when_it_mentions_generic_runtime_terms():
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        _validate_runtime_knowledge_contract,
+    )
+
+    plan = PrivilegedPlan(
+        plan_id="rag-relevance",
+        goal="重启目标平台",
+        risk="medium",
+        steps=[PrivilegedStep(
+            step_id="start", title="Start master screen component",
+            objective="启动 master", risk="medium",
+        )],
+    )
+    context = GroundedPlanContext(
+        knowledge_evidence=(
+            "[ev probe=klonet_knowledge]\n"
+            "- retrieval_status: weak\n"
+            "unrelated note mentioning <project_root>, mains and screen"
+        ),
+        environment_evidence="runtime facts",
+        action_catalog="catalog",
+    )
+
+    with pytest.raises(ExecutionBindingError) as exc:
+        _validate_runtime_knowledge_contract(plan, context)
+
+    assert exc.value.category == "knowledge_evidence_irrelevant"
 
 
 def test_missing_role_start_drops_model_invented_pre_stop_without_pid():
@@ -2861,3 +3070,39 @@ def test_workflow_binder_translates_shared_binding_failure_to_workflow_boundary(
 
     with pytest.raises(ChangeBindingError, match="clone target could not be grounded"):
         ChangeBinder(FailingSharedBinder()).bind(_plan())
+def test_structural_binding_compiles_frozen_future_component_spec():
+    import json
+
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    resources = [
+        PlanResource(
+            name="instance_identifier", kind="identifier", status="frozen",
+            role="instance_identifier", value="v4e2e",
+            consumers=["restart-backend-roles.platform"],
+        ),
+        PlanResource(
+            name="component_metrics_spec", kind="string", status="frozen",
+            role="runtime_component_spec:metrics",
+            value=json.dumps({
+                "name": "metrics", "screen_suffix": "metrics",
+                "command_argv": ["/opt/python", "-m", "metrics_service"],
+                "preflight_argv": ["/opt/python", "-c", "import metrics_service"],
+                "ports": [47009],
+            }),
+            consumers=["restart-backend-roles.component_spec"],
+        ),
+    ]
+
+    args = _infer_structural_action_args(
+        "restart_screen_component",
+        {"component": "metrics", "platform": "v4e2e"},
+        resources,
+    )
+
+    assert args["screen_session"] == "v4e2e_metrics"
+    assert args["command_argv"][-1] == "metrics_service"
+    assert args["metrics_port"] == 47009

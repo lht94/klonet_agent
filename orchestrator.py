@@ -197,6 +197,7 @@ class AgentOrchestrator:
             )
             probe_runner = context_builder.run_recovery_diagnostics
             executor = PrivilegedCommandExecutor(
+                on_start=privileged_progress("执行"),
                 on_output=lambda channel, chunk: print(chunk, end="", flush=True),
                 environment_fingerprint_provider=(
                     context_builder.current_environment_fingerprint
@@ -211,6 +212,7 @@ class AgentOrchestrator:
                 probe_runner=probe_runner,
                 readonly_command_runner=ValidatedReadonlyCommandRunner(executor),
                 on_progress=privileged_progress("Discovery"),
+                knowledge_search=context_builder.knowledge_search,
             )
             synthesis = EvidenceSynthesizer(self.llm)
             mutation_workflow = MutationWorkflow(

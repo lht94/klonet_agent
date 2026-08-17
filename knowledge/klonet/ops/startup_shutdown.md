@@ -130,6 +130,18 @@ test -f worker_gun.py
 test -f worker_main.py
 ~~~
 
+上述目录关系是运行合同：`source_root=<project_root>/mains`，复制目标和
+`startup_cwd` 都是 `<project_root>`。知识条目只提供候选合同；自动运维执行前仍须
+检查真实目录、冻结源/目标 SHA-256，并在审批中显示会被覆盖的文件。
+
+标准平台包含 Master、Celery、Web Terminal、Worker 四个受管应用组件。项目若增加
+需要随平台统一启停的应用组件，可在 `<project_root>/.klonet/runtime_components.json`
+声明 `components` 数组。每项至少包含 `name`、`screen_suffix`、不经过 shell 解析的
+`command_argv` 与 `preflight_argv`；可选 `ports`、`health_checks`、`start_after`、
+`managed`、`default_restart` 和 `category`。只有 `category=application` 且
+`managed/default_restart=true`、并经过当前服务器事实验证的组件才进入“重启平台”；
+`shared_dependency` 不会因平台重启而自动重启。
+
 常见运行时有两种：
 
 | 环境 | Gunicorn/Celery 目录 | Python 示例 |

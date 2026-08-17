@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,6 +22,8 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceConclusion,
     EvidenceRecord,
     ProbeRequest,
+    RuntimeComponentSpec,
+    normalize_instance_alias,
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
@@ -56,6 +59,55 @@ def _inventory_missing_runtime_roles(
                     )
                 )
     return missing
+
+
+def _runtime_component_specs_from_line(
+    line: str, *, evidence_ref: str,
+) -> dict[str, RuntimeComponentSpec]:
+    match = re.search(r"\bcomponent_specs_b64=([^\s]+)", str(line or ""))
+    if match is None:
+        return {}
+    try:
+        padding = "=" * (-len(match.group(1)) % 4)
+        raw = json.loads(base64.urlsafe_b64decode(
+            (match.group(1) + padding).encode("ascii")
+        ).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError):
+        return {}
+    specs: dict[str, RuntimeComponentSpec] = {}
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            spec = RuntimeComponentSpec.from_dict(
+                item, evidence_refs=(evidence_ref,),
+            )
+        except (TypeError, ValueError):
+            continue
+        specs[spec.name] = spec
+    return specs
+
+
+def _ordered_default_restart_components(
+    specs: dict[str, RuntimeComponentSpec],
+) -> list[str]:
+    selected = {
+        name: spec for name, spec in specs.items()
+        if spec.category == "application" and spec.managed and spec.default_restart
+    }
+    ordered: list[str] = []
+    pending = dict(selected)
+    while pending:
+        ready = sorted(
+            name for name, spec in pending.items()
+            if all(dep not in selected or dep in ordered for dep in spec.start_after)
+        )
+        if not ready:
+            return []
+        for name in ready:
+            ordered.append(name)
+            pending.pop(name)
+    return ordered
 
 
 def _request_rechecks_confirmed_missing_role(
@@ -252,8 +304,11 @@ class ChangePlannerAgent:
         conclusion: EvidenceConclusion,
         *,
         binding_feedback: str = "",
+        intent_context: dict[str, Any] | None = None,
     ) -> PlanningOutcome:
-        deterministic = self._deterministic_runtime_restart(goal, bundle)
+        deterministic = self._deterministic_runtime_restart(
+            goal, bundle, intent_context=intent_context,
+        )
         if deterministic is not None:
             try:
                 return self._outcome(deterministic, goal, bundle)
@@ -387,20 +442,40 @@ class ChangePlannerAgent:
     def _deterministic_runtime_restart(
         goal: str,
         bundle: EvidenceBundle,
+        intent_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        """Compile explicit master/worker restart intent from runtime evidence."""
+        """Compile restart intent without silently degrading it into repair."""
 
         text = str(goal or "")
         lowered = text.lower()
-        if not any(marker in lowered for marker in ("重启", "restart")):
+        structured_operation = str((intent_context or {}).get("operation") or "")
+        if structured_operation != "restart" and not any(
+            marker in lowered for marker in ("重启", "restart")
+        ):
             return None
+        role_patterns = (
+            ("master", r"(?<![A-Za-z0-9_])master(?![A-Za-z0-9_])"),
+            ("celery", r"(?<![A-Za-z0-9_])celery(?![A-Za-z0-9_])"),
+            ("web_terminal", r"web[_ -]?terminal|web终端"),
+            ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
+        )
         requested_roles = [
-            role for role in ("master", "worker")
-            if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % role, lowered)
+            role for role, pattern in role_patterns
+            if re.search(pattern, lowered, re.I)
         ]
+        platform_wide = not requested_roles and (
+            str((intent_context or {}).get("scope") or "") == "platform"
+            or bool(re.search(
+            r"平台|platform|整个|全部|all", lowered, re.I,
+            ))
+        )
+        if platform_wide:
+            requested_roles = [role for role, _pattern in role_patterns]
         if not requested_roles:
             return None
         selected: tuple[EvidenceRecord, str, str] | None = None
+        resolved_root = str((intent_context or {}).get("resolved_project_root") or "")
+        candidates: list[tuple[EvidenceRecord, str, str]] = []
         for record in bundle.records:
             if record.status != "available" or record.request.probe != "running_platforms":
                 continue
@@ -411,20 +486,34 @@ class ChangePlannerAgent:
                     continue
                 root = root_match.group(1)
                 alias = alias_match.group(1) if alias_match else Path(root).name
-                if root in text or re.search(
-                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
-                    % re.escape(alias),
-                    text,
-                    re.I,
-                ):
-                    selected = (record, line, alias)
-                    break
-            if selected is not None:
-                break
+                aliases = {alias, Path(root).name}
+                normalized_goal = normalize_instance_alias(text)
+                matches = (
+                    root == resolved_root
+                    or root in text
+                    or any(
+                        normalize_instance_alias(item)
+                        and normalize_instance_alias(item) in normalized_goal
+                        for item in aliases
+                    )
+                )
+                if matches:
+                    candidates.append((record, line, alias))
+        unique_roots = {
+            re.search(r"\bproject_root=(/[^\s]+)", item[1]).group(1)
+            for item in candidates
+        }
+        if len(unique_roots) == 1 and candidates:
+            selected = candidates[0]
         if selected is None:
             return None
         record, line, alias = selected
         root = re.search(r"\bproject_root=(/[^\s]+)", line).group(1)
+        component_specs = _runtime_component_specs_from_line(
+            line, evidence_ref=record.evidence_id,
+        )
+        if platform_wide and component_specs:
+            requested_roles = _ordered_default_restart_components(component_specs)
         step_id = "restart-backend-roles"
         resources: list[dict[str, Any]] = [
             {
@@ -442,39 +531,93 @@ class ChangePlannerAgent:
         ]
         expected = []
         postconditions = []
+        running_roles = set(
+            (re.search(r"\broles=([^\s]+)", line) or [None, ""])[1].split(",")
+        )
+        configured_ports = {
+            key: int(value)
+            for key, value in re.findall(
+                r"(master_port|worker_port|web_terminal_port):(\d{1,5})", line,
+            )
+        }
         for role in requested_roles:
-            port_match = re.search(r"\b%s_port=(\d{1,5})" % role, line)
-            endpoint_match = re.search(r"\b%s_endpoint=([^\s]+)" % role, line)
-            if port_match is None or endpoint_match is None:
-                return None
-            port = int(port_match.group(1))
-            endpoint = endpoint_match.group(1)
-            disposition = (
-                "start missing"
-                if endpoint == "not_checked"
-                and re.search(
-                    r"\b%s_endpoint=not_checked\s+reason=role_not_running" % role,
-                    line,
+            disposition = "restart requested" if role in running_roles else "start missing"
+            port_key = role + "_port"
+            port_match = re.search(r"\b%s=(\d{1,5})" % port_key, line)
+            port = (
+                int(port_match.group(1)) if port_match is not None
+                else configured_ports.get(port_key)
+            )
+            if role in {"master", "worker"}:
+                if port is None:
+                    return None
+                expected.append(
+                    "%s %s role at %s and backend health succeeds"
+                    % (disposition, role, port)
                 )
-                else "restart requested"
-            )
-            expected.append(
-                "%s %s role at %s and backend health succeeds"
-                % (disposition, role, port)
-            )
-            resources.append({
-                "name": role + "_port", "kind": "port", "status": "frozen",
-                "role": role + "_port", "value": port,
-                "source": "existing_runtime",
-                "consumers": [step_id + "." + role + "_port"],
-            })
-            postconditions.append({
-                "checker": "backend_health",
-                "args": {
-                    "url": "http://127.0.0.1:%s/server_health/" % port,
-                    "expected_code": 1,
-                },
-            })
+                postconditions.append({
+                    "checker": "backend_health",
+                    "args": {
+                        "url": "http://127.0.0.1:%s/server_health/" % port,
+                        "expected_code": 1,
+                    },
+                })
+            elif role == "web_terminal":
+                if port is None:
+                    return None
+                expected.append(
+                    "%s web_terminal role at %s and listener readiness succeeds"
+                    % (disposition, port)
+                )
+                postconditions.append({
+                    "checker": "port_listening", "args": {"port": port},
+                })
+            elif role == "celery":
+                expected.append(
+                    "%s celery role and process readiness succeeds" % disposition
+                )
+                postconditions.append({
+                    "checker": "process_running",
+                    "args": {"pattern": "celery", "cwd": root},
+                })
+            else:
+                spec = component_specs.get(role)
+                if spec is None or not spec.managed or not spec.default_restart:
+                    return None
+                expected.append(
+                    "%s managed component %s and component readiness succeeds"
+                    % (disposition, role)
+                )
+                postconditions.extend(list(spec.health_checks) or [{
+                    "checker": "screen_session_exists",
+                    "args": {"session": "%s_%s" % (alias, spec.screen_suffix)},
+                }])
+                resources.append({
+                    "name": "component_%s_spec" % role,
+                    "kind": "string", "status": "frozen",
+                    "role": "runtime_component_spec:%s" % role,
+                    "value": json.dumps({
+                        "name": spec.name,
+                        "category": spec.category,
+                        "managed": spec.managed,
+                        "default_restart": spec.default_restart,
+                        "screen_suffix": spec.screen_suffix,
+                        "command_argv": list(spec.command_argv),
+                        "preflight_argv": list(spec.preflight_argv),
+                        "ports": list(spec.ports),
+                        "health_checks": list(spec.health_checks),
+                        "start_after": list(spec.start_after),
+                    }, ensure_ascii=False, sort_keys=True),
+                    "source": "runtime_component_inventory",
+                    "consumers": [step_id + ".component_spec"],
+                })
+            if port is not None:
+                resources.append({
+                    "name": port_key, "kind": "port", "status": "frozen",
+                    "role": port_key, "value": port,
+                    "source": "existing_runtime",
+                    "consumers": [step_id + "." + port_key],
+                })
         identity_text = "\n".join(
             item.output for item in bundle.records if item.status == "available"
         )
@@ -521,12 +664,18 @@ class ChangePlannerAgent:
             "resources": resources,
             "changes": [{
                 "step_id": step_id,
-                "title": "重启 %s 的后端角色" % alias,
+                "title": "重启 %s 的应用组件" % alias,
                 "objective": "按项目根目录 %s 重启 %s" % (
                     root, " 和 ".join(requested_roles),
                 ),
                 "reason": "用户明确要求重启，运行清单已绑定实例根目录和角色端口",
-                "evidence_refs": [record.evidence_id],
+                "evidence_refs": [
+                    record.evidence_id,
+                    *[
+                        item.evidence_id for item in bundle.knowledge_records
+                        if item.status == "available"
+                    ],
+                ],
                 "depends_on": [],
                 "risk": "medium",
                 "expected_changes": expected,
@@ -887,12 +1036,7 @@ class ChangePlannerAgent:
         self._normalize_port_resource_roles(data)
         self._normalize_runtime_stop_scope(data, goal, bundle)
         self._normalize_runtime_repair_coverage(data, bundle)
-        explicit_runtime_restart = (
-            any(marker in str(goal or "").lower() for marker in ("重启", "restart"))
-            and any(role in str(goal or "").lower() for role in ("master", "worker"))
-        )
-        if not explicit_runtime_restart:
-            self._normalize_healthy_runtime_role_changes(data, bundle)
+        self._normalize_healthy_runtime_role_changes(data, bundle, goal=goal)
         self._collapse_redundant_runtime_repair_changes(data)
         resources = [
             PlanResource.from_dict(item)
@@ -2207,8 +2351,16 @@ class ChangePlannerAgent:
     def _normalize_healthy_runtime_role_changes(
         data: dict[str, Any],
         bundle: EvidenceBundle,
+        *,
+        goal: str = "",
     ) -> None:
         """Keep authoritative healthy roles read-only during a scoped repair."""
+
+        # An explicit restart authorizes replacement of healthy process
+        # identities.  The healthy-role preservation rule belongs only to
+        # repair/recovery plans and must never rewrite restart semantics.
+        if any(marker in str(goal or "").lower() for marker in ("重启", "restart")):
+            return
 
         states: dict[str, dict[str, tuple[str, int]]] = {}
         for record in bundle.records:
@@ -3858,7 +4010,7 @@ class ChangePlannerAgent:
             root_text = str(root.value).rstrip("/")
             owned_changes = changes_for_root(root)
             screen_consumers = [
-                "%s.project_root" % str(change.get("step_id") or "")
+                "%s.source_root" % str(change.get("step_id") or "")
                 for change in owned_changes
                 if re.search(
                     r"screen",

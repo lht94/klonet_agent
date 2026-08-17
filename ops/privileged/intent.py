@@ -21,6 +21,13 @@ INTENTS = {
 }
 GOAL_CLARITIES = {"clear", "discoverable", "missing"}
 ACTION_INTENTS = {"readonly_action", "mutating_action"}
+GOAL_RELATIONS = {"new", "continue_previous", "refine_previous"}
+GOAL_KINDS = {
+    "conversation", "execution", "status_query", "health_check",
+    "causal_diagnosis",
+}
+OPERATIONS = {"none", "restart", "repair", "start", "stop", "inspect"}
+SCOPES = {"none", "platform", "component"}
 
 INTENT_CLASSIFIER_SYSTEM_PROMPT = """
 You are the Klonet Ops-Privilege Intent Classifier.
@@ -59,6 +66,21 @@ Important:
   "latest". Never turn resume_plan into a new deploy, restart, or repair goal.
 - clarification_question must be a concise Chinese question and is required only
   for goal_clarity=missing.
+- goal_relation describes how the current request relates to the persisted
+  operational goal shown in recent context: new, continue_previous, or
+  refine_previous. Referential follow-ups such as "这个报错是为什么",
+  "那具体原因呢", and "继续查到根因" refine the previous goal rather than
+  starting a new one.
+- goal_kind is one of conversation, execution, status_query, health_check, or
+  causal_diagnosis. It describes the user's request, never wrapper text added
+  by another workflow stage.
+- operation is one of none, restart, repair, start, stop, or inspect.
+- scope is one of none, platform, or component. components contains explicitly
+  named application components; leave it empty for a platform-wide operation.
+- "重启平台" means restart the complete managed application-component set.
+  It is not a repair request and healthy components must not be preserved.
+- Questions such as "执行完了吗" and "刚才做了什么" are status_query, not a
+  refinement of the operational goal.
 
 Examples:
 - "帮我部署一个平台" -> mutating_action, discoverable
@@ -69,8 +91,9 @@ Examples:
 - "把它删掉" with no referent in recent context -> ambiguous, missing
 - "帮我处理一下" -> ambiguous, missing
 
-Return one JSON object only with intent, goal_clarity, requires_execution,
-command, confidence, reason, and clarification_question. Never execute tools.
+Return one JSON object only with intent, goal_clarity, goal_relation, goal_kind,
+operation, scope, components, requires_execution, command, confidence, reason,
+and clarification_question. Never execute tools.
 Also return plan_reference; use an empty string for non-resume intents. Do not
 classify command risk.
 """.strip()
@@ -87,6 +110,11 @@ class PrivilegedIntentDecision:
     clarification_question: str = ""
     classifier_status: str = "ok"
     plan_reference: str = ""
+    goal_relation: str = "new"
+    goal_kind: str = "conversation"
+    operation: str = "none"
+    scope: str = "none"
+    components: tuple[str, ...] = ()
 
     @property
     def should_clarify(self) -> bool:
@@ -184,6 +212,31 @@ class PrivilegedIntentClassifier:
             raise ValueError("invalid goal_clarity: %s" % goal_clarity)
         if intent == "ambiguous":
             goal_clarity = "missing"
+        goal_relation = str(data.get("goal_relation") or "new").strip().lower()
+        if goal_relation not in GOAL_RELATIONS:
+            raise ValueError("invalid goal_relation: %s" % goal_relation)
+        default_kind = (
+            "execution" if intent == "mutating_action"
+            else "health_check" if intent == "readonly_action"
+            else "conversation"
+        )
+        goal_kind = str(data.get("goal_kind") or default_kind).strip().lower()
+        if goal_kind not in GOAL_KINDS:
+            raise ValueError("invalid goal_kind: %s" % goal_kind)
+        operation = str(data.get("operation") or "none").strip().lower()
+        if operation not in OPERATIONS:
+            raise ValueError("invalid operation: %s" % operation)
+        scope = str(data.get("scope") or "none").strip().lower()
+        if scope not in SCOPES:
+            raise ValueError("invalid scope: %s" % scope)
+        raw_components = data.get("components") or []
+        if not isinstance(raw_components, list):
+            raise ValueError("components must be an array")
+        components = tuple(
+            str(item).strip().lower().replace("-", "_").replace(" ", "_")
+            for item in raw_components
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9 _-]{0,63}", str(item).strip())
+        )
         return PrivilegedIntentDecision(
             intent=intent,
             requires_execution=requires_execution,
@@ -195,6 +248,11 @@ class PrivilegedIntentClassifier:
                 data.get("clarification_question") or ""
             ).strip(),
             plan_reference=str(data.get("plan_reference") or "").strip()[:500],
+            goal_relation=goal_relation,
+            goal_kind=goal_kind,
+            operation=operation,
+            scope=scope,
+            components=components,
         )
 
 

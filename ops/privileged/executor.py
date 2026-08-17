@@ -6,6 +6,7 @@ import subprocess
 import threading
 import hashlib
 import os
+import shlex
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -23,6 +24,7 @@ from klonet_agent.ops.privileged.shell_artifact import (
     artifact_is_expired,
     build_shell_environment,
 )
+from klonet_agent.tools.environment import redact_sensitive_text
 
 
 class PrivilegedCommandExecutor:
@@ -42,10 +44,19 @@ class PrivilegedCommandExecutor:
         self.max_output_chars = max(1, int(max_output_chars))
         self.on_start = on_start
         self.on_output = on_output
+        self._command_events: list[dict] = []
         self._legacy_action_runner = action_runner
         self.action_runner = (
-            direct_action_runner or DirectPrivilegedActionRunner()
+            direct_action_runner or DirectPrivilegedActionRunner(
+                on_command=self._record_action_command,
+            )
         )
+        if (
+            direct_action_runner is not None
+            and hasattr(self.action_runner, "on_command")
+            and getattr(self.action_runner, "on_command") is None
+        ):
+            self.action_runner.on_command = self._record_action_command
         self.shell_policy = shell_policy or ShellArtifactPolicy()
         self.environment_fingerprint_provider = (
             environment_fingerprint_provider or (lambda: "")
@@ -94,6 +105,7 @@ class PrivilegedCommandExecutor:
         binding = step.execution_binding
         artifact = binding.shell_artifact if binding is not None else None
         started_at = utc_now()
+        self._command_events = []
         if artifact is None:
             return ExecutionEvidence(
                 return_code=2,
@@ -190,6 +202,19 @@ class PrivilegedCommandExecutor:
                 Path(temp_dir).chmod(0o711)
                 script_path.chmod(0o555)
                 argv = ["sudo", "-n", "-u", artifact.run_as, *argv]
+            script_display = redact_sensitive_text(artifact.script)
+            self._command_events.append({
+                "action": "shell_artifact",
+                "command": script_display,
+                "cwd": artifact.cwd,
+                "execution": "shell_artifact",
+                "changes_state": True,
+            })
+            if self.on_start:
+                self.on_start(
+                    "实际受控脚本（cwd=%s）：\n%s"
+                    % (artifact.cwd, script_display)
+                )
             evidence = self._execute(
                 step,
                 argv,
@@ -197,6 +222,7 @@ class PrivilegedCommandExecutor:
                 cwd=artifact.cwd,
                 env=build_shell_environment(artifact),
                 timeout=artifact.timeout,
+                announce=False,
             )
         artifact.status = (
             "executed"
@@ -205,6 +231,7 @@ class PrivilegedCommandExecutor:
         )
         artifact.executed_at = utc_now()
         evidence.environment_changed = True
+        evidence.commands = list(self._command_events)
         return evidence
 
     def current_environment_fingerprint(self) -> str:
@@ -214,6 +241,7 @@ class PrivilegedCommandExecutor:
         """Dispatch one validated registered action without a shell boundary."""
 
         started_at = utc_now()
+        self._command_events = []
         if self.on_start:
             self.on_start("正在执行已确认步骤：%s" % step.title)
         try:
@@ -252,6 +280,7 @@ class PrivilegedCommandExecutor:
                 started_at=started_at,
                 finished_at=utc_now(),
                 environment_changed=False,
+                commands=list(self._command_events),
             )
         output = self._bounded(str(result.output or ""))
         return_code = 0 if result.status == "completed" else (
@@ -272,7 +301,27 @@ class PrivilegedCommandExecutor:
             timed_out=False,
             environment_changed=changed,
             mutation=dict(getattr(result, "metadata", {}) or {}),
+            commands=list(self._command_events),
         )
+
+    def _record_action_command(self, event: dict) -> None:
+        argv = [str(item) for item in event.get("argv") or []]
+        display = _redacted_command(argv)
+        recorded = {
+            "action": str(event.get("action") or ""),
+            "command": display,
+            "cwd": str(event.get("cwd") or ""),
+            "execution": str(event.get("execution") or "subprocess"),
+            "changes_state": bool(event.get("changes_state")),
+        }
+        self._command_events.append(recorded)
+        if recorded["changes_state"] and self.on_start:
+            location = " cwd=%s" % recorded["cwd"] if recorded["cwd"] else ""
+            label = (
+                "Screen 前台命令" if recorded["execution"] == "screen_foreground"
+                else "实际命令"
+            )
+            self.on_start("%s：%s%s" % (label, display, location))
 
     def rollback(self, step: PrivilegedStep) -> ExecutionEvidence:
         """Compensate an uncommitted registered-action mutation exactly once."""
@@ -331,9 +380,10 @@ class PrivilegedCommandExecutor:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout: int | None = None,
+        announce: bool = True,
     ) -> ExecutionEvidence:
         started_at = utc_now()
-        if self.on_start:
+        if self.on_start and announce:
             self.on_start(step.command)
         try:
             process = subprocess.Popen(
@@ -414,3 +464,21 @@ class PrivilegedCommandExecutor:
         marker = "\n... output truncated ...\n"
         keep = max(0, self.max_output_chars - len(marker))
         return value[:keep] + marker
+
+
+def _redacted_command(argv: list[str]) -> str:
+    safe = list(argv)
+    secret_flags = {
+        "--password", "--passwd", "--requirepass", "--token", "--secret",
+    }
+    for index, item in enumerate(safe[:-1]):
+        if str(item).lower() in secret_flags:
+            safe[index + 1] = "[REDACTED]"
+    for index, item in enumerate(safe):
+        name, separator, _value = str(item).partition("=")
+        if separator and any(
+            marker in name.lower()
+            for marker in ("password", "passwd", "secret", "token", "credential")
+        ):
+            safe[index] = "%s=[REDACTED]" % name
+    return redact_sensitive_text(shlex.join(safe))

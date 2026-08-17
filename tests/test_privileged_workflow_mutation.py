@@ -6,6 +6,24 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_default_restart_components_follow_manifest_dependency_topology():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _ordered_default_restart_components,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import RuntimeComponentSpec
+
+    specs = {
+        "worker": RuntimeComponentSpec(name="worker", screen_suffix="w", start_after=("master",)),
+        "metrics": RuntimeComponentSpec(name="metrics", screen_suffix="metrics", start_after=("worker",)),
+        "master": RuntimeComponentSpec(name="master", screen_suffix="m"),
+        "sidecar": RuntimeComponentSpec(
+            name="sidecar", screen_suffix="sidecar", category="shared_dependency",
+        ),
+    }
+
+    assert _ordered_default_restart_components(specs) == ["master", "worker", "metrics"]
+
+
 class FakeLLM:
     def __init__(self, outputs):
         self.outputs = list(outputs)
@@ -17,6 +35,239 @@ class FakeLLM:
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=output))]
         )
+
+
+def test_completed_execution_renders_step_receipt_instead_of_generic_success():
+    from klonet_agent.ops.privileged.contracts import (
+        CheckResult, ExecutionBinding, ExecutionEvidence, ImplementationPlan,
+        PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+    from klonet_agent.ops.privileged.workflow.mutation import _execution_receipt
+
+    micro = PrivilegedStep(
+        step_id="restart-master",
+        title="重启 master",
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            risk="medium",
+            action="restart_screen_component",
+            args={"component": "master", "screen_session": "v4e2e_m"},
+        ),
+        status="completed",
+        evidence=ExecutionEvidence(
+            return_code=0,
+            stdout="action=restart_screen_component component=master session=v4e2e_m",
+            environment_changed=True,
+        ),
+        checks=[CheckResult(
+            checker="backend_health", status="passed",
+            expected="HTTP 200 code=1", observed="HTTP 200 code=1",
+        )],
+    )
+    plan = ChangePlan(
+        plan_id="priv-ops-receipt",
+        goal="重启 v4e2e",
+        risk="medium",
+            steps=[ChangeStep(
+            step_id="change-1", title="重启平台", objective="重启平台",
+            risk="medium", expected_changes=["平台完成重启"],
+            postconditions=[{"checker": "backend_health", "args": {
+                "url": "http://127.0.0.1:47001/server_health/",
+                "expected_code": 1,
+            }}],
+            implementation_plan=ImplementationPlan(
+                implementation_id="impl-1", semantic_step_id="change-1",
+                objective="重启平台", steps=[micro], status="completed",
+            ),
+            status="completed",
+        )],
+        status="completed",
+    )
+
+    rendered = _execution_receipt(plan)
+
+    assert "计划 priv-ops-receipt 已执行完成" in rendered
+    assert "重启 master" in rendered
+    assert "restart_screen_component" not in rendered
+    assert "backend_health：通过" in rendered
+
+
+def test_confirmation_localizes_all_baseline_component_restart_expectations():
+    from klonet_agent.ops.privileged.workflow.mutation import _localized_plan_text
+
+    assert _localized_plan_text(
+        "restart requested celery role and process readiness succeeds"
+    ) == "按要求重启 celery 角色，并确认进程就绪"
+    assert _localized_plan_text(
+        "start missing web_terminal role at 47003 and listener readiness succeeds"
+    ) == "启动缺失的 web_terminal 角色（端口 47003），并确认监听就绪"
+
+
+def test_platform_restart_compiler_keeps_all_managed_application_components():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="帮我重启 v4e2e 平台")
+    knowledge = bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("klonet_knowledge", {"query": bundle.goal}, "startup contract"),
+        "source=startup_shutdown.md\nstartup_cwd=<project_root>",
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        (
+            "platform=v4e2e project_root=/home/lzl/klonet_v4_e2e "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+            "worker_port=47002 worker_endpoint=healthy "
+            "runtime_identities=10:1000:/opt/python3.8"
+        ),
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        "帮我重启 v4e2e 平台", bundle,
+    )
+
+    assert data is not None
+    text = " ".join([
+        data["changes"][0]["objective"],
+        *data["changes"][0]["expected_changes"],
+    ])
+    for component in ("master", "celery", "web_terminal", "worker"):
+        assert component in text
+    assert "preserve healthy" not in text
+    assert knowledge.evidence_id in data["changes"][0]["evidence_refs"]
+
+
+def test_healthy_role_normalization_never_rewrites_platform_restart():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="帮我重启 v4e2e 平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=v4e2e project_root=/srv/v4e2e roles=master,worker "
+        "configured_ports=master_port:47001,worker_port:47002,"
+        "web_terminal_port:47003 "
+        "master_port=47001 master_endpoint=healthy "
+        "worker_port=47002 worker_endpoint=healthy "
+        "web_terminal_port=47003 runtime_identities=10:1000:/opt/python3.8",
+    ))
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        "帮我重启 v4e2e 平台", bundle,
+    )
+
+    ChangePlannerAgent._normalize_healthy_runtime_role_changes(
+        data, bundle, goal="帮我重启 v4e2e 平台",
+    )
+
+    serialized = str(data)
+    assert "preserve healthy" not in serialized
+    assert "restart requested master" in serialized
+    assert "restart requested worker" in serialized
+
+
+def test_v4_e2e_alias_uses_deterministic_restart_and_existing_ports():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="帮我重启v4_e2e平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=v4e2e project_root=/home/lzl/klonet_v4_e2e "
+        "roles=celery,master,worker backend_status=healthy "
+        "configured_ports=master_port:47001,worker_port:47002,"
+        "public_port:45553,web_terminal_port:47003 "
+        "master_port=47001 master_endpoint=healthy "
+        "worker_port=47002 worker_endpoint=healthy "
+        "web_terminal_port=47003 runtime_identities=10:1000:/opt/python3.8",
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        "帮我重启v4_e2e平台",
+        bundle,
+        intent_context={
+            "operation": "restart", "scope": "platform",
+            "resolved_project_root": "/home/lzl/klonet_v4_e2e",
+        },
+    )
+
+    assert data is not None
+    assert len(data["changes"]) == 1
+    assert "停止" not in data["changes"][0]["title"]
+    ports = {
+        item["role"]: item["value"] for item in data["resources"]
+        if item["kind"] == "port"
+    }
+    assert ports == {
+        "master_port": 47001,
+        "worker_port": 47002,
+        "web_terminal_port": 47003,
+    }
+
+
+def test_platform_restart_compiler_includes_manifest_managed_future_component():
+    import base64
+
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    specs = [
+        {"name": "master", "screen_suffix": "m", "start_after": []},
+        {"name": "celery", "screen_suffix": "c", "start_after": ["master"]},
+        {"name": "web_terminal", "screen_suffix": "web", "start_after": ["celery"]},
+        {"name": "worker", "screen_suffix": "w", "start_after": ["web_terminal"]},
+        {
+            "name": "metrics", "screen_suffix": "metrics",
+            "command_argv": ["/opt/python", "-m", "metrics_service"],
+            "preflight_argv": ["/opt/python", "-c", "import metrics_service"],
+            "start_after": ["worker"],
+            "health_checks": [{
+                "checker": "port_listening", "args": {"port": 47009},
+            }],
+        },
+        {
+            "name": "redis", "category": "shared_dependency",
+            "screen_suffix": "redis", "start_after": [],
+        },
+    ]
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(specs).encode("utf-8")
+    ).decode("ascii")
+    bundle = EvidenceBundle(goal="重启 v4e2e 平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        (
+            "platform=v4e2e project_root=/srv/v4e2e roles=master,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+            "worker_port=47002 worker_endpoint=healthy "
+            "component_specs_b64=%s runtime_identities=10:1000:/opt/python"
+        ) % encoded,
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        "重启 v4e2e 平台", bundle,
+    )
+
+    assert data is not None
+    expected = " ".join(data["changes"][0]["expected_changes"])
+    assert "managed component metrics" in expected
+    assert "redis" not in expected
+    resource = next(
+        item for item in data["resources"]
+        if item["role"] == "runtime_component_spec:metrics"
+    )
+    assert "metrics_service" in resource["value"]
 
 
 def _bundle_and_conclusion():
@@ -1352,7 +1603,7 @@ def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_ste
     assert resources[2].consumers == ["change-5.path"]
 
 
-def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
+def test_planner_compiles_canonical_container_names_and_runtime_entry_source():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
@@ -1410,7 +1661,7 @@ def test_planner_compiles_canonical_container_names_and_runtime_mains_root():
     assert data["changes"][0]["postconditions"][0]["args"]["name"] == "v4e2e-mysql"
     mains = next(item for item in resources if item.role == "runtime_mains_root")
     assert mains.value == "/home/lzl/klonet_workflow_e2e/mains"
-    assert mains.consumers == ["master.project_root"]
+    assert mains.consumers == ["master.source_root"]
 
 
 def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
@@ -1447,7 +1698,7 @@ def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
 
     mains = next(item for item in normalized if item.role == "runtime_mains_root")
     assert mains.value == str(nested_mains)
-    assert mains.consumers == ["start.project_root"]
+    assert mains.consumers == ["start.source_root"]
 
 
 def test_planner_derives_config_path_after_checker_path_normalization():
@@ -3857,6 +4108,6 @@ def test_derived_runtime_roots_are_scoped_per_same_named_instance():
     }
 
     assert mains == {
-        "/home/lzl/test/vemu_uestc/mains": {"change-1.project_root"},
-        "/home/lzl/vemu_uestc/mains": {"change-2.project_root"},
+        "/home/lzl/test/vemu_uestc/mains": {"change-1.source_root"},
+        "/home/lzl/vemu_uestc/mains": {"change-2.source_root"},
     }

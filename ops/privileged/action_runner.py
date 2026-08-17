@@ -92,6 +92,14 @@ DIRECT_PRIVILEGED_ACTIONS = frozenset(
     }
 )
 
+
+def _ops_backup_path(path: Path) -> Path:
+    """Return a recoverable, sibling backup path for a managed file write."""
+
+    return path.with_name(
+        "%s.klonet-agent.bak.%s" % (path.name, time.time_ns())
+    )
+
 _COMPONENTS = ("master", "celery", "web_terminal", "worker")
 _COMPONENT_SUFFIX = {
     "master": "m",
@@ -172,11 +180,14 @@ class DirectPrivilegedActionRunner:
         *,
         action_registry: OpsActionRegistry | None = None,
         command_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+        on_command: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.action_registry = (
             action_registry or configured_ops_action_registry()
         )
         self.command_runner = command_runner or self._run_command
+        self.on_command = on_command
+        self._active_action = ""
 
     def __call__(self, step: PrivilegedStep) -> DirectActionResult:
         spec = self.action_registry.get(step.action)
@@ -195,6 +206,7 @@ class DirectPrivilegedActionRunner:
             return self._blocked(
                 "direct_privileged_handler_missing=%s" % spec.name
             )
+        self._active_action = spec.name
         try:
             return handler(step)
         except subprocess.TimeoutExpired as exc:
@@ -225,11 +237,46 @@ class DirectPrivilegedActionRunner:
                 % _one_line(exc),
                 "inspect_runtime",
             )
+        finally:
+            self._active_action = ""
 
     def rollback(self, evidence) -> DirectActionResult:
         """Restore one exact text mutation recorded by this runner."""
 
         mutation = dict(getattr(evidence, "mutation", {}) or {})
+        if mutation.get("kind") == "runtime_entry_files":
+            try:
+                backups = json.loads(str(mutation.get("backups") or "{}"))
+                created = json.loads(str(mutation.get("created") or "[]"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return self._blocked("rollback_metadata_invalid")
+            if not isinstance(backups, dict) or not isinstance(created, list):
+                return self._blocked("rollback_metadata_invalid")
+            try:
+                for target_text, backup_text in backups.items():
+                    target = _absolute_path(target_text)
+                    backup = _absolute_path(backup_text)
+                    if target is None or backup is None or not backup.is_file():
+                        return self._blocked("rollback_backup_missing")
+                    shutil.copy2(backup, target)
+                for target_text in created:
+                    target = _absolute_path(target_text)
+                    if target is None:
+                        return self._blocked("rollback_created_path_invalid")
+                    if target.is_file():
+                        target.unlink()
+            except OSError as exc:
+                return DirectActionResult(
+                    "failed",
+                    "runtime_entry_rollback_failed=%s environment_changed=unknown"
+                    % exc.__class__.__name__,
+                    "inspect_project_layout",
+                )
+            return DirectActionResult(
+                "completed",
+                "runtime_entry_rollback_restored=%s removed_created=%s environment_changed=true"
+                % (len(backups), len(created)),
+            )
         path = _absolute_path(mutation.get("path"))
         backup = _absolute_path(mutation.get("backup"))
         created = str(mutation.get("created") or "").lower() == "true"
@@ -350,15 +397,78 @@ class DirectPrivilegedActionRunner:
             return self._blocked(
                 "entry_sources_missing=%s" % ",".join(missing)
             )
-        for name in REQUIRED_ENTRY_FILES:
-            shutil.copy2(source / name, root / name)
+        expected_hashes = (
+            step.args.get("entry_sha256s")
+            if isinstance(step.args.get("entry_sha256s"), dict)
+            else {}
+        )
+        if expected_hashes:
+            changed = [
+                name for name in REQUIRED_ENTRY_FILES
+                if str(expected_hashes.get(name) or "").lower()
+                != _file_sha256(source / name)
+            ]
+            if changed:
+                return self._blocked(
+                    "entry_sources_changed_after_approval=%s" % ",".join(changed)
+                )
+        expected_targets = (
+            step.args.get("target_sha256s")
+            if isinstance(step.args.get("target_sha256s"), dict)
+            else {}
+        )
+        stale_targets = []
+        for name, expected in expected_targets.items():
+            target = root / name
+            observed = _file_sha256(target) if target.is_file() else "missing"
+            if observed != str(expected):
+                stale_targets.append(name)
+        if stale_targets:
+            return self._blocked(
+                "entry_targets_changed_after_approval=%s" % ",".join(stale_targets)
+            )
+        changed_names = [
+            name for name in REQUIRED_ENTRY_FILES
+            if not (root / name).is_file()
+            or _file_sha256(source / name) != _file_sha256(root / name)
+        ]
+        backups = {}
+        created = []
+        for name in changed_names:
+            target = root / name
+            if target.exists():
+                backup = _ops_backup_path(target)
+                shutil.copy2(target, backup)
+                backups[str(target)] = str(backup)
+            else:
+                created.append(str(target))
+            shutil.copy2(source / name, target)
+        mismatched = [
+            name for name in REQUIRED_ENTRY_FILES
+            if _file_sha256(source / name) != _file_sha256(root / name)
+        ]
+        if mismatched:
+            return DirectActionResult(
+                "failed",
+                "prepared_entry_hash_mismatch=%s environment_changed=unknown"
+                % ",".join(mismatched),
+                "inspect_project_layout",
+            )
         return DirectActionResult(
             "completed",
             (
                 "action=prepare_project_files source_root=%s "
-                "project_root=%s copied=%s environment_changed=true"
+                "project_root=%s copied=%s environment_changed=%s"
             )
-            % (source, root, ",".join(REQUIRED_ENTRY_FILES)),
+                % (
+                    source, root, ",".join(changed_names) or "none",
+                    "true" if changed_names else "false",
+                ),
+            metadata={
+                "kind": "runtime_entry_files",
+                "backups": json.dumps(backups, sort_keys=True),
+                "created": json.dumps(created),
+            },
         )
 
     def _action_extract_archive(
@@ -477,9 +587,10 @@ class DirectPrivilegedActionRunner:
         session = str(step.args.get("screen_session") or "").strip()
         if problem:
             return self._blocked(problem)
-        if component not in _COMPONENTS:
+        suffix = _component_suffix(component, step.args)
+        if not suffix:
             return self._blocked("invalid_component")
-        expected = "%s_%s" % (platform, _COMPONENT_SUFFIX[component])
+        expected = "%s_%s" % (platform, suffix)
         if session != expected:
             return self._blocked("screen_session_mismatch expected=%s" % expected)
         run_as_uid = _runtime_run_as_uid(step.args)
@@ -744,9 +855,10 @@ class DirectPrivilegedActionRunner:
         session = str(step.args.get("screen_session") or "").strip()
         if problem:
             return self._blocked(problem)
-        if component not in _COMPONENTS or not _safe_token(session):
+        suffix = _component_suffix(component, step.args)
+        if not suffix or not _safe_token(session):
             return self._blocked("invalid_component_or_screen_session")
-        expected = "%s_%s" % (platform, _COMPONENT_SUFFIX[component])
+        expected = "%s_%s" % (platform, suffix)
         if session != expected:
             return self._blocked(
                 "screen_session_mismatch expected=%s" % expected
@@ -763,6 +875,27 @@ class DirectPrivilegedActionRunner:
             timeout=10,
         )
         port = _component_port_arg(step.args, component)
+        old_pids = (
+            _listener_pids_for_port(port)
+            if port else _component_pids(root, component)
+        )
+        if port and not old_pids:
+            return self._blocked("component_listener_missing_before_restart=%s" % port)
+        if port:
+            allowed = _allowed_runtime_cwds(root)
+            wrong = [
+                pid for pid in old_pids
+                if not _proc_cwd(pid) or not any(
+                    _path_is_relative_to(Path(_proc_cwd(pid)), candidate)
+                    for candidate in allowed
+                )
+            ]
+            if wrong:
+                return self._blocked(
+                    "component_listener_wrong_project_root=%s" % ",".join(
+                        str(pid) for pid in wrong
+                    )
+                )
         if control_check.returncode == 0 and targets:
             target = targets[0]
             interrupted = self._command(
@@ -809,10 +942,58 @@ class DirectPrivilegedActionRunner:
                     % (component, port),
                     "inspect_runtime",
                 )
+            new_pids = (
+                _listener_pids_for_port(port)
+                if port else _wait_component_new_pids(
+                    root, component, set(old_pids), timeout=min(float(step.timeout), 20.0),
+                )
+            )
+            if port and (
+                not new_pids
+                or set(old_pids).intersection(new_pids)
+                or not any(_proc_cwd(pid) == str(root) for pid in new_pids)
+            ):
+                return DirectActionResult(
+                    "failed",
+                    "component_restart_identity_failed component=%s old_pids=%s new_pids=%s environment_changed=unknown"
+                    % (
+                        component,
+                        ",".join(str(pid) for pid in old_pids) or "none",
+                        ",".join(str(pid) for pid in new_pids) or "none",
+                    ),
+                    "inspect_runtime",
+                )
+            if not port and (
+                not new_pids
+                or set(old_pids).intersection(new_pids)
+                or not any(_proc_cwd(pid) == str(root) for pid in new_pids)
+            ):
+                return DirectActionResult(
+                    "failed",
+                    "component_restart_identity_failed component=%s old_pids=%s new_pids=%s environment_changed=unknown"
+                    % (
+                        component,
+                        ",".join(str(pid) for pid in old_pids) or "none",
+                        ",".join(str(pid) for pid in new_pids) or "none",
+                    ),
+                    "inspect_runtime",
+                )
             return DirectActionResult(
                 "completed",
                 "action=restart_screen_component component=%s session=%s "
-                "session_preserved=true environment_changed=true" % (component, session),
+                "session_preserved=true old_pids=%s new_pids=%s environment_changed=true"
+                % (
+                    component, session,
+                    ",".join(str(pid) for pid in old_pids) or "none",
+                    ",".join(str(pid) for pid in new_pids) or "none",
+                ),
+                metadata={
+                    "kind": "component_restart",
+                    "component": component,
+                    "session": session,
+                    "old_pids": ",".join(str(pid) for pid in old_pids),
+                    "new_pids": ",".join(str(pid) for pid in new_pids),
+                },
             )
         for target in targets:
             self._command(
@@ -821,8 +1002,45 @@ class DirectPrivilegedActionRunner:
                 ),
                 timeout=20,
             )
-        return self._start_one_component(
+        started = self._start_one_component(
             component, session, root, step
+        )
+        if started.status != "completed":
+            return started
+        new_pids = (
+            _listener_pids_for_port(port)
+            if port else _wait_component_new_pids(
+                root, component, set(old_pids), timeout=min(float(step.timeout), 20.0),
+            )
+        )
+        if (
+            not new_pids
+            or set(old_pids).intersection(new_pids)
+            or not any(_proc_cwd(pid) == str(root) for pid in new_pids)
+        ):
+            return DirectActionResult(
+                "failed",
+                "component_restart_identity_failed component=%s old_pids=%s new_pids=%s environment_changed=unknown"
+                % (
+                    component,
+                    ",".join(str(pid) for pid in old_pids) or "none",
+                    ",".join(str(pid) for pid in new_pids) or "none",
+                ),
+                "inspect_runtime",
+            )
+        return DirectActionResult(
+            "completed",
+            "%s old_pids=%s new_pids=%s" % (
+                started.output,
+                ",".join(str(pid) for pid in old_pids) or "none",
+                ",".join(str(pid) for pid in new_pids) or "none",
+            ),
+            metadata={
+                "kind": "component_restart", "component": component,
+                "session": session,
+                "old_pids": ",".join(str(pid) for pid in old_pids),
+                "new_pids": ",".join(str(pid) for pid in new_pids),
+            },
         )
 
     def _action_stop_screen_component(
@@ -864,19 +1082,76 @@ class DirectPrivilegedActionRunner:
         self,
         step: PrivilegedStep,
     ) -> DirectActionResult:
-        platform = str(step.args.get("platform") or "").strip()
-        if not _safe_token(platform):
-            return self._blocked("invalid_platform")
+        platform, root, problem = _platform_root(step)
+        if problem:
+            return self._blocked(problem)
+        contracts = step.args.get("component_contracts")
+        if not isinstance(contracts, list) or not contracts:
+            return self._blocked("component_contracts_required")
+        run_as_uid = _runtime_run_as_uid(step.args)
+        if run_as_uid is None:
+            return self._blocked("invalid_run_as_uid")
+        frozen = []
+        allowed_cwds = _allowed_runtime_cwds(root)
+        for item in contracts:
+            if not isinstance(item, dict):
+                return self._blocked("invalid_component_contract")
+            component = str(item.get("component") or "").strip()
+            suffix = _component_suffix(component, item)
+            session = str(item.get("screen_session") or "").strip()
+            pids = [int(pid) for pid in item.get("pids") or [] if str(pid).isdigit()]
+            ports = [int(port) for port in item.get("ports") or [] if str(port).isdigit()]
+            if not suffix or session != "%s_%s" % (platform, suffix) or not pids:
+                return self._blocked("invalid_component_contract=%s" % component)
+            wrong_pids = [
+                pid for pid in pids
+                if not _proc_cwd(pid) or not any(
+                    _path_is_relative_to(Path(_proc_cwd(pid)), candidate)
+                    for candidate in allowed_cwds
+                )
+            ]
+            if wrong_pids:
+                return self._blocked(
+                    "component_contract_wrong_project_root=%s:%s"
+                    % (component, ",".join(str(pid) for pid in wrong_pids))
+                )
+            for port in ports:
+                listeners = set(_listener_pids_for_port(port))
+                if listeners and not listeners.intersection(pids):
+                    return self._blocked(
+                        "component_contract_port_owner_mismatch=%s:%s"
+                        % (component, port)
+                    )
+            targets = self._screen_session_targets(session, run_as_uid)
+            frozen.append((component, session, pids, ports, targets))
         stopped = []
-        for component in _COMPONENTS:
-            session = "%s_%s" % (platform, _COMPONENT_SUFFIX[component])
-            for target in self._screen_session_targets(session):
+        for _component, session, _pids, _ports, targets in frozen:
+            for target in targets:
                 result = self._command(
-                    ["screen", "-S", target, "-X", "quit"],
+                    _runtime_user_argv(
+                        ["screen", "-S", target, "-X", "quit"], run_as_uid,
+                    ),
                     timeout=min(step.timeout, 30),
                 )
                 if result.returncode == 0:
                     stopped.append(target)
+        remaining = [
+            "%s:%s" % (component, pid)
+            for component, _session, pids, _ports, _targets in frozen
+            for pid in pids if Path("/proc/%s" % pid).exists()
+        ]
+        listening = [
+            "%s:%s" % (component, port)
+            for component, _session, _pids, ports, _targets in frozen
+            for port in ports if _listener_pids_for_port(port)
+        ]
+        if remaining or listening:
+            return DirectActionResult(
+                "failed",
+                "platform_stop_incomplete remaining=%s listening=%s environment_changed=unknown"
+                % (",".join(remaining) or "none", ",".join(listening) or "none"),
+                "inspect_runtime",
+            )
         if not stopped:
             return DirectActionResult(
                 "completed",
@@ -3046,7 +3321,9 @@ class DirectPrivilegedActionRunner:
         run_as_uid = _runtime_run_as_uid(step.args)
         if run_as_uid is None:
             return self._blocked("invalid_run_as_uid")
-        command = _component_commands(python)[component]
+        command = _component_command(component, python, step.args)
+        if not command:
+            return self._blocked("component_command_missing")
         preflight = {
             "master": [
                 python, "-m", "gunicorn", "--check-config",
@@ -3065,7 +3342,9 @@ class DirectPrivilegedActionRunner:
                 "from gevent import pywsgi; "
                 "from geventwebsocket.handler import WebSocketHandler",
             ],
-        }[component]
+        }.get(component) or list(step.args.get("preflight_argv") or [])
+        if not preflight:
+            return self._blocked("component_preflight_missing")
         checked = self._command(
             _runtime_user_argv(preflight, run_as_uid, runtime_env),
             cwd=root,
@@ -3084,6 +3363,7 @@ class DirectPrivilegedActionRunner:
                 ),
                 "inspect_project_layout",
             )
+        self._emit_command(command, cwd=root, execution="screen_foreground")
         control_rc = _runtime_screen_control_path(root, session)
         rc_content = _interactive_screen_rc(
             root=root,
@@ -3336,12 +3616,30 @@ class DirectPrivilegedActionRunner:
         env: dict[str, str] | None = None,
         timeout: int = 120,
     ) -> subprocess.CompletedProcess:
+        self._emit_command(argv, cwd=cwd)
         return self.command_runner(
             argv,
             cwd=str(cwd) if cwd else None,
             env=env,
             timeout=max(1, min(int(timeout), 3600)),
         )
+
+    def _emit_command(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path | None = None,
+        execution: str = "subprocess",
+    ) -> None:
+        if self.on_command is None:
+            return
+        self.on_command({
+            "action": self._active_action,
+            "argv": list(argv),
+            "cwd": str(cwd or ""),
+            "execution": execution,
+            "changes_state": _command_changes_state(self._active_action, argv),
+        })
 
     @staticmethod
     def _run_command(
@@ -3475,20 +3773,19 @@ def _platform_root(
         return platform, root, problem
     if not _safe_token(platform):
         return platform, root, "invalid_platform"
-    backend = root / platform
-    if (backend / "vemu_config").is_dir():
-        mains = backend / "mains"
-        if all((mains / name).is_file() for name in REQUIRED_ENTRY_FILES):
-            return platform, mains.resolve(), ""
-        if all((backend / name).is_file() for name in REQUIRED_ENTRY_FILES):
-            return platform, backend.resolve(), ""
-        return platform, backend.resolve(), "runtime_entries_missing_in_backend"
+    if root.name == "mains":
+        return platform, root, "runtime_root_must_be_instance_root"
     if all((root / name).is_file() for name in REQUIRED_ENTRY_FILES):
         return platform, root, ""
-    for candidate in (root / "mains", root / "vemu_uestc" / "mains"):
-        if all((candidate / name).is_file() for name in REQUIRED_ENTRY_FILES):
-            return platform, candidate.resolve(), ""
-    return platform, root, "runtime_entries_missing_in_project_root"
+    backend = root / platform
+    if (backend / "vemu_config").is_dir():
+        return platform, root, "runtime_entries_not_prepared"
+    if any(
+        all((candidate / name).is_file() for name in REQUIRED_ENTRY_FILES)
+        for candidate in (root / "mains", root / "vemu_uestc" / "mains")
+    ):
+        return platform, root, "runtime_entries_not_prepared"
+    return platform, root, "runtime_entry_sources_missing"
 
 
 def _entry_sources(root: Path) -> dict[str, str]:
@@ -3674,6 +3971,68 @@ def _component_commands(python: str) -> dict[str, list[str]]:
             "worker_main:flask_app",
         ],
     }
+
+
+def _component_suffix(component: str, args: dict[str, Any]) -> str:
+    if component in _COMPONENT_SUFFIX:
+        return _COMPONENT_SUFFIX[component]
+    suffix = str(args.get("screen_suffix") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", suffix):
+        return ""
+    return suffix
+
+
+def _component_command(
+    component: str,
+    python: str,
+    args: dict[str, Any],
+) -> list[str]:
+    known = _component_commands(python).get(component)
+    if known:
+        return known
+    command = args.get("command_argv")
+    if not isinstance(command, list):
+        return []
+    return [str(item) for item in command]
+
+
+def _command_changes_state(action: str, argv: list[str]) -> bool:
+    """Classify subprocess events for concise user-facing execution output."""
+
+    words = [str(item) for item in argv]
+    if not words:
+        return False
+    unwrapped = list(words)
+    if unwrapped[:1] == ["sudo"]:
+        try:
+            marker = next(
+                index for index, value in enumerate(unwrapped)
+                if index and not value.startswith("-") and not value.startswith("#")
+                and value not in {"env"}
+            )
+            unwrapped = unwrapped[marker:]
+        except StopIteration:
+            return True
+    program = Path(unwrapped[0]).name
+    joined = " ".join(unwrapped)
+    if program in {"ss", "ps", "pgrep", "curl", "test", "stat", "readlink"}:
+        return False
+    if program == "screen" and any(flag in unwrapped for flag in ("-ls", "-Q")):
+        return False
+    if "--check-config" in unwrapped:
+        return False
+    if program.startswith("python") and "-c" in unwrapped:
+        return bool(re.search(
+            r"write_text|mkdir|chmod|unlink|replace|symlink_to", joined,
+        ))
+    if action in {
+        "start_screen_component", "restart_screen_component",
+        "stop_screen_component", "stop_platform_screens",
+        "start_platform_screens", "stop_klonet_component",
+        "stop_klonet_runtime_instance",
+    }:
+        return program == "screen" or "gunicorn" in joined or "celery" in joined
+    return True
 
 
 def _component_port_arg(args: dict[str, Any], component: str) -> int | None:
@@ -4004,6 +4363,8 @@ def _allowed_runtime_cwds(root: Path) -> list[Path]:
     allowed = [root.resolve()]
     if root.name == "mains":
         allowed.append(root.parent.resolve())
+    elif (root / "mains").is_dir():
+        allowed.append((root / "mains").resolve())
     return allowed
 
 
@@ -4036,6 +4397,56 @@ def _listener_pids_for_port(port: int) -> list[int]:
         if pids:
             return pids
     return []
+
+
+def _component_pids(root: Path, component: str) -> list[int]:
+    patterns = {
+        "master": ("master_main", "gun.py"),
+        "worker": ("worker_main", "worker_gun.py"),
+        "celery": ("celery_worker", " celery "),
+        "web_terminal": ("web_terminal_main", "create_web_terminal_app"),
+    }.get(component, (component,))
+    allowed = _allowed_runtime_cwds(root)
+    result = []
+    proc = Path("/proc")
+    try:
+        entries = list(proc.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        cwd = _proc_cwd(pid)
+        if not cwd or not any(
+            _path_is_relative_to(Path(cwd), candidate) for candidate in allowed
+        ):
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
+                "utf-8", errors="replace",
+            )
+        except OSError:
+            continue
+        if any(pattern.lower() in command.lower() for pattern in patterns):
+            result.append(pid)
+    return sorted(result)
+
+
+def _wait_component_new_pids(
+    root: Path,
+    component: str,
+    old_pids: set[int],
+    *,
+    timeout: float,
+) -> list[int]:
+    deadline = time.monotonic() + max(0.1, timeout)
+    while time.monotonic() < deadline:
+        current = _component_pids(root, component)
+        if current and old_pids.isdisjoint(current):
+            return current
+        time.sleep(0.2)
+    return _component_pids(root, component)
 
 
 def _path_is_relative_to(path: Path, parent: Path) -> bool:

@@ -1,0 +1,18 @@
+正在启动 Klonet 专用教学协作 Agent...
+Klonet Agent：已进入 ops-privilege 模式。(输入 exit 退出)
+
+Discovery：正在检索 Klonet 知识库…
+Discovery：关键证据：Klonet 知识检索完成（reliable；startup_shutdown.md）。
+Discovery：正在收集只读证据：privilege_capabilities
+Discovery：只读补证 1/1：正在检查 privilege_capabilities（确认本会话可用的受控权限通道）…
+Discovery：关键证据：本轮只读补证完成。
+Discovery：正在收集只读证据：running_platforms
+Discovery：只读补证 1/1：正在检查 running_platforms（按项目根目录核验后端角色、端口和健康接口）…
+Discovery：关键证据：本轮只读补证完成。
+工作流协调器：Screen 只是启动方式证据，不是后端健康的必要条件。
+实例 `102`（/home/klonet-agent/102）后端状态：healthy。
+- Master（端口 27694）：运行中，健康接口正常
+- Worker（端口 27695）：运行中，健康接口正常
+- Celery：未检测到运行证据
+- Web Terminal（端口 5045）：未检测到运行证据
+Klonet Agent：本次累计 token 约 0

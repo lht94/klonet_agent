@@ -1,0 +1,47 @@
+正在启动 Klonet 专用教学协作 Agent...
+Klonet Agent：已进入 ops-privilege 模式。(输入 exit 退出)
+
+Discovery：正在检索 Klonet 知识库…
+Discovery：关键证据：Klonet 知识检索完成（reliable；startup_shutdown.md）。
+Discovery：正在收集只读证据：privilege_capabilities
+Discovery：只读补证 1/1：正在检查 privilege_capabilities（确认本会话可用的受控权限通道）…
+Discovery：关键证据：本轮只读补证完成。
+Discovery：正在收集只读证据：running_platforms
+Discovery：只读补证 1/1：正在检查 running_platforms（按项目根目录核验后端角色、端口和健康接口）…
+Discovery：关键证据：本轮只读补证完成。
+实施绑定：语义步骤 1/1：正在把“重启 v4e2e 的应用组件”展开为原子实施计划…
+实施绑定：实现子步骤 1/5：正在为“准备项目根目录入口文件”绑定原子能力…
+实施绑定：能力边界：步骤“准备项目根目录入口文件”固定使用已注册动作：prepare_project_files。
+实施绑定：实现节点：已选定注册 Action“prepare_project_files”，正在单独补全参数合同…
+实施绑定：实现节点：注册 Action“prepare_project_files”的参数合同已补全。
+实施绑定：实现子步骤 2/5：正在为“重启 master Screen 组件”绑定原子能力…
+实施绑定：能力边界：步骤“重启 master Screen 组件”固定使用已注册动作：restart_screen_component。
+实施绑定：实现子步骤 3/5：正在为“重启 celery Screen 组件”绑定原子能力…
+实施绑定：能力边界：步骤“重启 celery Screen 组件”固定使用已注册动作：restart_screen_component。
+实施绑定：实现子步骤 4/5：正在为“启动 web_terminal Screen 组件”绑定原子能力…
+实施绑定：能力边界：步骤“启动 web_terminal Screen 组件”固定使用已注册动作：start_screen_component。
+实施绑定：实现子步骤 5/5：正在为“重启 worker Screen 组件”绑定原子能力…
+实施绑定：能力边界：步骤“重启 worker Screen 组件”固定使用已注册动作：restart_screen_component。
+工作流协调器：变更计划 priv-ops-10b3ef2535
+目标：帮我重启 v4_e2e 平台。
+风险：medium
+关键资源：
+- 项目根目录: /home/lzl/klonet_v4_e2e
+- 实例标识: v4e2e
+- Master 端口: 47001
+- Web Terminal 端口: 47003
+- Worker 端口: 47002
+变更步骤：
+- restart-backend-roles: 重启 v4e2e 的应用组件 — 按项目根目录 /home/lzl/klonet_v4_e2e 重启 master 和 celery 和 web_terminal 和 worker
+  预期：按要求重启 master 角色（端口 47001），并确认后端健康; 按要求重启 celery 角色，并确认进程就绪; 启动缺失的 web_terminal 角色（端口 47003），并确认监听就绪; 按要求重启 worker 角色（端口 47002），并确认后端健康
+  验收：process_running, port_listening, backend_health, backend_health
+  执行方式：准备项目根目录入口文件（6 个；覆盖：无）
+  执行方式：重启交互式 Screen 组件 master（v4e2e_m）
+  执行方式：重启交互式 Screen 组件 celery（v4e2e_c）
+  执行方式：启动交互式 Screen 组件 web_terminal（v4e2e_web）
+  执行方式：重启交互式 Screen 组件 worker（v4e2e_w）
+精确计划哈希：e5473f1f2568be12ce080b94d3613683e26accf7924eb5cb844736dd87bb2490
+查看完整绑定：show-priv-plan-details priv-ops-10b3ef2535
+请使用以下命令确认这份精确计划：
+confirm-priv-plan priv-ops-10b3ef2535 e5473f1f2568be12ce080b94d3613683e26accf7924eb5cb844736dd87bb2490
+Klonet Agent：本次累计 token 约 0

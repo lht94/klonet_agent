@@ -7,7 +7,7 @@ REQUIRED_ACTION_ARGS = {
     "restart_screen_component": ("platform", "component", "screen_session", "project_root"),
     "start_screen_component": ("platform", "component", "screen_session", "project_root"),
     "stop_screen_component": ("screen_session",),
-    "stop_platform_screens": ("platform",),
+    "stop_platform_screens": ("platform", "project_root", "component_contracts"),
     "start_platform_screens": ("platform", "project_root"),
     "validate_project_files": ("project_root",),
     "prepare_project_files": ("project_root",),

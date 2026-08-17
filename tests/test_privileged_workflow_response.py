@@ -37,6 +37,27 @@ def test_readonly_response_preserves_model_layout_with_one_call():
     assert "列表项分别换行" in system_prompt
 
 
+def test_response_agent_receives_frozen_knowledge_evidence():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    llm = FakeLLM("已回答")
+    bundle = EvidenceBundle(goal="检查平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("klonet_knowledge", {"query": "检查平台"}, "知识"),
+        "source=startup_shutdown.md\n后端健康以 /server_health/ 为准",
+    ))
+
+    ResponseAgent(llm).render_readonly(
+        "检查平台", EvidenceConclusion(), evidence_bundle=bundle,
+    )
+
+    prompt = llm.calls[0]["messages"][1]["content"]
+    assert "startup_shutdown.md" in prompt
+    assert "/server_health/" in prompt
+
+
 def test_runtime_inventory_response_preserves_project_root_identity():
     from klonet_agent.ops.privileged.workflow.contracts import EvidenceClaim
 

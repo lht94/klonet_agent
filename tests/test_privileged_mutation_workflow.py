@@ -79,13 +79,16 @@ def test_workflow_confirmation_redacts_registered_action_credentials():
     message = MutationWorkflow._confirmation_message(plan)
 
     assert "local-secret" not in message
-    assert "[REDACTED]" in message
+    assert "敏感参数已隐藏" in message
     assert "变更计划" in message
     assert "目标：" in message
     assert "风险：" in message
     assert "冻结资源：" not in message
     assert "变更步骤：" in message
     assert "请使用以下命令确认这份精确计划" in message
+    assert "参数=" not in message
+    assert "执行方式：受控动作 create_docker_container" in message
+    assert "show-priv-plan-details" in message
 
 
 def test_reload_nginx_verification_accepts_non_systemd_master_process():
@@ -139,7 +142,7 @@ def _change_plan(*, hierarchical=False):
     binding = ExecutionBinding(
         kind="registered_action",
         risk="high",
-        action="service_control",
+        action="manage_service",
         args={"service": "v4e2e", "operation": "start"},
         postconditions=[{"checker": "exit_code_zero"}],
     )
@@ -264,7 +267,8 @@ def test_submit_binds_and_persists_but_never_executes_before_confirmation(tmp_pa
         result.plan.content_hash,
     ) in result.message
     assert "deploy isolated instance" in result.message
-    assert "已注册动作 service_control" in result.message
+    assert "执行方式：受控动作 manage_service" in result.message
+    assert "参数=" not in result.message
     assert "exit_code_zero" in result.message
 
 
@@ -330,12 +334,13 @@ def test_failed_verification_pauses_without_retrying_execution(tmp_path):
 
     result = workflow.confirm(submitted.plan.plan_id, submitted.plan.content_hash)
 
-    assert result.kind == "paused"
+    assert result.kind == "awaiting_user_decision"
+    assert result.failure.stage == "verification"
     assert executor.steps == ["deploy"]
     assert store.load(submitted.plan.plan_id).steps[0].status == "paused"
 
 
-def test_exact_reconfirmation_recovers_current_state_without_reexecuting(tmp_path):
+def test_exact_reconfirmation_returns_failure_decision_without_reexecuting(tmp_path):
     workflow, _, _, store, executor, verifier = _workflow(
         tmp_path, _change_plan(hierarchical=True), verifier_status="failed"
     )
@@ -345,19 +350,18 @@ def test_exact_reconfirmation_recovers_current_state_without_reexecuting(tmp_pat
     plan_id = submitted.plan.plan_id
     content_hash = submitted.plan.content_hash
     paused = workflow.confirm(plan_id, content_hash)
-    assert paused.kind == "paused"
+    assert paused.kind == "awaiting_user_decision"
     assert executor.steps == ["deploy-1"]
 
-    verifier.status = "passed"
     resumed = workflow.confirm(plan_id, content_hash)
 
-    assert resumed.kind == "completed"
+    assert resumed.kind == "awaiting_user_decision"
     assert executor.steps == ["deploy-1"]
-    assert "recovered:deploy-1" in verifier.steps
-    assert store.load(plan_id).status == "completed"
+    assert "recovered:deploy-1" not in verifier.steps
+    assert store.load(plan_id).status == "awaiting_user_decision"
 
 
-def test_exact_reconfirmation_retries_only_conclusive_no_change_failure(tmp_path):
+def test_exact_reconfirmation_never_retries_even_conclusive_no_change_failure(tmp_path):
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence
     from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
@@ -401,11 +405,11 @@ def test_exact_reconfirmation_retries_only_conclusive_no_change_failure(tmp_path
     plan_id = submitted.plan.plan_id
     content_hash = submitted.plan.content_hash
 
-    assert workflow.confirm(plan_id, content_hash).kind == "paused"
+    assert workflow.confirm(plan_id, content_hash).kind == "awaiting_user_decision"
     resumed = workflow.confirm(plan_id, content_hash)
 
-    assert resumed.kind == "completed"
-    assert executor.calls == 2
+    assert resumed.kind == "awaiting_user_decision"
+    assert executor.calls == 1
 
 
 def test_exact_reconfirmation_can_retry_exited_screen_with_no_listener():
@@ -789,7 +793,8 @@ def test_verifier_exception_is_persisted_as_pause_after_single_execution(tmp_pat
 
     result = workflow.confirm(submitted.plan.plan_id, submitted.plan.content_hash)
 
-    assert result.kind == "paused"
+    assert result.kind == "awaiting_user_decision"
+    assert result.failure.category == "checker_execution_failed"
     assert "checker crashed" in result.message
     assert executor.steps == ["deploy"]
 
@@ -862,6 +867,51 @@ def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_pat
         "deploy", evidence_bundle=object(), evidence_conclusion=object()
     )
 
-    assert result.kind == "blocked"
-    assert result.plan.status == "blocked"
-    assert store.load(result.plan.plan_id).status == "blocked"
+    assert result.kind == "awaiting_user_decision"
+    assert result.failure.stage == "binding"
+    assert "clone target could not be grounded" in result.failure.technical_reason
+    assert result.plan.status == "awaiting_user_decision"
+    assert store.load(result.plan.plan_id).status == "awaiting_user_decision"
+
+
+def test_failure_control_persists_choice_and_never_executes_old_plan(tmp_path):
+    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+
+    class Binder:
+        def bind(self, plan, **kwargs):
+            from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
+            raise ChangeBindingError("project_root consumer missing")
+
+    store = ChangePlanStore(tmp_path, user_id="u", project_id="p")
+    executor = FakeExecutor()
+    workflow = MutationWorkflow(
+        planner=FakePlanner([
+            PlanningOutcome(status="ready", plan=_change_plan()),
+            PlanningOutcome(status="ready", plan=_change_plan()),
+        ]),
+        binder=Binder(), store=store, executor=executor, verifier=FakeVerifier(),
+    )
+    failed = workflow.submit(
+        "帮我重启 v4_e2e 平台",
+        evidence_bundle=object(), evidence_conclusion=object(),
+    )
+
+    details = workflow.handle_control("查看刚才失败的详细原因")
+
+    selected = workflow.handle_control("选择 1")
+
+    cancelled = workflow.handle_control("算了，取消这次操作")
+
+    assert failed.kind == "awaiting_user_decision"
+    assert details.kind == "failure_details"
+    assert "project_root consumer missing" in details.message
+    assert selected.kind == "failure_option_selected"
+    assert cancelled.kind == "aborted"
+    assert "不会执行剩余步骤" in cancelled.message
+    assert cancelled.failure.selected_option_id == "cancel"
+    assert store.load_failure(failed.failure.failure_id).selected_option_id == (
+        "cancel"
+    )
+    assert executor.steps == []

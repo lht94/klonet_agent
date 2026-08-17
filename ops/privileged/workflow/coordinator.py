@@ -12,6 +12,10 @@ from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
 from klonet_agent.ops.privileged.workflow.operational_context import (
     OperationalContextSnapshot,
 )
+from klonet_agent.ops.privileged.workflow.contracts import (
+    ResolvedPlatformIdentity,
+    normalize_instance_alias,
+)
 
 
 @dataclass
@@ -22,6 +26,7 @@ class WorkflowResult:
     plan: Any | None = None
     evidence: Any | None = None
     verification: Any | None = None
+    failure: Any | None = None
 
 
 class PrivilegedOpsCoordinator:
@@ -76,10 +81,32 @@ class PrivilegedOpsCoordinator:
                         snapshot=snapshot,
                         conversation_context=conversation_context,
                     )
+                if control.kind == "failure_option_selected":
+                    return self._recover_failure_option(
+                        control,
+                        snapshot=snapshot,
+                        conversation_context=conversation_context,
+                    )
                 return control
+        if _is_plan_status_query(normalized):
+            render_status = getattr(
+                self.mutation_workflow, "render_latest_status", None,
+            )
+            if render_status is not None:
+                return WorkflowResult(
+                    True,
+                    "plan_status",
+                    str(render_status()),
+                )
+        classifier_context = conversation_context
+        if snapshot is not None and snapshot.resolved_goal:
+            classifier_context = (
+                "%s\n\nPersisted operational goal:\n%s"
+                % (conversation_context or "(none)", snapshot.resolved_goal)
+            )
         decision = self.classifier.classify(
             normalized,
-            conversation_context=conversation_context,
+            conversation_context=classifier_context,
         )
         if decision.intent == "classifier_error":
             return WorkflowResult(
@@ -94,8 +121,21 @@ class PrivilegedOpsCoordinator:
                 str(getattr(decision, "clarification_question", "") or "请补充说明目标实例和操作。"),
             )
         continuation = _continuation_kind(normalized)
+        goal_kind = str(getattr(decision, "goal_kind", "") or "")
+        if not goal_kind:
+            goal_kind = (
+                "causal_diagnosis" if continuation == "diagnose"
+                else "execution" if decision.intent == "mutating_action"
+                else "health_check" if decision.intent == "readonly_action"
+                else "conversation"
+            )
+        goal_relation = str(getattr(decision, "goal_relation", "new") or "new")
+        if continuation == "diagnose" and goal_relation == "new":
+            goal_relation = "continue_previous"
         if decision.intent == "conversation" and not (
-            snapshot is not None and snapshot.resolved_goal and continuation
+            snapshot is not None
+            and snapshot.resolved_goal
+            and (continuation or goal_relation != "new")
         ):
             return WorkflowResult(False, "conversation")
         resolved_goal = normalized
@@ -104,6 +144,16 @@ class PrivilegedOpsCoordinator:
             if continuation == "submit_plan":
                 resolved_goal = snapshot.resolved_goal
                 effective_intent = "mutating_action"
+            elif goal_relation == "refine_previous":
+                resolved_goal = _refined_goal(snapshot.resolved_goal, normalized)
+                effective_intent = "readonly_action"
+            elif goal_relation == "continue_previous":
+                resolved_goal = snapshot.resolved_goal
+                effective_intent = (
+                    "readonly_action"
+                    if decision.intent == "conversation"
+                    else decision.intent
+                )
             elif continuation == "diagnose":
                 resolved_goal = snapshot.resolved_goal
                 effective_intent = "readonly_action"
@@ -115,12 +165,17 @@ class PrivilegedOpsCoordinator:
             )
         seed_bundle = (
             snapshot.reusable_evidence(resolved_goal)
-            if snapshot is not None and resolved_goal == snapshot.resolved_goal
+            if snapshot is not None and (
+                resolved_goal == snapshot.resolved_goal
+                or goal_relation in {"continue_previous", "refine_previous"}
+            )
             else None
         )
         collection_goal = (
             "只读诊断并补齐以下运维目标所需证据：%s" % resolved_goal
-            if continuation == "diagnose"
+            if continuation == "diagnose" or goal_relation in {
+                "continue_previous", "refine_previous",
+            }
             else resolved_goal
         )
         begin_probe_session = getattr(self.discovery, "begin_probe_session", None)
@@ -151,6 +206,7 @@ class PrivilegedOpsCoordinator:
                     collection_goal=collection_goal,
                     bundle=bundle,
                     conclusion=conclusion,
+                    goal_kind=goal_kind,
                 )
             target_question = _ambiguous_abnormal_target_question(resolved_goal, bundle)
             if target_question:
@@ -171,11 +227,28 @@ class PrivilegedOpsCoordinator:
                     already_satisfied,
                     evidence=bundle,
                 )
+            resolved_identity = _resolve_platform_identity(resolved_goal, bundle)
+            intent_context = {
+                "operation": str(getattr(decision, "operation", "") or ""),
+                "scope": str(getattr(decision, "scope", "") or ""),
+                "components": list(getattr(decision, "components", ()) or ()),
+            }
+            if resolved_identity is not None:
+                intent_context.update(resolved_identity.to_dict())
+                intent_context["resolved_project_root"] = (
+                    resolved_identity.project_root
+                )
+            submit_kwargs = {
+                "evidence_bundle": bundle,
+                "evidence_conclusion": conclusion,
+                "conversation_context": conversation_context,
+            }
+            if "intent_context" in inspect.signature(
+                self.mutation_workflow.submit
+            ).parameters:
+                submit_kwargs["intent_context"] = intent_context
             result = self.mutation_workflow.submit(
-                resolved_goal,
-                evidence_bundle=bundle,
-                evidence_conclusion=conclusion,
-                conversation_context=conversation_context,
+                resolved_goal, **submit_kwargs,
             )
             self._save_context(
                 snapshot,
@@ -183,6 +256,7 @@ class PrivilegedOpsCoordinator:
                 bundle=bundle,
                 phase={
                     "awaiting_confirmation": "awaiting_confirmation",
+                    "awaiting_user_decision": "awaiting_user_decision",
                     "completed": "completed",
                     "blocked": "blocked",
                 }.get(result.kind, "draft_ready"),
@@ -200,11 +274,12 @@ class PrivilegedOpsCoordinator:
         collection_goal: str,
         bundle: Any,
         conclusion: Any,
+        goal_kind: str = "health_check",
     ) -> WorkflowResult:
         """Continue safe evidence collection until the requested result exists."""
 
         decision, bundle, conclusion = self._advance_diagnostic_evidence(
-            collection_goal, bundle, conclusion,
+            collection_goal, bundle, conclusion, goal_kind=goal_kind,
         )
         status = str(getattr(decision, "status", "") or "")
         phase = {
@@ -218,10 +293,17 @@ class PrivilegedOpsCoordinator:
             phase=phase,
         )
         if status == "achieved":
+            response_kwargs: dict[str, Any] = {}
+            if "evidence_bundle" in inspect.signature(
+                self.response.render_readonly
+            ).parameters:
+                response_kwargs["evidence_bundle"] = bundle
             return WorkflowResult(
                 True,
                 "completed",
-                self.response.render_readonly(collection_goal, conclusion),
+                self.response.render_readonly(
+                    collection_goal, conclusion, **response_kwargs,
+                ),
                 evidence=bundle,
             )
         if status == "needs_user_decision":
@@ -252,6 +334,7 @@ class PrivilegedOpsCoordinator:
         conclusion: Any,
         *,
         phase: str = "readonly",
+        goal_kind: str = "health_check",
     ) -> tuple[Any, Any, Any]:
         attempted_keys = {
             item.request.cache_key for item in getattr(bundle, "records", [])
@@ -264,6 +347,8 @@ class PrivilegedOpsCoordinator:
                 assess_kwargs["attempted_keys"] = set(attempted_keys)
             if "phase" in parameters:
                 assess_kwargs["phase"] = phase
+            if "goal_kind" in parameters:
+                assess_kwargs["goal_kind"] = goal_kind
             decision = self.verifier.verify_goal(
                 goal, bundle, conclusion, **assess_kwargs,
             )
@@ -396,6 +481,82 @@ class PrivilegedOpsCoordinator:
         )
         return _localized_result(result)
 
+    def _recover_failure_option(
+        self,
+        control: WorkflowResult,
+        *,
+        snapshot: OperationalContextSnapshot | None,
+        conversation_context: str,
+    ) -> WorkflowResult:
+        """Resume the existing loop from a persisted user-selected recovery."""
+
+        failure = control.failure
+        if failure is None:
+            return WorkflowResult(
+                True, "blocked", "失败恢复记录缺失，无法安全继续。",
+            )
+        option = next(
+            (
+                item for item in failure.options
+                if item.option_id == failure.selected_option_id
+            ),
+            None,
+        )
+        if option is None:
+            return WorkflowResult(
+                True, "blocked", "所选恢复方案不存在，无法安全继续。",
+                failure=failure,
+            )
+        goal = str(failure.goal or "").strip()
+        seed = snapshot.reusable_evidence(goal) if snapshot is not None else None
+        begin = getattr(self.discovery, "begin_probe_session", None)
+        end = getattr(self.discovery, "end_probe_session", None)
+        if begin is not None:
+            begin()
+        try:
+            collect_kwargs: dict[str, Any] = {
+                "command": "",
+                "conversation_context": conversation_context,
+            }
+            if "seed_bundle" in inspect.signature(self.discovery.collect).parameters:
+                collect_kwargs["seed_bundle"] = seed
+            if "preload_capabilities" in inspect.signature(
+                self.discovery.collect
+            ).parameters:
+                collect_kwargs["preload_capabilities"] = True
+            bundle = self.discovery.collect(goal, **collect_kwargs)
+            conclusion = self.synthesis.synthesize(goal, bundle)
+            identity = _resolve_platform_identity(goal, bundle)
+            intent_context: dict[str, Any] = {}
+            if option.action == "component_restart":
+                intent_context.update({"operation": "restart", "scope": "platform"})
+            if identity is not None:
+                intent_context.update(identity.to_dict())
+                intent_context["resolved_project_root"] = identity.project_root
+            submit_kwargs = {
+                "evidence_bundle": bundle,
+                "evidence_conclusion": conclusion,
+                "conversation_context": conversation_context,
+            }
+            if "intent_context" in inspect.signature(
+                self.mutation_workflow.submit
+            ).parameters:
+                submit_kwargs["intent_context"] = intent_context
+            result = self.mutation_workflow.submit(goal, **submit_kwargs)
+            self._save_context(
+                snapshot,
+                resolved_goal=goal,
+                bundle=bundle,
+                phase={
+                    "awaiting_confirmation": "awaiting_confirmation",
+                    "awaiting_user_decision": "awaiting_user_decision",
+                }.get(result.kind, "blocked"),
+            )
+            return result
+        finally:
+            if end is not None:
+                end()
+
     def _save_context(
         self,
         previous: OperationalContextSnapshot | None,
@@ -484,13 +645,65 @@ def _contains_instance_alias(text: str, alias: str) -> bool:
     value = str(alias or "").strip()
     if not value:
         return False
-    return bool(
+    if bool(
         re.search(
             r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
             % re.escape(value),
             str(text or ""),
             re.I,
         )
+    ):
+        return True
+    normalized_alias = normalize_instance_alias(value)
+    return bool(
+        normalized_alias
+        and normalized_alias in normalize_instance_alias(str(text or ""))
+    )
+
+
+def _resolve_platform_identity(
+    text: str, bundle: Any,
+) -> ResolvedPlatformIdentity | None:
+    """Resolve a user alias to exactly one canonical runtime root."""
+
+    matches: dict[str, dict[str, Any]] = {}
+    normalized_text = normalize_instance_alias(text)
+    for record in getattr(bundle, "records", []):
+        if getattr(getattr(record, "request", None), "probe", "") != "running_platforms":
+            continue
+        for line in str(getattr(record, "output", "") or "").splitlines():
+            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
+            alias_match = re.search(r"\bplatform=([^\s]+)", line)
+            if root_match is None:
+                continue
+            root = root_match.group(1)
+            alias = alias_match.group(1) if alias_match else Path(root).name
+            aliases = {alias, Path(root).name}
+            if not (
+                root in str(text or "")
+                or any(
+                    normalize_instance_alias(item)
+                    and normalize_instance_alias(item) in normalized_text
+                    for item in aliases
+                )
+            ):
+                continue
+            item = matches.setdefault(root, {"aliases": set(), "refs": set()})
+            item["aliases"].update(aliases)
+            item["refs"].add(str(getattr(record, "evidence_id", "")))
+    if len(matches) != 1:
+        return None
+    root, data = next(iter(matches.items()))
+    aliases = tuple(sorted(data["aliases"]))
+    primary = next(
+        (item for item in aliases if not item.startswith("klonet_")),
+        aliases[0],
+    )
+    return ResolvedPlatformIdentity(
+        project_root=root,
+        primary_alias=primary,
+        aliases=aliases,
+        evidence_refs=tuple(sorted(data["refs"])),
     )
 
 
@@ -510,6 +723,33 @@ def _continuation_kind(text: str) -> str:
     )):
         return "submit_plan"
     return ""
+
+
+def _refined_goal(previous_goal: str, current_request: str) -> str:
+    """Preserve the resolved target while adding a semantic refinement."""
+
+    previous = str(previous_goal or "").strip()
+    current = str(current_request or "").strip()
+    if not previous:
+        return current
+    if not current or current in previous:
+        return previous
+    return "%s；进一步要求：%s" % (previous, current)
+
+
+def _is_plan_status_query(text: str) -> bool:
+    """Recognize execution receipt questions before operational routing."""
+
+    value = str(text or "").strip()
+    return bool(re.search(
+        r"(?:执行|操作|计划|重启|刚才|之前).{0,12}"
+        r"(?:完(?:成|了吗?)|成功(?:了吗?)?|结果|状态|做了什么)|"
+        r"(?:完(?:成|了吗?)|成功(?:了吗?)?|做了什么).{0,12}"
+        r"(?:执行|操作|计划|重启)|"
+        r"(?:did (?:it|that) (?:finish|succeed)|execution status|plan status)",
+        value,
+        re.I,
+    ))
 
 
 def _platform_alias_for_root(bundle: Any, root: str) -> str:

@@ -101,7 +101,7 @@ def test_verifier_goal_requests_registered_evidence_for_discoverable_gap():
     }, ensure_ascii=False)])
 
     outcome = PrivilegedVerifierAgent(llm).verify_goal(
-        bundle.goal, bundle, conclusion,
+        bundle.goal, bundle, conclusion, goal_kind="causal_diagnosis",
     )
 
     assert outcome.status == "need_evidence"
@@ -127,11 +127,84 @@ def test_verifier_goal_requires_causal_evidence_before_achieved():
     ])
 
     outcome = PrivilegedVerifierAgent(llm).verify_goal(
-        bundle.goal, bundle, conclusion,
+        bundle.goal, bundle, conclusion, goal_kind="causal_diagnosis",
     )
 
     assert outcome.status == "need_evidence"
     assert len(llm.calls) == 2
+
+
+def test_verifier_does_not_treat_unknown_root_cause_text_as_causal_evidence():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        DiagnosisAssessment, EvidenceClaim, EvidenceConclusion,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, _ = _diagnostic_goal_state()
+    conclusion = EvidenceConclusion(
+        confirmed_facts=[EvidenceClaim(
+            "已经发现报错，但根因尚未获取",
+            [bundle.records[0].evidence_id],
+        )],
+        diagnosis=DiagnosisAssessment(
+            status="symptom_confirmed",
+            symptom="gunicorn worker 初始化报错",
+            evidence_refs=[bundle.records[0].evidence_id],
+        ),
+    )
+    llm = FakeLLM([
+        json.dumps({"status": "achieved", "reason": "已经发现报错"}),
+        json.dumps({
+            "status": "need_evidence",
+            "reason": "根因仍未确认",
+            "evidence_requests": [{
+                "probe": "process_logs",
+                "args": {"pids": [1234], "project_root": "/srv/app"},
+                "purpose": "获取完整异常并定位根因",
+            }],
+        }, ensure_ascii=False),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        "v4e2e_m 现在是不是有报错？", bundle, conclusion,
+        goal_kind="causal_diagnosis",
+    )
+
+    assert outcome.status == "need_evidence"
+    assert len(llm.calls) == 2
+
+
+def test_verifier_accepts_structured_causal_chain():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        DiagnosisAssessment, EvidenceClaim, EvidenceConclusion,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, _ = _diagnostic_goal_state()
+    evidence_id = bundle.records[0].evidence_id
+    conclusion = EvidenceConclusion(
+        confirmed_facts=[EvidenceClaim(
+            "日志目录不存在导致处理器初始化失败", [evidence_id],
+        )],
+        diagnosis=DiagnosisAssessment(
+            status="cause_confirmed",
+            symptom="worker 初始化报错",
+            failure_point="ConcurrentRotatingFileHandler 创建锁文件",
+            root_cause="配置解析到不存在的日志目录",
+            evidence_refs=[evidence_id],
+        ),
+    )
+    llm = FakeLLM([
+        json.dumps({"status": "achieved", "reason": "根因已确认"}),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        "v4e2e_m 现在是不是有报错？", bundle, conclusion,
+        goal_kind="causal_diagnosis",
+    )
+
+    assert outcome.status == "achieved"
+    assert len(llm.calls) == 1
 
 
 def test_verifier_goal_rejects_offloading_logs_to_user():
@@ -154,7 +227,7 @@ def test_verifier_goal_rejects_offloading_logs_to_user():
     ])
 
     outcome = PrivilegedVerifierAgent(llm).verify_goal(
-        bundle.goal, bundle, conclusion,
+        bundle.goal, bundle, conclusion, goal_kind="causal_diagnosis",
     )
 
     assert outcome.status == "need_evidence"
@@ -171,7 +244,7 @@ def test_verifier_goal_allows_only_a_genuine_user_choice():
     }, ensure_ascii=False)])
 
     outcome = PrivilegedVerifierAgent(llm).verify_goal(
-        bundle.goal, bundle, conclusion,
+        bundle.goal, bundle, conclusion, goal_kind="causal_diagnosis",
     )
 
     assert outcome.status == "needs_user_decision"
@@ -244,8 +317,8 @@ def test_verifier_goal_decides_replan_after_supported_execution_failure():
 
 def test_verifier_goal_prioritizes_referenced_evidence_with_a_bounded_payload():
     from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceBundle, EvidenceClaim, EvidenceConclusion, EvidenceRecord,
-        ProbeRequest,
+        DiagnosisAssessment, EvidenceBundle, EvidenceClaim, EvidenceConclusion,
+        EvidenceRecord, ProbeRequest,
     )
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
@@ -259,14 +332,23 @@ def test_verifier_goal_prioritizes_referenced_evidence_with_a_bounded_payload():
         ProbeRequest("screen_session", {"session": "target"}, "traceback"),
         "FileNotFoundError: /srv/app/logs/.__access.lock",
     ))
-    conclusion = EvidenceConclusion(confirmed_facts=[EvidenceClaim(
-        "根因是日志目录不存在，导致日志处理器无法创建锁文件",
-        [causal.evidence_id],
-    )])
+    conclusion = EvidenceConclusion(
+        confirmed_facts=[EvidenceClaim(
+            "根因是日志目录不存在，导致日志处理器无法创建锁文件",
+            [causal.evidence_id],
+        )],
+        diagnosis=DiagnosisAssessment(
+            status="cause_confirmed",
+            symptom="日志处理器初始化报错",
+            failure_point="创建日志锁文件",
+            root_cause="日志目录不存在",
+            evidence_refs=[causal.evidence_id],
+        ),
+    )
     llm = FakeLLM([json.dumps({"status": "achieved", "reason": "根因已确认"})])
 
     outcome = PrivilegedVerifierAgent(llm).verify_goal(
-        bundle.goal, bundle, conclusion,
+        bundle.goal, bundle, conclusion, goal_kind="causal_diagnosis",
     )
 
     payload = llm.calls[0]["messages"][1]["content"]

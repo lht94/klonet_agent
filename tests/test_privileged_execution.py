@@ -71,7 +71,10 @@ def test_executor_timeout_is_execution_unknown_evidence_and_never_retries():
 
     assert evidence.timed_out is True
     assert evidence.return_code is None
-    assert calls == [command]
+    assert len(calls) == 1
+    assert "实际受控脚本" in calls[0]
+    assert "cwd=/tmp" in calls[0]
+    assert command in calls[0]
 
 
 def test_shell_artifact_executes_fixed_argv_without_shell_interpretation(monkeypatch):
@@ -166,6 +169,55 @@ def test_readonly_executor_uses_validated_argv_without_shell(monkeypatch):
     assert evidence.return_code == 0
     assert seen["command"] == ["find", "/tmp/scope", "-maxdepth", "1"]
     assert seen["shell"] is False
+
+
+def test_registered_action_persists_and_prints_only_redacted_mutating_commands():
+    from types import SimpleNamespace
+
+    from klonet_agent.ops.privileged.contracts import ExecutionBinding, PrivilegedStep
+    from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+
+    class Runner:
+        on_command = None
+
+        def __call__(self, step):
+            self.on_command({
+                "action": step.action,
+                "argv": ["ss", "-ltn"],
+                "cwd": "/srv/app",
+                "execution": "subprocess",
+                "changes_state": False,
+            })
+            self.on_command({
+                "action": step.action,
+                "argv": ["service-cli", "--token", "top-secret", "restart"],
+                "cwd": "/srv/app",
+                "execution": "subprocess",
+                "changes_state": True,
+            })
+            return SimpleNamespace(
+                status="completed", output="environment_changed=true", metadata={},
+            )
+
+    progress = []
+    executor = PrivilegedCommandExecutor(
+        direct_action_runner=Runner(), on_start=progress.append,
+    )
+    step = PrivilegedStep(
+        step_id="restart-extra", title="重启 extra", risk="medium",
+        execution_binding=ExecutionBinding(
+            kind="registered_action", risk="medium",
+            action="restart_screen_component", args={},
+        ),
+    )
+
+    evidence = executor.execute(step)
+
+    assert len(evidence.commands) == 2
+    assert "top-secret" not in str(evidence.commands)
+    assert "[REDACTED]" in str(evidence.commands)
+    assert any("实际命令" in item for item in progress)
+    assert not any("ss -ltn" in item for item in progress)
 
 
 def test_checker_registry_verifies_files_without_shell(tmp_path):

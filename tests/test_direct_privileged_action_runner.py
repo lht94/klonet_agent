@@ -187,6 +187,29 @@ def test_screen_component_keeps_interactive_shell_after_foreground_service_stops
     assert "session_mode=interactive_foreground" in result.output
 
 
+def test_start_component_requires_entries_in_instance_root(tmp_path, monkeypatch):
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    mains = tmp_path / "mains"
+    mains.mkdir()
+    _write_runtime_entries(mains)
+    runner = DirectPrivilegedActionRunner()
+
+    result = runner(_step(
+        "start_screen_component",
+        {
+            "platform": "v4e2e",
+            "component": "master",
+            "screen_session": "v4e2e_m",
+            "project_root": str(tmp_path),
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "blocked"
+    assert "runtime_entries_not_prepared" in result.output
+
+
 def test_restart_preserves_existing_interactive_screen_shell(tmp_path, monkeypatch):
     from klonet_agent.ops.privileged import action_runner as module
     from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
@@ -207,6 +230,13 @@ def test_restart_preserves_existing_interactive_screen_shell(tmp_path, monkeypat
         "_screen_session_targets",
         lambda session, run_as_uid="": ["123.v4e2e_w"],
     )
+    listener_snapshots = iter([[101], [202]])
+    monkeypatch.setattr(
+        module,
+        "_listener_pids_for_port",
+        lambda _port: next(listener_snapshots),
+    )
+    monkeypatch.setattr(module, "_proc_cwd", lambda _pid: str(tmp_path))
 
     result = runner(_step(
         "restart_screen_component",
@@ -596,6 +626,67 @@ def test_direct_runner_prepares_nested_entries_without_ops_helper(tmp_path):
     assert "klonet-agent-op" not in result.output
 
 
+def test_prepare_project_files_rejects_source_changed_after_approval(tmp_path):
+    import hashlib
+
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    root, _backend, mains = _layout(tmp_path)
+    hashes = {
+        name: hashlib.sha256((mains / name).read_bytes()).hexdigest()
+        for name in ENTRY_FILES
+    }
+    (mains / "master_main.py").write_text("changed\n", encoding="utf-8")
+
+    result = DirectPrivilegedActionRunner()(_step(
+        "prepare_project_files",
+        {
+            "project_root": str(root),
+            "source_root": str(mains),
+            "entry_sha256s": hashes,
+        },
+    ))
+
+    assert result.status == "blocked"
+    assert "entry_sources_changed_after_approval=master_main.py" in result.output
+    assert not (root / "gun.py").exists()
+
+
+def test_prepare_project_files_freezes_targets_and_records_recoverable_backups(tmp_path):
+    import hashlib
+    import json
+    from types import SimpleNamespace
+
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    root, _backend, mains = _layout(tmp_path)
+    target = root / "master_main.py"
+    target.write_text("user version\n", encoding="utf-8")
+    target_hashes = {
+        name: (
+            hashlib.sha256((root / name).read_bytes()).hexdigest()
+            if (root / name).is_file() else "missing"
+        )
+        for name in ENTRY_FILES
+    }
+    runner = DirectPrivilegedActionRunner()
+    result = runner(_step("prepare_project_files", {
+        "project_root": str(root),
+        "source_root": str(mains),
+        "target_sha256s": target_hashes,
+    }))
+
+    assert result.status == "completed"
+    backups = json.loads(result.metadata["backups"])
+    assert str(target) in backups
+    assert target.read_text(encoding="utf-8") != "user version\n"
+
+    rolled_back = runner.rollback(SimpleNamespace(mutation=result.metadata))
+
+    assert rolled_back.status == "completed"
+    assert target.read_text(encoding="utf-8") == "user version\n"
+
+
 def test_direct_runner_starts_platform_with_fixed_argv_not_helper(tmp_path, monkeypatch):
     from klonet_agent.ops.privileged import action_runner as module
     from klonet_agent.ops.privileged.action_runner import (
@@ -903,6 +994,46 @@ def test_privileged_executor_defaults_to_direct_backend():
 
     assert isinstance(executor.action_runner, DirectPrivilegedActionRunner)
     assert executor._legacy_action_runner is None
+
+
+def test_start_screen_component_accepts_grounded_future_component(tmp_path):
+    import subprocess
+    import sys
+
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+
+    for name in REQUIRED_ENTRY_FILES:
+        (tmp_path / name).write_text("# fixture\n", encoding="utf-8")
+    calls = []
+
+    def command_runner(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        stdout = "No Sockets found\n" if argv[-2:] == ["screen", "-ls"] else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    events = []
+    result = DirectPrivilegedActionRunner(
+        command_runner=command_runner,
+        on_command=events.append,
+    )(_step("start_screen_component", {
+        "platform": "v4e2e",
+        "component": "metrics",
+        "screen_suffix": "metrics",
+        "screen_session": "v4e2e_metrics",
+        "project_root": str(tmp_path),
+        "python": sys.executable,
+        "command_argv": [sys.executable, "-m", "metrics_service"],
+        "preflight_argv": [sys.executable, "-c", "import sys"],
+    }))
+
+    assert result.status == "completed"
+    assert any(
+        event["execution"] == "screen_foreground"
+        and event["argv"][-2:] == ["-m", "metrics_service"]
+        for event in events
+    )
+    assert any("v4e2e_metrics" in call[0] for call in calls)
 
 
 def test_direct_runner_filesystem_lifecycle(tmp_path):

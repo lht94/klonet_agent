@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from klonet_agent.ops.privileged.workflow.contracts import (
+    DiagnosisAssessment,
     EvidenceBundle,
     EvidenceClaim,
     EvidenceConclusion,
@@ -20,6 +21,14 @@ Use only the supplied read-only evidence. Never request tools, propose commands,
 write files, or claim facts without evidence references.
 Return one JSON object with confirmed_facts, uncertainties, missing_decisions.
 Each fact is {"text":"...","evidence_refs":["ev-..."]}.
+Also return diagnosis as
+{"status":"not_applicable|incomplete|symptom_confirmed|cause_confirmed|no_failure_confirmed",
+ "symptom":"", "failure_point":"", "root_cause":"", "evidence_refs":[]}.
+Use cause_confirmed only when evidence supports the symptom, exact failure
+point, and underlying cause. Use symptom_confirmed when an error is proven but
+its cause is not. Use no_failure_confirmed only when current evidence directly
+proves the investigated failure is absent. Never encode an unknown cause as a
+confirmed cause.
 When evidence supports a causal chain, include one explicit confirmed fact that
 states the root cause and references every supporting link. Uncertainties and
 missing_decisions must be necessary to answer the supplied goal. Do not list
@@ -204,12 +213,23 @@ class EvidenceSynthesizer:
             ]
 
         missing = data.get("missing_decisions")
+        raw_diagnosis = data.get("diagnosis")
+        raw_diagnosis = raw_diagnosis if isinstance(raw_diagnosis, dict) else {}
         return EvidenceConclusion(
             confirmed_facts=claims("confirmed_facts"),
             uncertainties=claims("uncertainties"),
             missing_decisions=[str(item) for item in missing]
             if isinstance(missing, list)
             else [],
+            diagnosis=DiagnosisAssessment(
+                status=str(raw_diagnosis.get("status") or "incomplete"),
+                symptom=str(raw_diagnosis.get("symptom") or ""),
+                failure_point=str(raw_diagnosis.get("failure_point") or ""),
+                root_cause=str(raw_diagnosis.get("root_cause") or ""),
+                evidence_refs=[
+                    str(ref) for ref in raw_diagnosis.get("evidence_refs", [])
+                ] if isinstance(raw_diagnosis.get("evidence_refs"), list) else [],
+            ),
         )
 
     @staticmethod

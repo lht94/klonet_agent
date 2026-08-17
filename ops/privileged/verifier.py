@@ -21,6 +21,9 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     ProbeRequest,
     normalize_probe_request,
 )
+from klonet_agent.ops.privileged.workflow.runtime_inventory import (
+    RuntimeInventory, runtime_inventory_answers_goal,
+)
 
 
 VERIFIER_SYSTEM_PROMPT = """
@@ -66,8 +69,9 @@ Return exactly one JSON object:
 
 Rules:
 - `achieved` requires evidence that directly answers the whole user goal. For
-  diagnosis, require a supported causal chain from symptom to failure point to
-  underlying cause; a list of uncertainties is not a diagnosis.
+  diagnosis, diagnosis.status must be cause_confirmed or no_failure_confirmed.
+  cause_confirmed requires a supported causal chain from symptom to failure
+  point to underlying cause; a list of uncertainties is not a diagnosis.
 - Once that causal chain is supported, uncertainties about historical timing
   or which future fix to choose do not prevent a diagnostic goal from being
   achieved. Those are separate change decisions, not missing diagnosis facts.
@@ -111,20 +115,30 @@ class PrivilegedVerifierAgent:
         *,
         attempted_keys: set[str] | None = None,
         phase: str = "readonly",
+        goal_kind: str = "health_check",
     ) -> GoalOutcome:
         """Evaluate the whole user goal, independently of any single step."""
 
         attempted_keys = set(attempted_keys or set())
         if (
             phase == "readonly"
+            and runtime_inventory_answers_goal(
+                goal, RuntimeInventory.from_bundle(bundle),
+            )
+        ):
+            return GoalOutcome("achieved")
+        if (
+            phase == "readonly"
             and
-            not _is_causal_diagnosis_goal(goal)
+            goal_kind != "causal_diagnosis"
             and not conclusion.uncertainties
             and not conclusion.missing_decisions
         ):
             return GoalOutcome("achieved")
         if self.llm is None:
-            return self._goal_fallback(conclusion)
+            return self._goal_fallback(
+                goal, conclusion, phase=phase, goal_kind=goal_kind,
+            )
         payload = {
             "goal": goal,
             "conclusion": {
@@ -137,10 +151,18 @@ class PrivilegedVerifierAgent:
                     for item in conclusion.uncertainties
                 ],
                 "missing_decisions": list(conclusion.missing_decisions),
+                "diagnosis": {
+                    "status": conclusion.diagnosis.status,
+                    "symptom": conclusion.diagnosis.symptom,
+                    "failure_point": conclusion.diagnosis.failure_point,
+                    "root_cause": conclusion.diagnosis.root_cause,
+                    "evidence_refs": conclusion.diagnosis.evidence_refs,
+                },
             },
             "evidence": self._goal_evidence_payload(bundle, conclusion),
             "attempted_probe_keys": sorted(attempted_keys),
             "workflow_phase": phase,
+            "goal_kind": goal_kind,
         }
         messages = [
             {
@@ -168,6 +190,7 @@ class PrivilegedVerifierAgent:
                     goal=goal,
                     conclusion=conclusion,
                     phase=phase,
+                    goal_kind=goal_kind,
                 )
             except Exception as exc:
                 last_error = exc
@@ -182,7 +205,9 @@ class PrivilegedVerifierAgent:
                             ),
                         },
                     ])
-        fallback = self._goal_fallback(conclusion)
+        fallback = self._goal_fallback(
+            goal, conclusion, phase=phase, goal_kind=goal_kind,
+        )
         if fallback.status == "achieved":
             return fallback
         return GoalOutcome(
@@ -199,17 +224,18 @@ class PrivilegedVerifierAgent:
         goal: str,
         conclusion: EvidenceConclusion,
         phase: str,
+        goal_kind: str,
     ) -> GoalOutcome:
         status = str(data.get("status") or "").strip().lower()
         question = str(data.get("user_question") or "").strip()
-        if status == "achieved" and _is_causal_diagnosis_goal(goal):
-            facts = " ".join(item.text for item in conclusion.confirmed_facts)
-            if not re.search(
-                r"根因|原因(?:是|为)|导致|由于|caused by|due to|root cause|"
-                r"未发现.{0,20}(?:报错|异常|故障|error|failure)",
-                facts,
-                re.I,
-            ):
+        if (
+            status == "achieved"
+            and phase == "readonly"
+            and goal_kind == "causal_diagnosis"
+        ):
+            if conclusion.diagnosis.status not in {
+                "cause_confirmed", "no_failure_confirmed",
+            }:
                 raise ValueError("diagnostic goal lacks causal evidence")
         if status == "needs_user_decision":
             if _question_offloads_discoverable_work(question):
@@ -262,7 +288,21 @@ class PrivilegedVerifierAgent:
         )
 
     @staticmethod
-    def _goal_fallback(conclusion: EvidenceConclusion) -> GoalOutcome:
+    def _goal_fallback(
+        goal: str, conclusion: EvidenceConclusion, *, phase: str,
+        goal_kind: str = "health_check",
+    ) -> GoalOutcome:
+        if (
+            phase == "readonly"
+            and goal_kind == "causal_diagnosis"
+            and conclusion.diagnosis.status not in {
+                "cause_confirmed", "no_failure_confirmed",
+            }
+        ):
+            return GoalOutcome(
+                "blocked",
+                reason="诊断尚未形成经过证据支持的完整因果链。",
+            )
         if not conclusion.uncertainties and not conclusion.missing_decisions:
             return GoalOutcome("achieved")
         return GoalOutcome(
@@ -291,8 +331,13 @@ class PrivilegedVerifierAgent:
             record for record in bundle.records
             if record.evidence_id in referenced
         ] + [
+            record for record in bundle.records
+            if record.request.probe == "klonet_knowledge"
+            and record.evidence_id not in referenced
+        ] + [
             record for record in reversed(bundle.records)
             if record.evidence_id not in referenced
+            and record.request.probe != "klonet_knowledge"
         ]
         result: list[dict[str, Any]] = []
         remaining = max(1000, int(output_budget))

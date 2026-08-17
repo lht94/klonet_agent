@@ -307,9 +307,22 @@ class PrivilegedPlanContextBuilder:
                     self._probe_cache[cache_key] = str(result)
             self._learn_project_roots_from_probe(name, str(result))
             roots = [Path(item).resolve() for item in self._candidate_project_roots()]
+            # Batch inventories are typed domain evidence consumed by multiple
+            # workflow stages.  Truncating them can preserve the declared
+            # counts while dropping later instance/code-only rows, producing a
+            # self-contradictory result.  LLM prompts are bounded separately;
+            # the canonical EvidenceRecord must remain complete.
+            result_limit = (
+                200000
+                if name in {"running_platforms", "platform_instances"}
+                else 7000
+            )
             sections.append(
                 "## recovery_probe_%s name=%s purpose=%s\n%s"
-                % (index, name, purpose or "补充失败诊断证据", _bounded(result, 7000))
+                % (
+                    index, name, purpose or "补充失败诊断证据",
+                    _bounded(result, result_limit),
+                )
             )
         if not sections:
             return "No adaptive recovery probes were requested."

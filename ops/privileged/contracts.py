@@ -155,6 +155,7 @@ class ExecutionEvidence:
     timed_out: bool = False
     environment_changed: bool = False
     mutation: dict[str, Any] = field(default_factory=dict)
+    commands: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

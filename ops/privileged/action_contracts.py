@@ -130,10 +130,18 @@ def _default_action_postconditions(
         return [{"checker": "file_exists", "args": {"path": path}}]
     if action == "prepare_project_files":
         root = Path(str(args.get("project_root") or ""))
+        hashes = (
+            args.get("entry_sha256s")
+            if isinstance(args.get("entry_sha256s"), dict)
+            else {}
+        )
         return [
             {
-                "checker": "file_exists",
-                "args": {"path": str(root / name)},
+                "checker": "file_sha256" if hashes.get(name) else "file_exists",
+                "args": {
+                    "path": str(root / name),
+                    **({"sha256": hashes[name]} if hashes.get(name) else {}),
+                },
             }
             for name in (
                 "gun.py",
@@ -348,6 +356,18 @@ def _default_action_postconditions(
             if action == "start_platform_screens"
             else "screen_session_absent"
         )
+        if action == "stop_platform_screens":
+            contracts = args.get("component_contracts")
+            if not isinstance(contracts, list):
+                return []
+            sessions = [
+                str(item.get("screen_session") or "")
+                for item in contracts if isinstance(item, dict)
+            ]
+            return [
+                {"checker": checker, "args": {"session": session}}
+                for session in sessions if session
+            ]
         return [
             {
                 "checker": checker,
@@ -854,12 +874,19 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
             "web_terminal": "web",
             "worker": "w",
         }
+        suffix = suffixes.get(component) or str(args.get("screen_suffix") or "").strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", component):
+            return "action=%s invalid_component=%s" % (action, component or "missing")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", suffix):
+            return "action=%s invalid_screen_suffix" % action
         if component not in suffixes:
-            return "action=%s invalid_component=%s" % (
-                action,
-                component or "missing",
-            )
-        if platform and session != "%s_%s" % (platform, suffixes[component]):
+            command = args.get("command_argv")
+            preflight = args.get("preflight_argv")
+            if not _safe_component_argv(command):
+                return "action=%s invalid_component_command" % action
+            if preflight is not None and not _safe_component_argv(preflight):
+                return "action=%s invalid_component_preflight" % action
+        if platform and session != "%s_%s" % (platform, suffix):
             return "action=%s screen_session_mismatch" % action
         run_as_uid = str(args.get("run_as_uid") or "").strip()
         if run_as_uid and not re.fullmatch(r"[1-9]\d{0,9}", run_as_uid):
@@ -1097,3 +1124,17 @@ def _grounding_summary(
     )
     summary["planner_source"] = planner_source
     return summary
+
+
+def _safe_component_argv(value: Any) -> bool:
+    if not isinstance(value, list) or not 1 <= len(value) <= 64:
+        return False
+    for item in value:
+        text = str(item)
+        if not text or len(text) > 2000 or "\x00" in text or "\n" in text:
+            return False
+    executable = str(value[0])
+    return bool(
+        executable.startswith("/")
+        or re.fullmatch(r"[A-Za-z0-9_.+-]{1,80}", executable)
+    )

@@ -45,6 +45,18 @@ def test_evidence_conclusion_rejects_unknown_evidence_reference():
         conclusion.validate_against(EvidenceBundle(goal="list platforms"))
 
 
+def test_diagnosis_assessment_requires_complete_causal_chain():
+    from klonet_agent.ops.privileged.workflow.contracts import DiagnosisAssessment
+
+    with pytest.raises(ValueError, match="failure_point"):
+        DiagnosisAssessment(
+            status="cause_confirmed",
+            symptom="worker 初始化失败",
+            root_cause="日志目录不存在",
+            evidence_refs=["ev-1"],
+        )
+
+
 def test_discovery_budget_rejects_too_many_or_repeated_rounds():
     from klonet_agent.ops.privileged.workflow.contracts import (
         DiscoveryBudget,
@@ -138,3 +150,31 @@ def test_canonical_workflow_has_no_versioned_public_api():
             MutationWorkflow,
         )
     )
+
+
+def test_failure_outcome_round_trips_user_recovery_options():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        FailureOutcome, RecoveryOption,
+    )
+
+    failure = FailureOutcome(
+        failure_id="failure-binding1",
+        stage="binding",
+        category="unsafe_target_scope",
+        summary="停止动作缺少根目录约束",
+        technical_reason="project_root consumer missing",
+        options=[RecoveryOption(
+            option_id="component_restart",
+            label="逐组件重启",
+            description="按根目录逐组件重启",
+            action="component_restart",
+            recommended=True,
+        )],
+        goal="重启平台",
+        plan_id="priv-ops-plan1",
+    )
+
+    restored = FailureOutcome.from_dict(failure.to_dict())
+
+    assert restored == failure
+    assert restored.options[0].recommended is True

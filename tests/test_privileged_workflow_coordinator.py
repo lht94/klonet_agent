@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 
 class StubClassifier:
-    def __init__(self, intent, command="", goal_clarity="clear"):
+    def __init__(
+        self, intent, command="", goal_clarity="clear", goal_relation="new",
+    ):
         self.decision = SimpleNamespace(
             intent=intent,
             command=command,
@@ -12,6 +14,7 @@ class StubClassifier:
             should_clarify=False,
             clarification_question="",
             reason="test",
+            goal_relation=goal_relation,
         )
         self.calls = []
 
@@ -128,6 +131,48 @@ def test_readonly_without_command_uses_discovery_synthesis_and_response_only():
     assert synthesis.calls == [("检查下现在服务器上有哪些平台", bundle)]
     assert response.calls == [("检查下现在服务器上有哪些平台", conclusion)]
     assert mutation.calls == []
+
+
+def test_completed_plan_status_followup_reads_receipt_without_discovery_or_verifier():
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+    from klonet_agent.ops.privileged.workflow.operational_context import (
+        OperationalContextSnapshot,
+    )
+
+    bundle, conclusion = _evidence()
+
+    class ContextStore:
+        def load(self):
+            return OperationalContextSnapshot(
+                resolved_goal="帮我重启 v4e2e 平台",
+                phase="completed",
+                evidence=bundle,
+            )
+
+    class StatusWorkflow(NoMutationWorkflow):
+        def render_latest_status(self):
+            return "计划已完成：master 与 worker 均通过健康检查。"
+
+    class ForbiddenVerifier(StubGoalVerifier):
+        def verify_goal(self, *args, **kwargs):
+            raise AssertionError("status query must not enter Verifier")
+
+    discovery = StubDiscovery(bundle)
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier("conversation"),
+        discovery=discovery,
+        synthesis=StubSynthesis(conclusion),
+        response=StubResponse(),
+        mutation_workflow=StatusWorkflow(),
+        verifier=ForbiddenVerifier(),
+        context_store=ContextStore(),
+    )
+
+    result = coordinator.handle("啥意思，你已经执行完了吗")
+
+    assert result.kind == "plan_status"
+    assert result.message == "计划已完成：master 与 worker 均通过健康检查。"
+    assert discovery.calls == []
 
 
 def test_readonly_diagnosis_automatically_collects_discoverable_gaps_until_achieved():
@@ -804,6 +849,189 @@ def test_self_directed_followup_reuses_previous_diagnostic_goal():
     assert discovery.goals == [
         "只读诊断并补齐以下运维目标所需证据：检查 v4e2e_m 为什么报错"
     ]
+
+
+def test_causal_followup_refines_previous_goal_and_reuses_static_evidence():
+    from klonet_agent.ops.privileged.workflow.operational_context import OperationalContextSnapshot
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+
+    previous = EvidenceBundle(goal="v4e2e_m 现在是不是有报错")
+    previous.add(EvidenceRecord.from_probe(
+        ProbeRequest("ops_file", {"path": "/srv/app/mains/gun.py"}, "启动配置"),
+        "errorlog=/srv/app/logs/error.log",
+    ))
+    previous.add(EvidenceRecord.from_probe(
+        ProbeRequest("screen_session", {"session": "v4e2e_m"}, "当前报错"),
+        "stale traceback",
+    ))
+    snapshot = OperationalContextSnapshot(
+        resolved_goal="v4e2e_m 现在是不是有报错",
+        target_roots=["/srv/app"],
+        phase="diagnosing",
+        evidence=previous,
+    )
+
+    class Store:
+        def load(self):
+            return snapshot
+
+        def save(self, value):
+            self.saved = value
+
+    class Discovery:
+        def __init__(self):
+            self.calls = []
+
+        def collect(
+            self, goal, *, command="", conversation_context="",
+            seed_bundle=None, preload_capabilities=False,
+        ):
+            self.calls.append((goal, seed_bundle))
+            return seed_bundle or EvidenceBundle(goal=goal)
+
+    discovery = Discovery()
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier("readonly_action", goal_relation="refine_previous"),
+        discovery=discovery,
+        synthesis=StubSynthesis(EvidenceConclusion()),
+        response=StubResponse(),
+        mutation_workflow=NoMutationWorkflow(),
+        verifier=StubGoalVerifier(),
+        context_store=Store(),
+    )
+
+    result = coordinator.handle("这个报错是为啥啊")
+
+    assert result.kind == "completed"
+    goal, seed = discovery.calls[0]
+    assert "v4e2e_m 现在是不是有报错" in goal
+    assert "这个报错是为啥啊" in goal
+    assert [item.request.probe for item in seed.records] == ["ops_file"]
+
+
+def test_privileged_intent_contract_marks_causal_followup_as_refinement():
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    decision = PrivilegedIntentClassifier._decision({
+        "intent": "readonly_action",
+        "goal_clarity": "discoverable",
+        "goal_relation": "refine_previous",
+        "confidence": 1,
+    })
+
+    assert decision.goal_relation == "refine_previous"
+
+
+def test_failure_option_reenters_discovery_and_creates_new_component_plan():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, FailureOutcome,
+        ProbeRequest, RecoveryOption,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator, WorkflowResult,
+    )
+    from klonet_agent.ops.privileged.workflow.operational_context import (
+        OperationalContextSnapshot,
+    )
+
+    goal = "帮我重启 v4_e2e 平台"
+    reusable = EvidenceBundle(goal=goal)
+    knowledge = reusable.add(EvidenceRecord.from_probe(
+        ProbeRequest("klonet_knowledge", {"query": goal}, "启动合同"),
+        "source=startup_shutdown.md\nstartup_cwd=<project_root>",
+    ))
+    snapshot = OperationalContextSnapshot(
+        resolved_goal=goal,
+        target_roots=["/home/lzl/klonet_v4_e2e"],
+        phase="awaiting_user_decision",
+        evidence=reusable,
+    )
+    failure = FailureOutcome(
+        failure_id="failure-restart-loop",
+        stage="binding",
+        category="implementation_contract_invalid",
+        summary="原子步骤无法落地",
+        technical_reason="component contract missing",
+        goal=goal,
+        selected_option_id="component_restart",
+        options=[RecoveryOption(
+            option_id="component_restart",
+            label="改用逐组件安全重启",
+            description="刷新运行证据并生成新计划",
+            action="component_restart",
+            recommended=True,
+        )],
+    )
+
+    class ControlMutation:
+        def __init__(self):
+            self.submissions = []
+
+        def handle_control(self, text):
+            return WorkflowResult(
+                True, "failure_option_selected", "selected", failure=failure,
+            )
+
+        def submit(
+            self, submitted_goal, *, evidence_bundle, evidence_conclusion,
+            conversation_context="", intent_context=None,
+        ):
+            self.submissions.append(
+                (submitted_goal, evidence_bundle, dict(intent_context or {}))
+            )
+            return WorkflowResult(
+                True, "awaiting_confirmation", "new plan", plan=SimpleNamespace(
+                    plan_id="priv-ops-new", content_hash="new-hash"
+                ),
+            )
+
+    class RefreshDiscovery:
+        def collect(
+            self, requested_goal, *, command="", conversation_context="",
+            seed_bundle=None, preload_capabilities=False,
+        ):
+            assert [item.evidence_id for item in seed_bundle.records] == [
+                knowledge.evidence_id
+            ]
+            seed_bundle.add(EvidenceRecord.from_probe(
+                ProbeRequest("running_platforms", {}, "刷新运行状态"),
+                "platform=v4e2e project_root=/home/lzl/klonet_v4_e2e "
+                "roles=master,worker configured_ports=master_port:47001,"
+                "worker_port:47002 component_specs_b64=e30= "
+                "runtime_identities=10:1000:/opt/python3.8",
+            ))
+            return seed_bundle
+
+    class Store:
+        def load(self):
+            return snapshot
+
+        def save(self, value):
+            self.saved = value
+
+    mutation = ControlMutation()
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier("conversation"),
+        discovery=RefreshDiscovery(),
+        synthesis=StubSynthesis(EvidenceConclusion()),
+        response=StubResponse(),
+        mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
+        context_store=Store(),
+    )
+
+    result = coordinator.handle("选择 1")
+
+    assert result.kind == "awaiting_confirmation"
+    submitted_goal, refreshed, intent = mutation.submissions[0]
+    assert submitted_goal == goal
+    assert knowledge.evidence_id in refreshed.evidence_ids
+    assert intent["operation"] == "restart"
+    assert intent["scope"] == "platform"
+    assert intent["resolved_project_root"] == "/home/lzl/klonet_v4_e2e"
 
 
 def test_operational_context_persists_goal_locale_and_only_reuses_static_evidence(

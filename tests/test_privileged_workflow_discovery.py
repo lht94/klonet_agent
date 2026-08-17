@@ -616,6 +616,40 @@ def test_synthesis_includes_probe_arguments_for_instance_attribution():
     assert '"args": {"url": "http://127.0.0.1:47001/server_health/"}' in payload
 
 
+def test_synthesis_returns_structured_confirmed_causal_chain():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.evidence_synthesis import EvidenceSynthesizer
+
+    bundle = EvidenceBundle(goal="检查 worker 报错")
+    record = bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("logs", {"path": "/srv/app/logs/error.log"}, "完整异常"),
+        "FileNotFoundError: /srv/app/missing/.__error.lock",
+    ))
+    llm = FakeLLM([json.dumps({
+        "confirmed_facts": [{
+            "text": "日志目录不存在导致锁文件创建失败",
+            "evidence_refs": [record.evidence_id],
+        }],
+        "uncertainties": [],
+        "missing_decisions": [],
+        "diagnosis": {
+            "status": "cause_confirmed",
+            "symptom": "worker 初始化报错",
+            "failure_point": "日志处理器创建锁文件",
+            "root_cause": "配置指向不存在的日志目录",
+            "evidence_refs": [record.evidence_id],
+        },
+    }, ensure_ascii=False)])
+
+    conclusion = EvidenceSynthesizer(llm).synthesize(bundle.goal, bundle)
+
+    assert conclusion.diagnosis.status == "cause_confirmed"
+    assert conclusion.diagnosis.failure_point == "日志处理器创建锁文件"
+    assert conclusion.diagnosis.evidence_refs == [record.evidence_id]
+
+
 def test_synthesis_promotes_user_selected_screen_git_mapping_deterministically():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
@@ -670,3 +704,114 @@ def test_response_fallback_reports_facts_and_uncertainty_without_llm():
     assert "确认 vemu_uestc 正在运行" in message
     assert "agent102 证据不足" in message
     assert "不确定" in message
+def test_runtime_component_manifest_extends_managed_applications_but_not_shared_dependencies(tmp_path):
+    import json
+
+    from klonet_agent.tools.environment import _runtime_component_specs
+
+    manifest = tmp_path / ".klonet"
+    manifest.mkdir()
+    (manifest / "runtime_components.json").write_text(json.dumps({
+        "components": [{
+            "name": "metrics",
+            "screen_suffix": "metrics",
+            "command_argv": ["/opt/python", "-m", "metrics_service"],
+            "preflight_argv": ["/opt/python", "-c", "import metrics_service"],
+            "ports": [47009],
+            "health_checks": [{
+                "checker": "port_listening", "args": {"port": 47009},
+            }],
+            "start_after": ["worker"],
+        }, {
+            "name": "redis_sidecar",
+            "category": "shared_dependency",
+            "screen_suffix": "redis",
+            "command_argv": ["redis-server", "redis.conf"],
+            "preflight_argv": ["redis-server", "--version"],
+        }],
+    }), encoding="utf-8")
+
+    specs = _runtime_component_specs(tmp_path, {"metrics"})
+    by_name = {item["name"]: item for item in specs}
+
+    assert by_name["metrics"]["default_restart"] is True
+    assert by_name["metrics"]["command_argv"][-1] == "metrics_service"
+    assert by_name["redis_sidecar"]["category"] == "shared_dependency"
+    assert {"master", "celery", "web_terminal", "worker"}.issubset(by_name)
+
+
+def test_discovery_collects_reusable_klonet_knowledge_before_host_probes():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    calls = []
+    progress = []
+    agent = DiscoveryAgent(
+        FakeLLM([json.dumps({"status": "ready"})]),
+        probe_runner=lambda requests: "inspect_running_platforms\nhealthy_count=1",
+        knowledge_search=lambda query, **kwargs: calls.append((query, kwargs)) or (
+            "source=knowledge/klonet/ops/startup_shutdown.md\n"
+            "启动前将 mains 入口文件复制到项目根目录，并从项目根目录启动 Screen"
+        ),
+        on_progress=progress.append,
+    )
+
+    bundle = agent.collect("帮我重启 v4_e2e 平台")
+
+    assert bundle.records[0].request.probe == "klonet_knowledge"
+    assert "startup_shutdown.md" in bundle.records[0].output
+    assert calls[0][1]["task_type"] == "operation_guide"
+    assert any("正在检索 Klonet 知识库" in item for item in progress)
+
+
+def test_explicit_restart_stops_after_rag_and_complete_runtime_inventory():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    llm = FakeLLM([])
+    progress = []
+    inventory = (
+        "platform=v4e2e project_root=/home/lzl/klonet_v4_e2e "
+        "roles=celery,master,worker configured_ports=master_port:47001,"
+        "worker_port:47002,web_terminal_port:47003 "
+        "component_specs_b64=eyJtYXN0ZXIiOnt9fQ== "
+        "runtime_identities=10:1000:/opt/python3.8"
+    )
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: inventory,
+        knowledge_search=lambda query, **kwargs: (
+            "retrieval_status: reliable\n"
+            "- path: knowledge/klonet/ops/startup_shutdown.md\n"
+            "startup_cwd=<project_root>"
+        ),
+        on_progress=progress.append,
+    )
+
+    bundle = agent.collect("帮我重启 v4_e2e 平台")
+
+    assert [item.request.probe for item in bundle.records] == [
+        "klonet_knowledge", "running_platforms"
+    ]
+    assert any("reliable；startup_shutdown.md" in item for item in progress)
+
+
+def test_binding_context_preserves_same_knowledge_evidence_id():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+
+    bundle = EvidenceBundle(goal="重启平台")
+    record = bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("klonet_knowledge", {"query": "重启平台"}, "流程知识"),
+        "source=startup_shutdown.md\n从项目根目录启动 Screen",
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "运行事实"),
+        "platform=v4e2e project_root=/srv/v4e2e",
+    ))
+
+    context = MutationWorkflow._binding_context(bundle)
+
+    assert record.evidence_id in context.knowledge_evidence
+    assert "startup_shutdown.md" in context.knowledge_evidence
+    assert "project_root=/srv/v4e2e" in context.environment_evidence

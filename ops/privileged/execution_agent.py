@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -32,6 +33,7 @@ from klonet_agent.ops.privileged.contracts import (
     ShellArtifact,
 )
 from klonet_agent.ops.privileged.context import GroundedPlanContext
+from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
 from klonet_agent.ops.privileged.action_contracts import (
     _action_risk,
     _default_action_postconditions,
@@ -285,6 +287,7 @@ class PrivilegedExecutionAgent:
         *,
         grounded_context: GroundedPlanContext | None,
     ) -> PrivilegedPlan:
+        _validate_runtime_knowledge_contract(plan, grounded_context)
         if self.enable_implementation_plans:
             return self._prepare_hierarchical_plan(
                 plan,
@@ -663,6 +666,9 @@ class PrivilegedExecutionAgent:
         )
         items = _order_runtime_migration_items(items, semantic_step)
         items = _order_source_runtime_recovery_items(items, semantic_step)
+        items = _ensure_runtime_entry_preparation_items(
+            items, semantic_step, plan.resources,
+        )
         if len(items) > 16:
             raise ExecutionBindingError(
                 "atomic configuration decomposition exceeds 16 items",
@@ -1587,23 +1593,8 @@ class PrivilegedExecutionAgent:
                         else root_path.name
                     )
                 )
-                entry_candidates = (
-                    root_path / "mains",
-                    root_path / "vemu_uestc" / "mains",
-                )
-                entry_root = next(
-                    (
-                        candidate
-                        for candidate in entry_candidates
-                        if candidate.is_dir()
-                        and (candidate / "master_main.py").is_file()
-                        and (candidate / "worker_main.py").is_file()
-                    ),
-                    None,
-                )
                 args["platform"] = platform_name
-                if entry_root is not None:
-                    args["project_root"] = str(entry_root.resolve())
+                args["project_root"] = str(root_path.resolve())
                 if suffix and not frozen_session:
                     args["screen_session"] = "%s%s" % (
                         platform_name, suffix,
@@ -3342,9 +3333,9 @@ def _split_multi_component_runtime_items(
     replacements: dict[str, str] = {}
     role_patterns = (
         ("master", r"(?<![A-Za-z0-9_])master(?![A-Za-z0-9_])"),
-        ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
         ("celery", r"(?<![A-Za-z0-9_])celery(?![A-Za-z0-9_])"),
         ("web_terminal", r"web[_ -]?terminal"),
+        ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
     )
     for index, item in enumerate(items, start=1):
         item_id = _safe_implementation_step_id(
@@ -3358,20 +3349,37 @@ def _split_multi_component_runtime_items(
             ]
         )
         roles = [role for role, pattern in role_patterns if re.search(pattern, text, re.I)]
+        for role in re.findall(
+            r"\bmanaged\s+component\s+([A-Za-z][A-Za-z0-9_-]{0,63})\b",
+            text,
+            re.I,
+        ):
+            normalized = role.lower().replace("-", "_")
+            if normalized not in roles:
+                roles.append(normalized)
         starts = re.search(r"\b(?:start|restart|restore|recover|launch)\b|启动|重启|恢复", text, re.I)
+        semantic_roles = _semantic_runtime_components(semantic_step)
+        if starts and len(semantic_roles) > len(roles) and re.search(
+            r"platform|runtime|components?|roles?|平台|运行时|组件|角色",
+            text,
+            re.I,
+        ):
+            roles = semantic_roles
         if not starts or len(roles) < 2:
             expanded.append(dict(item))
             continue
         previous = ""
         original_dependencies = list(item.get("depends_on") or [])
+        dispositions = _runtime_component_dispositions(semantic_step)
         for role in roles:
             atomic_id = "%s-%s" % (item_id, role.replace("_", "-"))
+            verb = dispositions.get(role, "Start")
             expanded.append(
                 {
                     "id": atomic_id,
-                    "title": "Start %s screen component" % role,
-                    "objective": "Start the %s role for %s" % (
-                        role,
+                    "title": "%s %s screen component" % (verb, role),
+                    "objective": "%s the %s role for %s" % (
+                        verb, role,
                         semantic_step.objective or semantic_step.title,
                     ),
                     "reason": str(item.get("reason") or "restore the runtime role"),
@@ -3964,8 +3972,12 @@ def _ensure_runtime_role_recovery_items(
         re.I,
     ):
         return items
-    required: list[tuple[str, str]] = []
+    required: list[tuple[str, str]] = list(
+        _runtime_component_dispositions(semantic_step).items()
+    )
     for role in ("master", "worker"):
+        if any(required_role == role for required_role, _ in required):
+            continue
         exact = re.search(
             r"\b(start missing|restart unhealthy|restart requested)\s+%s\s+role\b" % role,
             semantic_text,
@@ -4207,19 +4219,7 @@ def _normalize_runtime_role_recovery_verbs(
 ) -> list[dict[str, Any]]:
     """Compile evidence disposition (restart unhealthy/start missing) into Action verbs."""
 
-    semantic_text = " ".join(
-        [semantic_step.objective, *semantic_step.expected_changes]
-    )
-    dispositions: dict[str, str] = {}
-    for role in ("master", "worker"):
-        if re.search(
-            r"\brestart (?:unhealthy|requested)\s+%s\s+role\b" % role,
-            semantic_text,
-            re.I,
-        ):
-            dispositions[role] = "Restart"
-        elif re.search(r"\bstart missing\s+%s\s+role\b" % role, semantic_text, re.I):
-            dispositions[role] = "Start"
+    dispositions = _runtime_component_dispositions(semantic_step)
     if not dispositions:
         return items
     for item in items:
@@ -4233,6 +4233,38 @@ def _normalize_runtime_role_recovery_verbs(
             continue
         item["title"] = "%s %s screen component" % (dispositions[role], role)
     return items
+
+
+def _runtime_component_dispositions(
+    semantic_step: PrivilegedStep,
+) -> dict[str, str]:
+    """Return the frozen start/restart decision for every managed component."""
+
+    semantic_text = " ".join(
+        [semantic_step.objective, *semantic_step.expected_changes]
+    )
+    dispositions: dict[str, str] = {}
+    for disposition, role in re.findall(
+        r"\b(restart (?:unhealthy|requested)|start missing)\s+"
+        r"([A-Za-z][A-Za-z0-9_-]{0,63})\s+role\b",
+        semantic_text,
+        re.I,
+    ):
+        normalized = role.lower().replace("-", "_")
+        dispositions[normalized] = (
+            "Restart" if disposition.lower().startswith("restart") else "Start"
+        )
+    for disposition, role in re.findall(
+        r"\b(restart requested|start missing)\s+managed\s+component\s+"
+        r"([A-Za-z][A-Za-z0-9_-]{0,63})\b",
+        semantic_text,
+        re.I,
+    ):
+        normalized = role.lower().replace("-", "_")
+        dispositions[normalized] = (
+            "Restart" if disposition.lower().startswith("restart") else "Start"
+        )
+    return dispositions
 
 
 def _expand_unhealthy_role_restarts(
@@ -4283,7 +4315,7 @@ def _expand_unhealthy_role_restarts(
         )
         started = dict(item)
         started["id"] = item_id
-        started["title"] = "Start %s screen component" % role
+        started["title"] = "启动 %s Screen 组件" % role
         started["depends_on"] = [stop_id]
         expanded.append(started)
     return expanded
@@ -4580,7 +4612,7 @@ def _ground_runtime_item_roots(
     parent_text = " ".join(
         [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
     )
-    root = _semantic_runtime_root(parent_text)
+    root = _runtime_root_for_step(semantic_step, resources)
     if not root:
         return items
     for item in items:
@@ -4596,6 +4628,120 @@ def _ground_runtime_item_roots(
             suffix,
         )
     return items
+
+
+def _ensure_runtime_entry_preparation_items(
+    items: list[dict[str, Any]],
+    semantic_step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> list[dict[str, Any]]:
+    """Insert the existing explicit copy capability before Screen startup."""
+
+    starts = [
+        item for item in items
+        if _atomic_runtime_role(
+            "%s %s" % (item.get("title") or "", item.get("objective") or "")
+        )
+        and re.search(
+            r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
+            "%s %s" % (item.get("title") or "", item.get("objective") or ""),
+            re.I,
+        )
+        and not re.search(
+            r"\b(?:stop|terminate)\w*\b|停止|终止",
+            "%s %s" % (item.get("title") or "", item.get("objective") or ""),
+            re.I,
+        )
+    ]
+    if not starts or any(
+        re.match(
+            r"^\s*(?:Prepare\s+project\s+root\s+entry\s+files|"
+            r"准备项目根目录入口文件)\s*$",
+            str(item.get("title") or ""),
+            re.I,
+        )
+        for item in items
+    ):
+        return items
+    root_text = _runtime_root_for_step(semantic_step, resources)
+    if not root_text:
+        return items
+    root = Path(root_text)
+    source = next(
+        (
+            candidate
+            for candidate in (root / "mains", root / "vemu_uestc" / "mains")
+            if all((candidate / name).is_file() for name in REQUIRED_ENTRY_FILES)
+        ),
+        None,
+    )
+    if source is None:
+        return items
+    start_ids = {
+        _safe_implementation_step_id(item.get("id"), fallback="")
+        for item in starts
+    }
+    dependencies: list[str] = []
+    for item in starts:
+        for raw in item.get("depends_on") or []:
+            dependency = _safe_implementation_step_id(raw, fallback="")
+            if (
+                dependency
+                and dependency not in start_ids
+                and dependency not in dependencies
+            ):
+                dependencies.append(dependency)
+    prepare_id = "prepare-runtime-entries"
+    prepare = {
+        "id": prepare_id,
+        "title": "准备项目根目录入口文件",
+        "objective": (
+            "Copy canonical runtime entries before Screen startup; "
+            "source_root=%s project_root=%s" % (source.resolve(), root.resolve())
+        ),
+        "depends_on": dependencies,
+        "expected_changes": [
+            "Project root entry files match the canonical mains sources",
+        ],
+        "success_criteria": [
+            "All required runtime entry files exist in the project root",
+        ],
+        "risk_suggestion": "medium",
+    }
+    first_start_index = min(items.index(item) for item in starts)
+    result = list(items)
+    result.insert(first_start_index, prepare)
+    for item in starts:
+        existing = [
+            _safe_implementation_step_id(raw, fallback="")
+            for raw in item.get("depends_on") or []
+        ]
+        item["depends_on"] = [
+            dependency
+            for dependency in existing
+            if dependency in start_ids
+        ]
+        if not item["depends_on"]:
+            item["depends_on"] = [prepare_id]
+    return result
+
+
+def _runtime_root_for_step(
+    semantic_step: PrivilegedStep,
+    resources: list[PlanResource],
+) -> str:
+    text = " ".join(
+        [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+    )
+    return _semantic_runtime_root(text) or _runtime_root_from_frozen_paths(resources)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _drop_redundant_implementation_verifications(
@@ -5053,6 +5199,64 @@ def _selection_grounded_context(
     )
 
 
+def _validate_runtime_knowledge_contract(
+    plan: PrivilegedPlan,
+    grounded_context: GroundedPlanContext | None,
+) -> None:
+    """Require relevant retrieved runbook guidance for runtime mutations."""
+
+    if grounded_context is None:
+        return
+    knowledge = str(grounded_context.knowledge_evidence or "")
+    if "probe=klonet_knowledge" not in knowledge:
+        return  # Backward-compatible contexts created outside the staged workflow.
+    semantic = " ".join(
+        [plan.goal]
+        + [
+            "%s %s" % (step.title, step.objective)
+            for step in plan.steps
+        ]
+    )
+    if not re.search(
+        r"\b(?:start|restart|launch)\b|启动|重启",
+        semantic,
+        re.I,
+    ):
+        return
+    if "retrieval unavailable" in knowledge.lower() or "未执行 Klonet RAG" in knowledge:
+        raise ExecutionBindingError(
+            "runtime_knowledge_evidence_unavailable",
+            replan_recommended=False,
+            category="knowledge_evidence_unavailable",
+        )
+    retrieval_status = re.search(
+        r"(?im)^\s*-?\s*retrieval_status\s*:\s*([a-z_]+)\s*$",
+        knowledge,
+    )
+    if retrieval_status is not None and retrieval_status.group(1).lower() != "reliable":
+        raise ExecutionBindingError(
+            "runtime_knowledge_evidence_not_reliable=%s"
+            % retrieval_status.group(1).lower(),
+            replan_recommended=False,
+            category="knowledge_evidence_irrelevant",
+        )
+    required_groups = (
+        ("<project_root>", "project_root"),
+        ("mains", "source_root"),
+        ("screen", "Screen"),
+    )
+    missing = [
+        names[0] for names in required_groups
+        if not any(name.lower() in knowledge.lower() for name in names)
+    ]
+    if missing:
+        raise ExecutionBindingError(
+            "runtime_knowledge_contract_incomplete=%s" % ",".join(missing),
+            replan_recommended=False,
+            category="knowledge_evidence_irrelevant",
+        )
+
+
 def _resource_manifest_payload(
     resources: list[PlanResource],
 ) -> list[dict[str, Any]]:
@@ -5345,10 +5549,17 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
         and re.search(r"config|配置", primary, re.I)
     ):
         return "set_python_class_attribute"
-    if re.match(r"^\s*Start\s+(?:master|worker|celery|web_terminal)\s+screen\s+component\s*$", step.title, re.I):
+    if re.match(r"^\s*Start\s+[A-Za-z][A-Za-z0-9_-]{0,63}\s+screen\s+component\s*$", step.title, re.I):
         return "start_screen_component"
-    if re.match(r"^\s*Restart\s+(?:master|worker|celery|web_terminal)\s+screen\s+component\s*$", step.title, re.I):
+    if re.match(r"^\s*Restart\s+[A-Za-z][A-Za-z0-9_-]{0,63}\s+screen\s+component\s*$", step.title, re.I):
         return "restart_screen_component"
+    if re.match(
+        r"^\s*(?:Prepare\s+project\s+root\s+entry\s+files|"
+        r"准备项目根目录入口文件)\s*$",
+        step.title,
+        re.I,
+    ):
+        return "prepare_project_files"
     runtime_role = _atomic_runtime_role(step.title)
     if runtime_role in {"master", "worker"} and re.match(
         r"^\s*(?:stop|terminate|停止|终止)", step.title, re.I,
@@ -5910,19 +6121,6 @@ def _infer_structural_action_args(
         "restart_screen_component",
         "stop_screen_component",
     }:
-        mains_root = next(
-            (
-                str(resource.value)
-                for resource in resources
-                if resource.status == "frozen"
-                and resource.kind == "path"
-                and str(resource.value).rstrip("/").endswith("/mains")
-                and "mains" in "%s %s" % (resource.name, resource.role)
-            ),
-            "",
-        )
-        if mains_root:
-            compiled["project_root"] = mains_root
         session = str(compiled.get("screen_session") or "").strip()
         component_from_session = next(
             (
@@ -5948,12 +6146,36 @@ def _infer_structural_action_args(
             str(compiled.get("component") or "").strip(),
         )
         compiled["component"] = component
+        if component not in {"master", "celery", "web_terminal", "worker"}:
+            component_resource = next(
+                (
+                    resource for resource in resources
+                    if resource.status == "frozen"
+                    and resource.role == "runtime_component_spec:%s" % component
+                ),
+                None,
+            )
+            if component_resource is not None:
+                try:
+                    component_spec = json.loads(str(component_resource.value))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    component_spec = {}
+                if isinstance(component_spec, dict):
+                    for key in (
+                        "screen_suffix", "command_argv", "preflight_argv",
+                        "ports", "health_checks", "start_after",
+                    ):
+                        if key in component_spec:
+                            compiled[key] = component_spec[key]
+                    ports = component_spec.get("ports")
+                    if isinstance(ports, list) and len(ports) == 1:
+                        compiled["%s_port" % component] = ports[0]
         suffix = {
             "master": "m",
             "celery": "c",
             "web_terminal": "web",
             "worker": "w",
-        }.get(component)
+        }.get(component) or str(compiled.get("screen_suffix") or "").strip()
         platform = str(
             compiled.get("session_prefix")
             or compiled.get("platform")
@@ -6167,6 +6389,36 @@ def _canonical_action_postconditions(
                     },
                 }
             )
+            if str(args.get("project_root") or "").strip():
+                checks.append({
+                    "checker": "port_listener_project_root",
+                    "args": {
+                        "port": int(raw_port),
+                        "project_root": str(args.get("project_root") or ""),
+                    },
+                })
+        elif str(args.get("project_root") or "").strip():
+            checks.append({
+                "checker": "component_process_project_root",
+                "args": {
+                    "component": component,
+                    "project_root": str(args.get("project_root") or ""),
+                },
+            })
+        if (
+            action == "restart_screen_component"
+            and str(args.get("project_root") or "").strip()
+        ):
+            identity_args = {
+                "component": component,
+                "project_root": str(args.get("project_root") or ""),
+            }
+            if str(raw_port or "").isdigit():
+                identity_args["port"] = int(raw_port)
+            checks.append({
+                "checker": "component_restart_identity",
+                "args": identity_args,
+            })
         return checks
     if action == "reload_nginx":
         return [
@@ -6217,6 +6469,34 @@ def _infer_semantic_action_args(
     """Compile identifiers and service policy stated by the semantic change."""
 
     compiled = dict(args)
+    if action == "prepare_project_files":
+        text = " ".join(
+            [step.title, step.objective, step.reason, *step.expected_changes]
+        )
+        project_match = re.search(r"\bproject_root=(/[^\s;]+)", text)
+        source_match = re.search(r"\bsource_root=(/[^\s;]+)", text)
+        if project_match:
+            compiled["project_root"] = project_match.group(1).rstrip("/")
+        if source_match:
+            compiled["source_root"] = source_match.group(1).rstrip("/")
+        source = Path(str(compiled.get("source_root") or ""))
+        if all((source / name).is_file() for name in REQUIRED_ENTRY_FILES):
+            compiled["entry_sha256s"] = {
+                name: _sha256_file(source / name)
+                for name in REQUIRED_ENTRY_FILES
+            }
+            project_root = Path(str(compiled.get("project_root") or ""))
+            compiled["target_sha256s"] = {
+                name: _sha256_file(project_root / name)
+                if (project_root / name).is_file() else "missing"
+                for name in REQUIRED_ENTRY_FILES
+            }
+            compiled["overwrite_files"] = [
+                name for name in REQUIRED_ENTRY_FILES
+                if (project_root / name).is_file()
+                and _sha256_file(project_root / name)
+                != compiled["entry_sha256s"][name]
+            ]
     if action in {"start_screen_component", "restart_screen_component"}:
         text = " ".join(
             [step.title, step.objective, step.reason, *step.expected_changes]
@@ -6226,7 +6506,7 @@ def _infer_semantic_action_args(
         if role:
             compiled["component"] = role
         if root:
-            compiled["project_root"] = root.rstrip("/") + "/mains"
+            compiled["project_root"] = root.rstrip("/")
         platform = str(compiled.get("platform") or "").strip()
         if root:
             path = Path(root)
@@ -6499,7 +6779,8 @@ def _validate_source_mutation_action_coverage(
 def _atomic_runtime_role(text: str) -> str:
     leading = re.search(
         r"^\s*(?:start|restart|restore|recover|launch|启动|重启|恢复)\w*"
-        r"[^.!?。！？]{0,40}?\b(master|worker|celery|web[_ -]?terminal)\b",
+        r"[^.!?。！？]{0,40}?\b([A-Za-z][A-Za-z0-9_-]{0,63})\b"
+        r"(?=\s+(?:screen\s+component|component|role)\b)",
         str(text or ""),
         re.I,
     )
@@ -6515,6 +6796,28 @@ def _atomic_runtime_role(text: str) -> str:
         if re.search(pattern, str(text or ""), re.I):
             roles.append(role)
     return roles[0] if len(roles) == 1 else ""
+
+
+def _semantic_runtime_components(step: PrivilegedStep) -> list[str]:
+    text = " ".join([step.objective, *step.expected_changes])
+    ordered: list[str] = []
+    for role, pattern in (
+        ("master", r"(?<![A-Za-z0-9_])master(?![A-Za-z0-9_])"),
+        ("celery", r"(?<![A-Za-z0-9_])celery(?![A-Za-z0-9_])"),
+        ("web_terminal", r"web[_ -]?terminal"),
+        ("worker", r"(?<![A-Za-z0-9_])worker(?![A-Za-z0-9_])"),
+    ):
+        if re.search(pattern, text, re.I):
+            ordered.append(role)
+    for role in re.findall(
+        r"\bmanaged\s+component\s+([A-Za-z][A-Za-z0-9_-]{0,63})\b",
+        text,
+        re.I,
+    ):
+        normalized = role.lower().replace("-", "_")
+        if normalized not in ordered:
+            ordered.append(normalized)
+    return ordered
 
 
 def _semantic_runtime_root(text: str) -> str:
@@ -6848,15 +7151,13 @@ def _head_tail(value: Any, limit: int) -> str:
 def _progress_text(value: Any, limit: int = 80) -> str:
     text = " ".join(str(value or "").split())
     replacements = (
-        (r"^Start master screen component$", "启动 master Screen 组件"),
-        (r"^Start worker screen component$", "启动 worker Screen 组件"),
-        (r"^Restart master screen component$", "重启 master Screen 组件"),
-        (r"^Restart worker screen component$", "重启 worker Screen 组件"),
-        (r"^Stop master backend component$", "停止 master 后端组件"),
-        (r"^Stop worker backend component$", "停止 worker 后端组件"),
+        (r"^Start ([A-Za-z][A-Za-z0-9_-]*) screen component$", r"启动 \1 Screen 组件"),
+        (r"^Restart ([A-Za-z][A-Za-z0-9_-]*) screen component$", r"重启 \1 Screen 组件"),
+        (r"^Stop ([A-Za-z][A-Za-z0-9_-]*) backend component$", r"停止 \1 后端组件"),
     )
     for pattern, replacement in replacements:
-        if re.fullmatch(pattern, text, re.I):
-            text = replacement
+        match = re.fullmatch(pattern, text, re.I)
+        if match is not None:
+            text = match.expand(replacement)
             break
     return text[:limit] or "未命名步骤"

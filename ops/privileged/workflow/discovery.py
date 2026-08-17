@@ -14,7 +14,11 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceRecord,
     ProbeRequest,
+    normalize_instance_alias,
     normalize_probe_request,
+)
+from klonet_agent.ops.privileged.workflow.runtime_inventory import (
+    RuntimeInventory, looks_like_runtime_goal, runtime_inventory_answers_goal,
 )
 
 
@@ -53,6 +57,16 @@ def parse_json_object(content: str) -> dict[str, Any]:
     return value
 
 
+def _knowledge_task_type(goal: str) -> str:
+    lowered = str(goal or "").lower()
+    if any(marker in lowered for marker in (
+        "失败", "故障", "异常", "报错", "修复", "恢复", "诊断", "排查",
+        "failed", "error", "recover", "diagnose", "troubleshoot",
+    )):
+        return "troubleshooting"
+    return "operation_guide"
+
+
 class DiscoveryAgent:
     def __init__(
         self,
@@ -62,13 +76,49 @@ class DiscoveryAgent:
         readonly_command_runner: Callable[[str], str] | None = None,
         budget_factory: Callable[[], DiscoveryBudget] = DiscoveryBudget,
         on_progress: Callable[[str], None] | None = None,
+        knowledge_search: Callable[..., str] | None = None,
     ) -> None:
         self.llm = llm
         self.probe_runner = probe_runner
         self.readonly_command_runner = readonly_command_runner
         self.budget_factory = budget_factory
         self.on_progress = on_progress
+        self.knowledge_search = knowledge_search
 
+    def collect_knowledge(self, goal: str, bundle: EvidenceBundle) -> None:
+        """Collect one reusable, provenance-bearing Klonet knowledge record."""
+
+        if self.knowledge_search is None:
+            return
+
+        task_type = _knowledge_task_type(goal)
+        request = ProbeRequest(
+            "klonet_knowledge",
+            {"query": str(goal or "").strip(), "task_type": task_type},
+            "检索目标相关的 Klonet 流程、目录和安全操作约束",
+        )
+        if any(item.request.cache_key == request.cache_key for item in bundle.records):
+            return
+        if self.on_progress is not None:
+            self.on_progress("正在检索 Klonet 知识库…")
+        try:
+            output = self.knowledge_search(
+                str(goal or "").strip(), top_k=6, task_type=task_type,
+            )
+            status = "available"
+        except Exception as exc:
+            output = "Klonet knowledge retrieval unavailable: %s" % type(exc).__name__
+            status = "unavailable"
+        bundle.add(EvidenceRecord.from_probe(request, output, status=status))
+        if self.on_progress is not None:
+            source = _knowledge_source_summary(output) if status == "available" else ""
+            self.on_progress(
+                "关键证据：Klonet 知识检索%s%s。"
+                % (
+                    "完成" if status == "available" else "不可用",
+                    "（%s）" % source if source else "",
+                )
+            )
     def begin_probe_session(self) -> None:
         owner = getattr(self.probe_runner, "__self__", None)
         begin = getattr(owner, "begin_probe_session", None)
@@ -172,6 +222,7 @@ class DiscoveryAgent:
             goal=goal,
             records=list(getattr(seed_bundle, "records", []) or []),
         )
+        self.collect_knowledge(goal, bundle)
         if preload_capabilities and not any(
             item.request.probe == "privilege_capabilities"
             for item in bundle.records
@@ -184,6 +235,30 @@ class DiscoveryAgent:
                 )],
                 bundle,
             )
+        if _requires_running_platform_inventory(goal):
+            self.collect_requests(
+                [
+                    ProbeRequest(
+                        "running_platforms",
+                        {},
+                        "deterministically count only runtime roots whose master and worker health APIs are usable",
+                    )
+                ],
+                bundle,
+            )
+            if _running_platform_target_choice_required(goal, bundle):
+                return bundle
+            if runtime_inventory_answers_goal(
+                goal, RuntimeInventory.from_bundle(bundle),
+            ):
+                return bundle
+            if _deterministic_restart_inventory_sufficient(goal, bundle):
+                return bundle
+
+        # A classifier-proposed command is a generic fallback, not authority
+        # to bypass a typed domain probe.  Runtime inventory must be collected
+        # first so an incidental `screen -ls` cannot replace root-bound health
+        # evidence for a platform question.
         if command.strip():
             request = ProbeRequest(
                 "readonly_command",
@@ -206,20 +281,6 @@ class DiscoveryAgent:
                 status = "unavailable"
             bundle.add(EvidenceRecord.from_probe(request, output, status=status))
             return bundle
-
-        if _requires_running_platform_inventory(goal):
-            self.collect_requests(
-                [
-                    ProbeRequest(
-                        "running_platforms",
-                        {},
-                        "deterministically count only runtime roots whose master and worker health APIs are usable",
-                    )
-                ],
-                bundle,
-            )
-            if _running_platform_target_choice_required(goal, bundle):
-                return bundle
 
         budget = self.budget_factory()
         messages = [
@@ -441,9 +502,64 @@ def _requires_running_platform_inventory(goal: str) -> bool:
             "fix", "repair", "recover", "restart", "start", "stop",
         )
     )
-    return platform_requested and (health_requested or repair_requested) and (
-        inventory_requested or repair_requested
+    return (
+        platform_requested and (health_requested or repair_requested) and (
+            inventory_requested or repair_requested
+        )
+    ) or looks_like_runtime_goal(goal)
+
+
+def _knowledge_source_summary(output: str) -> str:
+    status = re.search(r"\bretrieval_status\s*[:=]\s*([^\s,]+)", output, re.I)
+    source = re.search(
+        r"(?:^|\n)\s*(?:-\s*)?(?:path|source)\s*[:=]\s*([^\s]+)",
+        output,
+        re.I,
     )
+    parts = []
+    if status:
+        parts.append(status.group(1))
+    if source:
+        parts.append(Path(source.group(1)).name)
+    return "；".join(parts)
+
+
+def _deterministic_restart_inventory_sufficient(
+    goal: str,
+    bundle: EvidenceBundle,
+) -> bool:
+    """Stop Discovery once an explicit restart target has one complete runtime row."""
+
+    text = str(goal or "")
+    lowered = text.lower()
+    if not any(marker in lowered for marker in ("重启", "restart")):
+        return False
+    records = [
+        item for item in bundle.records
+        if item.request.probe == "running_platforms" and item.status == "available"
+    ]
+    candidates: list[str] = []
+    for record in records:
+        for line in record.output.splitlines():
+            root = re.search(r"\bproject_root=(/[^\s]+)", line)
+            platform = re.search(r"\bplatform=([^\s]+)", line)
+            if root is None or platform is None:
+                continue
+            aliases = {
+                normalize_instance_alias(platform.group(1)),
+                normalize_instance_alias(Path(root.group(1)).name),
+            }
+            normalized_goal = normalize_instance_alias(text)
+            if not any(alias and alias in normalized_goal for alias in aliases):
+                continue
+            required = (
+                "configured_ports=" in line
+                and "component_specs_b64=" in line
+                and "runtime_identities=" in line
+            )
+            if required:
+                candidates.append(root.group(1).rstrip("/"))
+    return len(set(candidates)) == 1
 
 
 def _running_platform_target_choice_required(

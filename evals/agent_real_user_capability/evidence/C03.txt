@@ -1,0 +1,15 @@
+正在启动 Klonet 专用教学协作 Agent...
+Klonet Agent：已进入 ops-privilege 模式。(输入 exit 退出)
+
+Discovery：正在检索 Klonet 知识库…
+Discovery：关键证据：Klonet 知识检索完成（reliable；startup_shutdown.md）。
+Discovery：正在收集只读证据：privilege_capabilities
+Discovery：只读补证 1/1：正在检查 privilege_capabilities（确认本会话可用的受控权限通道）…
+Discovery：关键证据：本轮只读补证完成。
+Discovery：正在收集只读证据：running_platforms
+Discovery：只读补证 1/1：正在检查 running_platforms（按项目根目录核验后端角色、端口和健康接口）…
+Discovery：关键证据：本轮只读补证完成。
+工作流协调器：这些根目录对应独立平台实例，不会按名称合并：
+- project_root=/home/lzl/test/vemu_uestc；platform=test；backend_status=healthy；master_port=45554，master_endpoint=healthy；worker_port=45555，worker_endpoint=healthy
+- project_root=/home/lzl/vemu_uestc；platform=vemu_uestc；backend_status=healthy；master_port=45551，master_endpoint=healthy；worker_port=45552，worker_endpoint=healthy
+Klonet Agent：本次累计 token 约 0

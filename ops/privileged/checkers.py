@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import re
 import shutil
@@ -33,6 +34,7 @@ CHECKER_ARGUMENT_HINTS = {
     "file_absent": "path",
     "file_contains": "path,text",
     "file_not_contains": "path,text",
+    "file_sha256": "path,sha256",
     "python_file_syntax_valid": "path",
     "json_file_valid": "path",
     "service_active": "service",
@@ -43,6 +45,9 @@ CHECKER_ARGUMENT_HINTS = {
     "process_cwd_matches": "pid,cwd",
     "port_listening": "port; optional host,timeout",
     "port_not_listening": "port; optional host,timeout",
+    "port_listener_project_root": "port,project_root",
+    "component_restart_identity": "component,project_root; optional port",
+    "component_process_project_root": "component,project_root",
     "screen_session_exists": "session",
     "screen_session_absent": "session",
     "container_running": "container",
@@ -81,6 +86,7 @@ CHECKER_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "file_absent": ("path",),
     "file_contains": ("path", "text"),
     "file_not_contains": ("path", "text"),
+    "file_sha256": ("path", "sha256"),
     "python_file_syntax_valid": ("path",),
     "json_file_valid": ("path",),
     "service_active": ("service",),
@@ -91,6 +97,9 @@ CHECKER_REQUIRED_ARGS: dict[str, tuple[str, ...]] = {
     "process_cwd_matches": ("pid", "cwd"),
     "port_listening": ("port",),
     "port_not_listening": ("port",),
+    "port_listener_project_root": ("port", "project_root"),
+    "component_restart_identity": ("component", "project_root"),
+    "component_process_project_root": ("component", "project_root"),
     "screen_session_exists": ("session",),
     "screen_session_absent": ("session",),
     "container_running": ("container",),
@@ -128,6 +137,7 @@ class DefaultCheckerRegistry:
             "file_absent": self._file_absent,
             "file_contains": self._file_contains,
             "file_not_contains": self._file_not_contains,
+            "file_sha256": self._file_sha256,
             "python_file_syntax_valid": self._python_file_syntax_valid,
             "json_file_valid": self._json_file_valid,
             "service_active": self._service_active,
@@ -138,6 +148,9 @@ class DefaultCheckerRegistry:
             "process_cwd_matches": self._process_cwd_matches,
             "port_listening": self._port_listening,
             "port_not_listening": self._port_not_listening,
+            "port_listener_project_root": self._port_listener_project_root,
+            "component_restart_identity": self._component_restart_identity,
+            "component_process_project_root": self._component_process_project_root,
             "screen_session_exists": self._screen_session_exists,
             "screen_session_absent": self._screen_session_absent,
             "container_running": self._container_running,
@@ -268,6 +281,25 @@ class DefaultCheckerRegistry:
             "failed" if found else "passed",
             expected="content absent",
             observed="content matched" if found else "content missing",
+        )
+
+    def _file_sha256(self, args, evidence):
+        del evidence
+        path = Path(str(args["path"])).expanduser()
+        expected = str(args["sha256"]).strip().lower()
+        if not path.is_file():
+            return CheckResult(
+                "file_sha256", "failed", expected=expected,
+                observed="file missing: %s" % path,
+            )
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        return CheckResult(
+            "file_sha256", "passed" if actual == expected else "failed",
+            expected=expected, observed=actual,
         )
 
     def _python_file_syntax_valid(self, args, evidence):
@@ -402,6 +434,87 @@ class DefaultCheckerRegistry:
                 args["port"],
             ),
             observed=result.observed,
+        )
+
+    def _port_listener_project_root(self, args, evidence):
+        del evidence
+        port = int(args["port"])
+        expected = str(Path(str(args["project_root"])).resolve())
+        pids = _listener_pids(port)
+        cwds = {pid: _pid_cwd(pid) for pid in pids}
+        owned = [pid for pid, cwd in cwds.items() if cwd == expected]
+        return CheckResult(
+            "port_listener_project_root",
+            "passed" if owned else "failed",
+            expected="port %s owned by cwd %s" % (port, expected),
+            observed="pids=%s cwds=%s" % (
+                ",".join(str(pid) for pid in pids) or "none",
+                ",".join("%s:%s" % (pid, cwd or "unknown") for pid, cwd in cwds.items())
+                or "none",
+            ),
+        )
+
+    def _component_restart_identity(self, args, evidence):
+        mutation = dict(getattr(evidence, "mutation", {}) or {})
+        old_pids = {
+            int(item) for item in str(mutation.get("old_pids") or "").split(",")
+            if item.isdigit()
+        }
+        new_pids = {
+            int(item) for item in str(mutation.get("new_pids") or "").split(",")
+            if item.isdigit()
+        }
+        expected_root = str(Path(str(args["project_root"])).resolve())
+        valid = bool(
+            mutation.get("kind") == "component_restart"
+            and old_pids
+            and new_pids
+            and old_pids.isdisjoint(new_pids)
+            and any(_pid_cwd(pid) == expected_root for pid in new_pids)
+        )
+        return CheckResult(
+            "component_restart_identity", "passed" if valid else "failed",
+            expected="new component process identity under %s" % expected_root,
+            observed="component=%s old=%s new=%s" % (
+                args.get("component") or mutation.get("component") or "unknown",
+                ",".join(str(pid) for pid in sorted(old_pids)) or "none",
+                ",".join(str(pid) for pid in sorted(new_pids)) or "none",
+            ),
+        )
+
+    def _component_process_project_root(self, args, evidence):
+        del evidence
+        component = str(args["component"])
+        expected_root = str(Path(str(args["project_root"])).resolve())
+        patterns = {
+            "master": ("master_main", "gun.py"),
+            "worker": ("worker_main", "worker_gun.py"),
+            "celery": ("celery_worker", " celery "),
+            "web_terminal": ("web_terminal_main", "create_web_terminal_app"),
+        }.get(component, (component,))
+        matches = []
+        try:
+            process_entries = list(Path("/proc").iterdir())
+        except OSError:
+            process_entries = []
+        for entry in process_entries:
+            if not entry.name.isdigit() or _pid_cwd(int(entry.name)) != expected_root:
+                continue
+            try:
+                command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
+                    "utf-8", errors="replace",
+                )
+            except OSError:
+                continue
+            if any(pattern.lower() in command.lower() for pattern in patterns):
+                matches.append(int(entry.name))
+        return CheckResult(
+            "component_process_project_root",
+            "passed" if matches else "failed",
+            expected="%s process under %s" % (component, expected_root),
+            observed="pids=%s" % (
+                ",".join(str(pid) for pid in sorted(matches)) or "none"
+            ),
         )
 
     def _screen_session_exists(self, args, evidence):
@@ -1157,6 +1270,35 @@ def _deduplicate(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen.add(key)
             output.append(item)
     return output
+
+
+def _listener_pids(port: int) -> list[int]:
+    ss = shutil.which("ss")
+    if not ss:
+        return []
+    try:
+        result = subprocess.run(
+            [ss, "-ltnp"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    pids = []
+    for line in (result.stdout or "").splitlines():
+        if not re.search(r":%s\b" % int(port), line):
+            continue
+        for value in re.findall(r"pid=(\d+)", line):
+            pid = int(value)
+            if pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def _pid_cwd(pid: int) -> str:
+    try:
+        return str(Path("/proc/%s/cwd" % int(pid)).resolve())
+    except (OSError, ValueError):
+        return ""
 
 
 def _bool_arg(value: Any, *, default: bool) -> bool:

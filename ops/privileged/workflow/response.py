@@ -5,15 +5,28 @@ from __future__ import annotations
 from typing import Any
 import re
 
-from klonet_agent.ops.privileged.workflow.contracts import EvidenceConclusion
+from klonet_agent.ops.privileged.workflow.contracts import (
+    EvidenceBundle, EvidenceConclusion,
+)
+from klonet_agent.ops.privileged.workflow.runtime_inventory import (
+    RuntimeInventory, render_runtime_goal, runtime_inventory_answers_goal,
+)
 
 
 class ResponseAgent:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
 
-    def render_readonly(self, goal: str, conclusion: EvidenceConclusion) -> str:
-        runtime_inventory = self._runtime_inventory_response(goal, conclusion)
+    def render_readonly(
+        self, goal: str, conclusion: EvidenceConclusion,
+        evidence_bundle: EvidenceBundle | None = None,
+    ) -> str:
+        inventory = RuntimeInventory.from_bundle(evidence_bundle)
+        runtime_inventory = (
+            render_runtime_goal(goal, inventory)
+            if runtime_inventory_answers_goal(goal, inventory)
+            else self._runtime_inventory_response(goal, conclusion)
+        )
         if runtime_inventory:
             return runtime_inventory
         if self.llm is not None:
@@ -31,7 +44,9 @@ class ResponseAgent:
                         },
                         {
                             "role": "user",
-                            "content": self._prompt(goal, conclusion),
+                            "content": self._prompt(
+                                goal, conclusion, evidence_bundle=evidence_bundle,
+                            ),
                         },
                     ],
                     tools=None,
@@ -112,12 +127,24 @@ class ResponseAgent:
         return "\n".join(lines)
 
     @staticmethod
-    def _prompt(goal: str, conclusion: EvidenceConclusion) -> str:
+    def _prompt(
+        goal: str, conclusion: EvidenceConclusion,
+        *, evidence_bundle: EvidenceBundle | None = None,
+    ) -> str:
         facts = "\n".join("- %s" % item.text for item in conclusion.confirmed_facts)
         uncertain = "\n".join("- %s" % item.text for item in conclusion.uncertainties)
         missing = "\n".join("- %s" % item for item in conclusion.missing_decisions)
-        return "目标：%s\n已确认：\n%s\n不确定：\n%s\n缺失决策：\n%s" % (
+        knowledge = "\n".join(
+            str(item.output or "")[:6000]
+            for item in getattr(evidence_bundle, "knowledge_records", [])
+            if item.status == "available"
+        )
+        return (
+            "目标：%s\nKlonet 知识证据：\n%s\n已确认：\n%s\n"
+            "不确定：\n%s\n缺失决策：\n%s"
+        ) % (
             goal,
+            knowledge or "无",
             facts or "无",
             uncertain or "无",
             missing or "无",
