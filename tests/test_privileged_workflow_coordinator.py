@@ -6,6 +6,7 @@ from types import SimpleNamespace
 class StubClassifier:
     def __init__(
         self, intent, command="", goal_clarity="clear", goal_relation="new",
+        goal_kind="", operation="none", scope="none", components=(),
     ):
         self.decision = SimpleNamespace(
             intent=intent,
@@ -15,6 +16,10 @@ class StubClassifier:
             clarification_question="",
             reason="test",
             goal_relation=goal_relation,
+            goal_kind=goal_kind,
+            operation=operation,
+            scope=scope,
+            components=components,
         )
         self.calls = []
 
@@ -62,6 +67,13 @@ class StubGoalVerifier:
 
         self.calls.append((goal, bundle, conclusion, attempted_keys))
         return self.outcome or GoalOutcome("achieved")
+
+    def verify_pre_execution(self, goal, bundle, *, operation, scope):
+        from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+        return PrivilegedVerifierAgent.verify_pre_execution(
+            goal, bundle, operation=operation, scope=scope,
+        )
 
 
 class NoMutationWorkflow:
@@ -170,7 +182,7 @@ def test_completed_plan_status_followup_reads_receipt_without_discovery_or_verif
 
     discovery = StubDiscovery(bundle)
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("conversation"),
+        classifier=StubClassifier("conversation", goal_kind="status_query"),
         discovery=discovery,
         synthesis=StubSynthesis(conclusion),
         response=StubResponse(),
@@ -506,7 +518,7 @@ def test_mutation_clarifies_multiple_abnormal_runtime_roots_before_planning():
     )
     mutation = RecordingMutationWorkflow()
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("mutating_action"),
+        classifier=StubClassifier("mutating_action", operation="repair"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
@@ -543,7 +555,7 @@ def test_mutation_with_explicit_abnormal_roots_enters_planning():
     )
     mutation = RecordingMutationWorkflow()
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("mutating_action"),
+        classifier=StubClassifier("mutating_action", operation="repair"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
@@ -589,7 +601,7 @@ def test_mutation_with_explicit_roots_already_healthy_completes_without_plan():
     )
     mutation = NoMutationWorkflow()
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("mutating_action"),
+        classifier=StubClassifier("mutating_action", operation="repair"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
@@ -629,7 +641,7 @@ def test_named_platform_alias_selects_one_abnormal_root_without_clarification():
     ))
     mutation = RecordingMutationWorkflow()
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("mutating_action"),
+        classifier=StubClassifier("mutating_action", operation="repair"),
         discovery=StubDiscovery(bundle),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
@@ -665,6 +677,14 @@ def test_startup_traceback_collects_target_source_before_synthesis():
             super().__init__(evidence)
             self.incremental = []
 
+        def collect(self, goal, *, command="", conversation_context=""):
+            self.bundle.goal = goal
+            return super().collect(
+                goal,
+                command=command,
+                conversation_context=conversation_context,
+            )
+
         def collect_requests(self, requests, evidence):
             self.incremental.extend(requests)
             for request in requests:
@@ -672,7 +692,14 @@ def test_startup_traceback_collects_target_source_before_synthesis():
                     request,
                     "read_ops_file\nKLONET_E2E_INJECTED_BOOT_FAILURE()",
                 ))
-            return evidence
+                return evidence
+
+        def collect_traceback_source_evidence(self, evidence):
+            from klonet_agent.ops.privileged.workflow.discovery import (
+                _traceback_source_requests,
+            )
+
+            return self.collect_requests(_traceback_source_requests(evidence), evidence)
 
     discovery = SourceDiscovery(bundle)
     synthesis = StubSynthesis(EvidenceConclusion())
@@ -730,6 +757,13 @@ def test_named_platform_alias_scopes_traceback_source_collection():
             for request in requests:
                 evidence.add(EvidenceRecord.from_probe(request, "read_ops_file\nsource"))
             return evidence
+
+        def collect_traceback_source_evidence(self, evidence):
+            from klonet_agent.ops.privileged.workflow.discovery import (
+                _traceback_source_requests,
+            )
+
+            return self.collect_requests(_traceback_source_requests(evidence), evidence)
 
     discovery = SourceDiscovery(bundle)
     coordinator = PrivilegedOpsCoordinator(
@@ -801,7 +835,7 @@ def test_submit_previous_restart_goal_reuses_static_evidence_and_refreshes_runti
     mutation = RecordingMutationWorkflow()
     store = ContextStore()
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("conversation"),
+        classifier=StubClassifier("resume_plan"),
         discovery=discovery,
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
@@ -852,7 +886,11 @@ def test_self_directed_followup_reuses_previous_diagnostic_goal():
 
     discovery = Discovery()
     coordinator = PrivilegedOpsCoordinator(
-        classifier=StubClassifier("conversation"),
+        classifier=StubClassifier(
+            "readonly_action",
+            goal_relation="continue_previous",
+            goal_kind="causal_diagnosis",
+        ),
         discovery=discovery,
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(),
@@ -1133,8 +1171,12 @@ def test_unknown_internal_block_reason_is_not_leaked_in_english():
     assert "resource_binding" not in result.message
 
 
-def test_self_directed_diagnosis_phrase_resumes_the_previous_goal():
-    from klonet_agent.ops.privileged.workflow.coordinator import _continuation_kind
+def test_structured_continuation_replaces_phrase_specific_routing():
+    decision = StubClassifier(
+        "readonly_action",
+        goal_relation="continue_previous",
+        goal_kind="causal_diagnosis",
+    ).decision
 
-    for text in ("你自己定位啊", "继续查清楚", "别问我，自己查", "接着排查"):
-        assert _continuation_kind(text) == "diagnose"
+    assert decision.goal_relation == "continue_previous"
+    assert decision.goal_kind == "causal_diagnosis"

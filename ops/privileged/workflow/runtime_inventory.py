@@ -12,7 +12,10 @@ from pathlib import Path
 import re
 from typing import Any, Iterable
 
-from klonet_agent.ops.privileged.workflow.contracts import normalize_instance_alias
+from klonet_agent.ops.privileged.workflow.contracts import (
+    ResolvedPlatformIdentity,
+    normalize_instance_alias,
+)
 
 
 _RUNTIME_TERMS = (
@@ -212,6 +215,23 @@ class RuntimeInventory:
             ):
                 matches.append(item)
         return tuple(matches)
+
+    def resolve_identity(self, text: str) -> ResolvedPlatformIdentity | None:
+        matches = self.matching(text)
+        if len(matches) != 1:
+            return None
+        instance = matches[0]
+        aliases = tuple(sorted(instance.aliases))
+        primary = next(
+            (item for item in aliases if not item.startswith("klonet_")),
+            aliases[0],
+        )
+        return ResolvedPlatformIdentity(
+            project_root=instance.project_root,
+            primary_alias=primary,
+            aliases=aliases,
+            evidence_refs=(instance.evidence_id,),
+        )
 
 
 def looks_like_runtime_goal(goal: str) -> bool:

@@ -148,6 +148,60 @@ class PrivilegedVerifierAgent:
             reason="全部已审批变更及其后置条件均已通过验证。",
         )
 
+    @staticmethod
+    def verify_pre_execution(
+        goal: str,
+        bundle: EvidenceBundle,
+        *,
+        operation: str,
+        scope: str,
+    ) -> GoalOutcome | None:
+        """Resolve evidence-proven completion or a genuine target decision."""
+
+        inventory = RuntimeInventory.from_bundle(bundle)
+        matches = inventory.matching(goal)
+        if (
+            operation == "repair"
+            and len(inventory.abnormal) >= 2
+            and not matches
+            and scope != "platform"
+        ):
+            roots = [item.project_root for item in inventory.abnormal]
+            return GoalOutcome(
+                "needs_user_decision",
+                user_question=(
+                    "检测到多个后端异常运行候选，必须先由你确定修复边界；"
+                    "同名项目不会自动合并。请明确给出要修复的项目根目录：\n\n- "
+                    + "\n- ".join(roots)
+                ),
+            )
+        explicit_targets = [
+            item for item in inventory.instances
+            if item.project_root in str(goal or "")
+        ]
+        if (
+            operation in {"repair", "start"}
+            and explicit_targets
+            and all(item.backend_status == "healthy" for item in explicit_targets)
+        ):
+            lines = ["目标实例已经分别满足后端健康标准，无需变更或重启："]
+            for item in explicit_targets:
+                lines.append(
+                    "- project_root=%s；platform=%s；backend_status=healthy；"
+                    "master_port=%s，master_endpoint=%s；"
+                    "worker_port=%s，worker_endpoint=%s"
+                    % (
+                        item.project_root,
+                        item.platform,
+                        item.configured_ports.get("master_port", "unknown"),
+                        item.endpoints.get("master", "unknown"),
+                        item.configured_ports.get("worker_port", "unknown"),
+                        item.endpoints.get("worker", "unknown"),
+                    )
+                )
+            return GoalOutcome("achieved", reason="\n".join(lines))
+        return None
+
     def verify_goal(
         self,
         goal: str,

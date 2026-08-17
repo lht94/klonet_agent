@@ -4,16 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
-from pathlib import Path
 import re
 from typing import Any
 
 from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
 from klonet_agent.ops.privileged.workflow.operational_context import (
     OperationalContextSnapshot,
-)
-from klonet_agent.ops.privileged.workflow.contracts import (
-    ResolvedPlatformIdentity,
 )
 from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
 
@@ -89,16 +85,6 @@ class PrivilegedOpsCoordinator:
                         conversation_context=conversation_context,
                     )
                 return control
-        if _is_plan_status_query(normalized):
-            render_status = getattr(
-                self.mutation_workflow, "render_latest_status", None,
-            )
-            if render_status is not None:
-                return WorkflowResult(
-                    True,
-                    "plan_status",
-                    str(render_status()),
-                )
         classifier_context = conversation_context
         if snapshot is not None and snapshot.resolved_goal:
             classifier_context = (
@@ -121,28 +107,34 @@ class PrivilegedOpsCoordinator:
                 "clarification",
                 str(getattr(decision, "clarification_question", "") or "请补充说明目标实例和操作。"),
             )
-        continuation = _continuation_kind(normalized)
         goal_kind = str(getattr(decision, "goal_kind", "") or "")
         if not goal_kind:
             goal_kind = (
-                "causal_diagnosis" if continuation == "diagnose"
-                else "execution" if decision.intent == "mutating_action"
+                "execution" if decision.intent == "mutating_action"
                 else "health_check" if decision.intent == "readonly_action"
                 else "conversation"
             )
+        if goal_kind == "status_query":
+            render_status = getattr(
+                self.mutation_workflow, "render_latest_status", None,
+            )
+            if render_status is not None:
+                return WorkflowResult(
+                    True,
+                    "plan_status",
+                    str(render_status()),
+                )
         goal_relation = str(getattr(decision, "goal_relation", "new") or "new")
-        if continuation == "diagnose" and goal_relation == "new":
-            goal_relation = "continue_previous"
         if decision.intent == "conversation" and not (
             snapshot is not None
             and snapshot.resolved_goal
-            and (continuation or goal_relation != "new")
+            and goal_relation != "new"
         ):
             return WorkflowResult(False, "conversation")
         resolved_goal = normalized
         effective_intent = decision.intent
         if snapshot is not None and snapshot.resolved_goal:
-            if continuation == "submit_plan":
+            if decision.intent == "resume_plan":
                 resolved_goal = snapshot.resolved_goal
                 effective_intent = "mutating_action"
             elif goal_relation == "refine_previous":
@@ -155,9 +147,6 @@ class PrivilegedOpsCoordinator:
                     if decision.intent == "conversation"
                     else decision.intent
                 )
-            elif continuation == "diagnose":
-                resolved_goal = snapshot.resolved_goal
-                effective_intent = "readonly_action"
         elif decision.intent == "resume_plan":
             return WorkflowResult(
                 True,
@@ -174,7 +163,7 @@ class PrivilegedOpsCoordinator:
         )
         collection_goal = (
             "只读诊断并补齐以下运维目标所需证据：%s" % resolved_goal
-            if continuation == "diagnose" or goal_relation in {
+            if goal_kind == "causal_diagnosis" or goal_relation in {
                 "continue_previous", "refine_previous",
             }
             else resolved_goal
@@ -194,41 +183,46 @@ class PrivilegedOpsCoordinator:
             if "preload_capabilities" in collect_parameters:
                 collect_kwargs["preload_capabilities"] = True
             bundle = self.discovery.collect(collection_goal, **collect_kwargs)
-            _collect_traceback_source_evidence(resolved_goal, bundle, self.discovery)
+            collect_traceback_sources = getattr(
+                self.discovery, "collect_traceback_source_evidence", None,
+            )
+            if collect_traceback_sources is not None:
+                collect_traceback_sources(bundle)
             conclusion = self.synthesis.synthesize(collection_goal, bundle)
             if effective_intent == "readonly_action":
                 return self._run_readonly_goal_loop(
                     snapshot,
-                    resolved_goal=(
-                        snapshot.resolved_goal
-                        if snapshot is not None and continuation == "diagnose"
-                        else resolved_goal
-                    ),
+                    resolved_goal=resolved_goal,
                     collection_goal=collection_goal,
                     bundle=bundle,
                     conclusion=conclusion,
                     goal_kind=goal_kind,
                 )
-            target_question = _ambiguous_abnormal_target_question(resolved_goal, bundle)
-            if target_question:
+            pre_execution = self.verifier.verify_pre_execution(
+                resolved_goal,
+                bundle,
+                operation=str(getattr(decision, "operation", "none") or "none"),
+                scope=str(getattr(decision, "scope", "none") or "none"),
+            )
+            if pre_execution is not None and pre_execution.status == "needs_user_decision":
                 return WorkflowResult(
                     True,
                     "clarification",
-                    target_question,
+                    pre_execution.user_question,
                     evidence=bundle,
+                    outcome=pre_execution,
                 )
-            already_satisfied = _explicit_runtime_targets_already_healthy(
-                resolved_goal,
-                bundle,
-            )
-            if already_satisfied:
+            if pre_execution is not None and pre_execution.status == "achieved":
                 return WorkflowResult(
                     True,
                     "completed",
-                    already_satisfied,
+                    pre_execution.reason,
                     evidence=bundle,
+                    outcome=pre_execution,
                 )
-            resolved_identity = _resolve_platform_identity(resolved_goal, bundle)
+            resolved_identity = RuntimeInventory.from_bundle(bundle).resolve_identity(
+                resolved_goal,
+            )
             intent_context = {
                 "operation": str(getattr(decision, "operation", "") or ""),
                 "scope": str(getattr(decision, "scope", "") or ""),
@@ -511,7 +505,11 @@ class PrivilegedOpsCoordinator:
                 item.request.cache_key
                 for item in getattr(bundle, "records", [])
             )
-            _collect_traceback_source_evidence(goal, bundle, self.discovery)
+            collect_traceback_sources = getattr(
+                self.discovery, "collect_traceback_source_evidence", None,
+            )
+            if collect_traceback_sources is not None:
+                collect_traceback_sources(bundle)
             if len(getattr(bundle, "records", [])) <= before:
                 continue
             conclusion = self.synthesis.synthesize(goal, bundle)
@@ -663,7 +661,7 @@ class PrivilegedOpsCoordinator:
                 collect_kwargs["preload_capabilities"] = True
             bundle = self.discovery.collect(goal, **collect_kwargs)
             conclusion = self.synthesis.synthesize(goal, bundle)
-            identity = _resolve_platform_identity(goal, bundle)
+            identity = RuntimeInventory.from_bundle(bundle).resolve_identity(goal)
             intent_context: dict[str, Any] = {}
             if option.action == "component_restart":
                 intent_context.update({"operation": "restart", "scope": "platform"})
@@ -726,68 +724,6 @@ class PrivilegedOpsCoordinator:
         )
 
 
-def _ambiguous_abnormal_target_question(text: str, bundle: Any) -> str:
-    normalized = str(text or "")
-    lowered = normalized.lower()
-    repair_requested = any(
-        marker in lowered for marker in ("修复", "恢复", "排查", "fix", "repair", "recover")
-    )
-    if not repair_requested:
-        return ""
-    inventory = RuntimeInventory.from_bundle(bundle)
-    roots = [item.project_root for item in inventory.abnormal]
-    if len(roots) < 2:
-        return ""
-    if inventory.matching(normalized):
-        return ""
-    if any(marker in lowered for marker in ("全部", "所有", "all of", "all abnormal")):
-        return ""
-    return (
-        "检测到多个后端异常运行候选，必须先由你确定修复边界；"
-        "同名项目不会自动合并。请明确给出要修复的项目根目录：\n\n- "
-        + "\n- ".join(roots)
-    )
-
-def _resolve_platform_identity(
-    text: str, bundle: Any,
-) -> ResolvedPlatformIdentity | None:
-    """Resolve a user alias to exactly one canonical runtime root."""
-
-    matches = RuntimeInventory.from_bundle(bundle).matching(text)
-    if len(matches) != 1:
-        return None
-    instance = matches[0]
-    aliases = tuple(sorted(instance.aliases))
-    primary = next(
-        (item for item in aliases if not item.startswith("klonet_")),
-        aliases[0],
-    )
-    return ResolvedPlatformIdentity(
-        project_root=instance.project_root,
-        primary_alias=primary,
-        aliases=aliases,
-        evidence_refs=(instance.evidence_id,),
-    )
-
-
-def _continuation_kind(text: str) -> str:
-    value = str(text or "").strip().lower()
-    if any(marker in value for marker in (
-        "只读诊断", "先诊断", "继续诊断", "补齐信息", "补齐证据",
-        "你自己定位", "自己定位", "继续查清楚", "接着排查",
-        "自己查", "继续查", "查清楚", "继续定位",
-        "read-only diagnosis", "diagnose first",
-    )):
-        return "diagnose"
-    if any(marker in value for marker in (
-        "提交这个", "提交刚才", "提交重启计划", "走审批", "重新开始审批",
-        "根据刚才的信息", "根据你确认的信息", "帮我重启这个平台",
-        "submit this plan", "submit the plan", "start approval",
-    )):
-        return "submit_plan"
-    return ""
-
-
 def _refined_goal(previous_goal: str, current_request: str) -> str:
     """Preserve the resolved target while adding a semantic refinement."""
 
@@ -798,21 +734,6 @@ def _refined_goal(previous_goal: str, current_request: str) -> str:
     if not current or current in previous:
         return previous
     return "%s；进一步要求：%s" % (previous, current)
-
-
-def _is_plan_status_query(text: str) -> bool:
-    """Recognize execution receipt questions before operational routing."""
-
-    value = str(text or "").strip()
-    return bool(re.search(
-        r"(?:执行|操作|计划|重启|刚才|之前).{0,12}"
-        r"(?:完(?:成|了吗?)|成功(?:了吗?)?|结果|状态|做了什么)|"
-        r"(?:完(?:成|了吗?)|成功(?:了吗?)?|做了什么).{0,12}"
-        r"(?:执行|操作|计划|重启)|"
-        r"(?:did (?:it|that) (?:finish|succeed)|execution status|plan status)",
-        value,
-        re.I,
-    ))
 
 
 def _localized_result(result: WorkflowResult) -> WorkflowResult:
@@ -918,108 +839,3 @@ def _paused_plan_evidence(result: WorkflowResult) -> str:
                     )
                 )
     return "\n".join(lines)[:20000]
-
-
-def _explicit_runtime_targets_already_healthy(text: str, bundle: Any) -> str:
-    """Treat an already-achieved root-bound repair goal as idempotent success.
-
-    A mutating verb must not force a restart when the user names exact project
-    roots and the deterministic runtime inventory already proves every named
-    target healthy.  Unnamed abnormal instances are deliberately excluded: the
-    explicit roots define the requested mutation boundary.
-    """
-
-    lowered = str(text or "").lower()
-    if not any(
-        marker in lowered
-        for marker in ("修复", "恢复", "启动", "fix", "repair", "recover", "start")
-    ):
-        return ""
-    inventory = RuntimeInventory.from_bundle(bundle)
-    targets = [
-        item for item in inventory.instances
-        if item.project_root in str(text or "")
-    ]
-    if not targets:
-        return ""
-    if any(item.backend_status != "healthy" for item in targets):
-        return ""
-
-    lines = [
-        "目标实例已经分别满足后端健康标准，无需变更或重启："
-    ]
-    for item in targets:
-        lines.append(
-            "- project_root=%s；platform=%s；backend_status=healthy；"
-            "master_port=%s，master_endpoint=%s；worker_port=%s，worker_endpoint=%s"
-            % (
-                item.project_root,
-                item.platform,
-                item.configured_ports.get("master_port", "unknown"),
-                item.endpoints.get("master", "unknown"),
-                item.configured_ports.get("worker_port", "unknown"),
-                item.endpoints.get("worker", "unknown"),
-            )
-        )
-    return "\n".join(lines)
-
-
-def _collect_traceback_source_evidence(text: str, bundle: Any, discovery: Any) -> None:
-    """Read target-owned traceback sources before mutation planning.
-
-    Log evidence can prove the exception and exact source path while still
-    leaving the planner unable to choose a bounded edit.  Source inspection is
-    read-only and discoverable, so collect it deterministically instead of
-    allowing the planner to offload that implementation detail to the user.
-    """
-
-    deterministic = getattr(discovery, "collect_traceback_source_evidence", None)
-    if deterministic is not None:
-        deterministic(bundle)
-        return
-    collect_requests = getattr(discovery, "collect_requests", None)
-    if collect_requests is None:
-        return
-    roots = []
-    for raw in re.findall(r"/[A-Za-z0-9._/-]+", str(text or "")):
-        try:
-            root = Path(raw.rstrip("/"))
-        except (OSError, ValueError):
-            continue
-        if root not in roots:
-            roots.append(root)
-    inventory = RuntimeInventory.from_bundle(bundle)
-    for item in inventory.matching(text):
-        root = Path(item.project_root)
-        if root not in roots:
-            roots.append(root)
-    if not roots and len(inventory.instances) == 1:
-        roots.append(Path(inventory.instances[0].project_root))
-    if not roots:
-        return
-    candidates = []
-    for record in getattr(bundle, "records", []):
-        request = getattr(record, "request", None)
-        if getattr(request, "probe", "") != "logs":
-            continue
-        for raw in re.findall(r'File "(/[^"]+\.py)", line \d+', str(getattr(record, "output", "") or "")):
-            candidate = Path(raw)
-            if not any(candidate == root or root in candidate.parents for root in roots):
-                continue
-            if candidate not in candidates:
-                candidates.append(candidate)
-    if not candidates:
-        return
-    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
-
-    collect_requests(
-        [
-            ProbeRequest(
-                "ops_file",
-                {"path": str(path), "view": "head", "max_chars": 20000},
-                "inspect the target-owned Python source named by the startup traceback",
-            )
-            for path in candidates[:2]
-        ],
-        bundle,
-    )
