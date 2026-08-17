@@ -8,7 +8,7 @@
 - `v4_e2e`、`v4e2e` 和项目目录名能解析为唯一实例 `/home/lzl/klonet_v4_e2e`。
 - “重启平台”按运行清单处理所有受管应用组件：已运行组件重启，缺失组件启动。
 - 计划在 RAG 和完整运行清单足够时不再无关地查询 Screen、Git 和日志。
-- 规划、Binding、执行或验证失败都会产生持久化 `FailureOutcome`，展示准确原因、环境是否改变和可选恢复方案。用户选择后刷新动态证据并生成新计划，不执行旧计划。
+- 规划、Binding、执行或验证失败都会产生持久化 `FailureRecord`，展示准确原因、环境是否改变和可选恢复方案。用户选择后刷新动态证据并生成新计划，不执行旧计划。
 
 ## 真实 Agent 验收输入
 
@@ -67,7 +67,7 @@ confirm-priv-plan priv-ops-7d5edfaff5 e3361b27a4fae54b17211ebd4d99dbe45c27f9ce1c
 
 ## 自动化验收
 
-- 重启、RAG、Binding、FailureOutcome 定向回归：234 项通过（228 + 6）。
+- 重启、RAG、Binding、FailureRecord 定向回归：234 项通过（228 + 6）。
 - 完整回归：1041 项通过，2 项失败。
 - 两项失败均为既有环境问题：`shell_ast_parser_unavailable`，位于 `tests/test_privileged_execution.py`，与本轮功能无关，未放宽 Shell 安全策略。
 - `git diff --check` 通过。

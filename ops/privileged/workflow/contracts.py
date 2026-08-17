@@ -435,7 +435,6 @@ CHANGE_PLAN_STATUSES = {
     "blocked",
     "failed",
     "aborted",
-    "awaiting_user_decision",
 }
 
 
@@ -482,7 +481,7 @@ class RecoveryOption:
 
 
 @dataclass
-class FailureOutcome:
+class FailureRecord:
     failure_id: str
     stage: str
     category: str
@@ -538,7 +537,7 @@ class FailureOutcome:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "FailureOutcome | None":
+    def from_dict(cls, data: dict[str, Any] | None) -> "FailureRecord | None":
         if not isinstance(data, dict):
             return None
         return cls(
@@ -582,7 +581,7 @@ class ChangePlan:
     authorized_hash: str = ""
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
-    failure: FailureOutcome | None = None
+    failure: FailureRecord | None = None
 
     def __post_init__(self) -> None:
         if not self.plan_id.startswith("priv-ops-"):
@@ -674,5 +673,5 @@ class ChangePlan:
             authorized_hash=str(data.get("authorized_hash") or ""),
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
-            failure=FailureOutcome.from_dict(data.get("failure")),
+            failure=FailureRecord.from_dict(data.get("failure")),
         )

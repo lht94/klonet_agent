@@ -44,7 +44,7 @@ Discovery、Verifier 和 Response 共同使用结构化运行实例模型。模�
 
 ### 7. 失败是主工作流状态，不是异常旁路
 
-Planning、Binding、Execution、Verification 的失败统一形成 `FailureOutcome`，保存技术原因、环境是否改变、已完成/失败/跳过步骤和恢复选项。自然语言“选择 1”“查看刚才失败的详细原因”“取消这次操作”直接操作最新失败状态，并在需要时重新进入 Discovery 和审批。
+Planning、Binding、Execution、Verification 的失败统一形成 `FailureRecord`，保存技术原因、环境是否改变、已完成/失败/跳过步骤和恢复选项。自然语言“选择 1”“查看刚才失败的详细原因”“取消这次操作”直接操作最新失败状态，并在需要时重新进入 Discovery 和审批。
 
 效果：失败不会被隐藏成一句“有限次数校正后失败”，用户始终能参与下一轮决策。
 

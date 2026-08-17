@@ -453,7 +453,7 @@ screen -r v4e2e_m
 - 明确说明环境已经部分改变。
 - 不能输出“计划已执行并通过验证”。
 
-## 八、FailureOutcome 与用户参与闭环
+## 八、FailureRecord 与用户参与闭环
 
 ### 28. Binding 失败
 
@@ -464,7 +464,7 @@ screen -r v4e2e_m
 通过标准：
 
 - 返回准确技术原因，而不是“有限次数校正失败”。
-- 保存 `FailureOutcome`。
+- 保存 `FailureRecord`。
 - 给出用户可选方案，例如：
   1. 补充只读证据。
   2. 改为逐组件重启。
@@ -484,7 +484,7 @@ screen -r v4e2e_m
 
 通过标准：
 
-- 能关联最近的 `FailureOutcome`。
+- 能关联最近的 `FailureRecord`。
 - 不要求用户重新复制 failure ID。
 - 复用静态证据，刷新动态证据。
 - 不执行旧计划。
@@ -593,7 +593,7 @@ Agent 初步回答后：
 7. Agent 自主定位、修复并只重启 Master。
 8. 验证文件 SHA-256、属主、权限和所有健康接口。
 9. 人为制造一次 Binding 或执行失败。
-10. 验证 `FailureOutcome`、用户选择和新审批闭环。
+10. 验证 `FailureRecord`、用户选择和新审批闭环。
 11. 检查全过程语言、RAG 证据、执行命令和审计记录。
 
 这套综合场景能同时测试 Agent 的实例建模、RAG、诊断、规划、Binding、安全执行、审批、验证、失败恢复和多轮对话能力。
@@ -609,5 +609,5 @@ Agent 初步回答后：
 - 审批的计划 ID 和精确哈希。
 - 每个 Action 的参数、实际命令、返回码和环境变化标志。
 - Verifier 的验收结果。
-- `FailureOutcome` 及用户选择的恢复方案。
+- `FailureRecord` 及用户选择的恢复方案。
 - 测试前后的进程、端口、Screen、文件哈希和健康接口差异。

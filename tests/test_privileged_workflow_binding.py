@@ -604,9 +604,9 @@ def test_screen_postconditions_are_canonical_for_component_role():
     common = {
         "screen_session": "v4e2e_c",
         "component": "celery",
-        "port_47001": "47001",
-        "port_47002": "47002",
-        "port_47003": "47003",
+        "master_port": "47001",
+        "worker_port": "47002",
+        "web_terminal_port": "47003",
     }
     celery = _canonical_action_postconditions(
         "start_screen_component",

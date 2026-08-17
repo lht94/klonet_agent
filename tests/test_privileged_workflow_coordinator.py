@@ -945,7 +945,7 @@ def test_privileged_intent_contract_marks_causal_followup_as_refinement():
 
 def test_failure_option_reenters_discovery_and_creates_new_component_plan():
     from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceBundle, EvidenceConclusion, EvidenceRecord, FailureOutcome,
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, FailureRecord,
         ProbeRequest, RecoveryOption,
     )
     from klonet_agent.ops.privileged.workflow.coordinator import (
@@ -967,7 +967,7 @@ def test_failure_option_reenters_discovery_and_creates_new_component_plan():
         phase="awaiting_user_decision",
         evidence=reusable,
     )
-    failure = FailureOutcome(
+    failure = FailureRecord(
         failure_id="failure-restart-loop",
         stage="binding",
         category="implementation_contract_invalid",

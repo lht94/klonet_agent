@@ -152,12 +152,12 @@ def test_canonical_workflow_has_no_versioned_public_api():
     )
 
 
-def test_failure_outcome_round_trips_user_recovery_options():
+def test_failure_record_round_trips_user_recovery_options():
     from klonet_agent.ops.privileged.workflow.contracts import (
-        FailureOutcome, RecoveryOption,
+        FailureRecord, RecoveryOption,
     )
 
-    failure = FailureOutcome(
+    failure = FailureRecord(
         failure_id="failure-binding1",
         stage="binding",
         category="unsafe_target_scope",
@@ -174,7 +174,7 @@ def test_failure_outcome_round_trips_user_recovery_options():
         plan_id="priv-ops-plan1",
     )
 
-    restored = FailureOutcome.from_dict(failure.to_dict())
+    restored = FailureRecord.from_dict(failure.to_dict())
 
     assert restored == failure
     assert restored.options[0].recommended is True

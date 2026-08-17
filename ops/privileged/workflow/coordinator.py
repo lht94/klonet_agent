@@ -27,6 +27,7 @@ class WorkflowResult:
     evidence: Any | None = None
     verification: Any | None = None
     failure: Any | None = None
+    outcome: Any | None = None
 
 
 class PrivilegedOpsCoordinator:
@@ -361,6 +362,7 @@ class PrivilegedOpsCoordinator:
                     binding.user_question,
                     plan=binding.plan,
                     evidence=evidence_bundle,
+                    outcome=binding,
                 )
             if binding.status != "need_replan":
                 raise ValueError("invalid binding transition")
@@ -438,6 +440,7 @@ class PrivilegedOpsCoordinator:
                     collection_goal, conclusion, **response_kwargs,
                 ),
                 evidence=bundle,
+                outcome=decision,
             )
         if status == "needs_user_decision":
             return WorkflowResult(
@@ -447,6 +450,7 @@ class PrivilegedOpsCoordinator:
                     "需要你明确目标实例或检查范围。"
                 )),
                 evidence=bundle,
+                outcome=decision,
             )
         return WorkflowResult(
             True,
@@ -458,6 +462,7 @@ class PrivilegedOpsCoordinator:
                 else ""
             ),
             evidence=bundle,
+            outcome=decision,
         )
 
     def _advance_diagnostic_evidence(

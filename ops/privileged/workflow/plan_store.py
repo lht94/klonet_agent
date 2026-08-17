@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from klonet_agent.ops.privileged.workflow.contracts import (
-    ChangePlan, FailureOutcome, _utc_now,
+    ChangePlan, FailureRecord, _utc_now,
 )
 
 
@@ -56,7 +56,7 @@ class ChangePlanStore:
         ]
         return sorted(plans, key=lambda item: item.updated_at, reverse=True)
 
-    def save_failure(self, failure: FailureOutcome) -> None:
+    def save_failure(self, failure: FailureRecord) -> None:
         if not re.fullmatch(r"failure-[A-Za-z0-9_-]{1,64}", failure.failure_id):
             raise ValueError("invalid privileged failure id")
         self.failure_dir.mkdir(parents=True, exist_ok=True)
@@ -68,22 +68,22 @@ class ChangePlanStore:
         )
         os.replace(str(temporary), str(destination))
 
-    def load_failure(self, failure_id: str) -> FailureOutcome:
+    def load_failure(self, failure_id: str) -> FailureRecord:
         if not re.fullmatch(r"failure-[A-Za-z0-9_-]{1,64}", str(failure_id or "")):
             raise ValueError("invalid privileged failure id")
         path = self.failure_dir / (failure_id + ".json")
         if not path.is_file():
             raise KeyError("unknown privileged failure: %s" % failure_id)
-        failure = FailureOutcome.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        failure = FailureRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
         if failure is None:
             raise ValueError("invalid privileged failure")
         return failure
 
-    def list_failures(self) -> list[FailureOutcome]:
+    def list_failures(self) -> list[FailureRecord]:
         if not self.failure_dir.exists():
             return []
         failures = [
-            FailureOutcome.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            FailureRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
             for path in self.failure_dir.glob("failure-*.json")
         ]
         return sorted(

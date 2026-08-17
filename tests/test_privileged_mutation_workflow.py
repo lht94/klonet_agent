@@ -382,7 +382,7 @@ def test_exact_reconfirmation_returns_failure_decision_without_reexecuting(tmp_p
     assert resumed.kind == "awaiting_user_decision"
     assert executor.steps == ["deploy-1"]
     assert "recovered:deploy-1" not in verifier.steps
-    assert store.load(plan_id).status == "awaiting_user_decision"
+    assert store.load(plan_id).status == "paused"
 
 
 def test_exact_reconfirmation_never_retries_even_conclusive_no_change_failure(tmp_path):
@@ -899,8 +899,8 @@ def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_pat
     assert result.kind == "awaiting_user_decision"
     assert result.failure.stage == "binding"
     assert "clone target could not be grounded" in result.failure.technical_reason
-    assert result.plan.status == "awaiting_user_decision"
-    assert store.load(result.plan.plan_id).status == "awaiting_user_decision"
+    assert result.plan.status == "blocked"
+    assert store.load(result.plan.plan_id).status == "blocked"
 
 
 def test_failure_control_persists_choice_and_never_executes_old_plan(tmp_path):

@@ -19,45 +19,31 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     ChangeStep,
     EvidenceBundle,
     EvidenceConclusion,
-    EvidenceRecord,
     GoalOutcome,
     ProbeRequest,
     RuntimeComponentSpec,
-    normalize_instance_alias,
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
+from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
 
 
 def _inventory_missing_runtime_roles(
     bundle: EvidenceBundle,
 ) -> list[tuple[str, str, set[str]]]:
     missing = []
-    for record in bundle.records:
-        if record.request.probe != "running_platforms":
-            continue
-        for line in record.output.splitlines():
-            if "backend_status=abnormal" not in line:
-                continue
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            alias_match = re.search(r"\bplatform=([^\s]+)", line)
-            roles = {
-                role
-                for role in ("master", "worker")
-                if re.search(
-                    r"\b%s_endpoint=not_checked\s+reason=role_not_running\b"
-                    % role,
-                    line,
-                )
-            }
-            if root_match is not None and roles:
-                missing.append(
-                    (
-                        root_match.group(1),
-                        alias_match.group(1) if alias_match else "",
-                        roles,
-                    )
-                )
+    for instance in RuntimeInventory.from_bundle(bundle).abnormal:
+        roles = {
+            role
+            for role in ("master", "worker")
+            if re.search(
+                r"\b%s_endpoint=not_checked\s+reason=role_not_running\b"
+                % role,
+                instance.raw_line,
+            )
+        }
+        if roles:
+            missing.append((instance.project_root, instance.platform, roles))
     return missing
 
 
@@ -463,44 +449,20 @@ class ChangePlannerAgent:
             requested_roles = [role for role, _pattern in role_patterns]
         if not requested_roles:
             return None
-        selected: tuple[EvidenceRecord, str, str] | None = None
         resolved_root = str((intent_context or {}).get("resolved_project_root") or "")
-        candidates: list[tuple[EvidenceRecord, str, str]] = []
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for line in record.output.splitlines():
-                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                alias_match = re.search(r"\bplatform=([^\s]+)", line)
-                if root_match is None:
-                    continue
-                root = root_match.group(1)
-                alias = alias_match.group(1) if alias_match else Path(root).name
-                aliases = {alias, Path(root).name}
-                normalized_goal = normalize_instance_alias(text)
-                matches = (
-                    root == resolved_root
-                    or root in text
-                    or any(
-                        normalize_instance_alias(item)
-                        and normalize_instance_alias(item) in normalized_goal
-                        for item in aliases
-                    )
-                )
-                if matches:
-                    candidates.append((record, line, alias))
-        unique_roots = {
-            re.search(r"\bproject_root=(/[^\s]+)", item[1]).group(1)
-            for item in candidates
-        }
-        if len(unique_roots) == 1 and candidates:
-            selected = candidates[0]
-        if selected is None:
+        inventory = RuntimeInventory.from_bundle(bundle)
+        candidates = [
+            item for item in inventory.instances
+            if item.project_root == resolved_root
+        ] if resolved_root else list(inventory.matching(text))
+        if len(candidates) != 1:
             return None
-        record, line, alias = selected
-        root = re.search(r"\bproject_root=(/[^\s]+)", line).group(1)
+        selected = candidates[0]
+        line = selected.raw_line
+        alias = selected.platform
+        root = selected.project_root
         component_specs = _runtime_component_specs_from_line(
-            line, evidence_ref=record.evidence_id,
+            line, evidence_ref=selected.evidence_id,
         )
         if platform_wide and component_specs:
             requested_roles = _ordered_default_restart_components(component_specs)
@@ -521,15 +483,8 @@ class ChangePlannerAgent:
         ]
         expected = []
         postconditions = []
-        running_roles = set(
-            (re.search(r"\broles=([^\s]+)", line) or [None, ""])[1].split(",")
-        )
-        configured_ports = {
-            key: int(value)
-            for key, value in re.findall(
-                r"(master_port|worker_port|web_terminal_port):(\d{1,5})", line,
-            )
-        }
+        running_roles = set(selected.roles)
+        configured_ports = dict(selected.configured_ports)
         for role in requested_roles:
             disposition = "restart requested" if role in running_roles else "start missing"
             port_key = role + "_port"
@@ -660,7 +615,7 @@ class ChangePlannerAgent:
                 ),
                 "reason": "用户明确要求重启，运行清单已绑定实例根目录和角色端口",
                 "evidence_refs": [
-                    record.evidence_id,
+                    selected.evidence_id,
                     *[
                         item.evidence_id for item in bundle.knowledge_records
                         if item.status == "available"
@@ -1622,15 +1577,8 @@ class ChangePlannerAgent:
                     candidates.append(port)
                 if re.search(r":%s\b" % port, record.output):
                     occupied.add(port)
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for configured in re.findall(r"\bconfigured_ports=([^\s]+)", record.output):
-                occupied.update(
-                    int(raw)
-                    for raw in re.findall(r"(?:^|,)[A-Za-z_]+:(\d{1,5})", configured)
-                    if 1 <= int(raw) <= 65535
-                )
+        for instance in RuntimeInventory.from_bundle(bundle).instances:
+            occupied.update(instance.configured_ports.values())
         host_resources = [
             resource
             for resource in resources
@@ -1716,20 +1664,11 @@ class ChangePlannerAgent:
             for item in data.get("changes", [])
             if isinstance(item, dict)
         }
-        configured: list[tuple[str, str, int]] = []
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for line in record.output.splitlines():
-                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                ports_match = re.search(r"\bconfigured_ports=([^\s]+)", line)
-                if root_match is None or ports_match is None:
-                    continue
-                for role, raw in re.findall(
-                    r"(?:^|,)([A-Za-z_]+):(\d{1,5})",
-                    ports_match.group(1),
-                ):
-                    configured.append((root_match.group(1), role, int(raw)))
+        configured = [
+            (instance.project_root, role, port)
+            for instance in RuntimeInventory.from_bundle(bundle).instances
+            for role, port in instance.configured_ports.items()
+        ]
         for resource in resources:
             if resource.status != "frozen" or resource.kind != "port":
                 continue
@@ -1756,20 +1695,12 @@ class ChangePlannerAgent:
             for item in data.get("changes", [])
             if isinstance(item, dict)
         }
-        observed: dict[tuple[str, str], int] = {}
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for line in record.output.splitlines():
-                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                if root_match is None:
-                    continue
-                for role in ("master", "worker"):
-                    port_match = re.search(r"\b%s_port=(\d{1,5})\b" % role, line)
-                    if port_match is not None:
-                        observed[(root_match.group(1), "%s_port" % role)] = int(
-                            port_match.group(1)
-                        )
+        observed = {
+            (instance.project_root, role): port
+            for instance in RuntimeInventory.from_bundle(bundle).instances
+            for role, port in instance.configured_ports.items()
+            if role in {"master_port", "worker_port"}
+        }
 
         replacements: dict[str, dict[int, int]] = {}
         for resource in resources:
@@ -1931,19 +1862,12 @@ class ChangePlannerAgent:
             for item in data.get("changes", [])
             if isinstance(item, dict)
         }
-        runtime_ports: list[tuple[str, str, int]] = []
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for line in record.output.splitlines():
-                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                if root_match is None:
-                    continue
-                for role, raw_port in re.findall(
-                    r"\b(master_port|worker_port)=(\d{1,5})\b",
-                    line,
-                ):
-                    runtime_ports.append((root_match.group(1), role, int(raw_port)))
+        runtime_ports = [
+            (instance.project_root, role, port)
+            for instance in RuntimeInventory.from_bundle(bundle).instances
+            for role, port in instance.configured_ports.items()
+            if role in {"master_port", "worker_port"}
+        ]
         for resource in resources:
             if resource.status != "frozen" or resource.kind != "port":
                 continue
@@ -1978,13 +1902,8 @@ class ChangePlannerAgent:
             str,
             dict[str, tuple[int, str, list[int], dict[int, tuple[int, str]]]],
         ] = {}
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for line in record.output.splitlines():
-                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                if root_match is None or "backend_status=abnormal" not in line:
-                    continue
+        for instance in RuntimeInventory.from_bundle(bundle).abnormal:
+                line = instance.raw_line
                 roles: dict[
                     str,
                     tuple[int, str, list[int], dict[int, tuple[int, str]]],
@@ -2034,7 +1953,7 @@ class ChangePlannerAgent:
                             int(port_match.group(1)), disposition, pids, identities,
                         )
                 if roles:
-                    unhealthy[root_match.group(1)] = roles
+                    unhealthy[instance.project_root] = roles
         changes = data.get("changes")
         if not isinstance(changes, list):
             return
@@ -2353,21 +2272,14 @@ class ChangePlannerAgent:
             return
 
         states: dict[str, dict[str, tuple[str, int]]] = {}
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            for line in record.output.splitlines():
-                root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                if root_match is None:
-                    continue
-                root = root_match.group(1)
-                for role in ("master", "worker"):
-                    endpoint = re.search(r"\b%s_endpoint=([^\s]+)" % role, line)
-                    port = re.search(r"\b%s_port=(\d{1,5})" % role, line)
-                    if endpoint is not None and port is not None:
-                        states.setdefault(root, {})[role] = (
-                            endpoint.group(1), int(port.group(1)),
-                        )
+        for instance in RuntimeInventory.from_bundle(bundle).instances:
+            for role in ("master", "worker"):
+                port = instance.configured_ports.get(role + "_port")
+                endpoint = instance.endpoints.get(role)
+                if endpoint is not None and port is not None:
+                    states.setdefault(instance.project_root, {})[role] = (
+                        endpoint, port,
+                    )
         changes = data.get("changes")
         if not isinstance(changes, list):
             return
@@ -2552,18 +2464,12 @@ class ChangePlannerAgent:
             return
         authoritative: list[tuple[str, int]] = []
         if bundle is not None and re.search(r"\bworker\b|工作进程", goal, re.I):
-            for record in bundle.records:
-                if record.status != "available" or record.request.probe != "running_platforms":
-                    continue
-                for line in record.output.splitlines():
-                    root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-                    port_match = re.search(r"\bworker_port=(\d{1,5})\b", line)
-                    if root_match is None or port_match is None:
-                        continue
-                    root = root_match.group(1).rstrip("/")
-                    port = int(port_match.group(1))
-                    if root in goal and re.search(r"(?<!\d)%s(?!\d)" % port, goal):
-                        authoritative.append((root, port))
+            for instance in RuntimeInventory.from_bundle(bundle).instances:
+                port = instance.configured_ports.get("worker_port")
+                if port is not None and instance.project_root in goal and re.search(
+                    r"(?<!\d)%s(?!\d)" % port, goal,
+                ):
+                    authoritative.append((instance.project_root, port))
         authoritative = sorted(set(authoritative), key=lambda item: len(item[0]), reverse=True)
         for change in changes:
             if not isinstance(change, dict):
@@ -2633,26 +2539,19 @@ class ChangePlannerAgent:
                     if owner_pid is not None:
                         break
                 if owner_pid is None:
-                    for record in bundle.records:
-                        if record.status != "available" or record.request.probe != "running_platforms":
+                    for instance in RuntimeInventory.from_bundle(bundle).instances:
+                        if (
+                            instance.project_root != root
+                            or instance.configured_ports.get("worker_port") != port
+                        ):
                             continue
-                        for line in record.output.splitlines():
-                            if not (
-                                re.search(r"\bproject_root=%s(?:\s|$)" % re.escape(root), line)
-                                and re.search(r"\bworker_port=%s\b" % port, line)
-                            ):
-                                continue
-                            group_match = re.search(r"\bworker_pgids=([0-9,]+)", line)
-                            if group_match is None:
-                                continue
-                            groups = [
-                                int(value) for value in group_match.group(1).split(",")
-                                if value.isdigit()
-                            ]
-                            if groups:
-                                owner_pid = min(groups)
-                                break
-                        if owner_pid is not None:
+                        groups = [
+                            int(value)
+                            for value in instance.fields.get("worker_pgids", "").split(",")
+                            if value.isdigit()
+                        ]
+                        if groups:
+                            owner_pid = min(groups)
                             break
             for resource in data.get("resources") or []:
                 if not isinstance(resource, dict) or resource.get("kind") != "port":

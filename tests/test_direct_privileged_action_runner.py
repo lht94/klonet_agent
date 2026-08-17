@@ -92,7 +92,7 @@ def test_screen_component_waits_for_its_application_port(tmp_path, monkeypatch):
                 "component": "master",
                 "screen_session": "v4e2e_m",
                 "project_root": str(tmp_path),
-                "port_47001": "47001",
+                "master_port": "47001",
             },
             risk="medium",
         )

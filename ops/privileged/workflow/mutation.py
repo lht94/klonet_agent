@@ -16,7 +16,7 @@ from klonet_agent.ops.privileged.execution_agent import (
 from klonet_agent.ops.privileged.workflow.coordinator import WorkflowResult
 from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
 from klonet_agent.ops.privileged.workflow.contracts import (
-    ChangePlan, ChangeStep, FailureOutcome, GoalOutcome, RecoveryOption,
+    ChangePlan, ChangeStep, FailureRecord, GoalOutcome, RecoveryOption,
 )
 from klonet_agent.tools.environment import redact_sensitive_text
 
@@ -167,13 +167,19 @@ class MutationWorkflow:
             return WorkflowResult(
                 True, "completed", _execution_receipt(plan), plan=plan,
             )
-        if plan.status == "awaiting_user_decision" and plan.failure is not None:
+        if plan.failure is not None and plan.status in {"paused", "blocked"}:
+            outcome = GoalOutcome(
+                "needs_user_decision",
+                user_question=_failure_message(plan.failure),
+                failed_criteria=list(plan.failure.failed_checks),
+            )
             return WorkflowResult(
                 True,
                 "awaiting_user_decision",
                 _failure_message(plan.failure),
                 plan=plan,
                 failure=plan.failure,
+                outcome=outcome,
             )
         if plan.status == "paused" and plan.is_authorized:
             return self._resume_verified_state(plan)
@@ -420,7 +426,7 @@ class MutationWorkflow:
         failed_checks: list[str] | None = None,
         evidence: Any | None = None,
     ) -> WorkflowResult:
-        failure = FailureOutcome(
+        failure = FailureRecord(
             failure_id="failure-" + uuid.uuid4().hex[:12],
             stage=stage,
             category=category,
@@ -437,11 +443,22 @@ class MutationWorkflow:
         )
         if plan is not None:
             plan.failure = failure
-            plan.status = "awaiting_user_decision"
+            plan.status = (
+                "paused"
+                if stage in {"execution", "verification"}
+                or environment_changed != "false"
+                else "blocked"
+            )
             self.store.save(plan)
         save_failure = getattr(self.store, "save_failure", None)
         if save_failure is not None:
             save_failure(failure)
+        outcome = GoalOutcome(
+            "needs_user_decision",
+            reason=failure.technical_reason,
+            user_question=_failure_message(failure),
+            failed_criteria=list(failure.failed_checks),
+        )
         return WorkflowResult(
             True,
             "awaiting_user_decision",
@@ -449,6 +466,7 @@ class MutationWorkflow:
             plan=plan,
             evidence=evidence,
             failure=failure,
+            outcome=outcome,
         )
 
     def render_latest_status(self) -> str:
@@ -463,7 +481,7 @@ class MutationWorkflow:
             return _failure_message(failures[0])
         if not plans:
             return "当前会话没有可查询的变更计划。"
-        if plans[0].failure is not None and plans[0].status == "awaiting_user_decision":
+        if plans[0].failure is not None:
             return _failure_message(plans[0].failure)
         return _execution_receipt(plans[0])
 
@@ -632,6 +650,7 @@ class MutationWorkflow:
         self.store.save(plan)
         return WorkflowResult(
             True, "completed", _execution_receipt(plan), plan=plan,
+            outcome=goal_outcome,
         )
 
     def _emit_execution_progress(self, message: str) -> None:
@@ -1121,7 +1140,7 @@ def _recovery_options(goal: str, stage: str) -> list[RecoveryOption]:
     ]
 
 
-def _failure_message(failure: FailureOutcome) -> str:
+def _failure_message(failure: FailureRecord) -> str:
     lines = [
         "本轮目标尚未完成，系统没有隐藏失败。",
         "失败阶段：%s" % failure.stage,
@@ -1153,7 +1172,7 @@ def _failure_message(failure: FailureOutcome) -> str:
     return "\n".join(lines)
 
 
-def _failure_detail_message(failure: FailureOutcome) -> str:
+def _failure_detail_message(failure: FailureRecord) -> str:
     lines = [
         "失败记录 %s（技术详情，已脱敏）" % failure.failure_id,
         "目标：%s" % failure.goal,

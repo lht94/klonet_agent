@@ -15,13 +15,6 @@ def component_port_arg(args: dict[str, Any], component: str) -> int | None:
     """Resolve a component port from the shared execution contract."""
 
     raw = args.get("%s_port" % component)
-    if raw is None:
-        legacy_keys = {
-            "master": "port_47001",
-            "worker": "port_47002",
-            "web_terminal": "port_47003",
-        }
-        raw = args.get(legacy_keys.get(component, ""))
     try:
         port = int(raw)
     except (TypeError, ValueError):
