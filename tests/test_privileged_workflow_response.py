@@ -59,26 +59,26 @@ def test_response_agent_receives_frozen_knowledge_evidence():
 
 
 def test_runtime_inventory_response_preserves_project_root_identity():
-    from klonet_agent.ops.privileged.workflow.contracts import EvidenceClaim
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
 
-    conclusion = EvidenceConclusion(confirmed_facts=[
-        EvidenceClaim(
-            "runtime_inventory_counts runtime_candidate_count=2 healthy_count=1 abnormal_count=1 code_only_count=1",
-            ["ev-1"],
-        ),
-        EvidenceClaim(
-            "runtime_instance platform=vemu project_root=/srv/formal backend_status=healthy master_port=45551 master_endpoint=healthy worker_port=45552 worker_endpoint=healthy",
-            ["ev-1"],
-        ),
-        EvidenceClaim(
-            "runtime_instance platform=vemu project_root=/srv/test backend_status=abnormal master_port=45554 master_endpoint=healthy worker_port=45555 worker_endpoint=unreachable",
-            ["ev-1"],
-        ),
-        EvidenceClaim("runtime_code_only code_only_root=/srv/code-only", ["ev-1"]),
-    ])
+    bundle = EvidenceBundle(goal="检查有多少正常运行的平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "\n".join([
+            "runtime_candidate_count=2",
+            "healthy_count=1",
+            "abnormal_count=1",
+            "code_only_count=1",
+            "platform=vemu project_root=/srv/formal backend_status=healthy roles=master,worker master_port=45551 master_endpoint=healthy worker_port=45552 worker_endpoint=healthy",
+            "platform=vemu project_root=/srv/test backend_status=abnormal roles=master,worker master_port=45554 master_endpoint=healthy worker_port=45555 worker_endpoint=unreachable",
+            "code_only_root=/srv/code-only",
+        ]),
+    ))
 
     result = ResponseAgent(FakeLLM("should not be used")).render_readonly(
-        "检查有多少正常运行的平台", conclusion,
+        "检查有多少正常运行的平台", EvidenceConclusion(), evidence_bundle=bundle,
     )
 
     assert "正常运行实例（1）" in result

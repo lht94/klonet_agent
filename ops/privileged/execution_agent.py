@@ -31,6 +31,7 @@ from klonet_agent.ops.privileged.contracts import (
     PrivilegedStep,
     RISK_LEVELS,
     ShellArtifact,
+    component_port_arg,
 )
 from klonet_agent.ops.privileged.context import GroundedPlanContext
 from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
@@ -6371,20 +6372,13 @@ def _canonical_action_postconditions(
                 "checker": "screen_session_exists",
                 "args": {"session": session},
             })
-        port_key = {
-            "master": "port_47001",
-            "worker": "port_47002",
-            "web_terminal": "port_47003",
-        }.get(component)
-        raw_port = (
-            args.get(port_key) if port_key else None
-        ) or args.get("%s_port" % component)
-        if str(raw_port or "").isdigit():
+        component_port = component_port_arg(args, component)
+        if component_port is not None:
             checks.append(
                 {
                     "checker": "port_listening",
                     "args": {
-                        "port": int(raw_port),
+                        "port": component_port,
                         "host": "127.0.0.1",
                     },
                 }
@@ -6393,7 +6387,7 @@ def _canonical_action_postconditions(
                 checks.append({
                     "checker": "port_listener_project_root",
                     "args": {
-                        "port": int(raw_port),
+                        "port": component_port,
                         "project_root": str(args.get("project_root") or ""),
                     },
                 })

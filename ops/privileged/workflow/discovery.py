@@ -14,7 +14,6 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceRecord,
     ProbeRequest,
-    normalize_instance_alias,
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.runtime_inventory import (
@@ -534,32 +533,16 @@ def _deterministic_restart_inventory_sufficient(
     lowered = text.lower()
     if not any(marker in lowered for marker in ("重启", "restart")):
         return False
-    records = [
-        item for item in bundle.records
-        if item.request.probe == "running_platforms" and item.status == "available"
-    ]
-    candidates: list[str] = []
-    for record in records:
-        for line in record.output.splitlines():
-            root = re.search(r"\bproject_root=(/[^\s]+)", line)
-            platform = re.search(r"\bplatform=([^\s]+)", line)
-            if root is None or platform is None:
-                continue
-            aliases = {
-                normalize_instance_alias(platform.group(1)),
-                normalize_instance_alias(Path(root.group(1)).name),
-            }
-            normalized_goal = normalize_instance_alias(text)
-            if not any(alias and alias in normalized_goal for alias in aliases):
-                continue
-            required = (
-                "configured_ports=" in line
-                and "component_specs_b64=" in line
-                and "runtime_identities=" in line
+    candidates = [
+        item for item in RuntimeInventory.from_bundle(bundle).matching(text)
+        if all(
+            item.fields.get(name)
+            for name in (
+                "configured_ports", "component_specs_b64", "runtime_identities",
             )
-            if required:
-                candidates.append(root.group(1).rstrip("/"))
-    return len(set(candidates)) == 1
+        )
+    ]
+    return len(candidates) == 1
 
 
 def _running_platform_target_choice_required(
@@ -572,32 +555,11 @@ def _running_platform_target_choice_required(
         marker in lowered for marker in ("修复", "恢复", "排查", "fix", "repair", "recover")
     ):
         return False
-    roots = []
-    aliases = []
-    for record in bundle.records:
-        if record.request.probe != "running_platforms":
-            continue
-        for line in record.output.splitlines():
-            if "backend_status=abnormal" not in line:
-                continue
-            match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            if match and match.group(1) not in roots:
-                roots.append(match.group(1))
-            platform = re.search(r"\bplatform=([^\s]+)", line)
-            if platform and platform.group(1) not in aliases:
-                aliases.append(platform.group(1))
+    inventory = RuntimeInventory.from_bundle(bundle)
+    roots = [item.project_root for item in inventory.abnormal]
     if (
         len(roots) < 2
-        or any(root in text for root in roots)
-        or any(
-            re.search(
-                r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
-                % re.escape(alias),
-                text,
-                re.I,
-            )
-            for alias in aliases
-        )
+        or bool(inventory.matching(text))
     ):
         return False
     return not any(
@@ -612,31 +574,13 @@ def _traceback_source_requests(bundle: EvidenceBundle) -> list[ProbeRequest]:
         root = Path(raw.rstrip("/"))
         if root not in roots:
             roots.append(root)
-    inventory_targets = []
-    for record in bundle.records:
-        if record.request.probe != "running_platforms":
-            continue
-        for line in record.output.splitlines():
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            platform_match = re.search(r"\bplatform=([^\s]+)", line)
-            if not root_match:
-                continue
-            root = Path(root_match.group(1))
-            alias = platform_match.group(1) if platform_match else ""
-            inventory_targets.append((alias, root))
-            selected = str(root) in goal or bool(
-                alias
-                and re.search(
-                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
-                    % re.escape(alias),
-                    goal,
-                    re.I,
-                )
-            )
-            if selected and root not in roots:
-                roots.append(root)
-    if not roots and len(inventory_targets) == 1:
-        roots.append(inventory_targets[0][1])
+    inventory = RuntimeInventory.from_bundle(bundle)
+    for item in inventory.matching(goal):
+        root = Path(item.project_root)
+        if root not in roots:
+            roots.append(root)
+    if not roots and len(inventory.instances) == 1:
+        roots.append(Path(inventory.instances[0].project_root))
     if not roots:
         return []
     candidates = []
@@ -671,36 +615,19 @@ def _selected_master_process_log_requests(bundle: EvidenceBundle) -> list[ProbeR
     ):
         return []
     requests = []
-    for record in bundle.records:
-        if record.request.probe != "running_platforms":
+    inventory = RuntimeInventory.from_bundle(bundle)
+    for item in inventory.matching(goal):
+        if item.backend_status == "healthy":
             continue
-        for line in record.output.splitlines():
-            if "backend_status=abnormal" not in line:
-                continue
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            platform_match = re.search(r"\bplatform=([^\s]+)", line)
-            pids_match = re.search(r"\bmaster_pids=([0-9,]+)", line)
-            if not root_match or not pids_match:
-                continue
-            root = root_match.group(1)
-            alias = platform_match.group(1) if platform_match else ""
-            selected = root in goal or bool(
-                alias
-                and re.search(
-                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
-                    % re.escape(alias),
-                    goal,
-                    re.I,
-                )
-            )
-            if not selected:
-                continue
-            pids = [int(value) for value in pids_match.group(1).split(",")[:8]]
-            requests.append(ProbeRequest(
-                "process_logs",
-                {"pids": pids, "project_root": root},
-                "read the selected master process stdout/stderr logs after rechecking cwd",
-            ))
+        raw_pids = item.fields.get("master_pids", "")
+        if not re.fullmatch(r"[0-9,]+", raw_pids):
+            continue
+        pids = [int(value) for value in raw_pids.split(",")[:8]]
+        requests.append(ProbeRequest(
+            "process_logs",
+            {"pids": pids, "project_root": item.project_root},
+            "read the selected master process stdout/stderr logs after rechecking cwd",
+        ))
     return requests[:1]
 
 
@@ -720,41 +647,20 @@ def _selected_master_entry_source_requests(
     ):
         return []
     requests: list[ProbeRequest] = []
-    for record in bundle.records:
-        if record.request.probe != "running_platforms":
+    inventory = RuntimeInventory.from_bundle(bundle)
+    for item in inventory.matching(goal):
+        if item.backend_status == "healthy" or item.endpoints.get("master") == "healthy":
             continue
-        for line in record.output.splitlines():
-            if (
-                "backend_status=abnormal" not in line
-                or "master_endpoint=healthy" in line
-            ):
-                continue
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            platform_match = re.search(r"\bplatform=([^\s]+)", line)
-            if root_match is None:
-                continue
-            root = Path(root_match.group(1))
-            alias = platform_match.group(1) if platform_match else ""
-            selected = str(root) in goal or bool(
-                alias
-                and re.search(
-                    r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
-                    % re.escape(alias),
-                    goal,
-                    re.I,
-                )
-            )
-            if not selected:
-                continue
-            candidates = (
-                root / "mains" / "master_main.py",
-                root / "master_main.py",
-                root / "vemu_uestc" / "mains" / "master_main.py",
-            )
-            path = next((item for item in candidates if item.is_file()), candidates[0])
-            requests.append(ProbeRequest(
-                "ops_file",
-                {"path": str(path), "view": "head", "max_chars": 20000},
-                "inspect the selected failing master startup entry",
-            ))
+        root = Path(item.project_root)
+        candidates = (
+            root / "mains" / "master_main.py",
+            root / "master_main.py",
+            root / "vemu_uestc" / "mains" / "master_main.py",
+        )
+        path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+        requests.append(ProbeRequest(
+            "ops_file",
+            {"path": str(path), "view": "head", "max_chars": 20000},
+            "inspect the selected failing master startup entry",
+        ))
     return requests[:1]

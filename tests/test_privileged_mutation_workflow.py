@@ -235,10 +235,10 @@ class RaisingVerifier:
 
 
 def _workflow(tmp_path, plan, *, verifier_status="passed"):
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
-    planner = FakePlanner([PlanningOutcome(status="ready", plan=plan)])
+    planner = FakePlanner([GoalOutcome(status="need_execution", plan=plan)])
     binder = FakeBinder()
     executor = FakeExecutor()
     verifier = FakeVerifier(verifier_status)
@@ -363,7 +363,7 @@ def test_exact_reconfirmation_returns_failure_decision_without_reexecuting(tmp_p
 
 def test_exact_reconfirmation_never_retries_even_conclusive_no_change_failure(tmp_path):
     from klonet_agent.ops.privileged.contracts import ExecutionEvidence
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     class SequenceExecutor:
@@ -393,7 +393,7 @@ def test_exact_reconfirmation_never_retries_even_conclusive_no_change_failure(tm
     store = MemoryStore()
     executor = SequenceExecutor()
     workflow = MutationWorkflow(
-        planner=FakePlanner([PlanningOutcome(status="ready", plan=plan)]),
+        planner=FakePlanner([GoalOutcome(status="need_execution", plan=plan)]),
         binder=FakeBinder(),
         store=store,
         executor=executor,
@@ -546,15 +546,15 @@ def test_control_command_requires_exact_workflow_syntax(tmp_path):
 
 def test_planner_evidence_gap_returns_to_discovery_then_replans(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     bundle = SimpleNamespace(records=[])
-    gap = PlanningOutcome(
+    gap = GoalOutcome(
         status="need_evidence",
-        probe_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
+        evidence_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
     )
-    ready = PlanningOutcome(status="ready", plan=_change_plan())
+    ready = GoalOutcome(status="need_execution", plan=_change_plan())
     planner = FakePlanner([gap, ready])
 
     class Discovery:
@@ -596,7 +596,7 @@ def test_planner_evidence_gap_returns_to_discovery_then_replans(tmp_path):
 
 def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     candidate = _change_plan()
@@ -608,10 +608,10 @@ def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path
 
         def plan(self, *args, **kwargs):
             self.calls += 1
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
-                probe_requests=[
+                evidence_requests=[
                     ProbeRequest("ports", {"ports": [47001]}, "verify port")
                 ],
             )
@@ -619,7 +619,7 @@ def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path
         def finalize_candidate(self, plan, bundle):
             self.finalize_calls += 1
             assert plan is candidate
-            return PlanningOutcome(status="ready", plan=plan)
+            return GoalOutcome(status="need_execution", plan=plan)
 
     planner = CandidatePlanner()
     discovery = SimpleNamespace(
@@ -648,7 +648,7 @@ def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path
 
 def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     candidate = _change_plan()
@@ -662,18 +662,18 @@ def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
         def plan(self, *args, **kwargs):
             self.calls.append(kwargs)
             if len(self.calls) == 1:
-                return PlanningOutcome(
+                return GoalOutcome(
                     status="need_evidence",
                     candidate_plan=candidate,
-                    probe_requests=[
+                    evidence_requests=[
                         ProbeRequest("ports", {"ports": [6379]}, "verify port")
                     ],
                 )
-            return PlanningOutcome(status="ready", plan=replacement)
+            return GoalOutcome(status="need_execution", plan=replacement)
 
         def finalize_candidate(self, plan, bundle):
             self.finalize_calls += 1
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="blocked",
                 candidate_plan=plan,
                 reason="candidate ports became occupied: 6379",
@@ -706,12 +706,12 @@ def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
 
 def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
-    gap = PlanningOutcome(
+    gap = GoalOutcome(
         status="need_evidence",
-        probe_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
+        evidence_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
     )
     planner = FakePlanner([gap, gap, gap, gap, gap])
     discovery = SimpleNamespace(
@@ -742,15 +742,15 @@ def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
 
 def test_default_discovery_budget_allows_four_rounds_then_ready(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
-    gap = PlanningOutcome(
+    gap = GoalOutcome(
         status="need_evidence",
-        probe_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
+        evidence_requests=[ProbeRequest("ports", {"ports": [47001]}, "freeze port")],
     )
-    planner = FakePlanner([gap, gap, gap, gap, PlanningOutcome(
-        status="ready", plan=_change_plan()
+    planner = FakePlanner([gap, gap, gap, gap, GoalOutcome(
+        status="need_execution", plan=_change_plan()
     )])
     workflow = MutationWorkflow(
         planner=planner,
@@ -775,13 +775,13 @@ def test_default_discovery_budget_allows_four_rounds_then_ready(tmp_path):
 
 
 def test_verifier_exception_is_persisted_as_pause_after_single_execution(tmp_path):
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     executor = FakeExecutor()
     store = MemoryStore()
     workflow = MutationWorkflow(
-        planner=FakePlanner([PlanningOutcome(status="ready", plan=_change_plan())]),
+        planner=FakePlanner([GoalOutcome(status="need_execution", plan=_change_plan())]),
         binder=FakeBinder(),
         store=store,
         executor=executor,
@@ -801,7 +801,7 @@ def test_verifier_exception_is_persisted_as_pause_after_single_execution(tmp_pat
 
 def test_binder_failure_replans_at_most_once_then_succeeds(tmp_path):
     from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     class Binder:
@@ -816,8 +816,8 @@ def test_binder_failure_replans_at_most_once_then_succeeds(tmp_path):
 
     planner = FakePlanner(
         [
-            PlanningOutcome(status="ready", plan=_change_plan()),
-            PlanningOutcome(status="ready", plan=_change_plan()),
+            GoalOutcome(status="need_execution", plan=_change_plan()),
+            GoalOutcome(status="need_execution", plan=_change_plan()),
         ]
     )
     binder = Binder()
@@ -839,7 +839,7 @@ def test_binder_failure_replans_at_most_once_then_succeeds(tmp_path):
 
 def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_path):
     from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     class Binder:
@@ -853,8 +853,8 @@ def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_pat
     workflow = MutationWorkflow(
         planner=FakePlanner(
             [
-                PlanningOutcome(status="ready", plan=_change_plan()),
-                PlanningOutcome(status="ready", plan=_change_plan()),
+                GoalOutcome(status="need_execution", plan=_change_plan()),
+                GoalOutcome(status="need_execution", plan=_change_plan()),
             ]
         ),
         binder=Binder(),
@@ -875,7 +875,7 @@ def test_second_binder_failure_is_persisted_as_blocked_without_traceback(tmp_pat
 
 
 def test_failure_control_persists_choice_and_never_executes_old_plan(tmp_path):
-    from klonet_agent.ops.privileged.workflow.change_planner import PlanningOutcome
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
     from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
 
@@ -888,8 +888,8 @@ def test_failure_control_persists_choice_and_never_executes_old_plan(tmp_path):
     executor = FakeExecutor()
     workflow = MutationWorkflow(
         planner=FakePlanner([
-            PlanningOutcome(status="ready", plan=_change_plan()),
-            PlanningOutcome(status="ready", plan=_change_plan()),
+            GoalOutcome(status="need_execution", plan=_change_plan()),
+            GoalOutcome(status="need_execution", plan=_change_plan()),
         ]),
         binder=Binder(), store=store, executor=executor, verifier=FakeVerifier(),
     )

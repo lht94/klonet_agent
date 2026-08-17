@@ -33,7 +33,7 @@ from klonet_agent.ops.actions import (
     configured_ops_action_registry,
 )
 from klonet_agent.ops.command_policy import command_exists, decide_ops_command
-from klonet_agent.ops.privileged.contracts import PrivilegedStep
+from klonet_agent.ops.privileged.contracts import PrivilegedStep, component_port_arg
 from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
 from klonet_agent.ops.privileged.planner_schema import normalize_process_signal
 
@@ -874,7 +874,7 @@ class DirectPrivilegedActionRunner:
             ),
             timeout=10,
         )
-        port = _component_port_arg(step.args, component)
+        port = component_port_arg(step.args, component)
         old_pids = (
             _listener_pids_for_port(port)
             if port else _component_pids(root, component)
@@ -3419,25 +3419,18 @@ class DirectPrivilegedActionRunner:
                 % (component, _one_line(result.stderr)),
                 "inspect_runtime",
             )
-        port_key = {
-            "master": "port_47001",
-            "worker": "port_47002",
-            "web_terminal": "port_47003",
-        }.get(component)
-        raw_port = (
-            step.args.get(port_key) if port_key else None
-        ) or step.args.get("%s_port" % component)
-        if str(raw_port or "").isdigit():
+        component_port = component_port_arg(step.args, component)
+        if component_port is not None:
             ready = _wait_tcp_listening(
                 "127.0.0.1",
-                int(raw_port),
+                component_port,
                 timeout=min(float(step.timeout), 20.0),
             )
             if not ready:
                 return DirectActionResult(
                     "failed",
                     "component_port_not_ready component=%s port=%s environment_changed=unknown"
-                    % (component, raw_port),
+                    % (component, component_port),
                     "inspect_runtime",
                 )
         return DirectActionResult(
@@ -4033,22 +4026,6 @@ def _command_changes_state(action: str, argv: list[str]) -> bool:
     }:
         return program == "screen" or "gunicorn" in joined or "celery" in joined
     return True
-
-
-def _component_port_arg(args: dict[str, Any], component: str) -> int | None:
-    raw = args.get("%s_port" % component)
-    if raw is None:
-        legacy_keys = {
-            "master": "port_47001",
-            "worker": "port_47002",
-            "web_terminal": "port_47003",
-        }
-        raw = args.get(legacy_keys.get(component, ""))
-    try:
-        port = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return port if 1 <= port <= 65535 else None
 
 
 def _runtime_screen_control_path(root: Path, session: str) -> Path:

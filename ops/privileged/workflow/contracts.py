@@ -157,30 +157,6 @@ class EvidenceBundle:
 
 
 @dataclass(frozen=True)
-class RuntimeLayoutSpec:
-    project_root: str
-    source_root: str
-    startup_cwd: str
-    entry_files: tuple[str, ...]
-    source_sha256s: dict[str, str] = field(default_factory=dict)
-    instance_alias: str = ""
-    evidence_refs: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        roots = [Path(value).expanduser() for value in (
-            self.project_root, self.source_root, self.startup_cwd,
-        )]
-        if not all(path.is_absolute() for path in roots):
-            raise ValueError("runtime layout paths must be absolute")
-        if roots[2] != roots[0]:
-            raise ValueError("runtime startup cwd must equal project root")
-        if roots[1].parent != roots[0]:
-            raise ValueError("runtime source root must be directly under project root")
-        if not self.entry_files:
-            raise ValueError("runtime layout requires entry files")
-
-
-@dataclass(frozen=True)
 class RuntimeComponentSpec:
     name: str
     category: str = "application"
@@ -305,9 +281,7 @@ class EvidenceConclusion:
 GOAL_OUTCOME_STATUSES = {
     "achieved",
     "need_evidence",
-    "need_plan",
     "need_execution",
-    "need_verification",
     "need_replan",
     "needs_user_decision",
     "blocked",
@@ -324,6 +298,9 @@ class GoalOutcome:
     user_question: str = ""
     failed_criteria: list[str] = field(default_factory=list)
     next_objective: str = ""
+    plan: ChangePlan | None = None
+    candidate_plan: ChangePlan | None = None
+    missing_decisions: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.status not in GOAL_OUTCOME_STATUSES:
@@ -332,6 +309,8 @@ class GoalOutcome:
             raise ValueError("need_evidence requires evidence_requests")
         if self.status == "needs_user_decision" and not self.user_question:
             raise ValueError("needs_user_decision requires user_question")
+        if self.status == "need_execution" and self.plan is None:
+            raise ValueError("need_execution requires plan")
 
 
 class DiscoveryBudgetExceeded(RuntimeError):

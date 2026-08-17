@@ -48,11 +48,13 @@ class RuntimeInstance:
     pids: tuple[int, ...] = ()
     configured_ports: dict[str, int] = field(default_factory=dict)
     endpoints: dict[str, str] = field(default_factory=dict)
+    fields: dict[str, str] = field(default_factory=dict)
     raw_line: str = ""
     evidence_id: str = ""
 
     @classmethod
     def parse(cls, line: str, *, evidence_id: str = "") -> "RuntimeInstance | None":
+        fields = dict(re.findall(r"(?:^|\s)([A-Za-z][A-Za-z0-9_]*)=([^\s]+)", line))
         root = _field(line, "project_root")
         platform = _field(line, "platform")
         if not root or not platform or not root.startswith("/"):
@@ -84,6 +86,7 @@ class RuntimeInstance:
             ),
             configured_ports=ports,
             endpoints=endpoints,
+            fields=fields,
             raw_line=line.strip(),
             evidence_id=evidence_id,
         )

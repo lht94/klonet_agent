@@ -14,8 +14,8 @@ from klonet_agent.ops.privileged.workflow.operational_context import (
 )
 from klonet_agent.ops.privileged.workflow.contracts import (
     ResolvedPlatformIdentity,
-    normalize_instance_alias,
 )
+from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
 
 
 @dataclass
@@ -568,19 +568,9 @@ class PrivilegedOpsCoordinator:
         if self.context_store is None:
             return
         roots = sorted(set(re.findall(r"/[A-Za-z0-9._/-]+", resolved_goal)))
-        for record in getattr(bundle, "records", []):
-            for root in re.findall(
-                r"\bproject_root=(/[A-Za-z0-9._/-]+)",
-                str(getattr(record, "output", "") or ""),
-            ):
-                if root not in roots and (
-                    root in resolved_goal
-                    or _contains_instance_alias(
-                        resolved_goal,
-                        _platform_alias_for_root(bundle, root),
-                    )
-                ):
-                    roots.append(root)
+        for instance in RuntimeInventory.from_bundle(bundle).matching(resolved_goal):
+            if instance.project_root not in roots:
+                roots.append(instance.project_root)
         self.context_store.save(OperationalContextSnapshot(
             resolved_goal=resolved_goal,
             output_locale=(previous.output_locale if previous is not None else "zh-CN"),
@@ -611,26 +601,11 @@ def _ambiguous_abnormal_target_question(text: str, bundle: Any) -> str:
     )
     if not repair_requested:
         return ""
-    roots = []
-    aliases: dict[str, str] = {}
-    for record in getattr(bundle, "records", []):
-        request = getattr(record, "request", None)
-        if getattr(request, "probe", "") != "running_platforms":
-            continue
-        for line in str(getattr(record, "output", "") or "").splitlines():
-            if "backend_status=abnormal" not in line:
-                continue
-            match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            if match and match.group(1) not in roots:
-                roots.append(match.group(1))
-            platform = re.search(r"\bplatform=([^\s]+)", line)
-            if match and platform:
-                aliases[platform.group(1)] = match.group(1)
+    inventory = RuntimeInventory.from_bundle(bundle)
+    roots = [item.project_root for item in inventory.abnormal]
     if len(roots) < 2:
         return ""
-    if any(root in normalized for root in roots):
-        return ""
-    if any(_contains_instance_alias(normalized, alias) for alias in aliases):
+    if inventory.matching(normalized):
         return ""
     if any(marker in lowered for marker in ("全部", "所有", "all of", "all abnormal")):
         return ""
@@ -640,70 +615,25 @@ def _ambiguous_abnormal_target_question(text: str, bundle: Any) -> str:
         + "\n- ".join(roots)
     )
 
-
-def _contains_instance_alias(text: str, alias: str) -> bool:
-    value = str(alias or "").strip()
-    if not value:
-        return False
-    if bool(
-        re.search(
-            r"(?<![A-Za-z0-9_.:-])%s(?![A-Za-z0-9_.:-])"
-            % re.escape(value),
-            str(text or ""),
-            re.I,
-        )
-    ):
-        return True
-    normalized_alias = normalize_instance_alias(value)
-    return bool(
-        normalized_alias
-        and normalized_alias in normalize_instance_alias(str(text or ""))
-    )
-
-
 def _resolve_platform_identity(
     text: str, bundle: Any,
 ) -> ResolvedPlatformIdentity | None:
     """Resolve a user alias to exactly one canonical runtime root."""
 
-    matches: dict[str, dict[str, Any]] = {}
-    normalized_text = normalize_instance_alias(text)
-    for record in getattr(bundle, "records", []):
-        if getattr(getattr(record, "request", None), "probe", "") != "running_platforms":
-            continue
-        for line in str(getattr(record, "output", "") or "").splitlines():
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            alias_match = re.search(r"\bplatform=([^\s]+)", line)
-            if root_match is None:
-                continue
-            root = root_match.group(1)
-            alias = alias_match.group(1) if alias_match else Path(root).name
-            aliases = {alias, Path(root).name}
-            if not (
-                root in str(text or "")
-                or any(
-                    normalize_instance_alias(item)
-                    and normalize_instance_alias(item) in normalized_text
-                    for item in aliases
-                )
-            ):
-                continue
-            item = matches.setdefault(root, {"aliases": set(), "refs": set()})
-            item["aliases"].update(aliases)
-            item["refs"].add(str(getattr(record, "evidence_id", "")))
+    matches = RuntimeInventory.from_bundle(bundle).matching(text)
     if len(matches) != 1:
         return None
-    root, data = next(iter(matches.items()))
-    aliases = tuple(sorted(data["aliases"]))
+    instance = matches[0]
+    aliases = tuple(sorted(instance.aliases))
     primary = next(
         (item for item in aliases if not item.startswith("klonet_")),
         aliases[0],
     )
     return ResolvedPlatformIdentity(
-        project_root=root,
+        project_root=instance.project_root,
         primary_alias=primary,
         aliases=aliases,
-        evidence_refs=tuple(sorted(data["refs"])),
+        evidence_refs=(instance.evidence_id,),
     )
 
 
@@ -750,17 +680,6 @@ def _is_plan_status_query(text: str) -> bool:
         value,
         re.I,
     ))
-
-
-def _platform_alias_for_root(bundle: Any, root: str) -> str:
-    for record in getattr(bundle, "records", []):
-        for line in str(getattr(record, "output", "") or "").splitlines():
-            if "project_root=%s" % root not in line:
-                continue
-            match = re.search(r"\bplatform=([^\s]+)", line)
-            if match:
-                return match.group(1)
-    return ""
 
 
 def _localized_result(result: WorkflowResult) -> WorkflowResult:
@@ -883,42 +802,30 @@ def _explicit_runtime_targets_already_healthy(text: str, bundle: Any) -> str:
         for marker in ("修复", "恢复", "启动", "fix", "repair", "recover", "start")
     ):
         return ""
-    instances: dict[str, str] = {}
-    for record in getattr(bundle, "records", []):
-        request = getattr(record, "request", None)
-        if getattr(request, "probe", "") != "running_platforms":
-            continue
-        if str(getattr(record, "status", "available")) != "available":
-            continue
-        for line in str(getattr(record, "output", "") or "").splitlines():
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            if root_match:
-                instances[root_match.group(1)] = line.strip()
-    targets = [root for root in instances if root in str(text or "")]
+    inventory = RuntimeInventory.from_bundle(bundle)
+    targets = [
+        item for item in inventory.instances
+        if item.project_root in str(text or "")
+    ]
     if not targets:
         return ""
-    if any("backend_status=healthy" not in instances[root] for root in targets):
+    if any(item.backend_status != "healthy" for item in targets):
         return ""
-
-    def field(line: str, name: str, default: str = "unknown") -> str:
-        match = re.search(r"(?:^|\s)%s=([^\s]+)" % re.escape(name), line)
-        return match.group(1) if match else default
 
     lines = [
         "目标实例已经分别满足后端健康标准，无需变更或重启："
     ]
-    for root in targets:
-        item = instances[root]
+    for item in targets:
         lines.append(
             "- project_root=%s；platform=%s；backend_status=healthy；"
             "master_port=%s，master_endpoint=%s；worker_port=%s，worker_endpoint=%s"
             % (
-                root,
-                field(item, "platform"),
-                field(item, "master_port"),
-                field(item, "master_endpoint"),
-                field(item, "worker_port"),
-                field(item, "worker_endpoint"),
+                item.project_root,
+                item.platform,
+                item.configured_ports.get("master_port", "unknown"),
+                item.endpoints.get("master", "unknown"),
+                item.configured_ports.get("worker_port", "unknown"),
+                item.endpoints.get("worker", "unknown"),
             )
         )
     return "\n".join(lines)
@@ -948,26 +855,13 @@ def _collect_traceback_source_evidence(text: str, bundle: Any, discovery: Any) -
             continue
         if root not in roots:
             roots.append(root)
-    inventory_targets = []
-    for record in getattr(bundle, "records", []):
-        request = getattr(record, "request", None)
-        if getattr(request, "probe", "") != "running_platforms":
-            continue
-        for line in str(getattr(record, "output", "") or "").splitlines():
-            root_match = re.search(r"\bproject_root=(/[^\s]+)", line)
-            platform_match = re.search(r"\bplatform=([^\s]+)", line)
-            if not root_match:
-                continue
-            root = Path(root_match.group(1))
-            alias = platform_match.group(1) if platform_match else ""
-            inventory_targets.append((alias, root))
-            if (
-                str(root) in str(text or "")
-                or _contains_instance_alias(text, alias)
-            ) and root not in roots:
-                roots.append(root)
-    if not roots and len(inventory_targets) == 1:
-        roots.append(inventory_targets[0][1])
+    inventory = RuntimeInventory.from_bundle(bundle)
+    for item in inventory.matching(text):
+        root = Path(item.project_root)
+        if root not in roots:
+            roots.append(root)
+    if not roots and len(inventory.instances) == 1:
+        roots.append(Path(inventory.instances[0].project_root))
     if not roots:
         return
     candidates = []

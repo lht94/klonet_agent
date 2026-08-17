@@ -13,6 +13,7 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceConclusion,
 )
 from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
+from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
 
 
 SYNTHESIS_SYSTEM_PROMPT = """
@@ -99,44 +100,38 @@ class EvidenceSynthesizer:
     ) -> EvidenceConclusion:
         promoted: list[EvidenceClaim] = []
         goal_text = str(goal or "").lower()
-        complete_runtime_inventory_ids: set[str] = set()
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "running_platforms":
-                continue
-            output = record.output
+        inventory = RuntimeInventory.from_bundle(bundle)
+        complete_runtime_inventory_ids = set(inventory.evidence_ids) if inventory.complete else set()
+        if inventory.complete:
             count_fields = {
-                key: int(match.group(1))
-                for key in (
-                    "runtime_candidate_count", "healthy_count",
-                    "abnormal_count", "code_only_count",
-                )
-                for match in [re.search(r"(?m)^%s=(\d+)" % key, output)]
-                if match is not None
+                "runtime_candidate_count": inventory.declared_runtime_count,
+                "healthy_count": inventory.declared_healthy_count,
+                "abnormal_count": inventory.declared_abnormal_count,
+                "code_only_count": inventory.declared_code_only_count,
             }
-            if {"healthy_count", "abnormal_count", "code_only_count"}.issubset(count_fields):
-                complete_runtime_inventory_ids.add(record.evidence_id)
-                promoted.append(EvidenceClaim(
-                    "runtime_inventory_counts " + " ".join(
-                        "%s=%s" % (key, count_fields[key])
-                        for key in (
-                            "runtime_candidate_count", "healthy_count",
-                            "abnormal_count", "code_only_count",
-                        )
-                        if key in count_fields
-                    ),
-                    [record.evidence_id],
-                ))
-                for line in output.splitlines():
-                    if line.startswith("platform=") and " project_root=" in line:
-                        promoted.append(EvidenceClaim(
-                            "runtime_instance " + line,
-                            [record.evidence_id],
-                        ))
-                    elif line.startswith("code_only_root="):
-                        promoted.append(EvidenceClaim(
-                            "runtime_code_only " + line,
-                            [record.evidence_id],
-                        ))
+            refs = list(inventory.evidence_ids)
+            promoted.append(EvidenceClaim(
+                "runtime_inventory_counts " + " ".join(
+                    "%s=%s" % (key, value)
+                    for key, value in count_fields.items()
+                    if value is not None
+                ),
+                refs,
+            ))
+            promoted.extend(
+                EvidenceClaim(
+                    "runtime_instance " + item.raw_line,
+                    [item.evidence_id],
+                )
+                for item in inventory.instances
+            )
+            promoted.extend(
+                EvidenceClaim(
+                    "runtime_code_only code_only_root=" + root,
+                    refs,
+                )
+                for root in inventory.code_only_roots
+            )
         for record in bundle.records:
             if record.status != "available" or record.request.probe != "screen":
                 continue

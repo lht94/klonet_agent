@@ -97,7 +97,7 @@ class MutationWorkflow:
                         evidence=evidence_bundle,
                     )
                 evidence_bundle = self.discovery.collect_requests(
-                    outcome.probe_requests,
+                    outcome.evidence_requests,
                     evidence_bundle,
                 )
                 evidence_conclusion = self.synthesis.synthesize(goal, evidence_bundle)
@@ -130,7 +130,7 @@ class MutationWorkflow:
                 )
                 continue
             break
-        if outcome.status != "ready" or outcome.plan is None:
+        if outcome.status != "need_execution" or outcome.plan is None:
             return self._failure_result(
                 stage="planning",
                 category="planning_contract_unresolved",
@@ -151,7 +151,7 @@ class MutationWorkflow:
             )
         except ChangeBindingError as exc:
             outcome = plan(feedback=str(exc))
-            if outcome.status != "ready" or outcome.plan is None:
+            if outcome.status != "need_execution" or outcome.plan is None:
                 return self._failure_result(
                     stage="binding",
                     category="binding_replan_unresolved",

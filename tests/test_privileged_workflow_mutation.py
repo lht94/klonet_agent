@@ -402,7 +402,7 @@ def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
         bundle.goal, bundle, EvidenceConclusion(),
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert llm.calls == []
     assert outcome.plan is not None
     assert outcome.plan.steps[0].expected_changes == [
@@ -439,7 +439,7 @@ def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
         bundle.goal, bundle, EvidenceConclusion(),
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert outcome.plan is not None
     resources = {item.role: item.value for item in outcome.plan.resources}
     assert resources["run_as_uid"] == "1000"
@@ -715,14 +715,14 @@ def test_container_plan_requires_docker_image_discovery_before_binding():
     missing = ChangePlannerAgent.finalize_candidate(plan, bundle)
 
     assert missing.status == "need_evidence"
-    assert missing.probe_requests[0].probe == "docker_images"
+    assert missing.evidence_requests[0].probe == "docker_images"
     bundle.add(
         EvidenceRecord.from_probe(
             ProbeRequest("docker_images", {}, "select an installed image"),
             "inspect_docker_images\nredis latest sha256:a sha256:b now 1MB",
         )
     )
-    assert ChangePlannerAgent.finalize_candidate(plan, bundle).status == "ready"
+    assert ChangePlannerAgent.finalize_candidate(plan, bundle).status == "need_execution"
 
 
 def test_container_candidate_batches_port_and_image_discovery():
@@ -758,7 +758,7 @@ def test_container_candidate_batches_port_and_image_discovery():
         plan, EvidenceBundle(goal=plan.goal)
     )
 
-    assert {request.probe for request in outcome.probe_requests} == {
+    assert {request.probe for request in outcome.evidence_requests} == {
         "ports", "docker_images"
     }
 
@@ -878,7 +878,7 @@ def test_change_planner_returns_structured_evidence_gap_without_plan():
 
     assert outcome.status == "need_evidence"
     assert outcome.plan is None
-    assert outcome.probe_requests[0].probe == "ports"
+    assert outcome.evidence_requests[0].probe == "ports"
 
 
 def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative():
@@ -971,7 +971,7 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
         bundle.goal,
         bundle,
     )
-    assert [item.probe for item in mixed.probe_requests] == ["ports"]
+    assert [item.probe for item in mixed.evidence_requests] == ["ports"]
 
 
 def test_change_planner_builds_only_mutating_change_steps():
@@ -1057,7 +1057,7 @@ def test_change_planner_builds_only_mutating_change_steps():
 
     outcome = ChangePlannerAgent(llm).plan("deploy", bundle, conclusion)
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert outcome.plan.schema_version == 4
     assert outcome.plan.steps[0].risk == "high"
     assert outcome.plan.steps[0].evidence_refs == [evidence_id]
@@ -1175,7 +1175,7 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
         "restart isolated service", bundle, conclusion
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert len(llm.calls) == 2
     assert len(llm.calls) == 2
     assert "Discovery or Binding" in llm.calls[1]["messages"][-1]["content"]
@@ -1220,7 +1220,7 @@ def test_change_planner_allows_three_bounded_contract_repairs():
         "restart isolated service", bundle, conclusion
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert len(llm.calls) == 4
 
 
@@ -1261,7 +1261,7 @@ def test_change_planner_repairs_impossible_logs_request_for_missing_process():
         "start missing master", bundle, conclusion
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
 
 
 def test_existing_runtime_role_port_overrides_source_literal_for_repair():
@@ -1368,7 +1368,7 @@ def test_change_planner_repairs_recheck_of_confirmed_missing_role():
         "start missing master", bundle, conclusion
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert len(llm.calls) == 2
 
 
@@ -2685,7 +2685,7 @@ def test_deployment_planner_repairs_missing_resources_and_bad_checker_contract()
         conclusion,
     )
 
-    assert outcome.status == "ready"
+    assert outcome.status == "need_execution"
     assert {item.role for item in outcome.plan.resources} >= {
         "instance_root",
         "source_remote",
@@ -3978,7 +3978,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     )
 
     assert outcome.status == "need_evidence"
-    assert outcome.probe_requests == [
+    assert outcome.evidence_requests == [
         ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability")
     ]
     assert outcome.candidate_plan is not None
@@ -3999,7 +3999,7 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
         bundle,
     )
 
-    assert finalized.status == "ready"
+    assert finalized.status == "need_execution"
     assert finalized.plan is outcome.candidate_plan
 
 
@@ -4059,7 +4059,7 @@ def test_planner_normalizes_derived_config_path_and_hidden_selected_port():
     )
 
     assert outcome.status == "need_evidence"
-    assert outcome.probe_requests[0].args == {"ports": [47009]}
+    assert outcome.evidence_requests[0].args == {"ports": [47009]}
     resources = outcome.candidate_plan.resources
     assert any(item.kind == "port" and item.value == 47009 for item in resources)
     assert any(item.kind == "path" and item.value == "/srv/appe2e/config.py" for item in resources)

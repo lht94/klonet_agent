@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import base64
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +20,7 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceConclusion,
     EvidenceRecord,
+    GoalOutcome,
     ProbeRequest,
     RuntimeComponentSpec,
     normalize_instance_alias,
@@ -283,16 +283,6 @@ DISCOVERABLE_IMPLEMENTATION_MARKERS = (
 )
 
 
-@dataclass
-class PlanningOutcome:
-    status: str
-    plan: ChangePlan | None = None
-    candidate_plan: ChangePlan | None = None
-    probe_requests: list[ProbeRequest] = field(default_factory=list)
-    reason: str = ""
-    missing_decisions: list[str] = field(default_factory=list)
-
-
 class ChangePlannerAgent:
     def __init__(self, llm: Any) -> None:
         self.llm = llm
@@ -305,7 +295,7 @@ class ChangePlannerAgent:
         *,
         binding_feedback: str = "",
         intent_context: dict[str, Any] | None = None,
-    ) -> PlanningOutcome:
+    ) -> GoalOutcome:
         deterministic = self._deterministic_runtime_restart(
             goal, bundle, intent_context=intent_context,
         )
@@ -430,7 +420,7 @@ class ChangePlannerAgent:
                 if isinstance(exc, IndexError) and last_error is not None:
                     break
                 last_error = exc
-        return PlanningOutcome(
+        return GoalOutcome(
             status="blocked",
             reason=(
                 "Change Planner output invalid after bounded repairs: %s"
@@ -916,7 +906,7 @@ class ChangePlannerAgent:
         data: dict[str, Any],
         goal: str,
         bundle: EvidenceBundle,
-    ) -> PlanningOutcome:
+    ) -> GoalOutcome:
         assumptions = data.get("assumptions", [])
         if not isinstance(assumptions, list):
             raise ValueError("planner assumptions must be an array")
@@ -999,9 +989,9 @@ class ChangePlannerAgent:
                         "requesting duplicate source probes"
                     )
                 requests = fresh_requests
-            return PlanningOutcome(
+            return GoalOutcome(
                 status=status,
-                probe_requests=requests,
+                evidence_requests=requests,
             )
         if status == "blocked":
             missing = data.get("missing_decisions")
@@ -1019,7 +1009,7 @@ class ChangePlannerAgent:
                     "blocked cannot offload discoverable implementation details; "
                     "Discovery or Binding must resolve them"
                 )
-            return PlanningOutcome(
+            return GoalOutcome(
                 status=status,
                 reason=str(data.get("reason") or "planning blocked"),
                 missing_decisions=missing_items,
@@ -1081,10 +1071,10 @@ class ChangePlannerAgent:
                 if isinstance(candidate_assumptions, list)
                 else [],
             )
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=candidate_plan,
-                probe_requests=self._candidate_evidence_requests(
+                evidence_requests=self._candidate_evidence_requests(
                     candidate_plan, bundle, unproven_ports
                 ),
             )
@@ -1103,10 +1093,10 @@ class ChangePlannerAgent:
             else [],
         )
         if self._plan_needs_docker_images(plan) and not self._has_docker_images(bundle):
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=plan,
-                probe_requests=[
+                evidence_requests=[
                     ProbeRequest(
                         "docker_images",
                         {},
@@ -1114,7 +1104,7 @@ class ChangePlannerAgent:
                     )
                 ],
             )
-        return PlanningOutcome(status="ready", plan=plan)
+        return GoalOutcome(status="need_execution", plan=plan)
 
     @staticmethod
     def _normalize_postcondition_args(data: dict[str, Any]) -> None:
@@ -2829,16 +2819,16 @@ class ChangePlannerAgent:
     def finalize_candidate(
         candidate: ChangePlan,
         bundle: EvidenceBundle,
-    ) -> PlanningOutcome:
+    ) -> GoalOutcome:
         unproven = ChangePlannerAgent._unproven_port_resources(
             candidate.resources,
             bundle,
         )
         if unproven:
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
-                probe_requests=ChangePlannerAgent._candidate_evidence_requests(
+                evidence_requests=ChangePlannerAgent._candidate_evidence_requests(
                     candidate, bundle, unproven
                 ),
             )
@@ -2856,7 +2846,7 @@ class ChangePlannerAgent:
             if any(re.search(r":%s\b" % port, record.output) for record in relevant):
                 occupied.append(port)
         if occupied:
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="blocked",
                 candidate_plan=candidate,
                 reason="candidate ports became occupied: %s"
@@ -2866,10 +2856,10 @@ class ChangePlannerAgent:
             ChangePlannerAgent._plan_needs_docker_images(candidate)
             and not ChangePlannerAgent._has_docker_images(bundle)
         ):
-            return PlanningOutcome(
+            return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
-                probe_requests=[
+                evidence_requests=[
                     ProbeRequest(
                         "docker_images",
                         {},
@@ -2877,7 +2867,7 @@ class ChangePlannerAgent:
                     )
                 ],
             )
-        return PlanningOutcome(status="ready", plan=candidate)
+        return GoalOutcome(status="need_execution", plan=candidate)
 
     @staticmethod
     def _plan_needs_docker_images(plan: ChangePlan) -> bool:
