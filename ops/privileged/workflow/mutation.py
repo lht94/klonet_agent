@@ -164,8 +164,10 @@ class MutationWorkflow:
                 plan=plan,
             )
         if plan.status == "completed" and plan.is_authorized:
+            outcome = self.verifier.verify_execution_outcome(plan)
             return WorkflowResult(
                 True, "completed", _execution_receipt(plan), plan=plan,
+                outcome=outcome,
             )
         if plan.failure is not None and plan.status in {"paused", "blocked"}:
             outcome = GoalOutcome(

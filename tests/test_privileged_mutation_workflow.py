@@ -339,6 +339,7 @@ def test_exact_confirmation_executes_then_verifies_and_completes(tmp_path, hiera
     result = workflow.confirm(submitted.plan.plan_id, submitted.plan.content_hash)
 
     assert result.kind == "completed"
+    assert result.outcome.status == "achieved"
     assert executor.steps == (["deploy-1"] if hierarchical else ["deploy"])
     assert verifier.steps == (
         ["deploy-1", "deploy"] if hierarchical else ["deploy"]

@@ -149,6 +149,7 @@ def test_readonly_without_command_uses_discovery_synthesis_and_response_only():
 
     assert result.handled is True
     assert result.kind == "completed"
+    assert result.outcome.status == "achieved"
     assert result.message == "发现 3 个候选平台。"
     assert discovery.calls == [("检查下现在服务器上有哪些平台", "", "")]
     assert synthesis.calls == [("检查下现在服务器上有哪些平台", bundle)]

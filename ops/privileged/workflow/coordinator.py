@@ -583,6 +583,7 @@ class PrivilegedOpsCoordinator:
                 )),
                 plan=plan,
                 evidence=bundle,
+                outcome=decision,
             )
         if status == "achieved":
             return WorkflowResult(
@@ -591,6 +592,7 @@ class PrivilegedOpsCoordinator:
                 "重新验证后，原目标当前已经满足，无需生成恢复计划。",
                 plan=plan,
                 evidence=bundle,
+                outcome=decision,
             )
         if status != "need_replan":
             return WorkflowResult(
@@ -599,6 +601,7 @@ class PrivilegedOpsCoordinator:
                 "已自动诊断执行失败，但尚未取得足以安全重规划的根因证据。",
                 plan=plan,
                 evidence=bundle,
+                outcome=decision,
             )
         result = self._submit_mutation(
             goal,
