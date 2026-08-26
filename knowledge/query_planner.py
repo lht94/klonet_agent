@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import asdict
 from typing import Any, Mapping, Protocol
 
 from klonet_agent.config import (
-    DEFAULT_BASE_URL,
-    RAG_QUERY_PLANNER_MODEL,
-    RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
+    RAG_QUERY_PLANNER_MODEL, RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
 )
 from klonet_agent.knowledge.conversation_state import ConversationState
 from klonet_agent.knowledge.models import RetrievalPlan, RetrievalTask
@@ -249,15 +246,11 @@ def plan_from_mapping(
 
 
 def _default_client() -> LLMClient | None:
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return None
-    return LLMClient(
-        api_key=api_key,
-        base_url=DEFAULT_BASE_URL,
+    client = LLMClient(
         model=RAG_QUERY_PLANNER_MODEL,
         timeout=RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     )
+    return client if client.has_credentials else None
 
 
 def _response_payload(response: Any) -> Mapping[str, Any]:

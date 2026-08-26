@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import inspect
+import time
 from typing import Any
 
 try:
@@ -17,50 +18,153 @@ except ModuleNotFoundError:
         return None
 
 from klonet_agent.config import (
+    CHAT_LLM_API_KEY_ENV,
     DEFAULT_BASE_URL,
+    DEFAULT_LLM_MAX_RETRIES,
+    DEFAULT_LLM_TIMEOUT_SECONDS,
     DEFAULT_MODEL,
     DEFAULT_REASONING_EFFORT,
+    PARATERA_RATE_LIMIT_BACKOFF_SECONDS,
+    PARATERA_RATE_LIMIT_MAX_ATTEMPTS,
+    PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS,
 )
+from klonet_agent.llm.provider import ProviderRouter, ProviderTarget
 
 
 # os.environ 只能读取系统环境变量；load_dotenv 会把 .env 文件里的变量也加载进来。
-# 这样本地开发时可以把 DEEPSEEK_API_KEY 写在 .env 中，服务器部署时也可以直接用系统环境变量。
+# 本地开发把 CHAT_LLM_API_KEY 写在 .env 中；服务器也可直接使用系统环境变量。
 load_dotenv()
 
 
 class LLMClient:
     """统一的大模型调用入口。
 
-    这个类封装底层 OpenAI SDK 客户端。当前默认连接 DeepSeek 接口，
-    后续如果切换模型供应商，只需要优先改这一层。
+    这个类封装底层 OpenAI SDK 客户端，并在每次请求前通过唯一的
+    ProviderRouter 选择当前供应商。上层 Agent 不感知供应商切换。
     """
 
     def __init__(
         self,
         api_key: str | None = None,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str | None = None,
         model: str = DEFAULT_MODEL,
         timeout: float | None = None,
         max_retries: int | None = None,
     ):
-        # api_key: str | None 表示 api_key 可以是字符串，也可以是 None。
-        # 如果调用方没有显式传入 api_key，就从环境变量 DEEPSEEK_API_KEY 中读取。
-        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-        # base_url 默认指向 DeepSeek 接口。OpenAI SDK 支持自定义 base_url，
-        # 所以这里可以用 OpenAI 客户端去调用 DeepSeek 的 OpenAI-compatible API。
-        self.base_url = base_url
-        # model 默认从 config.py 读取，避免在多个文件里重复硬编码模型名。
         self.model = model
-        # 这里初始化的是底层 SDK 客户端。后续其他模块不应该直接操作它，
-        # 而是通过 LLMClient.complete() 发起模型请求。
+        self._router = None
+        effective_timeout = (
+            DEFAULT_LLM_TIMEOUT_SECONDS if timeout is None else float(timeout)
+        )
+        effective_retries = (
+            DEFAULT_LLM_MAX_RETRIES
+            if max_retries is None
+            else max(0, int(max_retries))
+        )
+        self._client_options: dict[str, Any] = {
+            "timeout": max(1.0, effective_timeout),
+            "max_retries": effective_retries,
+        }
+        self._clients: dict[tuple[str, str], Any] = {}
+        self._rate_limit_max_attempts = PARATERA_RATE_LIMIT_MAX_ATTEMPTS
+        self._rate_limit_backoff_seconds = PARATERA_RATE_LIMIT_BACKOFF_SECONDS
+        self._rate_limit_max_backoff_seconds = (
+            PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS
+        )
+
+        # Normal Agent construction uses the time-aware provider router.
+        # Explicit transport arguments remain a fixed-provider escape hatch for
+        # tests and deliberate integrations, never for normal orchestration.
+        if api_key is None and base_url is None:
+            self._router = ProviderRouter.from_environment()
+            current = self._router.resolve(model)
+            self.api_key = current[0].api_key if current else None
+            self.base_url = current[0].base_url if current else ""
+            return
+
+        self.api_key = api_key or os.environ.get(CHAT_LLM_API_KEY_ENV)
+        self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         from openai import OpenAI
 
-        client_options = {"api_key": self.api_key, "base_url": self.base_url}
-        if timeout is not None:
-            client_options["timeout"] = timeout
-        if max_retries is not None:
-            client_options["max_retries"] = max(0, int(max_retries))
+        client_options = {
+            "api_key": self.api_key,
+            "base_url": self.base_url,
+            **self._client_options,
+        }
         self.client = OpenAI(**client_options)
+
+    @property
+    def has_credentials(self) -> bool:
+        if getattr(self, "_router", None) is not None:
+            return self._router.has_credentials
+        return bool(getattr(self, "api_key", None))
+
+    def _targets(self) -> tuple[tuple[Any, str], ...]:
+        router = getattr(self, "_router", None)
+        if router is None:
+            return ((self.client, self.model),)
+        targets = router.resolve(self.model)
+        if not targets:
+            raise RuntimeError("active LLM provider has no configured API key")
+        return tuple((self._client_for(target), target.model) for target in targets)
+
+    def _client_for(self, target: ProviderTarget) -> Any:
+        cache_key = (target.base_url, target.api_key)
+        existing = self._clients.get(cache_key)
+        if existing is not None:
+            return existing
+        from openai import OpenAI
+
+        options = dict(self._client_options)
+        minimum = target.min_timeout_seconds
+        configured = options.get("timeout")
+        if minimum is not None and (
+            configured is None or float(configured) < minimum
+        ):
+            options["timeout"] = minimum
+        client = OpenAI(
+            api_key=target.api_key,
+            base_url=target.base_url,
+            **options,
+        )
+        self._clients[cache_key] = client
+        return client
+
+    @staticmethod
+    def _may_try_next_key(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        return status in {401, 402, 403, 429}
+
+    @staticmethod
+    def _is_rate_limit(exc: Exception) -> bool:
+        """Recognize provider throttling even when a gateway wraps it as 401."""
+
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 429:
+            return True
+        body = getattr(exc, "body", None)
+        text = str(body if body is not None else exc).lower()
+        return any(marker in text for marker in (
+            "ratelimit", "rate limit", "rate_limit", "too many requests",
+            "速率限制", "请求过于频繁", "调用频率",
+        ))
+
+    @staticmethod
+    def _retry_after_seconds(exc: Exception) -> float | None:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return None
+        try:
+            value = headers.get("retry-after") or headers.get("Retry-After")
+            delay = float(value)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return max(0.0, delay)
 
     def complete(
         self,
@@ -81,38 +185,96 @@ class LLMClient:
         client.chat.completions.create(...) 的代码。
         """
 
-        # request 是最终传给 SDK 的参数字典。先集中组装，再用 **request 展开传入，
-        # 这样后续增加 temperature、extra_body 等参数时更容易管理。
-        request = {
-            "model": self.model,
-            "messages": messages,
-            # stream=False 表示等待模型完整回复后再返回，和旧版行为一致。
-            "stream": stream,
-        }
-        create = self.client.chat.completions.create
-        parameters = inspect.signature(create).parameters
-        if reasoning_effort is not None and (
-            "reasoning_effort" in parameters
-            or any(
-                item.kind == inspect.Parameter.VAR_KEYWORD
-                for item in parameters.values()
+        targets = self._targets()
+        router = getattr(self, "_router", None)
+        routed_targets = router.resolve(self.model) if router is not None else ()
+        paratera_active = bool(routed_targets) and all(
+            target.provider == "paratera" for target in routed_targets
+        )
+        max_attempts = (
+            max(
+                len(targets),
+                int(getattr(
+                    self, "_rate_limit_max_attempts",
+                    PARATERA_RATE_LIMIT_MAX_ATTEMPTS,
+                )),
             )
-        ):
-            request["reasoning_effort"] = reasoning_effort
-        # tools 是可选参数。没有工具时不传 tools 字段，避免某些模型接口对空列表兼容不好。
-        if tools is not None:
-            request["tools"] = tools
-        if tool_choice is not None:
-            request["tool_choice"] = tool_choice
-        if temperature is not None:
-            request["temperature"] = temperature
-        if response_format is not None:
-            request["response_format"] = response_format
-        if max_tokens is not None:
-            request["max_tokens"] = max(1, int(max_tokens))
-        if extra_body is not None:
-            request["extra_body"] = extra_body
-
-        # 真正发起 HTTP 请求的位置。上层模块只调用 complete()，
-        # 不需要知道 OpenAI SDK 的具体调用链。
-        return create(**request)
+            if paratera_active
+            else len(targets)
+        )
+        last_error: Exception | None = None
+        rate_limit_round = 0
+        for attempt in range(max_attempts):
+            index = attempt % len(targets)
+            client, active_model = targets[index]
+            request = {
+                "model": active_model,
+                "messages": messages,
+                "stream": stream,
+            }
+            create = client.chat.completions.create
+            parameters = inspect.signature(create).parameters
+            if reasoning_effort is not None and (
+                "reasoning_effort" in parameters
+                or any(
+                    item.kind == inspect.Parameter.VAR_KEYWORD
+                    for item in parameters.values()
+                )
+            ):
+                request["reasoning_effort"] = reasoning_effort
+            if tools is not None:
+                request["tools"] = tools
+            if tool_choice is not None:
+                request["tool_choice"] = tool_choice
+            if temperature is not None:
+                request["temperature"] = temperature
+            if response_format is not None:
+                request["response_format"] = response_format
+            if max_tokens is not None:
+                request["max_tokens"] = max(1, int(max_tokens))
+            if extra_body is not None:
+                request["extra_body"] = extra_body
+            try:
+                return create(**request)
+            except Exception as exc:
+                last_error = exc
+                if not self._may_try_next_key(exc):
+                    raise
+                is_rate_limit = self._is_rate_limit(exc)
+                if not is_rate_limit:
+                    # Authentication/quota failures may fail over to each
+                    # configured key once, but must never cycle indefinitely.
+                    if attempt + 1 >= len(targets):
+                        raise
+                    continue
+                if not paratera_active or attempt + 1 >= max_attempts:
+                    raise RuntimeError(
+                        "LLM provider rate limit remained active after "
+                        "bounded key rotation and backoff"
+                    ) from exc
+                # Try every independent key once before sleeping.  Subsequent
+                # rounds use Retry-After when present, otherwise bounded
+                # exponential backoff.  This is explicit transport policy, not
+                # an SDK hidden retry.
+                if (attempt + 1) % len(targets) == 0:
+                    configured_base = float(getattr(
+                        self, "_rate_limit_backoff_seconds",
+                        PARATERA_RATE_LIMIT_BACKOFF_SECONDS,
+                    ))
+                    configured_max = float(getattr(
+                        self, "_rate_limit_max_backoff_seconds",
+                        PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS,
+                    ))
+                    delay = self._retry_after_seconds(exc)
+                    if delay is None:
+                        delay = min(
+                            configured_max,
+                            configured_base * (2 ** rate_limit_round),
+                        )
+                    else:
+                        delay = min(configured_max, delay)
+                    rate_limit_round += 1
+                    if delay > 0:
+                        time.sleep(delay)
+        assert last_error is not None
+        raise last_error

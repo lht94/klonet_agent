@@ -7,6 +7,7 @@ import os
 # vector construction.  Never spend real embedding quota during collection.
 os.environ.setdefault("KLONET_AGENT_AUTO_BUILD_VECTORS", "0")
 os.environ.setdefault("DEEPSEEK_API_KEY", "")
+os.environ.setdefault("CHAT_LLM_API_KEY", "")
 os.environ.setdefault("EMBEDDING_API_KEY", "")
 os.environ.setdefault("DASHSCOPE_API_KEY", "")
 os.environ.setdefault("OPENAI_API_KEY", "")

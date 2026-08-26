@@ -21,8 +21,13 @@ if load_dotenv is not None:
     # systemd service start from different directories in production.
     load_dotenv(PACKAGE_ROOT / ".env")
 
-DEFAULT_MODEL = "deepseek-v4-flash"
-DEFAULT_BASE_URL = "https://api.deepseek.com"
+CHAT_LLM_BASE_URL = os.getenv(
+    "CHAT_LLM_BASE_URL", "https://api.yyds168.net/v1",
+).strip().rstrip("/")
+CHAT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "minimax-m3").strip()
+CHAT_LLM_API_KEY_ENV = "CHAT_LLM_API_KEY"
+DEFAULT_MODEL = CHAT_LLM_MODEL
+DEFAULT_BASE_URL = CHAT_LLM_BASE_URL
 DEFAULT_EMBEDDING_MODEL = os.getenv(
     "DEFAULT_EMBEDDING_MODEL",
     "text-embedding-v4",
@@ -32,6 +37,32 @@ DEFAULT_EMBEDDING_BASE_URL = os.getenv(
     "https://ws-o108vxrjw8kdvbrm.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
 )
 DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_LLM_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("DEFAULT_LLM_TIMEOUT_SECONDS", "60")),
+)
+DEFAULT_LLM_MAX_RETRIES = max(
+    0, int(os.getenv("DEFAULT_LLM_MAX_RETRIES", "0")),
+)
+PARATERA_BASE_URL = os.getenv(
+    "PARATERA_BASE_URL", "https://llmapi.paratera.com/v1",
+).strip()
+PARATERA_MODEL = os.getenv("PARATERA_MODEL", "GLM-5.2").strip()
+PARATERA_MIN_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("PARATERA_MIN_TIMEOUT_SECONDS", "120")),
+)
+PARATERA_RATE_LIMIT_MAX_ATTEMPTS = max(
+    1, int(os.getenv("PARATERA_RATE_LIMIT_MAX_ATTEMPTS", "14")),
+)
+PARATERA_RATE_LIMIT_BACKOFF_SECONDS = max(
+    0.0, float(os.getenv("PARATERA_RATE_LIMIT_BACKOFF_SECONDS", "1")),
+)
+PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS = max(
+    PARATERA_RATE_LIMIT_BACKOFF_SECONDS,
+    float(os.getenv("PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS", "8")),
+)
+LLM_NIGHT_TIMEZONE = os.getenv("LLM_NIGHT_TIMEZONE", "Asia/Shanghai").strip()
+LLM_NIGHT_START_HOUR = int(os.getenv("LLM_NIGHT_START_HOUR", "21"))
+LLM_NIGHT_END_HOUR = int(os.getenv("LLM_NIGHT_END_HOUR", "9"))
 MAX_TOKEN = 500000
 HISTORY_MAX_MESSAGES = 20
 MAX_TOOL_ROUNDS = 8
@@ -43,7 +74,7 @@ DEFAULT_RAG_TOP_K = 3
 RAG_PIPELINE_MODE = os.getenv("RAG_PIPELINE_MODE", "multi_stage").strip().lower()
 RAG_QUERY_PLANNER_MODEL = os.getenv(
     "RAG_QUERY_PLANNER_MODEL",
-    "deepseek-v4-flash",
+    DEFAULT_MODEL,
 ).strip()
 RAG_QUERY_PLANNER_TIMEOUT_SECONDS = max(
     1.0,
@@ -51,7 +82,7 @@ RAG_QUERY_PLANNER_TIMEOUT_SECONDS = max(
 )
 OPS_PRIVILEGE_CLASSIFIER_MODEL = os.getenv(
     "OPS_PRIVILEGE_CLASSIFIER_MODEL",
-    "deepseek-v4-flash",
+    DEFAULT_MODEL,
 ).strip()
 _ops_classifier_timeout = float(
     os.getenv("OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS", "0")
@@ -61,10 +92,10 @@ OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS = (
 )
 OPS_PRIVILEGE_PLANNER_MODEL = os.getenv(
     "OPS_PRIVILEGE_PLANNER_MODEL",
-    "deepseek-v4-flash",
+    DEFAULT_MODEL,
 ).strip()
 _ops_planner_timeout = float(
-    os.getenv("OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS", "0")
+    os.getenv("OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS", "30")
 )
 OPS_PRIVILEGE_PLANNER_TIMEOUT_SECONDS = (
     _ops_planner_timeout if _ops_planner_timeout > 0 else None
