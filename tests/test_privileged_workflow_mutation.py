@@ -1650,6 +1650,39 @@ def test_replan_reuses_approved_identity_only_for_exact_role_and_root():
     ) is None
 
 
+def test_replan_reuses_identity_from_exact_authorized_atomic_binding():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _approved_component_identity,
+    )
+
+    binding = SimpleNamespace(
+        action="start_screen_component",
+        args={
+            "project_root": "/srv/klonet", "component": "worker",
+            "run_as_uid": "1000",
+            "python_executable": "/opt/klonet/bin/python3.8",
+        },
+    )
+    atomic = SimpleNamespace(execution_binding=binding)
+    change = SimpleNamespace(
+        implementation_plan=SimpleNamespace(steps=[atomic]),
+    )
+    candidate = SimpleNamespace(
+        resources=[], steps=[change], authorized_hash="approved-hash",
+    )
+
+    assert _approved_component_identity(
+        candidate, project_root="/srv/klonet", role="worker",
+    ) == (1000, "/opt/klonet/bin/python3.8")
+    assert _approved_component_identity(
+        candidate, project_root="/srv/other", role="worker",
+    ) is None
+    candidate.authorized_hash = ""
+    assert _approved_component_identity(
+        candidate, project_root="/srv/klonet", role="worker",
+    ) is None
+
+
 def test_running_web_terminal_identity_recognizes_the_registered_app_factory():
     from klonet_agent.ops.privileged.workflow.change_planner import (
         _runtime_component_identity,

@@ -636,9 +636,6 @@ def _approved_component_identity(
         for consumer in resource.consumers
         if str(consumer).partition(".")[0]
     }
-    if not root_steps:
-        return None
-
     def exact_value(resource_role: str, argument: str) -> str | None:
         values = {
             str(resource.value)
@@ -655,11 +652,51 @@ def _approved_component_identity(
 
     uid = exact_value("run_as_uid", "run_as_uid")
     python = exact_value("python_executable", "python_executable")
-    if uid is None or python is None or not uid.isdigit():
+    if (
+        uid is not None
+        and python is not None
+        and uid.isdigit()
+        and python.startswith("/")
+        and "python" in python.lower()
+    ):
+        return int(uid), python
+
+    # Some older exact plans froze startup identity only in their atomic
+    # ExecutionBinding.  That binding is still part of the authorized plan
+    # hash, so it is authoritative after approval.  Never inherit it from an
+    # unapproved draft or from another root/role.
+    if not str(getattr(candidate_plan, "authorized_hash", "") or ""):
         return None
-    if not python.startswith("/") or "python" not in python.lower():
-        return None
-    return int(uid), python
+    bound_identities: set[tuple[int, str]] = set()
+    for change in candidate_plan.steps:
+        implementation = getattr(change, "implementation_plan", None)
+        atomic_steps = (
+            list(getattr(implementation, "steps", []) or [])
+            if implementation is not None else [change]
+        )
+        for atomic in atomic_steps:
+            binding = getattr(atomic, "execution_binding", None)
+            if str(getattr(binding, "action", "") or "") not in {
+                "start_screen_component", "restart_screen_component",
+            }:
+                continue
+            args = dict(getattr(binding, "args", {}) or {})
+            bound_root = str(
+                args.get("project_root") or args.get("instance_root") or ""
+            ).rstrip("/")
+            if bound_root != project_root.rstrip("/"):
+                continue
+            if str(args.get("component") or "") != role:
+                continue
+            bound_uid = str(args.get("run_as_uid") or "")
+            bound_python = str(args.get("python_executable") or "")
+            if (
+                bound_uid.isdigit()
+                and bound_python.startswith("/")
+                and "python" in bound_python.lower()
+            ):
+                bound_identities.add((int(bound_uid), bound_python))
+    return next(iter(bound_identities)) if len(bound_identities) == 1 else None
 
 
 def _automatic_conflict_port_policy(decision_text: str) -> bool:
@@ -1430,6 +1467,7 @@ the complete proposed replacement goal and list what would be superseded.
                 bundle,
                 candidates,
                 intent_context=intent_context,
+                candidate_plan=candidate_plan,
             )
         if len(candidates) != 1:
             return {
@@ -1961,6 +1999,7 @@ the complete proposed replacement goal and list what would be superseded.
         candidates: list[Any],
         *,
         intent_context: dict[str, Any] | None = None,
+        candidate_plan: ChangePlan | None = None,
     ) -> dict[str, Any]:
         """Expand one all-platform restart into per-instance semantic changes."""
 
@@ -2124,6 +2163,7 @@ the complete proposed replacement goal and list what would be superseded.
                 goal,
                 bundle,
                 intent_context=child_context,
+                candidate_plan=candidate_plan,
             )
             if child is None:
                 return {
