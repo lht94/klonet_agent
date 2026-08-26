@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from klonet_agent.ops.privileged.environment_facts import EnvironmentFactCollector
 from klonet_agent.tools.environment import (
+    http_transport_for_url,
     inspect_install_scripts,
     inspect_klonet_runtime,
     inspect_nginx_routes,
@@ -31,6 +32,7 @@ from klonet_agent.tools.environment import (
     inspect_screen_session,
     inspect_service_health,
     inspect_system_environment,
+    open_http_request,
     read_klonet_logs,
     read_ops_file,
     redact_sensitive_text,
@@ -726,15 +728,20 @@ def _http_endpoint(args: dict[str, Any]) -> str:
     ):
         return "probe_http_endpoint\ninvalid_or_sensitive_url"
     request = urllib.request.Request(url, method="GET")
+    transport = http_transport_for_url(url)
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
+        with open_http_request(request, timeout=8) as response:
             body = response.read(1000).decode("utf-8", errors="replace")
-            return "probe_http_endpoint\nstatus=%s body=%s" % (
+            return "probe_http_endpoint\nstatus=%s transport=%s body=%s" % (
                 response.status,
+                transport,
                 _one_line(body),
             )
     except (urllib.error.URLError, OSError) as exc:
-        return "probe_http_endpoint\nfailed=%s" % exc.__class__.__name__
+        return "probe_http_endpoint\nfailed=%s transport=%s" % (
+            exc.__class__.__name__,
+            transport,
+        )
 
 
 def _python_import(args: dict[str, Any]) -> str:

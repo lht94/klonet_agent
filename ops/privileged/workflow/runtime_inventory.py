@@ -7,7 +7,9 @@ identity, counts, ports and component state from truncated prose.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import base64
+from dataclasses import dataclass, field, replace
+import json
 from pathlib import Path
 import re
 from typing import Any, Iterable
@@ -42,6 +44,71 @@ def _csv(value: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class RuntimeRoleBinding:
+    """Authoritative configured-port to runtime-process-group identity."""
+
+    role: str
+    configured_port: int | None
+    status: str
+    listener_pid: int | None = None
+    listener_pgid: int | None = None
+    listener_pids: tuple[int, ...] = ()
+    observed_role: str = "unknown"
+    runtime_root: str = "unknown"
+    code_root: str = "unknown"
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "RuntimeRoleBinding | None":
+        if not isinstance(value, dict):
+            return None
+        role = str(value.get("role") or "").strip()
+        status = str(value.get("status") or "").strip()
+        if not role or not status:
+            return None
+
+        def optional_int(raw: Any) -> int | None:
+            try:
+                parsed = int(raw)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
+        return cls(
+            role=role,
+            configured_port=optional_int(value.get("configured_port")),
+            status=status,
+            listener_pid=optional_int(value.get("listener_pid")),
+            listener_pgid=optional_int(value.get("listener_pgid")),
+            listener_pids=tuple(
+                parsed
+                for item in value.get("listener_pids") or []
+                if (parsed := optional_int(item)) is not None
+            ),
+            observed_role=str(value.get("observed_role") or "unknown"),
+            runtime_root=str(value.get("runtime_root") or "unknown"),
+            code_root=str(value.get("code_root") or "unknown"),
+        )
+
+
+def _decode_role_bindings(value: str) -> dict[str, RuntimeRoleBinding]:
+    if not value or value == "none":
+        return {}
+    try:
+        padding = "=" * (-len(value) % 4)
+        raw = json.loads(base64.urlsafe_b64decode(value + padding).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result = {}
+    for role, item in raw.items():
+        parsed = RuntimeRoleBinding.from_dict(item)
+        if parsed is not None and parsed.role == str(role):
+            result[str(role)] = parsed
+    return result
+
+
+@dataclass(frozen=True)
 class RuntimeInstance:
     platform: str
     project_root: str
@@ -51,6 +118,7 @@ class RuntimeInstance:
     pids: tuple[int, ...] = ()
     configured_ports: dict[str, int] = field(default_factory=dict)
     endpoints: dict[str, str] = field(default_factory=dict)
+    role_bindings: dict[str, RuntimeRoleBinding] = field(default_factory=dict)
     fields: dict[str, str] = field(default_factory=dict)
     raw_line: str = ""
     evidence_id: str = ""
@@ -89,10 +157,14 @@ class RuntimeInstance:
             ),
             configured_ports=ports,
             endpoints=endpoints,
+            role_bindings=_decode_role_bindings(_field(line, "role_bindings_b64")),
             fields=fields,
             raw_line=line.strip(),
             evidence_id=evidence_id,
         )
+
+    def role_binding(self, role: str) -> RuntimeRoleBinding | None:
+        return self.role_bindings.get(str(role or "").strip().lower())
 
     @property
     def aliases(self) -> tuple[str, ...]:
@@ -111,6 +183,96 @@ class RuntimeInstance:
         return "运行中" if normalized in self.roles else "未检测到运行证据"
 
 
+def _overlay_port_owner_bindings(
+    by_root: dict[str, RuntimeInstance],
+    records: Iterable[Any],
+) -> dict[str, RuntimeInstance]:
+    """Merge later port-owner evidence into the one runtime inventory model."""
+
+    updated = dict(by_root)
+    for record in records:
+        request = getattr(record, "request", None)
+        if (
+            getattr(request, "probe", "") != "port_owner"
+            or str(getattr(record, "status", "available")) != "available"
+        ):
+            continue
+        for line in str(getattr(record, "output", "") or "").splitlines():
+            port_match = re.search(r"\bport=(\d{1,5})\b", line)
+            pid_match = re.search(r"\b(?:tree_root_pid|pid)=(\d+)\b", line)
+            if port_match is None or pid_match is None:
+                continue
+            port = int(port_match.group(1))
+            pid = int(pid_match.group(1))
+            pgid_match = re.search(r"\bpgid=(\d+)\b", line)
+            cwd_match = re.search(r"\bcwd=([^\s]+)", line)
+            command_match = re.search(r"\bcmd=(.*?)\s+cwd=", line)
+            cwd = cwd_match.group(1).rstrip("/") if cwd_match else "unknown"
+            command = command_match.group(1) if command_match else ""
+            observed_role = _runtime_role_from_command(command)
+            listener_match = re.search(r"\blistener_pids=([0-9,]+)", line)
+            listener_pids = tuple(
+                int(item)
+                for item in (listener_match.group(1).split(",") if listener_match else [str(pid)])
+                if item.isdigit()
+            )
+            candidates = []
+            for root, instance in updated.items():
+                for key, expected_role in (
+                    ("master_port", "master"), ("worker_port", "worker"),
+                ):
+                    if instance.configured_ports.get(key) == port:
+                        candidates.append((root, instance, expected_role))
+            if not candidates:
+                continue
+            exact = [
+                item for item in candidates
+                if cwd in {item[0], item[0] + "/mains"}
+            ]
+            selected = exact if exact else candidates if len(candidates) == 1 else []
+            for root, instance, expected_role in selected:
+                code_root = _runtime_code_root(command) or "unknown"
+                if observed_role and observed_role != expected_role:
+                    status = "role_conflict"
+                elif cwd in {root, root + "/mains"}:
+                    status = "confirmed"
+                elif cwd.startswith("/"):
+                    status = "runtime_conflict"
+                else:
+                    status = "owner_ambiguous"
+                binding = RuntimeRoleBinding(
+                    role=expected_role,
+                    configured_port=port,
+                    status=status,
+                    listener_pid=pid,
+                    listener_pgid=(int(pgid_match.group(1)) if pgid_match else pid),
+                    listener_pids=listener_pids,
+                    observed_role=observed_role or "unknown",
+                    runtime_root=cwd,
+                    code_root=code_root,
+                )
+                role_bindings = dict(instance.role_bindings)
+                role_bindings[expected_role] = binding
+                updated[root] = replace(instance, role_bindings=role_bindings)
+    return updated
+
+
+def _runtime_role_from_command(command: str) -> str:
+    lowered = str(command or "").lower()
+    if "worker_main" in lowered or "worker_gun.py" in lowered:
+        return "worker"
+    if "master_main" in lowered or re.search(r"(?:^|\s)-c\s+\S*gun\.py", lowered):
+        return "master"
+    return ""
+
+
+def _runtime_code_root(command: str) -> str:
+    match = re.search(
+        r"((?:/[A-Za-z0-9._-]+)+)/mains(?:/|\b)", command or "",
+    )
+    return match.group(1).strip().rstrip("/") if match else ""
+
+
 @dataclass(frozen=True)
 class RuntimeInventory:
     instances: tuple[RuntimeInstance, ...] = ()
@@ -123,6 +285,7 @@ class RuntimeInventory:
 
     @classmethod
     def from_records(cls, records: Iterable[Any]) -> "RuntimeInventory":
+        records = tuple(records)
         instances: list[RuntimeInstance] = []
         code_only: list[str] = []
         evidence_ids: list[str] = []
@@ -153,6 +316,7 @@ class RuntimeInventory:
                     if root and root not in code_only:
                         code_only.append(root)
         by_root = {item.project_root: item for item in instances}
+        by_root = _overlay_port_owner_bindings(by_root, records)
         return cls(
             instances=tuple(by_root[root] for root in sorted(by_root)),
             code_only_roots=tuple(sorted(code_only)),
@@ -183,6 +347,16 @@ class RuntimeInventory:
     @property
     def abnormal(self) -> tuple[RuntimeInstance, ...]:
         return tuple(item for item in self.instances if item.backend_status != "healthy")
+
+    def instance_for_root(self, project_root: str) -> RuntimeInstance | None:
+        """Resolve one instance by normalized, exact project-root identity."""
+
+        normalized = str(project_root or "").rstrip("/") or "/"
+        matches = [
+            item for item in self.instances
+            if item.project_root == normalized
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     def matching(self, text: str) -> tuple[RuntimeInstance, ...]:
         raw = str(text or "")
@@ -245,14 +419,16 @@ def looks_like_runtime_goal(goal: str) -> bool:
 def runtime_inventory_answers_goal(goal: str, inventory: RuntimeInventory) -> bool:
     """Whether the complete inventory directly settles this read-only goal."""
 
-    if not inventory.complete or not looks_like_runtime_goal(goal):
+    if not inventory.complete:
         return False
-    text = str(goal or "").lower()
-    if any(marker in text for marker in ("多少", "几个", "数量", "哪些", "how many", "which")):
-        return True
     targets = inventory.matching(goal)
-    if not targets:
+    if not targets and not looks_like_runtime_goal(goal):
         return False
+    if not targets:
+        # A runtime question without an instance identity is inventory-wide.
+        # Do not infer this semantic scope from enumeration keywords.
+        return True
+    text = str(goal or "").lower()
     # A complete row settles backend health, configured ports, discovered
     # components, and whether Screen absence alone implies a stopped backend.
     readonly_markers = (
@@ -265,23 +441,26 @@ def runtime_inventory_answers_goal(goal: str, inventory: RuntimeInventory) -> bo
 def render_runtime_goal(goal: str, inventory: RuntimeInventory) -> str:
     text = str(goal or "").lower()
     targets = inventory.matching(goal)
-    if any(marker in text for marker in ("多少", "几个", "数量", "哪些", "how many", "which")):
-        lines = ["正常运行实例（%s）：" % len(inventory.healthy)]
-        lines.extend(_render_instance(item) for item in inventory.healthy)
+    if not targets:
+        lines = [
+            "当前发现 %s 个有后端运行证据的 Klonet 实例：%s 个正常，%s 个异常。"
+            % (len(inventory.instances), len(inventory.healthy), len(inventory.abnormal))
+        ]
+        lines.append("\n运行正常")
+        lines.extend(_render_inventory_instance(item) for item in inventory.healthy)
         if not inventory.healthy:
             lines.append("- 无")
-        lines.append("后端异常的运行候选（%s）：" % len(inventory.abnormal))
-        lines.extend(_render_instance(item) for item in inventory.abnormal)
+        lines.append("\n运行异常")
+        lines.extend(_render_inventory_instance(item) for item in inventory.abnormal)
         if not inventory.abnormal:
             lines.append("- 无")
-        lines.append("只有代码、没有后端运行证据的目录（%s）：" % len(inventory.code_only_roots))
-        lines.extend("- %s" % root for root in inventory.code_only_roots)
-        if not inventory.code_only_roots:
-            lines.append("- 无")
+        if inventory.code_only_roots:
+            lines.append("\n仅发现代码、没有后端运行证据")
+            lines.extend("- `%s`" % root for root in inventory.code_only_roots)
         return "\n".join(lines)
     if len(targets) > 1:
         lines = ["这些根目录对应独立平台实例，不会按名称合并："]
-        lines.extend(_render_instance(item) for item in targets)
+        lines.extend(_render_inventory_instance(item) for item in targets)
         return "\n".join(lines)
     if not targets:
         return ""
@@ -308,15 +487,48 @@ def render_runtime_goal(goal: str, inventory: RuntimeInventory) -> str:
     return "\n".join(lines)
 
 
-def _render_instance(item: RuntimeInstance) -> str:
-    return (
-        "- project_root=%s；platform=%s；backend_status=%s；"
-        "master_port=%s，master_endpoint=%s；worker_port=%s，worker_endpoint=%s"
-        % (
-            item.project_root, item.platform, item.backend_status,
-            item.configured_ports.get("master_port", "unknown"),
-            item.endpoints.get("master", "unknown"),
-            item.configured_ports.get("worker_port", "unknown"),
-            item.endpoints.get("worker", "unknown"),
+def _render_inventory_instance(item: RuntimeInstance) -> str:
+    status = "正常" if item.backend_status == "healthy" else "异常"
+    lines = [
+        "- `%s`：%s" % (item.platform, status),
+        "  - 项目目录：`%s`" % item.project_root,
+    ]
+    if item.roles:
+        lines.append(
+            "  - 已检测组件：%s"
+            % "、".join(_role_label(role) for role in item.roles)
         )
-    )
+    if item.missing_roles:
+        lines.append(
+            "  - 未检测到：%s"
+            % "、".join(_role_label(role) for role in item.missing_roles)
+        )
+    for role, label in (("master", "Master"), ("worker", "Worker")):
+        port = item.configured_ports.get(role + "_port")
+        endpoint = item.endpoints.get(role, "unknown")
+        if port is None and role not in item.roles and role not in item.missing_roles:
+            continue
+        port_text = "，端口 %s" % port if port is not None else ""
+        lines.append(
+            "  - %s：%s%s" % (label, _endpoint_label(endpoint), port_text)
+        )
+    return "\n".join(lines)
+
+
+def _role_label(role: str) -> str:
+    return {
+        "master": "Master",
+        "worker": "Worker",
+        "celery": "Celery",
+        "web_terminal": "Web Terminal",
+        "topology_store": "Topology Store",
+    }.get(str(role or ""), str(role or "未知组件"))
+
+
+def _endpoint_label(status: str) -> str:
+    return {
+        "healthy": "健康检查通过",
+        "unreachable": "健康接口不可达",
+        "not_checked": "未检测到运行进程",
+        "unknown": "状态未知",
+    }.get(str(status or ""), "状态未知")

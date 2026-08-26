@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -13,6 +15,7 @@ import subprocess
 import tarfile
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -59,6 +62,41 @@ OPS_RUNTIME_CHECKS = (
     "rabbitmq",
     "nginx",
 )
+
+
+def http_transport_for_url(url: str) -> str:
+    """Return the authoritative transport policy for one HTTP target.
+
+    Runtime checks against the local host must describe the local service, not
+    an ambient HTTP proxy.  Non-loopback traffic deliberately keeps urllib's
+    normal environment-proxy behavior.
+    """
+
+    hostname = (urllib.parse.urlparse(str(url)).hostname or "").strip().lower()
+    if hostname == "localhost":
+        return "direct_loopback"
+    try:
+        if ipaddress.ip_address(hostname).is_loopback:
+            return "direct_loopback"
+    except ValueError:
+        pass
+    return "default"
+
+
+def open_http_request(request_or_url, *, timeout: float):
+    """Open HTTP using the single runtime-inspection transport policy."""
+
+    url = (
+        request_or_url.full_url
+        if isinstance(request_or_url, urllib.request.Request)
+        else str(request_or_url)
+    )
+    if http_transport_for_url(url) == "direct_loopback":
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(request_or_url, timeout=timeout)
+    return urllib.request.urlopen(request_or_url, timeout=timeout)
+
+
 OPS_SERVICE_HEALTH_CHECKS = (
     "docker_containers",
     "redis",
@@ -564,12 +602,26 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
         if row.get("role") and row.get("role") != "unknown"
     ]
     unresolved_process_rows = []
-    root_aliases = {}
-    screen_roots = {}
+    root_aliases = {
+        str(_canonical_runtime_root(Path(row["project_root"])).resolve()): row["platform"]
+        for row in screen_rows
+        if str(row.get("project_root") or "").startswith("/")
+    }
+    screen_roots = {
+        row["platform"]: str(
+            _canonical_runtime_root(Path(row["project_root"])).resolve()
+        )
+        for row in screen_rows
+        if str(row.get("project_root") or "").startswith("/")
+    }
+    qualified_screen_roots = set(root_aliases)
     for row in process_rows:
         root = _runtime_root_from_process_row(row)
         screen_platform = _screen_platform_from_command(str(row.get("cmd") or ""))
         if root and screen_platform:
+            qualified_screen_roots.add(str(
+                _canonical_runtime_root(Path(root)).resolve()
+            ))
             current = root_aliases.get(root, "")
             if not current or len(screen_platform) < len(current):
                 root_aliases[root] = screen_platform
@@ -584,6 +636,13 @@ def inspect_platform_instances(args: Optional[dict] = None) -> str:
     for row in process_rows:
         root = _runtime_root_from_process_row(row)
         platform = root_aliases.get(root) or row["platform"]
+        if root and not _is_klonet_platform_runtime_root(
+            Path(root), screen_roots=qualified_screen_roots,
+        ):
+            # Keep the process visible as unresolved/external evidence, but do
+            # not promote an arbitrary cwd into a manageable platform.
+            unresolved_process_rows.append(row)
+            continue
         if not root and platform == "unknown":
             unresolved_process_rows.append(row)
             continue
@@ -665,12 +724,20 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
     args = args or {}
     instances: dict[str, dict] = {}
     process_rows = _process_instance_rows()
-    root_aliases = {}
+    screen_rows = _screen_instance_rows()
+    root_aliases = {
+        str(_canonical_runtime_root(Path(row["project_root"])).resolve()): row["platform"]
+        for row in screen_rows
+        if str(row.get("project_root") or "").startswith("/")
+    }
+    screen_roots = set(root_aliases)
+    external_runtime_rows: list[dict] = []
     for row in process_rows:
         root_text = _runtime_root_from_process_row(row)
         screen_platform = _screen_platform_from_command(str(row.get("cmd") or ""))
         if root_text and screen_platform:
             canonical = str(_canonical_runtime_root(Path(root_text)).resolve())
+            screen_roots.add(canonical)
             current = root_aliases.get(canonical, "")
             if not current or len(screen_platform) < len(current):
                 root_aliases[canonical] = screen_platform
@@ -684,6 +751,11 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         if not root_text or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", role):
             continue
         root = str(_canonical_runtime_root(Path(root_text)).resolve())
+        if not _is_klonet_platform_runtime_root(
+            Path(root), screen_roots=screen_roots,
+        ):
+            external_runtime_rows.append(row)
+            continue
         entry = instances.setdefault(
             root,
             {
@@ -709,6 +781,8 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         if str(row.get("pgid", "")).isdigit():
             entry.setdefault("role_pgids", {}).setdefault(role, []).append(int(row["pgid"]))
 
+    _qualify_colliding_platform_names(instances, root_aliases)
+
     rows = []
     healthy_count = 0
     for root_text in sorted(instances):
@@ -716,6 +790,17 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         entry = instances[root_text]
         roles = set(entry["roles"])
         ports = _read_config_ports_from_root(root)
+        role_bindings = {
+            role: _runtime_role_listener_binding(
+                root,
+                role,
+                _safe_port(ports.get(port_key)),
+            )
+            for role, port_key in (
+                ("master", "master_port"),
+                ("worker", "worker_port"),
+            )
+        }
         missing_roles = sorted({"master", "worker"} - roles)
         endpoint_fields = []
         endpoints_healthy = True
@@ -742,12 +827,23 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         backend_status = "healthy" if not missing_roles and endpoints_healthy else "abnormal"
         if backend_status == "healthy":
             healthy_count += 1
+        listener_fields = []
+        for role in ("master", "worker"):
+            binding = role_bindings[role]
+            listener_fields.extend([
+                f"{role}_listener_status={binding.get('status', 'unknown')}",
+                f"{role}_listener_pid={binding.get('listener_pid', 'none')}",
+                f"{role}_listener_pgid={binding.get('listener_pgid', 'none')}",
+            ])
         rows.append(
             "platform=%s project_root=%s runtime_source=process roles=%s pids=%s "
             "master_pids=%s worker_pids=%s master_pgids=%s worker_pgids=%s "
-            "master_identities=%s worker_identities=%s runtime_identities=%s "
+            "master_identities=%s worker_identities=%s "
+            "celery_identities=%s web_terminal_identities=%s "
+            "runtime_identities=%s "
+            "role_bindings_b64=%s "
             "backend_status=%s missing_roles=%s configured_ports=%s "
-            "managed_components=%s component_specs_b64=%s %s"
+            "managed_components=%s component_specs_b64=%s %s %s"
             % (
                 entry["platform"],
                 root_text,
@@ -759,11 +855,19 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                 ",".join(str(pid) for pid in sorted(set(entry.get("role_pgids", {}).get("worker", [])))) or "none",
                 ",".join(sorted(set(entry.get("role_identities", {}).get("master", [])))) or "none",
                 ",".join(sorted(set(entry.get("role_identities", {}).get("worker", [])))) or "none",
+                ",".join(sorted(set(entry.get("role_identities", {}).get("celery", [])))) or "none",
+                ",".join(sorted(set(entry.get("role_identities", {}).get("web_terminal", [])))) or "none",
                 ",".join(sorted({
                     identity
                     for identities in entry.get("role_identities", {}).values()
                     for identity in identities
                 })) or "none",
+                base64.urlsafe_b64encode(json.dumps(
+                    role_bindings,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).decode("ascii"),
                 backend_status,
                 ",".join(missing_roles) or "none",
                 ",".join(
@@ -781,6 +885,7 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                     ensure_ascii=True,
                     separators=(",", ":"),
                 ).encode("utf-8")).decode("ascii"),
+                " ".join(listener_fields),
                 " ".join(endpoint_fields),
             )
         )
@@ -810,8 +915,18 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         f"abnormal_count={len(rows) - healthy_count}",
     ]
     lines.append(f"code_only_count={len(code_only_roots)}")
+    external_roots = sorted({
+        str(_canonical_runtime_root(Path(_runtime_root_from_process_row(row))).resolve())
+        for row in external_runtime_rows
+        if _runtime_root_from_process_row(row)
+    })
+    lines.append(f"external_runtime_count={len(external_roots)}")
     lines.extend(rows)
     lines.extend(f"code_only_root={root}" for root in sorted(code_only_roots))
+    lines.extend(
+        "external_runtime_root=%s classification=conflict_evidence_only" % root
+        for root in external_roots
+    )
     lines.append("environment unchanged")
     return "\n".join(lines)
 
@@ -819,21 +934,42 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
 def _probe_backend_endpoint(port: int) -> tuple[str, int, str]:
     url = "http://127.0.0.1:%s/server_health/" % port
     request = urllib.request.Request(url, method="GET")
+    transport = http_transport_for_url(url)
     try:
-        with urllib.request.urlopen(request, timeout=3) as response:
+        with open_http_request(request, timeout=3) as response:
             body = response.read(1000).decode("utf-8", errors="replace")
             try:
                 payload = json.loads(body)
             except (TypeError, ValueError):
-                return "invalid_response", int(response.status), "response_not_json"
+                return (
+                    "invalid_response",
+                    int(response.status),
+                    "response_not_json transport=%s" % transport,
+                )
             if int(response.status) == 200 and payload.get("code") == 1:
-                return "healthy", int(response.status), "code=1"
-            return "unhealthy", int(response.status), "code=%s" % payload.get("code")
+                return (
+                    "healthy",
+                    int(response.status),
+                    "code=1 transport=%s" % transport,
+                )
+            return (
+                "unhealthy",
+                int(response.status),
+                "code=%s transport=%s" % (payload.get("code"), transport),
+            )
     except urllib.error.HTTPError as exc:
-        return "http_error", int(exc.code), exc.__class__.__name__
+        return (
+            "http_error",
+            int(exc.code),
+            "%s transport=%s" % (exc.__class__.__name__, transport),
+        )
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
-        return "unreachable", 0, reason.__class__.__name__
+        return (
+            "unreachable",
+            0,
+            "%s transport=%s" % (reason.__class__.__name__, transport),
+        )
 
 
 def inspect_platform_health(args: Optional[dict] = None) -> str:
@@ -1343,7 +1479,45 @@ def _canonical_runtime_root(root: Path) -> Path:
     return root
 
 
+def _is_klonet_platform_runtime_root(
+    root: Path,
+    *,
+    screen_roots: set[str] | None = None,
+) -> bool:
+    """Return whether a process cwd is a manageable Klonet instance root.
+
+    A runtime may import Klonet code while running in a container, simulation,
+    or unrelated working directory.  Such a process is useful ownership and
+    conflict evidence, but its cwd is not automatically a platform identity.
+    A root qualifies only through an existing platform contract: exact Screen
+    ownership, readable Klonet configuration, a runtime manifest, or the
+    standard master/worker entrypoint pair.
+    """
+
+    try:
+        canonical = _canonical_runtime_root(Path(root)).resolve()
+    except (OSError, RuntimeError):
+        return False
+    if str(canonical) in set(screen_roots or set()):
+        return True
+    if not canonical.is_dir() or _is_sensitive_path(canonical):
+        return False
+    if _read_config_ports_from_root(canonical):
+        return True
+    if (canonical / ".klonet" / "runtime_components.json").is_file():
+        return True
+    for entry_root in (canonical, canonical / "mains"):
+        if (
+            (entry_root / "master_main.py").is_file()
+            and (entry_root / "worker_main.py").is_file()
+        ):
+            return True
+    return False
+
+
 def _runtime_root_from_process_row(row: dict) -> str:
+    """Resolve runtime ownership, never merely imported code ownership."""
+
     cwd = str(row.get("cwd") or "").strip()
     if cwd and cwd != "?":
         return str(_canonical_runtime_root(Path(cwd)))
@@ -1351,9 +1525,11 @@ def _runtime_root_from_process_row(row: dict) -> str:
     cd_match = re.search(r"(?:^|\s)cd\s+([^\s;&]+)", command)
     if cd_match:
         return str(_canonical_runtime_root(Path(cd_match.group(1).strip("'\""))))
-    path_match = re.search(r"(/[A-Za-z0-9._/-]+)/mains(?:/|\b)", command)
-    if path_match:
-        return str(Path(path_match.group(1)))
+    # A gunicorn config, module, or entrypoint path identifies imported code,
+    # not the process runtime root.  Treating it as cwd collapses container or
+    # simulation workers into the source platform.  Cross-user runtime roots
+    # are recovered separately through the observed Screen/PPID chain; port
+    # ownership records retain command-derived code_root for conflict reports.
     return ""
 
 
@@ -1386,12 +1562,80 @@ def _screen_instance_rows() -> list:
         token = raw_line.strip().split(None, 1)[0] if raw_line.strip() else ""
         if "." not in token:
             continue
-        logical_name = token.split(".", 1)[1]
+        pid_text, logical_name = token.split(".", 1)
         parsed = _platform_role_from_name(logical_name)
         if parsed:
             platform, role = parsed
-            rows.append({"session": token, "platform": platform, "role": role})
+            project_root = ""
+            if pid_text.isdigit():
+                project_root = _read_proc_link("/proc/%s/cwd" % pid_text)
+            rows.append({
+                "session": token,
+                "platform": platform,
+                "role": role,
+                "pid": int(pid_text) if pid_text.isdigit() else None,
+                "project_root": (
+                    str(_canonical_runtime_root(Path(project_root)).resolve())
+                    if project_root.startswith("/") else ""
+                ),
+            })
     return rows
+
+
+def _qualify_colliding_platform_names(
+    instances: dict[str, dict],
+    screen_aliases: dict[str, str],
+) -> None:
+    """Make runtime prefixes unique without inventing random identities.
+
+    ``instances`` is already keyed by canonical project root, which remains
+    the authoritative identity.  Existing Screen prefixes are preferred.  If
+    roots without Screen evidence share a basename, preserve the shortest
+    root's familiar name and qualify the others with as much parent path as is
+    required for uniqueness.
+    """
+
+    groups: dict[str, list[str]] = {}
+    for root, entry in instances.items():
+        groups.setdefault(str(entry.get("platform") or "unknown"), []).append(root)
+    used = {
+        str(entry.get("platform") or "")
+        for entry in instances.values()
+        if str(entry.get("platform") or "")
+    }
+    for alias, roots in groups.items():
+        if len(roots) < 2:
+            continue
+        ordered = sorted(roots, key=lambda item: (len(Path(item).parts), item))
+        preserved = ordered[0]
+        for root in ordered:
+            explicit = str(screen_aliases.get(root) or "").strip()
+            if explicit and sum(
+                1 for value in screen_aliases.values() if value == explicit
+            ) == 1:
+                instances[root]["platform"] = explicit
+                used.add(explicit)
+                if explicit == alias:
+                    preserved = root
+        for root in ordered:
+            if root == preserved or str(screen_aliases.get(root) or "").strip():
+                continue
+            parts = [
+                re.sub(r"[^A-Za-z0-9_-]+", "_", part).strip("_")
+                for part in Path(root).parts
+                if part and part != "/"
+            ]
+            candidate = ""
+            for width in range(2, len(parts) + 1):
+                candidate = "_".join(parts[-width:])
+                if candidate and candidate not in used:
+                    break
+            if not candidate or candidate in used:
+                candidate = "instance_%s" % hashlib.sha256(
+                    root.encode("utf-8")
+                ).hexdigest()[:8]
+            instances[root]["platform"] = candidate
+            used.add(candidate)
 
 
 def _process_instance_rows() -> list:
@@ -1405,7 +1649,12 @@ def _process_instance_rows() -> list:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=PROBE_TIMEOUT_SECONDS,
+            # This is the only inventory probe which boundedly walks all
+            # matching /proc entries.  Treating its normal 5-8 second runtime
+            # as "no processes" turns a transient timeout into a false empty
+            # platform inventory, so give the same bounded operation enough
+            # time to finish instead of changing its semantic result.
+            timeout=PROBE_TIMEOUT_SECONDS * 4,
         )
     except (OSError, subprocess.TimeoutExpired):
         return []
@@ -1597,10 +1846,12 @@ def _role_from_command(command: str) -> str:
         return "web_terminal"
     if "worker_main" in lowered or "worker_gun.py" in lowered:
         return "worker"
-    if "master_main" in lowered or "gun.py" in lowered:
-        return "master"
     if "celery" in lowered:
         return "celery"
+    # Resolve the application entrypoint before considering a generic Gunicorn
+    # config name. ``data_server_gun.py`` contains the substring ``gun.py``;
+    # substring-first classification used to turn data_server into a second
+    # master role and polluted RuntimeInventory identities.
     generic = re.search(
         r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_-]{1,48})_main"
         r"(?:\.py|:|\b)",
@@ -1609,6 +1860,12 @@ def _role_from_command(command: str) -> str:
     )
     if generic is not None:
         return generic.group(1).lower().replace("-", "_")
+    if re.search(
+        r"(?:^|\s)-c\s+(?:[^\s/]+/)*gun\.py(?:\s|$)",
+        command or "",
+        re.I,
+    ):
+        return "master"
     return ""
 
 
@@ -1966,35 +2223,162 @@ def _inspect_port_owners(args: dict) -> list:
     if shutil.which("ss") is None:
         return [ProbeResult("port_owner", STATUS_UNCHECKED, "ss not found")]
 
-    results = []
-    for port in ports:
+    allow_interactive_sudo = args.get("allow_interactive_sudo") is True
+    return [
+        _port_owner_result(port, allow_interactive_sudo=allow_interactive_sudo)
+        for port in ports
+    ]
+
+
+def _port_owner_result(
+    port: int,
+    *,
+    allow_interactive_sudo: bool = False,
+) -> ProbeResult:
+    """Return one authoritative listener record, using cached sudo if present.
+
+    The ordinary query remains first and sufficient for same-user listeners.
+    ``sudo -n`` is only a read-only enrichment path; it never prompts here.
+    Interactive authentication remains owned by the privileged workflow.
+    """
+
+    ss_path = shutil.which("ss")
+    if not ss_path:
+        return ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} ss not found")
+    attempts = (["ss", "-ltnp", f"sport = :{port}"],)
+    if shutil.which("sudo"):
+        attempts += (["sudo", "-n", ss_path, "-ltnp", f"sport = :{port}"],)
+        if allow_interactive_sudo:
+            attempts += (["sudo", ss_path, "-ltnp", f"sport = :{port}"],)
+    saw_listener = False
+    last_problem = ""
+    for argv in attempts:
         try:
+            interactive_attempt = argv[:1] == ["sudo"] and "-n" not in argv
             completed = subprocess.run(
-                ["ss", "-ltnp", f"sport = :{port}"],
+                argv,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=PROBE_TIMEOUT_SECONDS,
+                timeout=120 if interactive_attempt else PROBE_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} probe timed out"))
+            last_problem = "probe timed out"
             continue
         except OSError as exc:
-            results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} {exc}"))
+            last_problem = str(exc)
             continue
-        output = redact_sensitive_text((completed.stdout or completed.stderr or "").strip())
+        output = redact_sensitive_text((completed.stdout or "").strip())
         if completed.returncode != 0:
-            results.append(ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} {output or 'ss failed'}"))
+            last_problem = redact_sensitive_text(
+                (completed.stderr or completed.stdout or "ss failed").strip()
+            )
             continue
         pids = _pids_from_ss_output(output)
         if pids:
-            results.append(_process_owner_result(port, pids))
-        elif _port_is_listening(output, port):
-            results.append(ProbeResult("port_owner", STATUS_DETECTED, f"port={port} pid=unchecked reason=ss did not expose pid"))
-        else:
-            results.append(ProbeResult("port_owner", STATUS_MISSING, f"port={port} not listening"))
-    return results
+            return _process_owner_result(port, pids)
+        listening = _port_is_listening(output, port)
+        if not listening:
+            # ``ss`` exposes listener addresses without elevated privileges;
+            # root is needed only for process metadata.  A successful query
+            # with no matching socket is therefore already authoritative and
+            # must not be downgraded by a later optional sudo enrichment.
+            return ProbeResult(
+                "port_owner", STATUS_MISSING, f"port={port} not listening"
+            )
+        saw_listener = True
+    if saw_listener:
+        return ProbeResult(
+            "port_owner",
+            STATUS_DETECTED,
+            f"port={port} pid=unchecked reason=ss did not expose pid",
+        )
+    if last_problem:
+        return ProbeResult("port_owner", STATUS_UNCHECKED, f"port={port} {last_problem}")
+    return ProbeResult("port_owner", STATUS_MISSING, f"port={port} not listening")
+
+
+def _runtime_role_listener_binding(
+    project_root: Path,
+    role: str,
+    port: int | None,
+) -> dict:
+    """Bind a configured role port to its actual process group.
+
+    A command path proves only which code was imported.  Runtime ownership is
+    confirmed independently from cwd.  This prevents two launchers which reuse
+    the same ``worker_gun.py`` from being collapsed into one runtime identity.
+    """
+
+    binding = {
+        "role": role,
+        "configured_port": port,
+        "status": "config_port_missing" if port is None else "owner_unavailable",
+    }
+    if port is None:
+        return binding
+    owner = _port_owner_result(port)
+    binding["owner_probe_status"] = owner.status
+    detail = owner.detail
+    if owner.status == STATUS_MISSING:
+        binding["status"] = "not_listening"
+        return binding
+    pid_match = re.search(r"\bpid=(\d+)\b", detail)
+    if pid_match is None:
+        binding["status"] = "owner_unavailable"
+        return binding
+    pid = int(pid_match.group(1))
+    process_detail = _process_detail(pid)
+    observed_role = _role_from_command(str(process_detail.get("cmd") or ""))
+    pgid = _safe_int(process_detail.get("pgid"), pid)
+    cwd = str(process_detail.get("cwd") or "").strip()
+    if cwd in {"", "?", "unchecked"}:
+        cwd = _privileged_process_cwd(pid)
+    command = str(process_detail.get("cmd") or "")
+    command_root = _command_code_root(command)
+    target = project_root.resolve()
+    runtime_matches = bool(
+        cwd.startswith("/")
+        and (
+            Path(cwd).resolve() == target
+            or _canonical_runtime_root(Path(cwd).resolve()) == target
+        )
+    )
+    binding.update({
+        "listener_pid": pid,
+        "listener_pgid": pgid,
+        "listener_pids": _pids_from_port_owner_detail(detail),
+        "observed_role": observed_role or "unknown",
+        "runtime_root": cwd if cwd.startswith("/") else "unknown",
+        "code_root": command_root or "unknown",
+    })
+    if observed_role and observed_role != role:
+        binding["status"] = "role_conflict"
+    elif runtime_matches:
+        binding["status"] = "confirmed"
+    elif cwd.startswith("/"):
+        binding["status"] = "runtime_conflict"
+    else:
+        binding["status"] = "owner_ambiguous"
+    return binding
+
+
+def _pids_from_port_owner_detail(detail: str) -> list[int]:
+    match = re.search(r"\blistener_pids=([0-9,]+)", detail or "")
+    if match:
+        return _dedupe_ints(match.group(1).split(","))
+    match = re.search(r"\bpid=(\d+)\b", detail or "")
+    return [int(match.group(1))] if match else []
+
+
+def _command_code_root(command: str) -> str:
+    match = re.search(
+        r"((?:/[A-Za-z0-9._-]+)+)/mains(?:/|\b)", command or "",
+    )
+    if not match:
+        return ""
+    return str(Path(match.group(1).strip()).resolve())
 
 
 def _inspect_process_details(args: dict) -> list:
@@ -2036,6 +2420,9 @@ def _process_detail(pid: int) -> dict:
     ps = _ps_detail(pid)
     cmd = _read_proc_text(f"/proc/{pid}/cmdline").replace("\x00", " ").strip()
     cwd = _read_proc_link(f"/proc/{pid}/cwd")
+    if not cwd:
+        privileged_cwd = _privileged_process_cwd(pid)
+        cwd = privileged_cwd if privileged_cwd != "?" else ""
     if not cmd:
         cmd = ps.get("cmd", "")
     return {

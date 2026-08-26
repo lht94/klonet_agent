@@ -12,13 +12,19 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from klonet_agent.ops.privileged.contracts import CheckResult, ExecutionEvidence
+from klonet_agent.ops.privileged.environment_facts import (
+    process_belongs_to_project_root,
+)
 from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
-from klonet_agent.tools.environment import redact_sensitive_text
+from klonet_agent.tools.environment import (
+    http_transport_for_url,
+    open_http_request,
+    redact_sensitive_text,
+)
 
 
 Checker = Callable[[Dict[str, Any], Optional[ExecutionEvidence]], CheckResult]
@@ -467,9 +473,12 @@ class DefaultCheckerRegistry:
         expected_root = str(Path(str(args["project_root"])).resolve())
         valid = bool(
             mutation.get("kind") == "component_restart"
-            and old_pids
             and new_pids
-            and old_pids.isdisjoint(new_pids)
+            # A stale or missing Screen has no live pre-restart PID.  In that
+            # lifecycle state identity is established by the newly observed
+            # process under the frozen root.  When an old process did exist,
+            # retain the stronger requirement that its identity changed.
+            and (not old_pids or old_pids.isdisjoint(new_pids))
             and any(_pid_cwd(pid) == expected_root for pid in new_pids)
         )
         return CheckResult(
@@ -498,13 +507,19 @@ class DefaultCheckerRegistry:
         except OSError:
             process_entries = []
         for entry in process_entries:
-            if not entry.name.isdigit() or _pid_cwd(int(entry.name)) != expected_root:
+            if not entry.name.isdigit():
                 continue
             try:
                 command = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(
                     "utf-8", errors="replace",
                 )
             except OSError:
+                continue
+            if not process_belongs_to_project_root(
+                cwd=_pid_cwd(int(entry.name)),
+                cmdline=command,
+                project_root=expected_root,
+            ):
                 continue
             if any(pattern.lower() in command.lower() for pattern in patterns):
                 matches.append(int(entry.name))
@@ -724,21 +739,23 @@ class DefaultCheckerRegistry:
             expected = sorted({int(item) for item in raw_statuses})
         else:
             expected = [int(args.get("status", 200))]
+        transport = http_transport_for_url(url)
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with open_http_request(url, timeout=5) as response:
                 observed = int(response.status)
         except urllib.error.HTTPError as exc:
             observed = int(exc.code)
         except (urllib.error.URLError, OSError) as exc:
             return CheckResult(
                 "http_status", "failed",
-                expected=str(expected), observed=exc.__class__.__name__,
+                expected=str(expected),
+                observed="%s transport=%s" % (exc.__class__.__name__, transport),
             )
         return CheckResult(
             "http_status",
             "passed" if observed in expected else "failed",
             expected=str(expected),
-            observed=str(observed),
+            observed="%s transport=%s" % (observed, transport),
         )
 
     def _backend_health(self, args, evidence):
@@ -747,21 +764,22 @@ class DefaultCheckerRegistry:
         del evidence
         url = str(args["url"])
         expected_code = int(args.get("expected_code", 1))
+        transport = http_transport_for_url(url)
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
+            with open_http_request(url, timeout=5) as response:
                 status = int(response.status)
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             return CheckResult(
                 "backend_health", "failed",
                 expected="http=200 code=%s" % expected_code,
-                observed="http=%s" % int(exc.code),
+                observed="http=%s transport=%s" % (int(exc.code), transport),
             )
         except (urllib.error.URLError, OSError, UnicodeError, json.JSONDecodeError) as exc:
             return CheckResult(
                 "backend_health", "failed",
                 expected="http=200 code=%s" % expected_code,
-                observed=exc.__class__.__name__,
+                observed="%s transport=%s" % (exc.__class__.__name__, transport),
             )
         observed_code = payload.get("code") if isinstance(payload, dict) else None
         passed = status == 200 and observed_code == expected_code
@@ -769,7 +787,8 @@ class DefaultCheckerRegistry:
             "backend_health",
             "passed" if passed else "failed",
             expected="http=200 code=%s" % expected_code,
-            observed="http=%s code=%s" % (status, observed_code),
+            observed="http=%s code=%s transport=%s"
+            % (status, observed_code, transport),
         )
 
     def _git_revision(self, args, evidence):

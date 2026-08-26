@@ -34,7 +34,10 @@ from klonet_agent.ops.actions import (
 )
 from klonet_agent.ops.command_policy import command_exists, decide_ops_command
 from klonet_agent.ops.privileged.contracts import PrivilegedStep, component_port_arg
-from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+from klonet_agent.ops.privileged.environment_facts import (
+    REQUIRED_ENTRY_FILES,
+    process_belongs_to_project_root,
+)
 from klonet_agent.ops.privileged.planner_schema import normalize_process_signal
 
 
@@ -188,6 +191,13 @@ class DirectPrivilegedActionRunner:
         self.command_runner = command_runner or self._run_command
         self.on_command = on_command
         self._active_action = ""
+        # Authentication belongs to the Action execution boundary, not to
+        # every low-level argv.  ``unknown`` is reset for each atomic Action;
+        # after one interactive validation all actual commands use ``sudo
+        # -n``.  A rejected validation is also remembered so one Action can
+        # never produce an unbounded password-prompt loop.
+        self._sudo_auth_state = "unknown"
+        self._sudo_auth_error = ""
 
     def __call__(self, step: PrivilegedStep) -> DirectActionResult:
         spec = self.action_registry.get(step.action)
@@ -207,6 +217,8 @@ class DirectPrivilegedActionRunner:
                 "direct_privileged_handler_missing=%s" % spec.name
             )
         self._active_action = spec.name
+        self._sudo_auth_state = "unknown"
+        self._sudo_auth_error = ""
         try:
             return handler(step)
         except subprocess.TimeoutExpired as exc:
@@ -252,26 +264,11 @@ class DirectPrivilegedActionRunner:
                 return self._blocked("rollback_metadata_invalid")
             if not isinstance(backups, dict) or not isinstance(created, list):
                 return self._blocked("rollback_metadata_invalid")
-            try:
-                for target_text, backup_text in backups.items():
-                    target = _absolute_path(target_text)
-                    backup = _absolute_path(backup_text)
-                    if target is None or backup is None or not backup.is_file():
-                        return self._blocked("rollback_backup_missing")
-                    shutil.copy2(backup, target)
-                for target_text in created:
-                    target = _absolute_path(target_text)
-                    if target is None:
-                        return self._blocked("rollback_created_path_invalid")
-                    if target.is_file():
-                        target.unlink()
-            except OSError as exc:
-                return DirectActionResult(
-                    "failed",
-                    "runtime_entry_rollback_failed=%s environment_changed=unknown"
-                    % exc.__class__.__name__,
-                    "inspect_project_layout",
-                )
+            problem = self._restore_runtime_entry_files(
+                backups, created, timeout=120,
+            )
+            if problem is not None:
+                return problem
             return DirectActionResult(
                 "completed",
                 "runtime_entry_rollback_restored=%s removed_created=%s environment_changed=true"
@@ -432,27 +429,91 @@ class DirectPrivilegedActionRunner:
             if not (root / name).is_file()
             or _file_sha256(source / name) != _file_sha256(root / name)
         ]
+        candidates = {}
+        for name in changed_names:
+            try:
+                content = (source / name).read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                return self._blocked(
+                    "entry_source_not_readable=%s:%s"
+                    % (name, exc.__class__.__name__)
+                )
+            validation_problem = _candidate_validation_problem(root / name, content)
+            if validation_problem:
+                return self._blocked(
+                    "entry_candidate_invalid=%s:%s"
+                    % (name, validation_problem)
+                )
+            candidates[name] = content
         backups = {}
         created = []
         for name in changed_names:
             target = root / name
-            if target.exists():
-                backup = _ops_backup_path(target)
-                shutil.copy2(target, backup)
+            result, backup, was_created = self._commit_text_candidate(
+                target,
+                None if not target.exists() else "existing",
+                candidates[name],
+                step.timeout,
+            )
+            if backup is not None:
                 backups[str(target)] = str(backup)
-            else:
+            if was_created:
                 created.append(str(target))
-            shutil.copy2(source / name, target)
+            if result is not None:
+                rollback = self._restore_runtime_entry_files(
+                    backups, created, timeout=step.timeout,
+                )
+                if rollback is None:
+                    return DirectActionResult(
+                        "failed",
+                        "prepare_project_files_commit_failed name=%s reason=%s "
+                        "partial_changes_rolled_back=true environment_changed=false"
+                        % (name, _one_line(result.output, 2000)),
+                        "inspect_path_permissions",
+                    )
+                return DirectActionResult(
+                    "failed",
+                    "prepare_project_files_commit_failed name=%s reason=%s "
+                    "rollback_failed=%s environment_changed=unknown"
+                    % (
+                        name,
+                        _one_line(result.output, 2000),
+                        _one_line(rollback.output, 2000),
+                    ),
+                    "inspect_path_permissions",
+                    metadata={
+                        "kind": "runtime_entry_files",
+                        "backups": json.dumps(backups, sort_keys=True),
+                        "created": json.dumps(created),
+                    },
+                )
         mismatched = [
             name for name in REQUIRED_ENTRY_FILES
             if _file_sha256(source / name) != _file_sha256(root / name)
         ]
         if mismatched:
+            rollback = self._restore_runtime_entry_files(
+                backups, created, timeout=step.timeout,
+            )
+            if rollback is None:
+                return DirectActionResult(
+                    "failed",
+                    "prepared_entry_hash_mismatch=%s "
+                    "partial_changes_rolled_back=true environment_changed=false"
+                    % ",".join(mismatched),
+                    "inspect_project_layout",
+                )
             return DirectActionResult(
                 "failed",
-                "prepared_entry_hash_mismatch=%s environment_changed=unknown"
-                % ",".join(mismatched),
+                "prepared_entry_hash_mismatch=%s rollback_failed=%s "
+                "environment_changed=unknown"
+                % (",".join(mismatched), _one_line(rollback.output, 2000)),
                 "inspect_project_layout",
+                metadata={
+                    "kind": "runtime_entry_files",
+                    "backups": json.dumps(backups, sort_keys=True),
+                    "created": json.dumps(created),
+                },
             )
         return DirectActionResult(
             "completed",
@@ -470,6 +531,88 @@ class DirectPrivilegedActionRunner:
                 "created": json.dumps(created),
             },
         )
+
+    def _restore_runtime_entry_files(
+        self,
+        backups: dict[str, str],
+        created: list[str],
+        *,
+        timeout: int,
+    ) -> DirectActionResult | None:
+        """Restore the exact runtime-entry transaction through one privilege path."""
+
+        for target_text, backup_text in backups.items():
+            target = _absolute_path(target_text)
+            backup = _absolute_path(backup_text)
+            expected_prefix = "%s.klonet-agent.bak." % (
+                target.name if target is not None else ""
+            )
+            if (
+                target is None
+                or backup is None
+                or target.name not in REQUIRED_ENTRY_FILES
+                or backup.parent != target.parent
+                or not backup.name.startswith(expected_prefix)
+                or not backup.is_file()
+            ):
+                return self._blocked("rollback_backup_missing_or_untrusted")
+            if os.access(target.parent, os.W_OK):
+                try:
+                    shutil.copy2(backup, target)
+                except OSError as exc:
+                    return DirectActionResult(
+                        "failed",
+                        "runtime_entry_restore_failed path=%s error=%s "
+                        "environment_changed=unknown"
+                        % (target, exc.__class__.__name__),
+                        "inspect_path_permissions",
+                    )
+            else:
+                copied = self._command(
+                    _sudo_if_needed([
+                        "cp", "-p", "--", str(backup), str(target),
+                    ]),
+                    timeout=timeout,
+                )
+                if copied.returncode != 0:
+                    return DirectActionResult(
+                        "failed",
+                        "runtime_entry_restore_failed path=%s stderr=%s "
+                        "environment_changed=unknown"
+                        % (target, _one_line(copied.stderr)),
+                        "inspect_path_permissions",
+                    )
+        for target_text in created:
+            target = _absolute_path(target_text)
+            if target is None or target.name not in REQUIRED_ENTRY_FILES:
+                return self._blocked("rollback_created_path_invalid")
+            if not target.exists():
+                continue
+            if os.access(target.parent, os.W_OK):
+                try:
+                    target.unlink()
+                except OSError as exc:
+                    return DirectActionResult(
+                        "failed",
+                        "runtime_entry_remove_failed path=%s error=%s "
+                        "environment_changed=unknown"
+                        % (target, exc.__class__.__name__),
+                        "inspect_path_permissions",
+                    )
+            else:
+                removed = self._command(
+                    _sudo_if_needed(["rm", "-f", "--", str(target)]),
+                    timeout=timeout,
+                )
+                if removed.returncode != 0:
+                    return DirectActionResult(
+                        "failed",
+                        "runtime_entry_remove_failed path=%s stderr=%s "
+                        "environment_changed=unknown"
+                        % (target, _one_line(removed.stderr)),
+                        "inspect_path_permissions",
+                    )
+        return None
 
     def _action_extract_archive(
         self,
@@ -596,19 +739,72 @@ class DirectPrivilegedActionRunner:
         run_as_uid = _runtime_run_as_uid(step.args)
         if run_as_uid is None:
             return self._blocked("invalid_run_as_uid")
-        dead_targets = self._dead_screen_session_targets(session, run_as_uid)
-        for target in dead_targets:
-            self._command(
-                _runtime_user_argv(["screen", "-wipe", target], run_as_uid),
-                timeout=20,
+        _dead_targets, cleanup_error = self._clean_dead_screen_session(
+            session, run_as_uid,
+        )
+        if cleanup_error:
+            return DirectActionResult(
+                "failed", cleanup_error, "inspect_runtime",
             )
-        if dead_targets:
-            for _attempt in range(10):
-                if session not in self._existing_screen_sessions(run_as_uid):
-                    break
-                time.sleep(0.1)
-        if session in self._existing_screen_sessions(run_as_uid):
-            return self._blocked("screen_session_already_exists=%s" % session)
+        targets = self._screen_session_targets(session, run_as_uid)
+        if targets:
+            port = component_port_arg(step.args, component)
+            component_pids = (
+                _listener_pids_for_port(port)
+                if port else _component_pids(root, component)
+            )
+            if not component_pids:
+                # A live Screen shell with no managed foreground component is
+                # the missing-role state this Action was approved to repair.
+                # Reuse the one authoritative replacement lifecycle instead
+                # of returning a synthetic failure that requires LLM Replan.
+                forwarded = PrivilegedStep.from_dict(step.to_dict())
+                forwarded.action = "restart_screen_component"
+                recovered = self._action_restart_screen_component(forwarded)
+                if recovered.status == "completed":
+                    return DirectActionResult(
+                        "completed",
+                        "action=start_screen_component component=%s session=%s "
+                        "recovered_stale_screen=true %s"
+                        % (component, session, recovered.output),
+                        metadata={
+                            **dict(recovered.metadata or {}),
+                            "kind": "component_start",
+                            "recovered_stale_screen": "true",
+                        },
+                    )
+                return recovered
+            owner_targets, ownership_observed = _screen_owner_targets_for_pids(
+                component_pids,
+            )
+            if ownership_observed and set(targets).intersection(owner_targets):
+                allowed = _allowed_runtime_cwds(root)
+                if all(
+                    _proc_cwd(pid)
+                    and any(
+                        _path_is_relative_to(Path(_proc_cwd(pid)), candidate)
+                        for candidate in allowed
+                    )
+                    for pid in component_pids
+                ):
+                    return DirectActionResult(
+                        "completed",
+                        "action=start_screen_component component=%s session=%s "
+                        "already_running=true pids=%s environment_changed=false"
+                        % (
+                            component, session,
+                            ",".join(str(pid) for pid in component_pids),
+                        ),
+                        metadata={
+                            "kind": "component_start",
+                            "component": component,
+                            "session": session,
+                            "already_running": "true",
+                        },
+                    )
+            return self._blocked(
+                "screen_session_runtime_ownership_unresolved=%s" % session
+            )
         return self._start_one_component(component, session, root, step)
 
     def _action_start_platform_screens(
@@ -846,6 +1042,134 @@ class DirectPrivilegedActionRunner:
             ),
         )
 
+    def _stop_frozen_component_groups(
+        self,
+        root: Path,
+        component: str,
+        frozen_pids: list[int],
+        step: PrivilegedStep,
+    ) -> DirectActionResult:
+        """Stop proven same-root/same-role orphan groups before Screen restart.
+
+        This is part of the existing restart Action's replacement invariant,
+        not a second public lifecycle operation.  Authority is limited to PIDs
+        already frozen by that Action and revalidated by cwd, role and PGID
+        immediately before TERM and again before any KILL escalation.
+        """
+
+        frozen = {int(pid) for pid in frozen_pids if int(pid) > 1}
+        if not frozen:
+            return DirectActionResult(
+                "completed", "orphan_component_groups_already_stopped=true",
+            )
+
+        def matching_groups() -> tuple[list[dict[str, int]], str]:
+            processes = _klonet_runtime_processes(
+                root,
+                command_runner=self._command,
+                allow_command_root_identity=True,
+            )
+            live_frozen = {
+                int(proc["pid"]) for proc in processes
+                if int(proc["pid"]) in frozen
+            }
+            if not live_frozen:
+                return [], ""
+            targets = [
+                proc for proc in processes
+                if int(proc["pid"]) in live_frozen
+                and _klonet_component_for_command(str(proc["cmdline"])) == component
+            ]
+            if {int(proc["pid"]) for proc in targets} != live_frozen:
+                return [], "orphan_component_identity_drift"
+            pgids = {int(proc["pgid"]) for proc in targets}
+            groups = [proc for proc in processes if int(proc["pgid"]) in pgids]
+            if any(
+                _klonet_component_for_command(str(proc["cmdline"])) != component
+                for proc in groups
+            ):
+                return [], "orphan_component_process_group_mixed_roles"
+            return _runtime_process_groups(groups), ""
+
+        groups, problem = matching_groups()
+        if problem:
+            return self._blocked(problem)
+        if not groups:
+            return DirectActionResult(
+                "completed", "orphan_component_groups_already_stopped=true",
+            )
+        for group in groups:
+            result = self._command(
+                _kill_argv_for_owner_pid(
+                    group["owner_pid"], "TERM", "-%s" % group["pgid"],
+                ),
+                timeout=min(step.timeout, 30),
+            )
+            if result.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "orphan_component_term_failed component=%s pgid=%s stderr=%s "
+                    "environment_changed=unknown"
+                    % (component, group["pgid"], _one_line(result.stderr)),
+                    "inspect_process",
+                )
+        deadline = time.monotonic() + min(8.0, max(1.0, float(step.timeout)))
+        while time.monotonic() < deadline:
+            live = {
+                int(proc["pid"])
+                for proc in _klonet_runtime_processes(
+                    root,
+                    command_runner=self._command,
+                    allow_command_root_identity=True,
+                )
+            }
+            if frozen.isdisjoint(live):
+                return DirectActionResult(
+                    "completed",
+                    "orphan_component_groups_stopped component=%s pids=%s "
+                    "signal=TERM environment_changed=true"
+                    % (component, ",".join(str(pid) for pid in sorted(frozen))),
+                )
+            time.sleep(0.2)
+
+        remaining_groups, problem = matching_groups()
+        if problem:
+            return self._blocked(problem + "_before_kill")
+        for group in remaining_groups:
+            result = self._command(
+                _kill_argv_for_owner_pid(
+                    group["owner_pid"], "KILL", "-%s" % group["pgid"],
+                ),
+                timeout=min(step.timeout, 30),
+            )
+            if result.returncode != 0:
+                return DirectActionResult(
+                    "failed",
+                    "orphan_component_kill_failed component=%s pgid=%s stderr=%s "
+                    "environment_changed=unknown"
+                    % (component, group["pgid"], _one_line(result.stderr)),
+                    "inspect_process",
+                )
+        kill_deadline = time.monotonic() + min(
+            8.0, max(1.0, float(step.timeout)),
+        )
+        while time.monotonic() < kill_deadline:
+            if frozen.isdisjoint(_component_pids(root, component)):
+                return DirectActionResult(
+                    "completed",
+                    "orphan_component_groups_stopped component=%s pids=%s "
+                    "signal=TERM,KILL environment_changed=true"
+                    % (component, ",".join(str(pid) for pid in sorted(frozen))),
+                )
+            time.sleep(0.2)
+        return DirectActionResult(
+            "failed",
+            "orphan_component_not_stopped component=%s pids=%s "
+            "environment_changed=true"
+            % (component, ",".join(str(pid) for pid in sorted(frozen))),
+            "inspect_process",
+        )
+
     def _action_restart_screen_component(
         self,
         step: PrivilegedStep,
@@ -866,7 +1190,14 @@ class DirectPrivilegedActionRunner:
         run_as_uid = _runtime_run_as_uid(step.args)
         if run_as_uid is None:
             return self._blocked("invalid_run_as_uid")
-        targets = self._screen_session_targets(session, run_as_uid) or [session]
+        dead_targets, cleanup_error = self._clean_dead_screen_session(
+            session, run_as_uid,
+        )
+        if cleanup_error:
+            return DirectActionResult(
+                "failed", cleanup_error, "inspect_runtime",
+            )
+        targets = self._screen_session_targets(session, run_as_uid)
         control_rc = _runtime_screen_control_path(root, session)
         control_check = self._command(
             _runtime_user_argv(
@@ -879,8 +1210,6 @@ class DirectPrivilegedActionRunner:
             _listener_pids_for_port(port)
             if port else _component_pids(root, component)
         )
-        if port and not old_pids:
-            return self._blocked("component_listener_missing_before_restart=%s" % port)
         if port:
             allowed = _allowed_runtime_cwds(root)
             wrong = [
@@ -896,7 +1225,52 @@ class DirectPrivilegedActionRunner:
                         str(pid) for pid in wrong
                     )
                 )
-        if control_check.returncode == 0 and targets:
+        owner_targets, ownership_observed = _screen_owner_targets_for_pids(
+            old_pids,
+        )
+        target_owns_runtime = bool(
+            set(targets).intersection(owner_targets)
+        )
+        foreign_owner_targets = [
+            target for target in owner_targets if target not in targets
+        ]
+        proven_orphan_pids: list[int] = []
+        for pid in old_pids:
+            per_pid_owners, per_pid_observed = _screen_owner_targets_for_pids(
+                [pid],
+            )
+            if per_pid_observed and not per_pid_owners:
+                proven_orphan_pids.append(pid)
+        if proven_orphan_pids:
+            orphan_cleanup = self._stop_frozen_component_groups(
+                root, component, proven_orphan_pids, step,
+            )
+            if orphan_cleanup.status != "completed":
+                return DirectActionResult(
+                    "failed",
+                    "screen_restart_orphan_cleanup_failed component=%s reason=%s "
+                    "environment_changed=unknown"
+                    % (component, orphan_cleanup.output),
+                    "inspect_process",
+                )
+        # A named Screen can outlive the foreground service it manages, and a
+        # role can also be owned by a differently named Screen from an older
+        # convention.  Screen presence alone is never process ownership.
+        # Preserve the interactive shell only when /proc ancestry proves that
+        # it owns the frozen runtime.  When ancestry is unavailable (mainly
+        # restricted /proc environments), retain the prior conservative
+        # behavior instead of guessing that another session owns the process.
+        stale_screen = bool(targets) and (
+            not old_pids
+            or (ownership_observed and not target_owns_runtime)
+            or bool(foreign_owner_targets)
+        )
+        screen_migration = bool(
+            old_pids
+            and ownership_observed
+            and (not target_owns_runtime or bool(foreign_owner_targets))
+        )
+        if control_check.returncode == 0 and targets and not stale_screen:
             target = targets[0]
             interrupted = self._command(
                 _runtime_user_argv(
@@ -981,11 +1355,13 @@ class DirectPrivilegedActionRunner:
             return DirectActionResult(
                 "completed",
                 "action=restart_screen_component component=%s session=%s "
-                "session_preserved=true old_pids=%s new_pids=%s environment_changed=true"
+                "session_preserved=true old_pids=%s new_pids=%s "
+                "cleaned_orphan_pids=%s environment_changed=true"
                 % (
                     component, session,
                     ",".join(str(pid) for pid in old_pids) or "none",
                     ",".join(str(pid) for pid in new_pids) or "none",
+                    ",".join(str(pid) for pid in proven_orphan_pids) or "none",
                 ),
                 metadata={
                     "kind": "component_restart",
@@ -995,12 +1371,80 @@ class DirectPrivilegedActionRunner:
                     "new_pids": ",".join(str(pid) for pid in new_pids),
                 },
             )
-        for target in targets:
-            self._command(
+        cleanup_targets = list(targets)
+        if screen_migration:
+            cleanup_targets.extend(
+                target for target in owner_targets
+                if target not in cleanup_targets
+            )
+        failed_targets = []
+        for target in cleanup_targets:
+            stopped = self._command(
                 _runtime_user_argv(
                     ["screen", "-S", target, "-X", "quit"], run_as_uid,
                 ),
                 timeout=20,
+            )
+            if stopped.returncode != 0:
+                failed_targets.append(
+                    "%s:%s" % (target, _one_line(stopped.stderr))
+                )
+        if failed_targets:
+            return DirectActionResult(
+                "failed",
+                "screen_restart_cleanup_failed session=%s stderr=%s "
+                "environment_changed=unknown"
+                % (session, ";".join(failed_targets)),
+                "inspect_runtime",
+            )
+        if cleanup_targets:
+            for _attempt in range(20):
+                existing = self._existing_screen_sessions(run_as_uid)
+                if not any(
+                    _screen_logical_name(target) in existing
+                    for target in cleanup_targets
+                ):
+                    break
+                time.sleep(0.1)
+            existing = self._existing_screen_sessions(run_as_uid)
+            remaining_sessions = [
+                target for target in cleanup_targets
+                if _screen_logical_name(target) in existing
+            ]
+            if remaining_sessions:
+                return DirectActionResult(
+                    "failed",
+                    "screen_restart_cleanup_incomplete sessions=%s "
+                    "environment_changed=unknown" % ",".join(remaining_sessions),
+                    "inspect_runtime",
+                )
+        # Once this Action deliberately removes a Screen, every old PID it
+        # froze before that removal is now its lifecycle responsibility.  A
+        # foreground service can survive Screen teardown (notably when an old
+        # session lacks the interactive control rc).  Clean only those exact
+        # frozen groups before creating the replacement; do not rediscover a
+        # new target by process name or by whichever PID currently owns a
+        # port.
+        if cleanup_targets and old_pids:
+            stopped_runtime = self._stop_frozen_component_groups(
+                root, component, old_pids, step,
+            )
+            if stopped_runtime.status != "completed":
+                return DirectActionResult(
+                    "failed",
+                    "screen_replacement_runtime_stop_failed component=%s reason=%s "
+                    "environment_changed=unknown"
+                    % (component, stopped_runtime.output),
+                    "inspect_runtime",
+                )
+        if old_pids and port and not _wait_tcp_released(
+            "127.0.0.1", port, timeout=8.0,
+        ):
+            return DirectActionResult(
+                "failed",
+                "screen_migration_port_not_released=%s environment_changed=unknown"
+                % port,
+                "inspect_runtime",
             )
         started = self._start_one_component(
             component, session, root, step
@@ -1030,8 +1474,14 @@ class DirectPrivilegedActionRunner:
             )
         return DirectActionResult(
             "completed",
-            "%s old_pids=%s new_pids=%s" % (
+            "%s restart_state=%s old_pids=%s new_pids=%s" % (
                 started.output,
+                "dead_screen_replaced" if dead_targets else (
+                        "runtime_screen_migrated" if screen_migration else (
+                        "stale_screen_replaced" if stale_screen else (
+                        "missing_screen_created" if not targets else "screen_replaced"
+                    ))
+                ),
                 ",".join(str(pid) for pid in old_pids) or "none",
                 ",".join(str(pid) for pid in new_pids) or "none",
             ),
@@ -2202,7 +2652,10 @@ class DirectPrivilegedActionRunner:
         ports = _port_arg_list(step.args.get("ports"))
         if not ports:
             return self._blocked("invalid_runtime_ports")
-        processes = _klonet_runtime_processes(runtime_cwd)
+        processes = _klonet_runtime_processes(
+            runtime_cwd,
+            command_runner=self._command,
+        )
         if not processes:
             owned_ports = _runtime_ports_owned_by_allowed_cwd(ports, runtime_cwd)
             if owned_ports:
@@ -2239,7 +2692,9 @@ class DirectPrivilegedActionRunner:
                     ",".join(str(port) for port in ports),
                 ),
             )
-        remaining = _klonet_runtime_processes(runtime_cwd)
+        remaining = _klonet_runtime_processes(
+            runtime_cwd, command_runner=self._command,
+        )
         kill_groups = _runtime_process_groups(remaining)
         for group in kill_groups:
             result = self._command(
@@ -2259,7 +2714,12 @@ class DirectPrivilegedActionRunner:
                 "failed",
                 "runtime_not_stopped_stably remaining_pids=%s runtime_ports_still_listening=%s environment_changed=true"
                 % (
-                    ",".join(str(proc["pid"]) for proc in _klonet_runtime_processes(runtime_cwd)) or "none",
+                    ",".join(
+                        str(proc["pid"])
+                        for proc in _klonet_runtime_processes(
+                            runtime_cwd, command_runner=self._command,
+                        )
+                    ) or "none",
                     ",".join(str(port) for port in occupied) or "none",
                 ),
                 "inspect_process",
@@ -2298,7 +2758,12 @@ class DirectPrivilegedActionRunner:
         if expected_pid <= 1 or not 1 <= port <= 65535:
             return self._blocked("invalid_component_pid_or_port")
 
-        processes = _klonet_runtime_processes(runtime_cwd)
+        processes = _klonet_runtime_processes(
+            runtime_cwd,
+            command_runner=self._command,
+            expected_pid=expected_pid,
+            allow_command_root_identity=True,
+        )
         target = next(
             (proc for proc in processes if int(proc["pid"]) == expected_pid),
             None,
@@ -2321,7 +2786,35 @@ class DirectPrivilegedActionRunner:
         listener_pids = set(_listener_pids_for_port(port))
         group_pids = {int(proc["pid"]) for proc in group}
         if not listener_pids.intersection(group_pids):
-            return self._blocked("component_port_not_owned_by_pid_group")
+            listener_groups = []
+            listener_cwds = []
+            for listener_pid in sorted(listener_pids):
+                try:
+                    listener_group = os.getpgid(listener_pid)
+                except (OSError, ProcessLookupError):
+                    listener_group = 0
+                if listener_group > 0 and listener_group not in listener_groups:
+                    listener_groups.append(listener_group)
+                listener_cwd = _proc_cwd(
+                    listener_pid,
+                    command_runner=self._command,
+                )
+                if listener_cwd and listener_cwd not in listener_cwds:
+                    listener_cwds.append(listener_cwd)
+            return self._blocked(
+                "component_port_not_owned_by_pid_group "
+                "expected_pid=%s expected_pgid=%s port=%s "
+                "actual_listener_pids=%s actual_listener_pgids=%s "
+                "actual_listener_cwds=%s"
+                % (
+                    expected_pid,
+                    pgid,
+                    port,
+                    ",".join(str(item) for item in sorted(listener_pids)) or "unknown",
+                    ",".join(str(item) for item in listener_groups) or "unknown",
+                    ",".join(listener_cwds) or "unknown",
+                )
+            )
 
         owner_pid = next(
             (int(proc["pid"]) for proc in group if int(proc["pid"]) == pgid),
@@ -2349,9 +2842,75 @@ class DirectPrivilegedActionRunner:
                     % (component, expected_pid, pgid, runtime_cwd, port),
                 )
             time.sleep(0.2)
+        # A Gunicorn role may legitimately exceed the graceful TERM window.
+        # Re-freeze the exact same role/group/port identity before escalating;
+        # never fall back to a name scan or a newly appeared PID.
+        remaining = _klonet_runtime_processes(
+            runtime_cwd,
+            command_runner=self._command,
+            expected_pid=expected_pid,
+            allow_command_root_identity=True,
+        )
+        remaining_target = next(
+            (proc for proc in remaining if int(proc["pid"]) == expected_pid),
+            None,
+        )
+        if remaining_target is None:
+            if not set(_listener_pids_for_port(port)).intersection(group_pids):
+                return DirectActionResult(
+                    "completed",
+                    "action=stop_klonet_component component=%s pid=%s pgid=%s "
+                    "runtime_cwd=%s port=%s signal=TERM environment_changed=true"
+                    % (component, expected_pid, pgid, runtime_cwd, port),
+                )
+            return self._blocked("component_pid_state_drift_after_term")
+        remaining_group = [
+            proc for proc in remaining if int(proc["pgid"]) == pgid
+        ]
+        remaining_group_pids = {int(proc["pid"]) for proc in remaining_group}
+        listeners = set(_listener_pids_for_port(port))
+        if (
+            int(remaining_target["pgid"]) != pgid
+            or _klonet_component_for_command(
+                str(remaining_target["cmdline"])
+            ) != component
+            or not remaining_group
+            or any(
+                _klonet_component_for_command(str(proc["cmdline"])) != component
+                for proc in remaining_group
+            )
+            or not listeners.intersection(remaining_group_pids)
+        ):
+            return self._blocked("component_identity_drift_before_kill")
+        killed = self._command(
+            _kill_argv_for_owner_pid(owner_pid, "KILL", "-%s" % pgid),
+            timeout=min(step.timeout, 30),
+        )
+        if killed.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "stop_component_kill_failed pid=%s pgid=%s stderr=%s "
+                "environment_changed=unknown"
+                % (expected_pid, pgid, _one_line(killed.stderr)),
+                "inspect_process",
+            )
+        kill_deadline = time.monotonic() + 8.0
+        while time.monotonic() < kill_deadline:
+            if not Path("/proc/%s" % expected_pid).exists() and not set(
+                _listener_pids_for_port(port)
+            ).intersection(remaining_group_pids):
+                return DirectActionResult(
+                    "completed",
+                    "action=stop_klonet_component component=%s pid=%s pgid=%s "
+                    "runtime_cwd=%s port=%s signal=TERM,KILL "
+                    "environment_changed=true"
+                    % (component, expected_pid, pgid, runtime_cwd, port),
+                )
+            time.sleep(0.2)
         return DirectActionResult(
             "failed",
-            "component_not_stopped pid=%s pgid=%s port=%s environment_changed=true"
+            "component_not_stopped_after_kill pid=%s pgid=%s port=%s "
+            "environment_changed=true"
             % (expected_pid, pgid, port),
             "inspect_process",
         )
@@ -3502,6 +4061,46 @@ class DirectPrivilegedActionRunner:
                 targets.append(target)
         return targets
 
+    def _clean_dead_screen_session(
+        self, session: str, run_as_uid: str = "",
+    ) -> tuple[list[str], str]:
+        """Remove exact dead sockets and decide success from observed state.
+
+        ``screen -S <dead> -X quit`` cannot succeed because no server process
+        exists.  ``screen -wipe`` is the canonical cleanup operation.  Its
+        return code is advisory: a concurrent cleanup can make it non-zero,
+        so the authoritative result is whether the exact dead target remains.
+        """
+
+        dead_targets = self._dead_screen_session_targets(session, run_as_uid)
+        if not dead_targets:
+            return [], ""
+        wipe_errors = []
+        for target in dead_targets:
+            result = self._command(
+                _runtime_user_argv(["screen", "-wipe", target], run_as_uid),
+                timeout=20,
+            )
+            if result.returncode != 0:
+                wipe_errors.append("%s:%s" % (
+                    target, _one_line(result.stderr or result.stdout),
+                ))
+        remaining = list(dead_targets)
+        for _attempt in range(10):
+            remaining = self._dead_screen_session_targets(session, run_as_uid)
+            if not remaining:
+                return dead_targets, ""
+            time.sleep(0.1)
+        return dead_targets, (
+            "screen_dead_cleanup_incomplete session=%s remaining=%s stderr=%s "
+            "environment_changed=unknown"
+            % (
+                session,
+                ",".join(remaining),
+                ";".join(wipe_errors) or "none",
+            )
+        )
+
     def _write_file(
         self,
         path: Path,
@@ -3634,8 +4233,8 @@ class DirectPrivilegedActionRunner:
             "changes_state": _command_changes_state(self._active_action, argv),
         })
 
-    @staticmethod
     def _run_command(
+        self,
         argv: list[str],
         *,
         cwd: str | None,
@@ -3651,21 +4250,81 @@ class DirectPrivilegedActionRunner:
             "errors": "replace",
             "check": False,
         }
-        if argv[:1] == ["sudo"] and sys.stdin.isatty():
-            # Keep stdin and stderr attached to the user's terminal so sudo can
-            # request a password without the password entering prompts, args,
-            # logs, or captured evidence. Stdout remains bounded evidence.
-            return subprocess.run(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=None,
-                **options,
+        if argv[:1] == ["sudo"]:
+            auth_error = self._ensure_sudo_authenticated(
+                timeout=max(1, min(int(timeout), 120)),
             )
+            if auth_error:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    stdout="",
+                    stderr=auth_error,
+                )
+            argv = _noninteractive_sudo_argv(argv)
         return subprocess.run(
             argv,
             capture_output=True,
             **options,
         )
+
+    def _ensure_sudo_authenticated(self, *, timeout: int) -> str:
+        """Validate sudo once per atomic Action and never capture a password."""
+
+        if self._sudo_auth_state == "ready":
+            return ""
+        if self._sudo_auth_state == "failed":
+            return self._sudo_auth_error or "sudo_authentication_failed"
+
+        validation_options = {
+            "timeout": timeout,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "check": False,
+        }
+        try:
+            cached = subprocess.run(
+                ["sudo", "-n", "-v"],
+                capture_output=True,
+                **validation_options,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._sudo_auth_state = "failed"
+            self._sudo_auth_error = "sudo_authentication_unavailable=%s" % (
+                exc.__class__.__name__,
+            )
+            return self._sudo_auth_error
+        if cached.returncode == 0:
+            self._sudo_auth_state = "ready"
+            return ""
+        if not sys.stdin.isatty():
+            self._sudo_auth_state = "failed"
+            self._sudo_auth_error = "sudo_authentication_required_no_tty"
+            return self._sudo_auth_error
+
+        # This is the sole interactive sudo call for the Action.  stdin and
+        # stderr stay attached to the user's terminal; the password never
+        # enters argv, captured evidence, prompts, plans, or memory.
+        try:
+            authenticated = subprocess.run(
+                ["sudo", "-v"],
+                stdout=subprocess.DEVNULL,
+                stderr=None,
+                **validation_options,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._sudo_auth_state = "failed"
+            self._sudo_auth_error = "sudo_authentication_unavailable=%s" % (
+                exc.__class__.__name__,
+            )
+            return self._sudo_auth_error
+        if authenticated.returncode != 0:
+            self._sudo_auth_state = "failed"
+            self._sudo_auth_error = "sudo_authentication_failed"
+            return self._sudo_auth_error
+        self._sudo_auth_state = "ready"
+        return ""
 
     @staticmethod
     def _blocked(
@@ -4410,6 +5069,63 @@ def _component_pids(root: Path, component: str) -> list[int]:
     return sorted(result)
 
 
+def _screen_logical_name(target: str) -> str:
+    value = str(target or "").strip()
+    return value.split(".", 1)[1] if value.partition(".")[0].isdigit() else value
+
+
+def _screen_owner_targets_for_pids(pids: list[int]) -> tuple[list[str], bool]:
+    """Return Screen socket targets proven to own any supplied runtime PID.
+
+    Ownership is derived only from the live /proc parent chain.  The boolean
+    reports whether at least one complete chain was observable; callers must
+    not interpret an unreadable chain as proof that a Screen does not own the
+    process.
+    """
+
+    owners: list[str] = []
+    observed = False
+    for raw_pid in pids:
+        try:
+            current = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        visited: set[int] = set()
+        chain_observed = False
+        for _depth in range(32):
+            if current <= 1 or current in visited:
+                break
+            visited.add(current)
+            proc = Path("/proc") / str(current)
+            try:
+                command = proc.joinpath("cmdline").read_bytes().replace(
+                    b"\x00", b" ",
+                ).decode("utf-8", errors="replace").strip()
+                stat = proc.joinpath("stat").read_text(
+                    encoding="utf-8", errors="replace",
+                )
+            except OSError:
+                break
+            chain_observed = True
+            match = re.search(r"(?:^|\s)-dmS\s+(\S+)", command)
+            if (
+                command.lstrip().startswith("SCREEN ")
+                and match is not None
+                and _safe_token(match.group(1))
+            ):
+                target = "%s.%s" % (current, match.group(1))
+                if target not in owners:
+                    owners.append(target)
+                break
+            closing = stat.rfind(")")
+            tail = stat[closing + 1:].strip().split() if closing >= 0 else []
+            if len(tail) < 2 or not tail[1].isdigit():
+                break
+            current = int(tail[1])
+        observed = observed or chain_observed
+    return owners, observed
+
+
 def _wait_component_new_pids(
     root: Path,
     component: str,
@@ -4627,25 +5343,50 @@ def _port_arg_list(value) -> list[int]:
     return result
 
 
-def _klonet_runtime_processes(runtime_cwd: Path) -> list[dict[str, int | str]]:
+def _klonet_runtime_processes(
+    runtime_cwd: Path,
+    *,
+    command_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    expected_pid: int | None = None,
+    allow_command_root_identity: bool = False,
+) -> list[dict[str, int | str]]:
     processes: list[dict[str, int | str]] = []
     proc_root = Path("/proc")
     allowed_cwds = {str(runtime_cwd)}
     mains = runtime_cwd / "mains"
     if mains.is_dir():
         allowed_cwds.add(str(mains.resolve()))
+    expected_pgid = None
+    if expected_pid is not None:
+        if expected_pid <= 1:
+            return []
+        expected_pgid = _proc_pgid(expected_pid)
+        if expected_pgid is None or expected_pgid <= 1:
+            return []
     for item in (proc_root.iterdir() if proc_root.is_dir() else []):
         if not item.name.isdigit():
             continue
         pid = int(item.name)
-        cwd = _proc_cwd(pid)
-        if cwd not in allowed_cwds:
+        pgid = _proc_pgid(pid)
+        if pgid is None or pgid <= 1:
+            continue
+        # A frozen component action owns one PID/PGID.  Filter by that
+        # identity before reading cwd so unrelated cross-user runtimes cannot
+        # trigger sudo or enter this Action's authority boundary.
+        if expected_pgid is not None and pgid != expected_pgid:
             continue
         cmdline = _proc_cmdline(pid)
         if not _is_klonet_runtime_command(cmdline):
             continue
-        pgid = _proc_pgid(pid)
-        if pgid is None or pgid <= 1:
+        cwd = _proc_cwd(pid, command_runner=command_runner)
+        if cwd not in allowed_cwds and not (
+            allow_command_root_identity
+            and process_belongs_to_project_root(
+                cwd=cwd,
+                cmdline=cmdline,
+                project_root=runtime_cwd,
+            )
+        ):
             continue
         processes.append({"pid": pid, "pgid": pgid, "cmdline": cmdline, "cwd": cwd})
     return processes
@@ -4690,7 +5431,9 @@ def _runtime_stopped_stably(
     deadline = time.monotonic() + timeout
     stable_since: float | None = None
     while time.monotonic() < deadline:
-        stopped = not _klonet_runtime_processes(runtime_cwd)
+        stopped = not _klonet_runtime_processes(
+            runtime_cwd, command_runner=runner._command,
+        )
         target_ports_released = not _runtime_ports_owned_by_allowed_cwd(
             ports, runtime_cwd
         )
@@ -4723,7 +5466,11 @@ def _ports_currently_listening(runner: DirectPrivilegedActionRunner, ports: list
     return _listening_ports("%s\n%s" % (result.stdout or "", result.stderr or ""), ports)
 
 
-def _proc_cwd(pid: int) -> str:
+def _proc_cwd(
+    pid: int,
+    *,
+    command_runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> str:
     try:
         resolved = str((Path("/proc") / str(pid) / "cwd").resolve())
         if resolved and resolved != str(Path("/proc") / str(pid) / "cwd"):
@@ -4732,16 +5479,25 @@ def _proc_cwd(pid: int) -> str:
         pass
     if not 1 < int(pid) <= 4_194_304:
         return ""
+    argv = ["readlink", "-f", "/proc/%s/cwd" % int(pid)]
     try:
-        completed = subprocess.run(
-            ["sudo", "-n", "readlink", "-f", "/proc/%s/cwd" % int(pid)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-            check=False,
-        )
+        if command_runner is not None:
+            # Registered Actions already have a reviewable privilege boundary.
+            # Reuse its TTY-aware sudo path so cross-user identity checks can
+            # authenticate without placing a password in prompts, argv, or
+            # captured evidence.  Read-only Discovery callers deliberately do
+            # not pass this runner and retain the non-interactive probe path.
+            completed = command_runner(_sudo_if_needed(argv), timeout=5)
+        else:
+            completed = subprocess.run(
+                ["sudo", "-n", *argv],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired):
         return ""
     lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
@@ -5101,6 +5857,14 @@ def _sudo_if_needed(argv: list[str]) -> list[str]:
     ):
         return argv
     return ["sudo", *argv]
+
+
+def _noninteractive_sudo_argv(argv: list[str]) -> list[str]:
+    """Make an already-authenticated sudo command unable to prompt again."""
+
+    if argv[:1] != ["sudo"] or "-n" in argv[1:]:
+        return list(argv)
+    return ["sudo", "-n", *argv[1:]]
 
 
 def _safe_token(value: str) -> bool:

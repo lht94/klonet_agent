@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from klonet_agent.ops.privileged.context import GroundedPlanContext
+from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
 from klonet_agent.ops.privileged.contracts import (
     PlanResource,
     PrivilegedPlan,
@@ -143,14 +144,7 @@ def _default_action_postconditions(
                     **({"sha256": hashes[name]} if hashes.get(name) else {}),
                 },
             }
-            for name in (
-                "gun.py",
-                "master_main.py",
-                "celery_worker.py",
-                "web_terminal_main.py",
-                "worker_gun.py",
-                "worker_main.py",
-            )
+            for name in REQUIRED_ENTRY_FILES
         ]
     if action == "copy_files":
         destination = Path(str(args.get("destination") or ""))

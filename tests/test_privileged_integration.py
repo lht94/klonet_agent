@@ -177,7 +177,9 @@ def test_workflow_readonly_turn_runs_through_staged_runtime(capsys):
         reply, _, _ = orchestrator.single_chat("inspect platforms", [], 0)
 
     assert reply == "readonly response"
-    assert "工作流协调器：readonly response" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Klonet Agent：readonly response" in output
+    assert "工作流协调器：readonly response" not in output
 
 
 def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys):
@@ -207,10 +209,9 @@ def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys)
     assert supervisor.calls == [("请重启 nginx 服务", "")]
     assert history[-1] == {"role": "assistant", "content": reply}
     assert token == 0
-    assert (
-        "工作流协调器：privileged supervisor completed"
-        in capsys.readouterr().out
-    )
+    output = capsys.readouterr().out
+    assert "Klonet Agent：privileged supervisor completed" in output
+    assert "工作流协调器：privileged supervisor completed" not in output
 
 
 def test_orchestrator_returns_handled_supervisor_result_before_main_llm():
@@ -234,6 +235,72 @@ def test_orchestrator_returns_handled_supervisor_result_before_main_llm():
 
     assert reply == "privileged supervisor completed"
     assert supervisor.calls == [("show-priv priv-123", "")]
+
+
+def test_handled_privileged_turn_persists_episode_shared_memory_and_trace(tmp_path):
+    import json
+
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, GoalOutcome, ProbeRequest,
+    )
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+    from klonet_agent.tracing.logger import TraceLogger
+
+    bundle = EvidenceBundle(goal="查看 test 平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "platform=test project_root=/srv/test backend_status=healthy",
+    ))
+
+    class Supervisor:
+        def handle(self, text, environment_context=""):
+            return SimpleNamespace(
+                handled=True,
+                kind="completed",
+                message="test 平台运行正常",
+                plan=None,
+                failure=None,
+                evidence=bundle,
+                outcome=GoalOutcome("achieved", reason="inventory complete"),
+            )
+
+    memory = MemoryStore.for_session(tmp_path / "memory", "u", "p")
+    trace_path = tmp_path / "trace.jsonl"
+    orchestrator = AgentOrchestrator(
+        profile=get_profile("ops-privilege"),
+        session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+        llm=NoCallLLM(),
+        memory_store=memory,
+        trace_logger=TraceLogger(trace_path),
+        privileged_supervisor=Supervisor(),
+    )
+
+    orchestrator.single_chat("查看 test 平台", [], 0)
+
+    episode = memory.read_today_episode()
+    shared = memory.read_shared_memory()
+    trace_rows = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert "Ops-Privilege 工作流记录" in episode
+    assert "running_platforms" in episode
+    assert "Ops 诊断记录" in shared
+    assert "test 平台运行正常" in shared
+    assert trace_rows[-1]["event"] == "privileged_workflow_result"
+    assert trace_rows[-1]["kind"] == "completed"
+    assert trace_rows[-1]["goal_status"] == "achieved"
+
+
+def test_ops_privilege_memory_prompt_includes_shared_ops_evidence(tmp_path):
+    from klonet_agent.memory import MemoryStore
+
+    memory = MemoryStore.for_session(tmp_path / "memory", "u", "p")
+    memory.append_shared_episode("## Ops evidence\n- marker: shared-runtime-fact")
+
+    assert "shared-runtime-fact" in memory.memory_prompt(mode="ops-privilege")
+    assert "shared-runtime-fact" in memory.memory_prompt(mode="ops")
+    assert "shared-runtime-fact" not in memory.memory_prompt(mode="mentor")
 
 
 def test_orchestrator_passes_recent_dialogue_to_privileged_classifier():

@@ -45,15 +45,29 @@ class ChangePlanStore:
         path = self.plan_dir / (plan_id + ".json")
         if not path.is_file():
             raise KeyError("unknown privileged plan: %s" % plan_id)
-        return ChangePlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        plan = ChangePlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        if self._repair_inconsistent_completion(plan):
+            self.save(plan)
+        return plan
 
     def list(self) -> list[ChangePlan]:
         if not self.plan_dir.exists():
             return []
-        plans = [
-            ChangePlan.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            for path in self.plan_dir.glob("priv-ops-*.json")
-        ]
+        plans = []
+        for path in self.plan_dir.glob("priv-ops-*.json"):
+            try:
+                plan = ChangePlan.from_dict(json.loads(
+                    path.read_text(encoding="utf-8")
+                ))
+                if self._repair_inconsistent_completion(plan):
+                    self.save(plan)
+                plans.append(plan)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                # Historical drafts are not an authority over the current
+                # workflow. A malformed or now-invalid draft remains available
+                # for explicit forensic inspection, but cannot crash plan
+                # routing or masquerade as the latest usable plan.
+                continue
         return sorted(plans, key=lambda item: item.updated_at, reverse=True)
 
     def save_failure(self, failure: FailureRecord) -> None:
@@ -82,15 +96,22 @@ class ChangePlanStore:
     def list_failures(self) -> list[FailureRecord]:
         if not self.failure_dir.exists():
             return []
-        failures = [
-            FailureRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
-            for path in self.failure_dir.glob("failure-*.json")
-        ]
-        return sorted(
-            [item for item in failures if item is not None],
-            key=lambda item: item.created_at,
+        failures = []
+        for path in self.failure_dir.glob("failure-*.json"):
+            try:
+                failure = FailureRecord.from_dict(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if failure is not None:
+                failures.append((failure, path.stat().st_mtime_ns))
+        ordered = sorted(
+            failures,
+            key=lambda item: (item[0].created_at, item[1]),
             reverse=True,
         )
+        return [item[0] for item in ordered]
 
     def recover(self, plan_id: str) -> ChangePlan:
         plan = self.load(plan_id)
@@ -123,3 +144,12 @@ class ChangePlanStore:
     def _validate_id(plan_id: str) -> None:
         if not re.fullmatch(r"priv-ops-[A-Za-z0-9_-]{1,64}", str(plan_id or "")):
             raise ValueError("invalid privileged plan id")
+
+    @staticmethod
+    def _repair_inconsistent_completion(plan: ChangePlan) -> bool:
+        """Demote historical outer-completed/inner-incomplete plan state."""
+
+        if plan.status != "completed" or plan.execution_is_complete:
+            return False
+        plan.status = "paused"
+        return True

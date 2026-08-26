@@ -206,7 +206,9 @@ def test_existing_runtime_start_rejects_nonexistent_mains_without_predecessor(tm
 
 
 def test_forced_start_compiles_new_screen_from_frozen_project_root(tmp_path):
-    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource, PrivilegedPlan, PrivilegedStep,
+    )
     from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
 
     root = tmp_path / "102"
@@ -596,6 +598,55 @@ def test_python_class_attribute_postcondition_is_canonicalized_from_action_args(
     ]
 
 
+def test_prepare_project_files_replaces_model_guesses_with_registered_contract():
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_postconditions,
+    )
+
+    root = "/srv/klonet/test"
+    checks = _canonical_action_postconditions(
+        "prepare_project_files",
+        {
+            "project_root": root,
+            "entry_sha256s": {"master_main.py": "a" * 64},
+        },
+        [
+            {"checker": "file_exists", "args": {"path": root + "/manage.py"}},
+            {"checker": "file_exists", "args": {"path": root + "/mains"}},
+        ],
+    )
+
+    assert [item["args"]["path"] for item in checks] == [
+        root + "/" + name for name in REQUIRED_ENTRY_FILES
+    ]
+    assert all("manage.py" not in item["args"]["path"] for item in checks)
+    master = next(
+        item for item in checks
+        if item["args"]["path"].endswith("/master_main.py")
+    )
+    assert master == {
+        "checker": "file_sha256",
+        "args": {"path": root + "/master_main.py", "sha256": "a" * 64},
+    }
+
+
+def test_shared_klonet_context_is_role_scoped_and_not_runtime_evidence():
+    from klonet_agent.ops.privileged.context import klonet_domain_context
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+
+    binding = klonet_domain_context("binding")
+    discovery = klonet_domain_context("discovery")
+
+    assert "KLONET_DOMAIN_CONTEXT" in binding
+    assert "never current-host evidence" in binding
+    assert all(name in binding for name in REQUIRED_ENTRY_FILES)
+    assert "manage.py are not Klonet readiness criteria" in binding
+    assert "canonical pre/postconditions" in binding
+    assert "policy-validated read-only commands" in discovery
+    assert "canonical pre/postconditions" not in discovery
+
+
 def test_screen_postconditions_are_canonical_for_component_role():
     from klonet_agent.ops.privileged.execution_agent import (
         _canonical_action_postconditions,
@@ -639,6 +690,374 @@ def test_screen_postconditions_are_canonical_for_component_role():
         "checker": "port_listening",
         "args": {"port": 45555, "host": "127.0.0.1"},
     }
+    assert worker[0] == {
+        "checker": "screen_session_exists",
+        "args": {"session": "test_w"},
+    }
+
+
+def test_screen_postconditions_keep_session_acceptance_with_run_as_uid():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_postconditions,
+    )
+
+    checks = _canonical_action_postconditions(
+        "restart_screen_component",
+        {
+            "screen_session": "test_m",
+            "component": "master",
+            "project_root": "/home/lzl/test/vemu_uestc",
+            "master_port": 45554,
+            "run_as_uid": 1000,
+        },
+        [{"checker": "screen_session_exists", "args": {"session": "test_m"}}],
+    )
+
+    assert checks[0] == {
+        "checker": "screen_session_exists",
+        "args": {"session": "test_m"},
+    }
+    assert sum(item["checker"] == "screen_session_exists" for item in checks) == 1
+
+
+def test_each_atomic_component_consumes_only_its_runtime_identity(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    root = tmp_path / "vemu_uestc"
+    root.mkdir()
+    resources = [
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root", str(root),
+            "running_platforms", consumers=["restart.project_root"],
+        ),
+        PlanResource(
+            "master_uid", "identifier", "frozen", "master_uid", 1000,
+            "process_detail", consumers=["restart.run_as_uid"],
+        ),
+        PlanResource(
+            "master_python", "path", "frozen", "master_python_executable",
+            "/envs/test/bin/python3.8", "process_detail",
+            consumers=["restart.python_executable"],
+        ),
+        PlanResource(
+            "worker_uid", "identifier", "frozen", "worker_uid", 1000,
+            "process_detail", consumers=["restart.run_as_uid"],
+        ),
+        PlanResource(
+            "worker_python", "path", "frozen", "worker_python_executable",
+            "/envs/klonet-py38/bin/python3.8", "process_detail",
+            consumers=["restart.python_executable"],
+        ),
+    ]
+    agent = PrivilegedExecutionAgent(None)
+
+    master = agent._registered_binding(
+        {"action": "restart_screen_component", "args": {}},
+        PrivilegedStep(
+            step_id="restart__master", title="Restart master screen component",
+            objective="Restart master for %s" % root, risk="medium",
+        ),
+        None,
+        resources,
+    )
+    worker = agent._registered_binding(
+        {"action": "restart_screen_component", "args": {}},
+        PrivilegedStep(
+            step_id="restart__worker", title="Restart worker screen component",
+            objective="Restart worker for %s" % root, risk="medium",
+        ),
+        None,
+        resources,
+    )
+
+    assert master.args["python_executable"] == "/envs/test/bin/python3.8"
+    assert worker.args["python_executable"] == (
+        "/envs/klonet-py38/bin/python3.8"
+    )
+
+
+def test_binding_rejects_restart_and_preserve_for_the_same_role():
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError, _validate_semantic_runtime_consistency,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart",
+        title="Restart test runtime",
+        objective="Restart master for /srv/test",
+        expected_changes=[
+            "restart requested master role",
+            "preserve healthy master role without restart",
+        ],
+        risk="medium",
+    )
+
+    with pytest.raises(ExecutionBindingError, match="restart_and_preserve"):
+        _validate_semantic_runtime_consistency(step)
+
+
+def test_stop_platform_action_schema_requires_structured_component_contracts():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _action_arg_json_schema,
+    )
+
+    schema = _action_arg_json_schema("component_contracts")
+
+    assert schema["type"] == "array"
+    assert schema["items"]["required"] == [
+        "component", "screen_session", "pids", "ports",
+    ]
+    assert schema["items"]["properties"]["pids"]["items"] == {
+        "type": "integer",
+    }
+
+
+def test_stop_platform_contracts_are_compiled_from_runtime_inventory_not_model_prose():
+    import base64
+    import json
+
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.execution_agent import (
+        _compile_stop_platform_contracts,
+        _validate_action_contract_consistency,
+    )
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+
+    specs = [
+        {"name": "master", "managed": True, "screen_suffix": "m"},
+        {"name": "celery", "managed": True, "screen_suffix": "c"},
+        {"name": "web_terminal", "managed": True, "screen_suffix": "web"},
+        {"name": "worker", "managed": True, "screen_suffix": "w"},
+    ]
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(specs).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    context = GroundedPlanContext(
+        knowledge_evidence="knowledge",
+        environment_evidence="runtime",
+        action_catalog="actions",
+        facts={"runtime_instances": [{
+            "platform": "test",
+            "project_root": "/srv/test",
+            "roles": ["master", "celery", "web_terminal", "worker"],
+            "configured_ports": {
+                "master_port": 45554,
+                "web_terminal_port": 5114,
+                "worker_port": 45555,
+            },
+            "fields": {
+                "component_specs_b64": encoded,
+                "master_identities": "10:1000:/env/test/python3.8,11:1000:/env/test/python3.8",
+                "celery_identities": "20:1000:/env/test/python3.8",
+                "web_terminal_identities": "30:1000:/env/test/python3.8",
+                "worker_identities": "40:1000:/env/worker/python3.8,41:1000:/env/worker/python3.8",
+            },
+        }]},
+    )
+
+    compiled, problem = _compile_stop_platform_contracts(
+        {
+            "platform": "test",
+            "project_root": "/srv/test",
+            "component_contracts": "model-authored prose must be replaced",
+        },
+        context,
+    )
+
+    assert problem == ""
+    assert compiled["run_as_uid"] == 1000
+    assert compiled["component_contracts"] == [
+        {
+            "component": "master", "screen_session": "test_m",
+            "pids": [10, 11], "ports": [45554],
+        },
+        {
+            "component": "celery", "screen_session": "test_c",
+            "pids": [20], "ports": [],
+        },
+        {
+            "component": "web_terminal", "screen_session": "test_web",
+            "pids": [30], "ports": [5114],
+        },
+        {
+            "component": "worker", "screen_session": "test_w",
+            "pids": [40, 41], "ports": [45555],
+        },
+    ]
+    step = PrivilegedStep(
+        step_id="stop-test", title="Stop test platform screens",
+        objective="Stop the existing test Screen-managed roles",
+        expected_changes=["test Screen sessions stop"], risk="high",
+    )
+    assert _validate_action_contract_consistency(
+        "stop_platform_screens", compiled, step,
+    ) == ""
+
+
+def test_stop_platform_contract_compiler_rejects_mixed_runtime_users():
+    import base64
+    import json
+
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.execution_agent import (
+        _compile_stop_platform_contracts,
+    )
+
+    encoded = base64.urlsafe_b64encode(json.dumps([
+        {"name": "master", "managed": True, "screen_suffix": "m"},
+        {"name": "worker", "managed": True, "screen_suffix": "w"},
+    ]).encode("utf-8")).decode("ascii").rstrip("=")
+    context = GroundedPlanContext(
+        "knowledge", "runtime", "actions",
+        facts={"runtime_instances": [{
+            "platform": "test", "project_root": "/srv/test",
+            "roles": ["master", "worker"], "configured_ports": {},
+            "fields": {
+                "component_specs_b64": encoded,
+                "master_identities": "10:1000:/env/test/python3.8",
+                "worker_identities": "20:1001:/env/worker/python3.8",
+            },
+        }]},
+    )
+
+    _compiled, problem = _compile_stop_platform_contracts(
+        {"platform": "test", "project_root": "/srv/test"}, context,
+    )
+
+    assert problem == "stop_platform_mixed_or_missing_run_as_uid"
+
+
+def test_binding_does_not_confuse_preserved_port_owner_with_preserved_role():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_semantic_runtime_consistency,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart",
+        title="重启 vemu_uestc 的应用组件",
+        objective=(
+            "按项目根目录 /home/lzl/vemu_uestc 重启 master 和 worker；"
+            "修改端口 worker:45552→45556，保留冲突端口的当前占用者"
+        ),
+        expected_changes=[
+            "restart requested master role at 45551",
+            "worker_port changes to 45556 while the existing listener on "
+            "45552 is preserved",
+            "restart requested worker role at 45556",
+        ],
+        risk="medium",
+    )
+
+    _validate_semantic_runtime_consistency(step)
+
+
+def test_binding_still_rejects_role_preservation_written_after_role():
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError, _validate_semantic_runtime_consistency,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart",
+        title="Restart application roles",
+        objective="Restart master and worker",
+        expected_changes=["master remains unchanged without restart"],
+        risk="medium",
+    )
+
+    with pytest.raises(ExecutionBindingError, match="master restart_and_preserve"):
+        _validate_semantic_runtime_consistency(step)
+
+
+def test_binding_allows_preserving_an_unrelated_runtime_role():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_semantic_runtime_consistency,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart-worker",
+        title="Restart worker only",
+        objective="Restart worker and preserve healthy master role",
+        expected_changes=["restart requested worker role"],
+        risk="medium",
+    )
+
+    _validate_semantic_runtime_consistency(step)
+
+
+def test_restart_screen_identity_uses_the_canonical_component_port():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_postconditions,
+    )
+
+    for component, port_key, port in [
+        ("master", "master_port", "45554"),
+        ("worker", "worker_port", 45555),
+    ]:
+        checks = _canonical_action_postconditions(
+            "restart_screen_component",
+            {
+                "screen_session": "test_%s" % component[0],
+                "component": component,
+                "project_root": "/home/lzl/test/vemu_uestc",
+                port_key: port,
+            },
+            [],
+        )
+
+        assert checks[-1] == {
+            "checker": "component_restart_identity",
+            "args": {
+                "component": component,
+                "project_root": "/home/lzl/test/vemu_uestc",
+                "port": int(port),
+            },
+        }
+
+
+def test_restart_screen_identity_without_a_component_port_uses_process_identity():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_postconditions,
+    )
+
+    checks = _canonical_action_postconditions(
+        "restart_screen_component",
+        {
+            "screen_session": "test_c",
+            "component": "celery",
+            "project_root": "/home/lzl/test/vemu_uestc",
+        },
+        [],
+    )
+
+    assert checks == [
+        {
+            "checker": "screen_session_exists",
+            "args": {"session": "test_c"},
+        },
+        {
+            "checker": "component_process_project_root",
+            "args": {
+                "component": "celery",
+                "project_root": "/home/lzl/test/vemu_uestc",
+            },
+        },
+        {
+            "checker": "component_restart_identity",
+            "args": {
+                "component": "celery",
+                "project_root": "/home/lzl/test/vemu_uestc",
+            },
+        },
+    ]
 
 
 def test_screen_preconditions_are_scoped_to_exact_session_and_role_port():
@@ -687,6 +1106,41 @@ def test_structured_config_preconditions_do_not_require_old_listener_after_stop(
 
     assert result == [
         {"checker": "file_exists", "args": {"path": "/srv/test/vemu_config/config.py"}},
+    ]
+
+
+def test_stop_component_preconditions_drop_cross_role_model_checks():
+    from klonet_agent.ops.privileged.execution_agent import (
+        _canonical_action_preconditions,
+    )
+
+    result = _canonical_action_preconditions(
+        "stop_klonet_component",
+        {
+            "component": "worker", "pid": 1698329, "port": "45552",
+            "runtime_cwd": "/home/lzl/vemu_uestc",
+        },
+        [
+            {"checker": "process_pid_absent", "args": {"pid": 1669188}},
+            {"checker": "port_listening", "args": {"port": 45552}},
+        ],
+    )
+
+    assert result == [
+        {
+            "checker": "component_process_project_root",
+            "args": {
+                "component": "worker",
+                "project_root": "/home/lzl/vemu_uestc",
+            },
+        },
+        {
+            "checker": "port_listener_project_root",
+            "args": {
+                "port": 45552,
+                "project_root": "/home/lzl/vemu_uestc",
+            },
+        },
     ]
 
 import pytest
@@ -791,8 +1245,14 @@ def test_runtime_recovery_requires_bound_action_for_every_promised_role():
         ),
     )
 
-    with pytest.raises(ExecutionBindingError, match="worker"):
+    with pytest.raises(ExecutionBindingError, match="worker") as captured:
         _validate_runtime_recovery_action_coverage(semantic, [master])
+
+    assert captured.value.failed_criteria == [
+        "语义计划要求恢复 worker，但 Implementation Plan 没有为该角色"
+        "绑定启动或重启动作。"
+    ]
+    assert captured.value.missing_decisions == []
 
 
 def test_semantic_backend_health_is_canonicalized_for_each_recovered_role():
@@ -945,6 +1405,121 @@ def test_stop_component_pid_must_be_frozen_for_same_semantic_step():
         _validate_semantic_resource_coverage(semantic, [stop], [])
 
 
+def test_role_qualified_worker_pid_compiles_to_stop_action_pid():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _inject_frozen_resource_args,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart-test__stop-worker",
+        title="Stop current worker runtime process",
+        objective="Stop worker for /home/lzl/test/vemu_uestc",
+        risk="high",
+    )
+    resources = [PlanResource(
+        name="test_worker_pid", kind="identifier", status="frozen",
+        role="worker_pid", value="3075451", source="running_platforms",
+        consumers=["restart-test.worker_pid"],
+    )]
+
+    compiled = _inject_frozen_resource_args(step, {}, resources)
+
+    assert compiled["pid"] == "3075451"
+    assert "worker_pid" not in compiled
+
+
+def test_role_qualified_pid_never_leaks_across_components():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _inject_frozen_resource_args,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart-test__stop-master",
+        title="Stop current master runtime process",
+        objective="Stop master for /home/lzl/test/vemu_uestc",
+        risk="high",
+    )
+    resources = [PlanResource(
+        name="test_worker_pid", kind="identifier", status="frozen",
+        role="worker_pid", value="3075451", source="running_platforms",
+        consumers=["restart-test.worker_pid"],
+    )]
+
+    compiled = _inject_frozen_resource_args(step, {}, resources)
+
+    assert "pid" not in compiled
+    assert "worker_pid" not in compiled
+
+
+def test_stop_component_compiles_port_from_same_semantic_scope_not_step_text():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _compile_stop_component_args,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart-v4__stop-worker",
+        title="Stop current worker runtime process",
+        objective=(
+            "Stop worker for /home/lzl/klonet_v4_e2e; "
+            "unrelated instance uses port 45552"
+        ),
+        risk="high",
+    )
+    resources = [
+        PlanResource(
+            name="v4_root", kind="path", status="frozen",
+            role="instance_root", value="/home/lzl/klonet_v4_e2e",
+            source="running_platforms",
+            consumers=["restart-v4.project_root"],
+        ),
+        PlanResource(
+            name="v4_worker_pid", kind="identifier", status="frozen",
+            role="worker_pid", value="3943652", source="running_platforms",
+            consumers=["restart-v4.worker_pid"],
+        ),
+        PlanResource(
+            name="v4_worker_port", kind="port", status="frozen",
+            role="worker_port", value=47002, source="running_platforms",
+            consumers=["restart-v4.worker_port"],
+        ),
+        PlanResource(
+            name="other_worker_port", kind="port", status="frozen",
+            role="worker_port", value=45552, source="running_platforms",
+            consumers=["restart-other.worker_port"],
+        ),
+    ]
+
+    compiled = _compile_stop_component_args(
+        step, {"port": 45552, "pid": 999}, resources,
+    )
+
+    assert compiled["component"] == "worker"
+    assert compiled["runtime_cwd"] == "/home/lzl/klonet_v4_e2e"
+    assert compiled["pid"] == 3943652
+    assert compiled["port"] == 47002
+
+
+def test_stop_component_rejects_model_port_when_no_frozen_role_port_exists():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _compile_stop_component_args,
+    )
+
+    step = PrivilegedStep(
+        step_id="restart-v4__stop-worker",
+        title="Stop current worker runtime process",
+        objective="Stop worker for /home/lzl/klonet_v4_e2e on guessed port 45552",
+        risk="high",
+    )
+
+    compiled = _compile_stop_component_args(step, {"port": 45552}, [])
+
+    assert "port" not in compiled
+
+
 def test_multi_attribute_config_micro_step_is_split_into_atomic_updates():
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
@@ -1053,6 +1628,57 @@ def test_unmentioned_master_ip_repair_is_dropped_from_runtime_recovery():
 
     assert [item["id"] for item in result] == ["master"]
     assert result[0]["depends_on"] == []
+
+
+def test_compact_role_port_migration_authorizes_only_the_named_config_writes():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _drop_unauthorized_config_mutations,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="migrate-runtime-ports",
+        title="Restart the selected runtime roles",
+        objective=(
+            "Keep the existing listeners and move the target runtime to "
+            "web_terminal:5114→5115,worker:45552→45556"
+        ),
+        risk="high",
+        expected_changes=["restart requested worker role at 45556"],
+    )
+    items = [
+        {
+            "id": "worker-port",
+            "title": "Set WtxConfig worker_port",
+            "objective": "Set worker_port",
+            "depends_on": [],
+        },
+        {
+            "id": "web-port",
+            "title": "Set WtxConfig web_terminal_port",
+            "objective": "Set web_terminal_port",
+            "depends_on": ["worker-port"],
+        },
+        {
+            "id": "master-ip",
+            "title": "Set WtxConfig master_ip",
+            "objective": "Set master_ip",
+            "depends_on": ["web-port"],
+        },
+        {
+            "id": "restart-worker",
+            "title": "Restart worker screen component",
+            "objective": "Restart worker",
+            "depends_on": ["master-ip"],
+        },
+    ]
+
+    result = _drop_unauthorized_config_mutations(items, semantic)
+
+    assert [item["id"] for item in result] == [
+        "worker-port", "web-port", "restart-worker",
+    ]
+    assert result[-1]["depends_on"] == ["web-port"]
 
 
 def test_chinese_duplicate_scalar_config_writes_are_collapsed():
@@ -1172,11 +1798,11 @@ def test_screen_action_contract_must_match_role_and_runtime_root():
         },
         step,
     )
-    assert "platform_mismatch" in _validate_action_contract_consistency(
+    assert "session_mismatch" in _validate_action_contract_consistency(
         "start_screen_component",
         {
             "component": "worker",
-            "platform": "vemu_uestc",
+            "platform": "test",
             "screen_session": "vemu_uestc_w",
             "project_root": "/home/lzl/test/vemu_uestc/mains",
         },
@@ -1275,6 +1901,53 @@ def test_forced_screen_start_compiles_new_session_without_existing_session_evide
     assert binding.args["component"] == "worker"
     assert binding.args["screen_session"] == "test_w"
     assert binding.args["project_root"] == "/home/lzl/test/vemu_uestc"
+
+
+def test_forced_component_stop_compiles_frozen_contract_without_llm(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource, PrivilegedPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    root = tmp_path / "vemu_uestc"
+    root.mkdir()
+    step = PrivilegedStep(
+        step_id="restart-test__stop-worker",
+        title="Stop current worker runtime process",
+        objective="Stop worker for %s" % root,
+        risk="high", expected_changes=["current worker process stops"],
+    )
+    resources = [
+        PlanResource(
+            name="test_root", kind="path", status="frozen",
+            role="instance_root", value=str(root), source="running_platforms",
+            consumers=["restart-test.project_root"],
+        ),
+        PlanResource(
+            name="test_worker_pid", kind="identifier", status="frozen",
+            role="worker_pid", value="3075451", source="running_platforms",
+            consumers=["restart-test.worker_pid"],
+        ),
+        PlanResource(
+            name="test_worker_port", kind="port", status="frozen",
+            role="worker_port", value=45555, source="running_platforms",
+            consumers=["restart-test.worker_port"],
+        ),
+    ]
+    plan = PrivilegedPlan(
+        plan_id="stop-worker", goal="restart test worker", risk="high",
+        steps=[step], resources=resources,
+    )
+
+    binding = PrivilegedExecutionAgent(None).prepare_step(
+        plan, step, grounded_context=None,
+    )
+
+    assert binding.action == "stop_klonet_component"
+    assert binding.args["runtime_cwd"] == str(root)
+    assert binding.args["component"] == "worker"
+    assert binding.args["pid"] == "3075451"
+    assert int(binding.args["port"]) == 45555
 
 
 def test_frozen_entry_source_never_overrides_screen_runtime_root():
@@ -1430,6 +2103,59 @@ def test_screen_start_keeps_frozen_instance_identifier_after_canonicalization(
     assert binding.args["project_root"] == str(instance)
 
 
+def test_scoped_resource_name_does_not_hide_instance_root_role(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _runtime_root_from_frozen_paths,
+    )
+
+    instance = tmp_path / "102"
+    instance.mkdir()
+    resource = PlanResource(
+        "instance_102_instance_root", "path", "frozen", "instance_root",
+        str(instance), "running_platforms",
+        consumers=["restart-102.project_root"],
+    )
+
+    assert _runtime_root_from_frozen_paths([resource]) == str(instance)
+
+
+def test_frozen_runtime_root_is_scoped_to_owning_semantic_step(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _runtime_root_from_frozen_paths,
+    )
+
+    first = tmp_path / "102"
+    second = tmp_path / "v4e2e"
+    first.mkdir()
+    second.mkdir()
+    resources = [
+        PlanResource(
+            "instance_102_instance_root", "path", "frozen", "instance_root",
+            str(first), "running_platforms",
+            consumers=["restart-102.project_root"],
+        ),
+        PlanResource(
+            "v4e2e_instance_root", "path", "frozen", "instance_root",
+            str(second), "running_platforms",
+            consumers=["restart-v4e2e.project_root"],
+        ),
+    ]
+
+    assert _runtime_root_from_frozen_paths(
+        resources,
+        semantic_step_id="restart-v4e2e__start-master",
+    ) == str(second)
+    assert _runtime_root_from_frozen_paths(
+        resources,
+        semantic_step_id="restart-102__start-master",
+    ) == str(first)
+    # An unscoped multi-instance lookup is ambiguous and must not select the
+    # first platform merely because of resource ordering.
+    assert _runtime_root_from_frozen_paths(resources) == ""
+
+
 def test_runtime_start_inserts_explicit_entry_preparation_before_screen(tmp_path):
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
     from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
@@ -1479,6 +2205,60 @@ def test_runtime_start_inserts_explicit_entry_preparation_before_screen(tmp_path
     assert result[2]["depends_on"] == ["prepare-runtime-entries"]
 
 
+def test_entry_preparation_breaks_model_back_edge_from_stop_to_start(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+    from klonet_agent.ops.privileged.execution_agent import (
+        _ensure_runtime_entry_preparation_items,
+        _topologically_order_implementation_items,
+    )
+
+    instance = tmp_path / "102"
+    mains = instance / "mains"
+    mains.mkdir(parents=True)
+    for name in REQUIRED_ENTRY_FILES:
+        (mains / name).write_text("# entry\n", encoding="utf-8")
+    semantic = PrivilegedStep(
+        step_id="restart-102", title="Restart all runtime roles",
+        objective="Restart master celery web_terminal worker",
+        expected_changes=["restart unhealthy worker role"], risk="medium",
+    )
+    resources = [PlanResource(
+        "instance_102_instance_root", "path", "frozen", "instance_root",
+        str(instance), "running_platforms",
+        consumers=["restart-102.project_root"],
+    )]
+    items = [
+        {
+            "id": "start-master", "title": "Start master screen component",
+            "objective": "Start master", "depends_on": [],
+        },
+        {
+            "id": "start-web", "title": "Start web_terminal screen component",
+            "objective": "Start web_terminal", "depends_on": ["start-master"],
+        },
+        {
+            "id": "stop-worker", "title": "Stop current worker runtime process",
+            "objective": "Stop unhealthy worker while recovering master celery "
+            "web_terminal and worker", "depends_on": ["start-web"],
+        },
+        {
+            "id": "start-worker", "title": "Start worker screen component",
+            "objective": "Start worker", "depends_on": ["stop-worker"],
+        },
+    ]
+
+    prepared = _ensure_runtime_entry_preparation_items(
+        items, semantic, resources,
+    )
+    ordered = _topologically_order_implementation_items(prepared)
+
+    assert [item["id"] for item in ordered] == [
+        "stop-worker", "prepare-runtime-entries", "start-master",
+        "start-web", "start-worker",
+    ]
+
+
 def test_runtime_restart_keeps_explicit_preparation_when_entries_already_match(tmp_path):
     from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
     from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
@@ -1516,6 +2296,220 @@ def test_runtime_restart_keeps_explicit_preparation_when_entries_already_match(t
         step_id="prepare", title=result[0]["title"], objective=result[0]["objective"],
     )
     assert _forced_registered_action_for_step(prepare_step) == "prepare_project_files"
+
+
+def test_canonical_runtime_dispositions_lower_without_implementation_llm(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource, PrivilegedPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        _deterministic_runtime_recovery_items,
+    )
+
+    root = tmp_path / "vemu"
+    root.mkdir()
+    semantic = PrivilegedStep(
+        step_id="restart-vemu",
+        title="重启 vemu 的应用组件",
+        objective=(
+            "按项目根目录 %s 重启全部应用角色；修改端口 "
+            "web_terminal:5114→5115,worker:45552→45556" % root
+        ),
+        expected_changes=[
+            "restart requested master role at 45551",
+            "worker_port changes from 45552 to checked-free port 45556",
+            "restart requested worker role at 45556",
+        ],
+        risk="medium",
+    )
+    resources = [
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root", str(root),
+            "running_platforms", consumers=["restart-vemu.project_root"],
+        ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 45556,
+            "planner_decision", consumers=["restart-vemu.worker_port"],
+        ),
+        PlanResource(
+            "web_terminal_port", "port", "frozen", "web_terminal_port", 5115,
+            "planner_decision", consumers=["restart-vemu.web_terminal_port"],
+        ),
+    ]
+    plan = PrivilegedPlan(
+        plan_id="p-vemu", goal="重启 vemu 全部角色", risk="medium",
+        steps=[semantic], resources=resources,
+    )
+
+    items = _deterministic_runtime_recovery_items(plan, semantic)
+
+    assert [item["title"] for item in items] == [
+        "Set WtxConfig worker_port",
+        "Set WtxConfig web_terminal_port",
+        "Restart master screen component",
+        "Restart worker screen component",
+    ]
+    assert items[0]["objective"].endswith("/vemu_config/config.py")
+    assert items[-1]["depends_on"] == ["restart-master"]
+
+
+def test_noncanonical_runtime_prose_still_uses_normal_binding_selection(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _deterministic_runtime_recovery_items,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="custom", title="Handle unusual runtime concern",
+        objective="Use operator judgment for an unfamiliar component",
+        expected_changes=["custom outcome"], risk="medium",
+    )
+    plan = PrivilegedPlan(
+        plan_id="p", goal="custom", risk="medium", steps=[semantic],
+    )
+
+    assert _deterministic_runtime_recovery_items(plan, semantic) == []
+
+
+def test_registered_runtime_lowering_binds_without_any_llm_call(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource, PrivilegedPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    root = tmp_path / "v4e2e"
+    mains = root / "mains"
+    mains.mkdir(parents=True)
+    for name in REQUIRED_ENTRY_FILES:
+        (mains / name).write_text("# %s\n" % name, encoding="utf-8")
+    semantic = PrivilegedStep(
+        step_id="restart-runtime",
+        title="Restart v4e2e application roles",
+        objective="Restart application roles for %s" % root,
+        expected_changes=["restart requested worker role at 47002"],
+        postconditions=[{
+            "checker": "backend_health",
+            "args": {"url": "http://127.0.0.1:47002/server_health/"},
+        }],
+        risk="medium",
+    )
+    resources = [
+        PlanResource(
+            "root", "path", "frozen", "instance_root", str(root),
+            "running_platforms", consumers=["restart-runtime.project_root"],
+        ),
+        PlanResource(
+            "platform", "identifier", "frozen", "instance_identifier", "v4e2e",
+            "running_platforms", consumers=["restart-runtime.platform"],
+        ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 47002,
+            "running_platforms", consumers=["restart-runtime.worker_port"],
+        ),
+        PlanResource(
+            "worker_uid", "identifier", "frozen", "worker_uid", 1000,
+            "running_platforms", consumers=["restart-runtime.worker_run_as_uid"],
+        ),
+        PlanResource(
+            "worker_python", "path", "frozen", "worker_python_executable",
+            "/env/worker/python3.8", "running_platforms",
+            consumers=["restart-runtime.worker_python_executable"],
+        ),
+    ]
+    plan = PrivilegedPlan(
+        plan_id="p-runtime", goal="restart", risk="medium",
+        steps=[semantic], resources=resources,
+    )
+
+    bound = PrivilegedExecutionAgent(None).prepare_plan(
+        plan, grounded_context=None,
+    )
+
+    implementation = bound.steps[0].implementation_plan
+    assert implementation is not None
+    assert [
+        step.execution_binding.action for step in implementation.steps
+    ] == ["prepare_project_files", "restart_screen_component"]
+
+
+def test_nested_frozen_config_path_binds_without_llm_or_root_path_guess(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        PlanResource, PrivilegedPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    root = tmp_path / "outer"
+    config = root / "runtime" / "vemu_config" / "config.py"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "class WtxConfig:\n    worker_port = 46552\n"
+        "PROJ_CONFIG = WtxConfig()\n",
+        encoding="utf-8",
+    )
+    semantic = PrivilegedStep(
+        step_id="restart-runtime",
+        title="Restart target worker",
+        objective=(
+            "Restart worker for %s; change worker:46552→46554"
+            % root
+        ),
+        expected_changes=[
+            "worker_port changes from 46552 to checked-free port 46554",
+            "start missing worker role at 46554",
+        ],
+        postconditions=[{
+            "checker": "backend_health",
+            "args": {"url": "http://127.0.0.1:46554/server_health/"},
+        }],
+        risk="medium",
+    )
+    resources = [
+        PlanResource(
+            "root", "path", "frozen", "instance_root", str(root),
+            "running_platforms", consumers=["restart-runtime.project_root"],
+        ),
+        PlanResource(
+            "config", "path", "frozen", "config_path", str(config),
+            "existing_layout", consumers=["restart-runtime.path"],
+        ),
+        PlanResource(
+            "worker_port", "port", "frozen", "worker_port", 46554,
+            "checked_free_replacement",
+            consumers=["restart-runtime.worker_port"],
+        ),
+        PlanResource(
+            "platform", "identifier", "frozen", "instance_identifier",
+            "target", "running_platforms",
+            consumers=["restart-runtime.platform"],
+        ),
+        PlanResource(
+            "uid", "identifier", "frozen", "run_as_uid", 1000,
+            "runtime_evidence", consumers=["restart-runtime.worker_run_as_uid"],
+        ),
+        PlanResource(
+            "python", "path", "frozen", "python_executable",
+            "/usr/bin/python3", "runtime_evidence",
+            consumers=["restart-runtime.worker_python_executable"],
+        ),
+    ]
+    plan = PrivilegedPlan(
+        plan_id="p-nested-config", goal="migrate worker", risk="medium",
+        steps=[semantic], resources=resources,
+    )
+
+    bound = PrivilegedExecutionAgent(None).prepare_plan(
+        plan, grounded_context=None,
+    )
+
+    implementation = bound.steps[0].implementation_plan
+    assert implementation is not None
+    config_binding = implementation.steps[0].execution_binding
+    assert config_binding is not None
+    assert config_binding.action == "set_python_class_attribute"
+    assert config_binding.args["path"] == str(config)
+    assert config_binding.args["attribute"] == "worker_port"
+    assert config_binding.args["value"] == "46554"
 
 
 def test_entry_preparation_binding_freezes_source_hashes(tmp_path):
@@ -2148,6 +3142,40 @@ def test_missing_worker_evidence_drops_stale_stop_before_start():
     assert result[0]["depends_on"] == []
 
 
+def test_missing_worker_drops_stop_when_objective_mentions_every_role():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _drop_runtime_stops_for_roles_known_missing,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="recover-all-roles",
+        title="Recover stopped platform",
+        objective="Start missing master, celery, web_terminal and worker roles",
+        risk="medium",
+        expected_changes=[
+            "start missing master role at 47001 and backend health succeeds",
+            "start missing worker role at 47002 and backend health succeeds",
+        ],
+    )
+    items = [
+        {
+            "id": "stop-worker", "title": "Stop current worker runtime process",
+            "objective": "Stop worker before recovering master, celery, web_terminal and worker",
+            "depends_on": [],
+        },
+        {
+            "id": "start-worker", "title": "Start worker screen component",
+            "objective": "Start worker", "depends_on": ["stop-worker"],
+        },
+    ]
+
+    result = _drop_runtime_stops_for_roles_known_missing(items, semantic)
+
+    assert [item["id"] for item in result] == ["start-worker"]
+    assert result[0]["depends_on"] == []
+
+
 def test_runtime_recovery_does_not_checkout_observed_existing_revision():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
@@ -2310,13 +3338,33 @@ def test_runtime_migration_orders_pid_titled_stop_before_config_and_start():
 
 
 def test_stop_binding_supports_json_encoded_pid_resource_group():
-    import inspect
-    from klonet_agent.ops.privileged import execution_agent
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _compile_stop_component_args,
+    )
 
-    source = inspect.getsource(execution_agent.PrivilegedExecutionAgent._registered_binding)
+    step = PrivilegedStep(
+        step_id="restart-test__stop-worker", title="Stop worker",
+        objective="Stop worker for /home/lzl/test/vemu_uestc", risk="high",
+    )
+    resources = [
+        PlanResource(
+            name="test_worker_pids", kind="identifier", status="frozen",
+            role="worker_pid", value="[3075490, 3075451]",
+            source="running_platforms",
+            consumers=["restart-test.worker_pid"],
+        ),
+        PlanResource(
+            name="test_worker_port", kind="port", status="frozen",
+            role="worker_port", value=45555, source="running_platforms",
+            consumers=["restart-test.worker_port"],
+        ),
+    ]
 
-    assert "json.loads(pid)" in source
-    assert "pid = min(numeric_pids)" in source
+    compiled = _compile_stop_component_args(step, {}, resources)
+
+    assert compiled["pid"] == 3075451
+    assert compiled["port"] == 45555
 
 
 def test_port_config_mutation_forces_structured_class_attribute_action():
@@ -2533,6 +3581,62 @@ def test_runtime_binding_rejects_weak_rag_even_when_it_mentions_generic_runtime_
         _validate_runtime_knowledge_contract(plan, context)
 
     assert exc.value.category == "knowledge_evidence_irrelevant"
+
+
+def test_runtime_binding_accepts_reliable_rag_without_literal_layout_keywords():
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_runtime_knowledge_contract,
+    )
+
+    plan = PrivilegedPlan(
+        plan_id="rag-structured-contract",
+        goal="将 test Master 收编到 Screen",
+        risk="medium",
+        steps=[PrivilegedStep(
+            step_id="master", title="Restart master screen component",
+            objective="重新启动已确认的 Master", risk="medium",
+        )],
+    )
+    context = GroundedPlanContext(
+        knowledge_evidence=(
+            "[ev probe=klonet_knowledge]\n"
+            "- retrieval_status: reliable\n"
+            "Use the verified component command and validate health after restart."
+        ),
+        environment_evidence="structured runtime facts",
+        action_catalog="catalog",
+    )
+
+    _validate_runtime_knowledge_contract(plan, context)
+
+
+def test_screen_runtime_project_root_cannot_be_rebound_to_mains_source_directory():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _validate_action_resource_bindings,
+    )
+
+    step = PrivilegedStep(
+        step_id="master", title="Restart master screen component",
+        objective="Restart selected master", risk="medium",
+    )
+    resource = PlanResource(
+        "instance_root", "path", "frozen", "instance_root",
+        "/srv/test", "running_platforms", consumers=["master.project_root"],
+    )
+
+    _validate_action_resource_bindings(
+        step, "restart_screen_component", {"project_root": "/srv/test"}, [resource],
+    )
+    with pytest.raises(ValueError, match="resource_binding_violation"):
+        _validate_action_resource_bindings(
+            step,
+            "restart_screen_component",
+            {"project_root": "/srv/test/mains"},
+            [resource],
+        )
 
 
 def test_missing_role_start_drops_model_invented_pre_stop_without_pid():
@@ -2812,6 +3916,52 @@ def test_runtime_migration_orders_stop_before_config_and_component_starts():
     ]
     assert result[1]["depends_on"] == ["stop"]
     assert result[-1]["depends_on"] == ["start-worker"]
+
+
+def test_runtime_migration_orders_every_wtx_config_write_before_start_without_cycle():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _order_runtime_migration_items,
+        _topologically_order_implementation_items,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="migrate-runtime",
+        title="Migrate runtime ports",
+        objective="Move web_terminal and worker to checked-free ports",
+        risk="high",
+    )
+    items = [
+        {
+            "id": "worker-port",
+            "title": "Set WtxConfig worker_port",
+            "depends_on": ["web-port"],
+        },
+        {
+            "id": "start-master",
+            "title": "Restart master screen component",
+            "depends_on": ["worker-port"],
+        },
+        {
+            "id": "start-worker",
+            "title": "Start worker screen component",
+            "depends_on": ["start-master"],
+        },
+        {
+            "id": "web-port",
+            "title": "Set WtxConfig web_terminal_port",
+            "depends_on": ["start-worker"],
+        },
+    ]
+
+    ordered = _order_runtime_migration_items(items, semantic)
+    result = _topologically_order_implementation_items(ordered)
+
+    assert [item["id"] for item in result] == [
+        "worker-port", "web-port", "start-master", "start-worker",
+    ]
+    assert result[1]["depends_on"] == ["worker-port"]
+    assert result[2]["depends_on"] == ["web-port"]
 
 
 def _plan():
@@ -3106,3 +4256,292 @@ def test_structural_binding_compiles_frozen_future_component_spec():
     assert args["screen_session"] == "v4e2e_metrics"
     assert args["command_argv"][-1] == "metrics_service"
     assert args["metrics_port"] == 47009
+def test_binding_preserves_long_tail_evidence_need_for_discovery():
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    requests = PrivilegedExecutionAgent._probe_requests([{
+        "probe": "proc_environment_identity",
+        "args": {"pid": 1234},
+        "purpose": "resolve interpreter environment",
+        "required_facts": ["python executable", "run_as uid"],
+        "freshness": "refresh",
+    }])
+
+    assert requests == [{
+        "probe": "proc_environment_identity",
+        "args": {"pid": 1234},
+        "purpose": "resolve interpreter environment",
+        "required_facts": ["python executable", "run_as uid"],
+        "freshness": "refresh",
+    }]
+
+
+def test_authorization_accepts_compacted_role_qualified_runtime_identity():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding, ImplementationPlan, PlanResource, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        validate_authorizable_change_plan,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    micro = PrivilegedStep(
+        step_id="restart-test__start-master",
+        title="Start master Screen component",
+        objective="Start test master in Screen",
+        risk="high",
+        expected_changes=["master role starts in test_m"],
+        execution_binding=ExecutionBinding(
+            kind="registered_action",
+            risk="high",
+            action="start_screen_component",
+            args={
+                "component": "master", "screen_session": "test_m",
+                "run_as_uid": 1000, "python_executable": "/opt/test/bin/python",
+            },
+            postconditions=[{
+                "checker": "screen_session_exists",
+                "args": {"session": "test_m"},
+            }],
+        ),
+    )
+    change = ChangeStep(
+        step_id="restart-test",
+        title="Restart test master",
+        objective="Restart test master in Screen",
+        risk="high",
+        expected_changes=["master role runs in Screen"],
+        postconditions=[{"checker": "screen_session_exists", "args": {"session": "test_m"}}],
+        implementation_plan=ImplementationPlan(
+            implementation_id="impl-restart-test",
+            semantic_step_id="restart-test",
+            objective="Restart test master in Screen",
+            steps=[micro],
+        ),
+    )
+    plan = ChangePlan(
+        plan_id="priv-ops-shared-identity",
+        goal="Restart test master in Screen",
+        risk="high",
+        steps=[change],
+        resources=[
+            PlanResource(
+                "test_uid", "identifier", "frozen", "run_as_uid", 1000,
+                "process_detail", consumers=["restart-test.master_run_as_uid"],
+            ),
+            PlanResource(
+                "test_python", "path", "frozen", "python_executable",
+                "/opt/test/bin/python", "process_detail",
+                consumers=["restart-test.master_python_executable"],
+            ),
+        ],
+    )
+
+    validate_authorizable_change_plan(plan)
+
+
+def test_successor_authorization_does_not_refreeze_completed_component_identity():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding, ImplementationPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        validate_authorizable_change_plan,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    completed = PrivilegedStep(
+        step_id="restart-test__completed-master",
+        title="Previously completed master Screen restart",
+        objective="Preserve the proved master Screen effect",
+        risk="medium",
+        status="completed",
+        expected_changes=["master already runs in test_m"],
+        execution_binding=ExecutionBinding(
+            kind="registered_action", risk="medium",
+            action="restart_screen_component",
+            args={
+                "component": "master", "screen_session": "test_m",
+                "run_as_uid": 1000,
+                "python_executable": "/opt/test/bin/python",
+                "project_root": "/srv/test",
+            },
+            postconditions=[{
+                "checker": "screen_session_exists",
+                "args": {"session": "test_m"},
+            }],
+        ),
+    )
+    plan = ChangePlan(
+        plan_id="priv-ops-successor-progress",
+        goal="Restart all test roles in Screen", risk="medium",
+        steps=[ChangeStep(
+            step_id="restart-test", title="Restart remaining test roles",
+            objective="Restart remaining test roles", risk="medium",
+            expected_changes=["remaining roles run in Screen"],
+            postconditions=[{
+                "checker": "screen_session_exists",
+                "args": {"session": "test_m"},
+            }],
+            implementation_plan=ImplementationPlan(
+                implementation_id="impl-successor-progress",
+                semantic_step_id="restart-test",
+                objective="Restart remaining test roles",
+                steps=[completed],
+            ),
+        )],
+        # The identity resources belonged to the predecessor authorization;
+        # this successor will never execute the completed node.
+        resources=[],
+    )
+
+    validate_authorizable_change_plan(plan)
+
+
+def test_authorization_rejects_compacted_identity_owned_by_other_role():
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding, ImplementationPlan, PlanResource, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError, validate_authorizable_change_plan,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    micro = PrivilegedStep(
+        step_id="restart-test__start-master",
+        title="Start master Screen component",
+        objective="Start test master in Screen",
+        risk="high",
+        expected_changes=["master role starts in test_m"],
+        execution_binding=ExecutionBinding(
+            kind="registered_action", risk="high",
+            action="start_screen_component",
+            args={"component": "master", "screen_session": "test_m", "run_as_uid": 1000},
+            postconditions=[{"checker": "screen_session_exists", "args": {"session": "test_m"}}],
+        ),
+    )
+    plan = ChangePlan(
+        plan_id="priv-ops-wrong-role-identity",
+        goal="Restart test master in Screen", risk="high",
+        steps=[ChangeStep(
+            step_id="restart-test", title="Restart test master",
+            objective="Restart test master in Screen", risk="high",
+            expected_changes=["master role runs in Screen"],
+            postconditions=[{"checker": "screen_session_exists", "args": {"session": "test_m"}}],
+            implementation_plan=ImplementationPlan(
+                implementation_id="impl-restart-test",
+                semantic_step_id="restart-test",
+                objective="Restart test master in Screen", steps=[micro],
+            ),
+        )],
+        resources=[PlanResource(
+            "test_uid", "identifier", "frozen", "run_as_uid", 1000,
+            "process_detail", consumers=["restart-test.worker_run_as_uid"],
+        )],
+    )
+
+    with pytest.raises(
+        ExecutionBindingError,
+        match="component_runtime_identity_not_frozen=master.run_as_uid",
+    ):
+        validate_authorizable_change_plan(plan)
+
+
+def test_observational_step_rejects_mutating_registered_action_even_without_effect_metadata():
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    step = PrivilegedStep(
+        step_id="verify-klonet",
+        title="终验 klonet 全部角色就绪",
+        objective="校验 master、celery、web_terminal、worker 四角色均处于就绪状态",
+        risk="readonly",
+        expected_changes=[],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="readonly_verification_cannot_bind_mutating_action=start_screen_component",
+    ):
+        PrivilegedExecutionAgent(None)._registered_binding(
+            {
+                "action": "start_screen_component",
+                "args": {
+                    "component": "worker",
+                    "platform": "klonet",
+                    "screen_session": "klonet_w",
+                    "project_root": "/home/lzl/xxy/klonet",
+                },
+            },
+            step,
+            None,
+            [],
+        )
+
+
+def test_observational_step_can_bind_existing_shell_artifact_as_readonly(tmp_path):
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    step = PrivilegedStep(
+        step_id="verify-processes",
+        title="检查运行进程",
+        objective="只读检查当前 Klonet 进程",
+        risk="readonly",
+        expected_changes=[],
+    )
+    binding = PrivilegedExecutionAgent(None)._shell_binding(
+        {
+            "script": "ps -ef",
+            "cwd": str(tmp_path),
+            "run_as": "",
+            "timeout": 10,
+            "declared_changes": [],
+            "rollback": "",
+            "postconditions": [{"checker": "exit_code_zero", "args": {}}],
+        },
+        step,
+        None,
+        [],
+        observational=True,
+    )
+
+    assert binding.kind == "shell_artifact"
+    assert binding.risk == "readonly"
+    assert binding.approval_scope == "plan"
+    assert binding.shell_artifact.declared_changes == []
+
+
+def test_observational_shell_rejects_state_changing_command(tmp_path):
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    step = PrivilegedStep(
+        step_id="verify-service",
+        title="检查服务状态",
+        objective="只读检查服务状态",
+        risk="readonly",
+        expected_changes=[],
+    )
+
+    with pytest.raises(ValueError, match="readonly shell line rejected"):
+        PrivilegedExecutionAgent(None)._shell_binding(
+            {
+                "script": "systemctl restart nginx",
+                "cwd": str(tmp_path),
+                "run_as": "",
+                "timeout": 10,
+                "declared_changes": [],
+                "rollback": "",
+                "postconditions": [{"checker": "exit_code_zero", "args": {}}],
+            },
+            step,
+            None,
+            [],
+            observational=True,
+        )

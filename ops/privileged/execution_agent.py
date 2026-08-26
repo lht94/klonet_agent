@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import hashlib
 import json
 import os
@@ -33,7 +34,10 @@ from klonet_agent.ops.privileged.contracts import (
     ShellArtifact,
     component_port_arg,
 )
-from klonet_agent.ops.privileged.context import GroundedPlanContext
+from klonet_agent.ops.privileged.context import (
+    GroundedPlanContext,
+    klonet_domain_context,
+)
 from klonet_agent.ops.privileged.environment_facts import REQUIRED_ENTRY_FILES
 from klonet_agent.ops.privileged.action_contracts import (
     _action_risk,
@@ -46,6 +50,7 @@ from klonet_agent.ops.privileged.action_contracts import (
 )
 from klonet_agent.ops.privileged.planner_schema import REQUIRED_ACTION_ARGS
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 from klonet_agent.ops.privileged.shell_artifact import (
     MAX_SCRIPT_BYTES,
     MAX_SCRIPT_LINES,
@@ -68,7 +73,9 @@ Return one JSON object with status exactly:
    "resolved_from_evidence":[]}
 - verification_only, when the semantic step only observes post-execution state
   and needs registered checkers but no state-changing Action or shell command.
-- need_evidence: include at most 3 registered read-only probe_requests.
+- need_evidence: include at most 3 semantic read-only probe_requests with
+  required_facts. Prefer registered probes; Discovery binds uncovered long-tail
+  facts to a policy-validated read-only command. Never emit a command here.
 - blocked: {"status":"blocked","reason":"...",
   "shell_blocker_category":"<optional hard blocker>"}, only when no registered
   Action, safe one-time shell artifact, or verification-only checker contract
@@ -101,6 +108,11 @@ Planned predecessor effects are valid future-state grounding. When an earlier
 semantic or implementation step creates a path/resource, bind its consumer to
 that frozen future value and verify it after the dependency runs. Do not probe
 or reject the future target merely because it does not exist during binding.
+The request contains semantic_effect. It is immutable across selection and
+repair. For observational steps, select verification_only, need_evidence, a
+deterministically read-only shell_artifact, or blocked. A registered Action is
+allowed only when its registered contract is itself read-only. Never turn an
+observational check into start, stop, restart, write, or another mutation.
 """.strip()
 
 MAX_BINDING_PROBE_ROUNDS = 2
@@ -216,6 +228,11 @@ You are stage 2 of the Klonet Implementation Binding Agent. The semantic step
 and the decision to use a one-time shell artifact are frozen. Generate only the
 complete shell execution contract for this one step.
 
+The payload includes semantic_effect=observational or mutating. Preserve that
+effect. For observational steps, generate only deterministic read commands;
+declared_changes and rollback must be empty. For mutating steps, declare every
+change and provide rollback as before.
+
 Return exactly one JSON object with status:
 - ready: include script, cwd, run_as, timeout, declared_changes, rollback,
   binding_reason, resolved_from_evidence, and registered postconditions.
@@ -223,7 +240,7 @@ Return exactly one JSON object with status:
   cannot implement the frozen objective.
 
 The script must use ordinary bash, be non-interactive, produce observable
-state, contain at most {max_lines} lines, and occupy at most {max_bytes} UTF-8
+evidence or observable state, contain at most {max_lines} lines, and occupy at most {max_bytes} UTF-8
 bytes. Prefer compact commands and heredocs when writing configuration. Do not
 use eval, source, command substitution, background execution, dynamic
 download-and-execute, unbounded deletion, or changes to sudoers, SSH, or Agent
@@ -247,10 +264,16 @@ class ExecutionBindingError(Exception):
         *,
         replan_recommended: bool = True,
         category: str = "semantic_binding",
+        failed_criteria: list[str] | None = None,
+        missing_decisions: list[str] | None = None,
+        replan_context: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.replan_recommended = replan_recommended
         self.category = category
+        self.failed_criteria = list(failed_criteria or [])
+        self.missing_decisions = list(missing_decisions or [])
+        self.replan_context = dict(replan_context or {})
 
 
 class ImplementationRejected(Exception):
@@ -309,6 +332,7 @@ class PrivilegedExecutionAgent:
                 grounded_context=grounded_context,
             )
             binding = step.execution_binding
+            _validate_binding_semantic_effect(step, binding)
             step.risk = binding.risk
             step.approval_scope = binding.approval_scope
             step.preconditions = list(binding.preconditions)
@@ -394,6 +418,7 @@ class PrivilegedExecutionAgent:
     ) -> PrivilegedPlan:
         bound_micro_steps: list[PrivilegedStep] = []
         for index, semantic_step in enumerate(plan.steps, start=1):
+            _validate_semantic_runtime_consistency(semantic_step)
             _validate_semantic_destination_availability(
                 semantic_step,
                 plan.resources,
@@ -445,16 +470,23 @@ class PrivilegedExecutionAgent:
                                 ),
                             )
                         )
+                        observational = _step_is_verification(micro_step)
                         binding = self.prepare_step(
                             plan,
                             micro_step,
                             grounded_context=grounded_context,
+                        )
+                        _validate_binding_semantic_effect(
+                            micro_step,
+                            binding,
+                            observational=observational,
                         )
                         _apply_binding_to_step(micro_step, binding)
                     _validate_runtime_recovery_action_coverage(
                         semantic_step,
                         micro_steps,
                     )
+                    _validate_screen_runtime_acceptance(micro_steps)
                     _validate_source_mutation_action_coverage(
                         semantic_step,
                         micro_steps,
@@ -596,6 +628,7 @@ class PrivilegedExecutionAgent:
         deterministic = (
             _deterministic_runtime_stop_items(semantic_step)
             or _deterministic_klonet_config_items(plan, semantic_step)
+            or _deterministic_runtime_recovery_items(plan, semantic_step)
         )
         if deterministic:
             result = {"status": "ready", "implementation_steps": deterministic}
@@ -824,6 +857,10 @@ class PrivilegedExecutionAgent:
         grounded_context: GroundedPlanContext | None,
         implementation_feedback: str = "",
     ) -> ExecutionBinding:
+        # Freeze the semantic effect before any probabilistic selection or
+        # contract repair. Implementations may change; observational versus
+        # mutating intent may not.
+        observational = _step_is_verification(step)
         forced_action = _forced_registered_action_for_step(step)
         if forced_action:
             if self.action_registry.get(forced_action) is None:
@@ -842,19 +879,24 @@ class PrivilegedExecutionAgent:
             if forced_action in {
                 "start_screen_component",
                 "restart_screen_component",
+                "stop_klonet_component",
+                "stop_platform_screens",
+                "prepare_project_files",
+                "set_python_class_attribute",
             }:
-                # A new Screen session is derived from the frozen instance root
-                # and the atomic component role.  Requiring evidence that the
-                # session already exists contradicts the start operation and
-                # lets the probabilistic contract stage invent a false blocker.
+                # Screen identity and exact component-stop identity are
+                # compiled from frozen resources.  Requiring a probabilistic
+                # contract verdict before that compiler runs lets the model
+                # invent a false missing-evidence blocker for already-grounded
+                # registered Actions.
                 try:
                     return self._registered_binding(
                         {
                             "action": forced_action,
                             "args": {},
                             "binding_reason": (
-                                "screen identity is compiled from the frozen "
-                                "instance root and component role"
+                                "registered Action identity is compiled from "
+                                "the frozen instance resources"
                             ),
                             "resolved_from_evidence": [],
                         },
@@ -891,7 +933,11 @@ class PrivilegedExecutionAgent:
                     category="capability_contract_invalid",
                 ) from exc
         messages = [
-            {"role": "system", "content": EXECUTION_SELECTION_PROMPT},
+            {
+                "role": "system",
+                "content": EXECUTION_SELECTION_PROMPT
+                + "\n\n" + klonet_domain_context("binding"),
+            },
             {
                 "role": "user",
                 "content": self._selection_request_content(
@@ -976,6 +1022,15 @@ class PrivilegedExecutionAgent:
                     continue
                 if status == "registered_action":
                     action = str(data.get("action") or "").strip()
+                    spec = self.action_registry.get(action)
+                    if observational and (
+                        spec is None or not bool(spec.readonly)
+                    ):
+                        raise ImplementationRejected(
+                            "registered_action:%s" % (action or "<missing>"),
+                            "observational semantic effect cannot bind a "
+                            "state-changing registered Action",
+                        )
                     selected_spec = self.action_registry.get(action)
                     if (
                         selected_spec is None
@@ -1056,6 +1111,7 @@ class PrivilegedExecutionAgent:
                             semantic_step=step,
                             grounded_context=grounded_context,
                             plan_resources=plan.resources,
+                            observational=observational,
                         )
                     except ExecutionBindingError as exc:
                         raise ImplementationRejected(
@@ -1069,7 +1125,7 @@ class PrivilegedExecutionAgent:
                     return binding
                 if status == "verification_only":
                     if (
-                        not _step_is_verification(step)
+                        not observational
                         or step.risk != "readonly"
                         or step.expected_changes
                     ):
@@ -1220,6 +1276,9 @@ class PrivilegedExecutionAgent:
                                 "Shell candidate %s of %s failed contract or"
                                 " safety validation: %s. Select shell_artifact"
                                 " again with a materially different implementation;"
+                                " preserve semantic_effect=%s and for an"
+                                " observational step use only commands accepted by"
+                                " the deterministic read-only policy;"
                                 " do not repeat the rejected script or merely repair"
                                 " its formatting. You may return blocked early only"
                                 " for a truthful hard_policy, unverifiable, or"
@@ -1228,6 +1287,10 @@ class PrivilegedExecutionAgent:
                                     shell_candidate_attempts,
                                     MAX_SHELL_CANDIDATE_ATTEMPTS,
                                     str(exc)[:1000],
+                                    (
+                                        "observational"
+                                        if observational else "mutating"
+                                    ),
                                 )
                             ),
                         }
@@ -1242,10 +1305,11 @@ class PrivilegedExecutionAgent:
                     ) from exc
                 reselection_attempts += 1
                 self._progress(
-                    "实现结论：%s 不适合当前步骤，正在重新选择"
+                    "实现结论：%s 不适合当前步骤（%s），正在重新选择"
                     " Action、Shell 或纯验证实现（第 %s/%s 次）。"
                     % (
                         _progress_text(exc.implementation),
+                        _progress_text(str(exc), 180),
                         reselection_attempts,
                         MAX_IMPLEMENTATION_RESELECTIONS,
                     )
@@ -1256,10 +1320,18 @@ class PrivilegedExecutionAgent:
                         "content": (
                             "The selected implementation was rejected after"
                             " contract validation. Do not repeat it unchanged."
-                            " Select another registered Action, shell_artifact,"
-                            " or verification_only. If none can implement the"
-                            " frozen semantic step, return blocked. Rejected: %s"
-                            % rejected_implementations[-1]
+                            " Preserve semantic_effect=%s. Select another"
+                            " implementation with that same effect. For an"
+                            " observational step, allowed routes are a read-only"
+                            " registered capability, deterministically read-only"
+                            " shell_artifact, need_evidence, verification_only,"
+                            " or blocked; never select a state-changing Action or"
+                            " shell. If none can implement the frozen semantic"
+                            " step, return blocked. Rejected: %s"
+                            % (
+                                "observational" if observational else "mutating",
+                                rejected_implementations[-1],
+                            )
                         ),
                     }
                 )
@@ -1311,6 +1383,9 @@ class PrivilegedExecutionAgent:
 
         payload = {
             "goal": plan.goal,
+            "semantic_effect": (
+                "observational" if _step_is_verification(step) else "mutating"
+            ),
             "semantic_step": {
                 "step_id": step.step_id,
                 "objective": step.objective,
@@ -1361,10 +1436,7 @@ class PrivilegedExecutionAgent:
                 "action_not_directly_registered=%s"
                 % (action or "<missing>")
             )
-        if (
-            _step_is_verification(semantic_step)
-            and spec.effects
-        ):
+        if _step_is_verification(semantic_step) and not spec.readonly:
             raise ValueError(
                 "readonly_verification_cannot_bind_mutating_action=%s"
                 % action
@@ -1453,57 +1525,17 @@ class PrivilegedExecutionAgent:
             args,
             plan_resources or [],
         )
+        if action == "stop_platform_screens":
+            args, contract_problem = _compile_stop_platform_contracts(
+                args,
+                grounded_context,
+            )
+            if contract_problem:
+                raise ValueError(contract_problem)
         if action == "stop_klonet_component":
-            semantic_text = " ".join(
-                [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+            args = _compile_stop_component_args(
+                semantic_step, args, plan_resources or [],
             )
-            role = _atomic_runtime_role(semantic_text)
-            root = _semantic_runtime_root(semantic_text)
-            port_match = re.search(r"\b([1-9]\d{3,4})\b", semantic_text)
-            pid = next(
-                (
-                    resource.value
-                    for resource in plan_resources or []
-                    if resource.status == "frozen"
-                    and resource.kind == "identifier"
-                    and "pid" in "%s %s" % (resource.name, resource.role)
-                    and (not role or role in "%s %s" % (resource.name, resource.role))
-                    and any(
-                        semantic_step.step_id == str(consumer).rsplit(".", 1)[0]
-                        for consumer in resource.consumers
-                    )
-                ),
-                None,
-            )
-            if isinstance(pid, list):
-                numeric_pids = []
-                for value in pid:
-                    try:
-                        numeric_pids.append(int(value))
-                    except (TypeError, ValueError):
-                        continue
-                pid = min(numeric_pids) if numeric_pids else None
-            elif isinstance(pid, str) and pid.strip().startswith("["):
-                try:
-                    parsed_pids = json.loads(pid)
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    parsed_pids = []
-                numeric_pids = []
-                if isinstance(parsed_pids, list):
-                    for value in parsed_pids:
-                        try:
-                            numeric_pids.append(int(value))
-                        except (TypeError, ValueError):
-                            continue
-                pid = min(numeric_pids) if numeric_pids else None
-            if role:
-                args["component"] = role
-            if root:
-                args["runtime_cwd"] = root
-            if port_match:
-                args["port"] = port_match.group(1)
-            if pid is not None:
-                args["pid"] = pid
         if action in {
             "set_python_class_attribute",
             "start_screen_component",
@@ -1528,9 +1560,36 @@ class PrivilegedExecutionAgent:
             if not semantic_root or not Path(semantic_root).is_dir():
                 semantic_root = _runtime_root_from_frozen_paths(
                     plan_resources or [],
+                    semantic_step_id=semantic_step.step_id,
                 )
-            if semantic_root:
-                args["path"] = semantic_root.rstrip("/") + "/vemu_config/config.py"
+            frozen_config_path = next(
+                (
+                    str(resource.value)
+                    for resource in plan_resources or []
+                    if resource.status == "frozen"
+                    and resource.kind == "path"
+                    and resource.role == "config_path"
+                    and any(
+                        semantic_step.step_id
+                        == str(consumer).rsplit(".", 1)[0]
+                        or semantic_step.step_id.startswith(
+                            str(consumer).rsplit(".", 1)[0] + "__"
+                        )
+                        for consumer in resource.consumers
+                    )
+                ),
+                "",
+            )
+            if frozen_config_path:
+                args["path"] = frozen_config_path
+            elif semantic_root and (
+                not str(args.get("path") or "").strip()
+                or str(args.get("path") or "").rstrip("/")
+                == semantic_root.rstrip("/")
+            ):
+                args["path"] = (
+                    semantic_root.rstrip("/") + "/vemu_config/config.py"
+                )
             attribute = str(args.get("attribute") or "").strip()
             if (
                 str(args.get("path") or "").endswith("/vemu_config/config.py")
@@ -1557,6 +1616,7 @@ class PrivilegedExecutionAgent:
         if action in {"start_screen_component", "restart_screen_component"}:
             session = str(args.get("screen_session") or "").strip()
             component = str(args.get("component") or "").strip()
+            frozen_session = False
             suffix = {
                 "master": "_m",
                 "worker": "_w",
@@ -1573,6 +1633,7 @@ class PrivilegedExecutionAgent:
             if not semantic_root or not Path(semantic_root).is_dir():
                 semantic_root = _runtime_root_from_frozen_paths(
                     plan_resources or [],
+                    semantic_step_id=semantic_step.step_id,
                 )
             if semantic_root:
                 root_path = Path(semantic_root)
@@ -1601,16 +1662,6 @@ class PrivilegedExecutionAgent:
                         platform_name, suffix,
                     )
                     session = str(args["screen_session"])
-            if (
-                suffix
-                and "/test/" in semantic_root
-                and not re.search(
-                    r"(?:^|[_-])test(?:$|[_-])", session, re.I
-                )
-            ):
-                args["platform"] = "test"
-                args["screen_session"] = "test%s" % suffix
-                session = str(args["screen_session"])
             if suffix and session.endswith(suffix):
                 args["platform"] = session[:-len(suffix)]
             # The runtime canonicalizer may derive a convenient platform name
@@ -1800,7 +1851,11 @@ class PrivilegedExecutionAgent:
             "validation_error": initial_error,
         }
         messages = [
-            {"role": "system", "content": ACTION_CONTRACT_PROMPT},
+            {
+                "role": "system",
+                "content": ACTION_CONTRACT_PROMPT
+                + "\n\n" + klonet_domain_context("binding"),
+            },
             {
                 "role": "user",
                 "content": json.dumps(payload, ensure_ascii=False),
@@ -1875,11 +1930,15 @@ class PrivilegedExecutionAgent:
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
         plan_resources: list[PlanResource] | None = None,
+        observational: bool = False,
     ) -> ExecutionBinding:
         """Generate stage 2 Shell fields without reopening capability choice."""
 
         payload = {
             "frozen_implementation_kind": "shell_artifact",
+            "semantic_effect": (
+                "observational" if observational else "mutating"
+            ),
             "selection_reason": selection.get("selection_reason"),
             "semantic_step": {
                 "step_id": semantic_step.step_id,
@@ -1896,7 +1955,11 @@ class PrivilegedExecutionAgent:
             "registered_checker_catalog": self.checkers.render_catalog(),
         }
         messages = [
-            {"role": "system", "content": SHELL_CONTRACT_PROMPT},
+            {
+                "role": "system",
+                "content": SHELL_CONTRACT_PROMPT
+                + "\n\n" + klonet_domain_context("binding"),
+            },
             {
                 "role": "user",
                 "content": json.dumps(payload, ensure_ascii=False),
@@ -1938,6 +2001,7 @@ class PrivilegedExecutionAgent:
                     semantic_step,
                     grounded_context,
                     plan_resources,
+                    observational=observational,
                 )
                 self._progress(
                     "实现节点：一次性脚本执行合同已生成并通过安全校验。"
@@ -1980,6 +2044,8 @@ class PrivilegedExecutionAgent:
         semantic_step: PrivilegedStep,
         grounded_context: GroundedPlanContext | None,
         plan_resources: list[PlanResource] | None = None,
+        *,
+        observational: bool | None = None,
     ) -> ExecutionBinding:
         raw_script = str(data.get("script") or "")
         if not raw_script.strip():
@@ -1987,12 +2053,24 @@ class PrivilegedExecutionAgent:
         cwd = str(data.get("cwd") or "").strip()
         if not cwd:
             raise ValueError("shell artifact requires explicit cwd")
+        if observational is None:
+            observational = _step_is_verification(semantic_step)
         declared_changes = _strings(data.get("declared_changes"), 20)
-        if not declared_changes:
-            raise ValueError("shell artifact requires declared_changes")
         rollback = str(data.get("rollback") or "").strip()[:2000]
-        if not rollback:
-            raise ValueError("shell artifact requires rollback")
+        if observational:
+            if declared_changes:
+                raise ValueError(
+                    "readonly shell artifact cannot declare state changes"
+                )
+            if rollback:
+                raise ValueError(
+                    "readonly shell artifact cannot declare rollback mutations"
+                )
+        else:
+            if not declared_changes:
+                raise ValueError("shell artifact requires declared_changes")
+            if not rollback:
+                raise ValueError("shell artifact requires rollback")
         fingerprint = ""
         if grounded_context is not None:
             fingerprint = str(
@@ -2027,6 +2105,12 @@ class PrivilegedExecutionAgent:
         )
         if problem:
             raise ValueError(problem)
+        if observational:
+            _argvs, readonly_problem = PrivilegedRiskPolicy().readonly_script_argvs(
+                artifact.script
+            )
+            if _argvs is None:
+                raise ValueError(readonly_problem)
         _validate_shell_resource_bindings(
             semantic_step,
             artifact,
@@ -2034,7 +2118,8 @@ class PrivilegedExecutionAgent:
         )
         try:
             postconditions = self._strict_shell_postconditions(
-                data.get("postconditions")
+                data.get("postconditions"),
+                observational=observational,
             )
         except ValueError as exc:
             postconditions = self._complete_shell_postconditions(
@@ -2042,12 +2127,17 @@ class PrivilegedExecutionAgent:
                 semantic_step=semantic_step,
                 artifact=artifact,
                 initial_error=str(exc),
+                observational=observational,
             )
         return ExecutionBinding(
             kind="shell_artifact",
             shell_artifact=artifact,
-            risk=_effective_declared_risk("high", semantic_step.risk),
-            approval_scope="step",
+            risk=(
+                "readonly"
+                if observational
+                else _effective_declared_risk("high", semantic_step.risk)
+            ),
+            approval_scope="plan" if observational else "step",
             resolved_from_evidence=_strings(
                 data.get("resolved_from_evidence"),
                 20,
@@ -2080,7 +2170,11 @@ class PrivilegedExecutionAgent:
             "registered_checker_catalog": self.checkers.render_catalog(),
         }
         messages = [
-            {"role": "system", "content": VERIFICATION_ONLY_PROMPT},
+            {
+                "role": "system",
+                "content": VERIFICATION_ONLY_PROMPT
+                + "\n\n" + klonet_domain_context("binding"),
+            },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
         last_error = "verification-only contract was not generated"
@@ -2158,13 +2252,17 @@ class PrivilegedExecutionAgent:
         semantic_step: PrivilegedStep,
         artifact: ShellArtifact,
         initial_error: str,
+        observational: bool = False,
     ) -> list[dict[str, Any]]:
         """Complete only the verifier contract; the validated script is frozen."""
 
         inferred = infer_postconditions(artifact.script)
         if inferred:
             try:
-                return self._strict_shell_postconditions(inferred)
+                return self._strict_shell_postconditions(
+                    inferred,
+                    observational=observational,
+                )
             except ValueError:
                 # Inference is deliberately conservative.  If it cannot form a
                 # complete state proof, ask the model using the exact catalog.
@@ -2173,6 +2271,9 @@ class PrivilegedExecutionAgent:
             "实现节点：一次性脚本已通过安全校验并冻结，正在单独补全结果验收条件…"
         )
         payload = {
+            "semantic_effect": (
+                "observational" if observational else "mutating"
+            ),
             "semantic_step": {
                 "step_id": semantic_step.step_id,
                 "objective": semantic_step.objective,
@@ -2191,7 +2292,11 @@ class PrivilegedExecutionAgent:
             "validation_error": initial_error,
         }
         messages = [
-            {"role": "system", "content": SHELL_VERIFICATION_PROMPT},
+            {
+                "role": "system",
+                "content": SHELL_VERIFICATION_PROMPT
+                + "\n\n" + klonet_domain_context("binding"),
+            },
             {
                 "role": "user",
                 "content": json.dumps(payload, ensure_ascii=False),
@@ -2215,7 +2320,8 @@ class PrivilegedExecutionAgent:
                         % (status or "<missing>")
                     )
                 checks = self._strict_shell_postconditions(
-                    result.get("postconditions")
+                    result.get("postconditions"),
+                    observational=observational,
                 )
                 self._progress(
                     "实现节点：一次性脚本验收合同已补全（%s 个确定性检查）。"
@@ -2250,13 +2356,18 @@ class PrivilegedExecutionAgent:
     def _strict_shell_postconditions(
         self,
         value: Any,
+        *,
+        observational: bool = False,
     ) -> list[dict[str, Any]]:
         checks, errors = self._validated_checks(value)
         if errors:
             raise ValueError("; ".join(errors))
         if not checks:
             raise ValueError("shell artifact requires registered postconditions")
-        if all(item["checker"] == "exit_code_zero" for item in checks):
+        if (
+            not observational
+            and all(item["checker"] == "exit_code_zero" for item in checks)
+        ):
             raise ValueError(
                 "mutating shell artifact requires an observable state postcondition"
             )
@@ -2308,22 +2419,23 @@ class PrivilegedExecutionAgent:
     def _probe_requests(value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list) or not value:
             raise ValueError("binding need_evidence requires probe_requests")
-        known = {
-            spec.name for spec in DEFAULT_READONLY_PROBES.describe()
-        }
         result = []
         for item in value[:3]:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("probe") or "").strip()
-            if name not in known:
-                raise ValueError("binding probe not registered=%s" % name)
             args = item.get("args")
             result.append(
                 {
                     "probe": name,
                     "args": args if isinstance(args, dict) else {},
                     "purpose": str(item.get("purpose") or "").strip()[:500],
+                    "required_facts": [
+                        str(value).strip()[:500]
+                        for value in item.get("required_facts") or []
+                        if str(value).strip()
+                    ][:12],
+                    "freshness": str(item.get("freshness") or "cached"),
                 }
             )
         if not result:
@@ -2352,9 +2464,6 @@ class PrivilegedExecutionAgent:
         return "\n".join(lines)
 
     def _selection_function_tool(self) -> dict[str, Any]:
-        probe_names = sorted(
-            spec.name for spec in DEFAULT_READONLY_PROBES.describe()
-        )
         return _function_tool(
             "select_execution_implementation",
             "Select one frozen implementation kind for the semantic step.",
@@ -2386,17 +2495,25 @@ class PrivilegedExecutionAgent:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "probe": {
-                                    "type": "string",
-                                    "enum": probe_names,
-                                },
+                                "probe": {"type": "string", "maxLength": 100},
                                 "args": {
                                     "type": "object",
                                     "additionalProperties": True,
                                 },
                                 "purpose": {"type": "string"},
+                                "required_facts": {
+                                    "type": "array",
+                                    "maxItems": 12,
+                                    "items": {"type": "string"},
+                                },
+                                "freshness": {
+                                    "type": "string",
+                                    "enum": ["cached", "refresh"],
+                                },
                             },
-                            "required": ["probe", "args", "purpose"],
+                            "required": [
+                                "probe", "args", "purpose", "required_facts"
+                            ],
                             "additionalProperties": False,
                         },
                     },
@@ -2726,7 +2843,129 @@ def _function_arguments(response: Any, expected_name: str) -> dict[str, Any]:
     return data
 
 
+def _compile_stop_platform_contracts(
+    args: dict[str, Any],
+    grounded_context: GroundedPlanContext | None,
+) -> tuple[dict[str, Any], str]:
+    """Freeze aggregate Screen-stop identity from RuntimeInventory evidence.
+
+    The model may choose the registered Action, but it cannot author PID,
+    session, port, or UID identity. Those values are an exact projection of
+    the one runtime inventory already supplied by Discovery.
+    """
+
+    compiled = dict(args)
+    if grounded_context is None:
+        return compiled, ""
+    project_root = str(compiled.get("project_root") or "").rstrip("/")
+    platform = str(compiled.get("platform") or "").strip()
+    facts = grounded_context.facts.get("runtime_instances")
+    instances = facts if isinstance(facts, list) else []
+    matches = [
+        item for item in instances
+        if isinstance(item, dict)
+        and str(item.get("project_root") or "").rstrip("/") == project_root
+        and (
+            not platform
+            or str(item.get("platform") or "").strip() == platform
+        )
+    ]
+    if len(matches) != 1:
+        return compiled, "stop_platform_runtime_identity_unresolved"
+    instance = matches[0]
+    platform = str(instance.get("platform") or platform).strip()
+    fields = instance.get("fields")
+    if not isinstance(fields, dict):
+        return compiled, "stop_platform_runtime_fields_missing"
+    encoded_specs = str(fields.get("component_specs_b64") or "")
+    try:
+        padding = "=" * (-len(encoded_specs) % 4)
+        specs = json.loads(
+            base64.urlsafe_b64decode(encoded_specs + padding).decode("utf-8")
+        )
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return compiled, "stop_platform_component_manifest_invalid"
+    if not isinstance(specs, list):
+        return compiled, "stop_platform_component_manifest_invalid"
+    active_roles = {
+        str(item).strip().lower().replace("-", "_")
+        for item in instance.get("roles") or []
+        if str(item).strip()
+    }
+    configured_ports = instance.get("configured_ports")
+    configured_ports = (
+        configured_ports if isinstance(configured_ports, dict) else {}
+    )
+    contracts = []
+    run_as_uids: set[int] = set()
+    for spec in specs:
+        if not isinstance(spec, dict) or not bool(spec.get("managed", True)):
+            continue
+        component = str(spec.get("name") or "").strip().lower().replace("-", "_")
+        if not component or component not in active_roles:
+            continue
+        suffix = str(spec.get("screen_suffix") or "").strip()
+        identities = str(fields.get(component + "_identities") or "")
+        parsed = [
+            (int(match.group(1)), int(match.group(2)))
+            for raw in identities.split(",")
+            for match in [re.fullmatch(r"(\d+):(\d+):(/[^,\s]+)", raw)]
+            if match is not None
+        ]
+        if not parsed:
+            return compiled, "stop_platform_component_identity_missing=%s" % component
+        pids = sorted({pid for pid, _uid in parsed if pid > 1})
+        run_as_uids.update(uid for _pid, uid in parsed if uid > 0)
+        if not suffix or not pids:
+            return compiled, "stop_platform_component_contract_invalid=%s" % component
+        ports = []
+        port = configured_ports.get(component + "_port")
+        if str(port or "").isdigit() and 1 <= int(port) <= 65535:
+            ports.append(int(port))
+        for raw_port in spec.get("ports") or []:
+            if str(raw_port).isdigit() and 1 <= int(raw_port) <= 65535:
+                if int(raw_port) not in ports:
+                    ports.append(int(raw_port))
+        contracts.append({
+            "component": component,
+            "screen_session": "%s_%s" % (platform, suffix),
+            "pids": pids,
+            "ports": ports,
+        })
+    if not contracts:
+        return compiled, "stop_platform_component_contracts_missing"
+    if len(run_as_uids) != 1:
+        return compiled, "stop_platform_mixed_or_missing_run_as_uid"
+    compiled["platform"] = platform
+    compiled["project_root"] = project_root
+    compiled["component_contracts"] = contracts
+    compiled["run_as_uid"] = next(iter(run_as_uids))
+    return compiled, ""
+
+
 def _action_arg_json_schema(name: str) -> dict[str, Any]:
+    if name == "component_contracts":
+        return {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["component", "screen_session", "pids", "ports"],
+                "properties": {
+                    "component": {"type": "string"},
+                    "screen_session": {"type": "string"},
+                    "pids": {
+                        "type": "array", "minItems": 1,
+                        "items": {"type": "integer"},
+                    },
+                    "ports": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                    },
+                },
+            },
+        }
     if name in {"ports"}:
         return {"type": "array", "items": {"type": "integer"}}
     if name in {
@@ -2741,7 +2980,7 @@ def _action_arg_json_schema(name: str) -> dict[str, Any]:
         return {"type": "array", "items": {"type": "string"}}
     if name in {"patch", "credential_source"}:
         return {"type": "object", "additionalProperties": True}
-    if name in {"pid", "expected_port"}:
+    if name in {"pid", "expected_port", "run_as_uid"}:
         return {"type": "integer"}
     return {"type": "string"}
 
@@ -3243,6 +3482,128 @@ def _deterministic_runtime_stop_items(
     ]
 
 
+def _deterministic_runtime_recovery_items(
+    plan: PrivilegedPlan,
+    semantic_step: PrivilegedStep,
+) -> list[dict[str, Any]]:
+    """Lower Planner's canonical role dispositions without another LLM.
+
+    The semantic Planner has already decided *which* roles change. Binding
+    owns only *how* those effects map to registered capabilities. Canonical
+    ``restart requested``/``start missing`` markers therefore provide a
+    complete, deterministic lowering boundary. Unrecognized semantics still
+    use the ordinary Action/Shell selection path.
+    """
+
+    dispositions = _runtime_component_dispositions(semantic_step)
+    if not dispositions:
+        return []
+
+    def scoped(resource: PlanResource) -> bool:
+        return any(
+            str(consumer).partition(".")[0] == semantic_step.step_id
+            for consumer in resource.consumers
+        )
+
+    root = _runtime_root_for_step(semantic_step, plan.resources)
+    if not root:
+        return []
+    destination_ports = {
+        str(resource.role): resource.value
+        for resource in plan.resources
+        if resource.status == "frozen"
+        and resource.kind == "port"
+        and scoped(resource)
+    }
+    config_path = next(
+        (
+            str(resource.value)
+            for resource in plan.resources
+            if resource.status == "frozen"
+            and resource.kind == "path"
+            and resource.role == "config_path"
+            and scoped(resource)
+        ),
+        "%s/vemu_config/config.py" % root.rstrip("/"),
+    )
+    semantic_text = " ".join(
+        [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
+    )
+    compact_migrations = _compact_runtime_port_migrations(semantic_text)
+    migrated_attributes = []
+    for attribute in ("master_port", "worker_port", "web_terminal_port"):
+        if attribute not in destination_ports:
+            continue
+        long_form = re.search(
+            r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])"
+            r"[^.!?。！？]{0,80}(?:changes?\s+from|→|->|改为|变更为|切换到|迁移到)"
+            % re.escape(attribute),
+            semantic_text,
+            re.I,
+        )
+        if long_form or attribute in compact_migrations:
+            migrated_attributes.append(attribute)
+
+    items: list[dict[str, Any]] = []
+    previous = ""
+    for attribute in migrated_attributes:
+        value = destination_ports[attribute]
+        item_id = "set-%s" % attribute.replace("_", "-")
+        items.append({
+            "id": item_id,
+            "title": "Set WtxConfig %s" % attribute,
+            "objective": (
+                "Set WtxConfig.%s to the frozen destination value %r in "
+                "%s" % (attribute, value, config_path)
+            ),
+            "reason": "apply the Planner-authorized port migration",
+            "depends_on": [previous] if previous else [],
+            "expected_changes": ["WtxConfig.%s becomes %r" % (attribute, value)],
+            "success_criteria": ["WtxConfig.%s equals %r" % (attribute, value)],
+            "risk_suggestion": "medium",
+        })
+        previous = item_id
+
+    for role, verb in dispositions.items():
+        item_id = "%s-%s" % (verb.lower(), role.replace("_", "-"))
+        items.append({
+            "id": item_id,
+            "title": "%s %s screen component" % (verb, role),
+            "objective": "%s the %s role for %s" % (
+                verb,
+                role,
+                root,
+            ),
+            "reason": "lower the frozen semantic role disposition",
+            "depends_on": [previous] if previous else [],
+            "expected_changes": ["%s role is recovered" % role],
+            "success_criteria": ["%s role satisfies canonical readiness" % role],
+            "risk_suggestion": "medium",
+        })
+        previous = item_id
+    return items
+
+
+def _compact_runtime_port_migrations(text: str) -> set[str]:
+    """Map canonical ``role:old→new`` notation to WtxConfig attributes."""
+
+    result = set()
+    for role, attribute in (
+        ("master", "master_port"),
+        ("worker", "worker_port"),
+        ("web_terminal", "web_terminal_port"),
+    ):
+        if re.search(
+            r"(?<![A-Za-z0-9_])%s(?:_port)?(?![A-Za-z0-9_])"
+            r"\s*[:=]?\s*\d{1,5}\s*(?:→|->)\s*\d{1,5}"
+            % re.escape(role),
+            str(text or ""),
+            re.I,
+        ):
+            result.add(attribute)
+    return result
+
+
 def _split_multi_attribute_config_items(
     items: list[dict[str, Any]],
     semantic_step: PrivilegedStep,
@@ -3517,6 +3878,7 @@ def _drop_unauthorized_config_mutations(
             for fragment in fragments
         )
     }
+    authorized.update(_compact_runtime_port_migrations(semantic_text))
     removed: dict[str, list[str]] = {}
     kept: list[dict[str, Any]] = []
     for index, item in enumerate(items, start=1):
@@ -3809,7 +4171,13 @@ def _order_runtime_migration_items(
     items: list[dict[str, Any]],
     semantic_step: PrivilegedStep,
 ) -> list[dict[str, Any]]:
-    """Enforce stop -> configure -> start for an in-place runtime migration."""
+    """Enforce stop -> configure -> start for an in-place runtime migration.
+
+    Configuration is one architectural phase, not a hard-coded pair of port
+    fields.  Every scalar WtxConfig write authorized by the semantic plan must
+    finish before a runtime role is started.  Unrelated items retain their own
+    dependencies instead of being appended to the lifecycle chain.
+    """
 
     def text_of(item: dict[str, Any]) -> str:
         return "%s %s" % (item.get("title") or "", item.get("objective") or "")
@@ -3829,10 +4197,13 @@ def _order_runtime_migration_items(
     configs = [
         item for item in items
         if (
-            re.search(
-                r"(?<![A-Za-z0-9_])(?:master_port|worker_port)(?![A-Za-z0-9_])",
-                text_of(item),
-                re.I,
+            (
+                re.match(
+                    r"^\s*Set\s+WtxConfig\s+",
+                    str(item.get("title") or ""),
+                    re.I,
+                )
+                or re.search(r"\bWtxConfig\b|\bconfig(?:uration)?\b|配置", text_of(item), re.I)
             )
             and re.search(
                 r"\b(?:set|update|change|edit|replace)\b|设置|更新|修改|改为",
@@ -3862,18 +4233,18 @@ def _order_runtime_migration_items(
         for item in [*stops, *configs, *starts]
     }
     remainder = [item for item in items if item not in stops + configs + starts]
-    ordered = [*stops, *configs, *starts, *remainder]
+    lifecycle = [*stops, *configs, *starts]
     external_dependencies = []
-    for item in ordered:
+    for item in lifecycle:
         for dependency in item.get("depends_on") or []:
             normalized = _safe_implementation_step_id(dependency, fallback="")
             if normalized and normalized not in selected_ids and normalized not in external_dependencies:
                 external_dependencies.append(normalized)
     previous = ""
-    for item in ordered:
+    for item in lifecycle:
         item["depends_on"] = [previous] if previous else list(external_dependencies)
         previous = _safe_implementation_step_id(item.get("id"), fallback="")
-    return ordered
+    return [*lifecycle, *remainder]
 
 
 def _order_source_runtime_recovery_items(
@@ -4641,7 +5012,7 @@ def _ensure_runtime_entry_preparation_items(
     starts = [
         item for item in items
         if _atomic_runtime_role(
-            "%s %s" % (item.get("title") or "", item.get("objective") or "")
+            str(item.get("title") or "")
         )
         and re.search(
             r"\b(?:start|restart|restore|recover|launch)\w*\b|启动|重启|恢复",
@@ -4682,13 +5053,44 @@ def _ensure_runtime_entry_preparation_items(
         _safe_implementation_step_id(item.get("id"), fallback="")
         for item in starts
     }
-    dependencies: list[str] = []
+    stops = [
+        item for item in items
+        if _atomic_runtime_role(
+            str(item.get("title") or "")
+        )
+        and re.search(
+            r"\b(?:stop|terminate)\w*\b|停止|终止",
+            "%s %s" % (item.get("title") or "", item.get("objective") or ""),
+            re.I,
+        )
+    ]
+    stop_ids = [
+        _safe_implementation_step_id(item.get("id"), fallback="")
+        for item in stops
+    ]
+    # A model may place an exact stop after one of the starts.  The invariant
+    # here is stronger than that ordering: stop live role(s), prepare entry
+    # files, then start roles.  Remove start back-edges from stops before
+    # wiring the preparation node so this compiler cannot manufacture a cycle.
+    for item in stops:
+        item["depends_on"] = [
+            dependency
+            for raw in item.get("depends_on") or []
+            for dependency in [
+                _safe_implementation_step_id(raw, fallback="")
+            ]
+            if dependency and dependency not in start_ids
+        ]
+    dependencies: list[str] = list(dict.fromkeys(
+        item for item in stop_ids if item
+    ))
     for item in starts:
         for raw in item.get("depends_on") or []:
             dependency = _safe_implementation_step_id(raw, fallback="")
             if (
                 dependency
                 and dependency not in start_ids
+                and dependency not in stop_ids
                 and dependency not in dependencies
             ):
                 dependencies.append(dependency)
@@ -4734,7 +5136,10 @@ def _runtime_root_for_step(
     text = " ".join(
         [semantic_step.title, semantic_step.objective, *semantic_step.expected_changes]
     )
-    return _semantic_runtime_root(text) or _runtime_root_from_frozen_paths(resources)
+    return _semantic_runtime_root(text) or _runtime_root_from_frozen_paths(
+        resources,
+        semantic_step_id=semantic_step.step_id,
+    )
 
 
 def _sha256_file(path: Path) -> str:
@@ -5028,13 +5433,9 @@ def _contains_mutation_intent(text: str) -> bool:
 
 
 def _step_is_verification(step: PrivilegedStep) -> bool:
-    """Require both a readonly contract and an observational objective."""
+    """Use the typed effect contract, not a vocabulary list, as authority."""
 
-    if step.risk != "readonly" or step.expected_changes:
-        return False
-    return _implementation_item_is_verification(
-        {"title": step.title, "objective": step.objective}
-    )
+    return step.risk == "readonly" and not step.expected_changes
 
 
 def _planned_output_paths(step: PrivilegedStep) -> tuple[Any, ...]:
@@ -5176,6 +5577,53 @@ def _apply_binding_to_step(
     )
 
 
+def _validate_binding_semantic_effect(
+    step: PrivilegedStep,
+    binding: ExecutionBinding,
+    *,
+    observational: bool | None = None,
+) -> None:
+    """Keep implementation choice inside the frozen semantic effect."""
+
+    if observational is None:
+        # Binding may have overwritten ``risk`` on an old persisted plan. The
+        # declared effect remains authoritative: an implementation cannot
+        # manufacture a state transition absent from expected_changes.
+        observational = not bool(step.expected_changes)
+    artifact = binding.shell_artifact
+    shell_declares_mutation = bool(
+        artifact is not None
+        and (artifact.declared_changes or str(artifact.rollback or "").strip())
+    )
+    implementation_mutates = (
+        binding.risk != "readonly"
+        or shell_declares_mutation
+        or (
+            binding.kind == "registered_action"
+            and binding.risk != "readonly"
+        )
+    )
+    if observational and implementation_mutates:
+        raise ExecutionBindingError(
+            "observational_step_bound_to_mutation=%s:%s"
+            % (step.step_id, binding.action or binding.kind),
+            replan_recommended=True,
+            category="implementation_contract_invalid",
+        )
+    if not observational and binding.kind == "verification_only":
+        raise ExecutionBindingError(
+            "mutating_step_bound_to_verification_only=%s" % step.step_id,
+            replan_recommended=True,
+            category="implementation_contract_invalid",
+        )
+    if not observational and binding.kind == "shell_artifact" and not shell_declares_mutation:
+        raise ExecutionBindingError(
+            "mutating_step_bound_to_readonly_shell=%s" % step.step_id,
+            replan_recommended=True,
+            category="implementation_contract_invalid",
+        )
+
+
 def _selection_grounded_context(
     grounded_context: GroundedPlanContext | None,
 ) -> str:
@@ -5204,7 +5652,12 @@ def _validate_runtime_knowledge_contract(
     plan: PrivilegedPlan,
     grounded_context: GroundedPlanContext | None,
 ) -> None:
-    """Require relevant retrieved runbook guidance for runtime mutations."""
+    """Require reliable runbook evidence; actions validate the exact contract.
+
+    Retrieved prose is supporting evidence, not an executable data model.  The
+    project root, entry source, Screen session and component command are bound
+    later from frozen resources and validated by the Action contract.
+    """
 
     if grounded_context is None:
         return
@@ -5238,21 +5691,6 @@ def _validate_runtime_knowledge_contract(
         raise ExecutionBindingError(
             "runtime_knowledge_evidence_not_reliable=%s"
             % retrieval_status.group(1).lower(),
-            replan_recommended=False,
-            category="knowledge_evidence_irrelevant",
-        )
-    required_groups = (
-        ("<project_root>", "project_root"),
-        ("mains", "source_root"),
-        ("screen", "Screen"),
-    )
-    missing = [
-        names[0] for names in required_groups
-        if not any(name.lower() in knowledge.lower() for name in names)
-    ]
-    if missing:
-        raise ExecutionBindingError(
-            "runtime_knowledge_contract_incomplete=%s" % ",".join(missing),
             replan_recommended=False,
             category="knowledge_evidence_irrelevant",
         )
@@ -5341,6 +5779,11 @@ def _validate_action_resource_bindings(
                 raise ValueError(
                     "unfrozen_container_port=%s" % min(unknown)
                 )
+    runtime_role = _atomic_runtime_role(
+        " ".join(
+            [step.title, step.objective, step.reason, *step.expected_changes]
+        )
+    )
     for resource in resources:
         for consumer in resource.consumers:
             semantic_id, arg_name = consumer.rsplit(".", 1)
@@ -5348,6 +5791,11 @@ def _validate_action_resource_bindings(
                 step.step_id == semantic_id
                 or step.step_id.startswith(semantic_id + "__")
             ):
+                continue
+            bound_arg_name = _runtime_identity_consumer_arg(
+                resource, arg_name, runtime_role,
+            )
+            if bound_arg_name is None:
                 continue
             if resource.role == "screen_session":
                 role = _atomic_runtime_role(
@@ -5363,17 +5811,13 @@ def _validate_action_resource_bindings(
                 }.get(role, "")
                 if not suffix or not str(resource.value).endswith(suffix):
                     continue
-                semantic_root = _semantic_runtime_root(
-                    " ".join(
-                        [step.title, step.objective, step.reason, *step.expected_changes]
-                    )
-                )
-                if (
-                    "/test/" in semantic_root
-                    and not re.search(
-                        r"(?:^|[_-])test(?:$|[_-])", str(resource.value), re.I
-                    )
+                observed_platform = str(args.get("platform") or "").strip()
+                if not _screen_session_matches_platform(
+                    str(resource.value), observed_platform, suffix,
                 ):
+                    # A plan may retain observations for another same-named
+                    # runtime.  Only the session qualified by this action's
+                    # frozen platform identity is authoritative here.
                     continue
                 observed = args.get("screen_session")
                 if not _resource_values_equal(resource, observed):
@@ -5382,12 +5826,12 @@ def _validate_action_resource_bindings(
                         % (semantic_id, resource.name)
                     )
                 continue
-            if arg_name not in args:
+            if bound_arg_name not in args:
                 continue
             if (
                 resource.kind == "port"
                 and resource.role in {"master_port", "worker_port"}
-                and arg_name == resource.role
+                and bound_arg_name == resource.role
             ):
                 scoped_value = _scoped_role_port_value(
                     step, resources, resource.role
@@ -5402,20 +5846,11 @@ def _validate_action_resource_bindings(
                     "deferred_plan_resource_required=%s resolve_before=%s"
                     % (resource.name, resource.resolve_before)
                 )
-            observed = args.get(arg_name)
-            if (
-                action in {"start_screen_component", "restart_screen_component"}
-                and arg_name == "project_root"
-                and str(observed or "").rstrip("/") in {
-                    str(resource.value).rstrip("/") + "/mains",
-                    str(resource.value).rstrip("/") + "/vemu_uestc/mains",
-                }
-            ):
-                continue
+            observed = args.get(bound_arg_name)
             if not _resource_values_equal(resource, observed):
                 raise ValueError(
                     "resource_binding_violation=%s.%s must use ${%s}"
-                    % (semantic_id, arg_name, resource.name)
+                    % (semantic_id, bound_arg_name, resource.name)
                 )
 
 
@@ -5438,6 +5873,7 @@ def _inject_frozen_resource_args(
         "celery": "_c",
         "web_terminal": "_web",
     }.get(runtime_role, "")
+    inferred_platform = str(compiled.get("platform") or "").strip()
     scoped_screen = next(
         (
             resource
@@ -5446,14 +5882,10 @@ def _inject_frozen_resource_args(
             and resource.role == "screen_session"
             and role_suffix
             and str(resource.value).endswith(role_suffix)
-            and not (
-                "/test/" in _semantic_runtime_root(
-                    " ".join(
-                        [step.title, step.objective, step.reason, *step.expected_changes]
-                    )
-                )
-                and not re.search(
-                    r"(?:^|[_-])test(?:$|[_-])", str(resource.value), re.I
+            and (
+                not inferred_platform
+                or _screen_session_matches_platform(
+                    str(resource.value), inferred_platform, role_suffix,
                 )
             )
             and any(
@@ -5478,8 +5910,65 @@ def _inject_frozen_resource_args(
             ):
                 if resource.role == "screen_session":
                     continue
-                compiled[arg_name] = resource.value
+                bound_arg_name = _runtime_identity_consumer_arg(
+                    resource, arg_name, runtime_role,
+                )
+                if bound_arg_name is not None:
+                    value = resource.value
+                    if bound_arg_name == "run_as_uid" and str(value).isdigit():
+                        value = int(value)
+                    compiled[bound_arg_name] = value
     return compiled
+
+
+def _screen_session_matches_platform(
+    session: str,
+    platform: str,
+    suffix: str,
+) -> bool:
+    """Whether a role-qualified session belongs to one platform prefix."""
+
+    if not session or not platform or not suffix or not session.endswith(suffix):
+        return False
+    prefix = session[:-len(suffix)]
+    return prefix == platform or bool(re.match(
+        r"^%s(?:[_-].+)$" % re.escape(platform), prefix, re.I,
+    ))
+
+
+def _runtime_identity_consumer_arg(
+    resource: PlanResource,
+    consumer_arg: str,
+    runtime_role: str,
+) -> str | None:
+    """Map role-qualified identity consumers to Action argument names."""
+
+    role = str(resource.role or "")
+    legacy = re.fullmatch(
+        r"(master|celery|web_terminal|worker)_(uid|python_executable)",
+        role,
+    )
+    if legacy is not None:
+        if legacy.group(1) != runtime_role:
+            return None
+        return "run_as_uid" if legacy.group(2) == "uid" else "python_executable"
+    component_pid = re.fullmatch(r"(master|worker)_pid", role)
+    if component_pid is not None:
+        # Planner resources remain role-qualified so multiple instance roles
+        # can coexist in one semantic plan.  The registered stop Action has
+        # one canonical scalar argument, ``pid``.  Compile that distinction
+        # here instead of asking the Binding LLM to reinterpret resource names.
+        return "pid" if component_pid.group(1) == runtime_role else None
+    if role not in {"run_as_uid", "python_executable"}:
+        return consumer_arg
+    qualified = re.fullmatch(
+        r"(master|celery|web_terminal|worker)_"
+        r"(run_as_uid|python_executable)",
+        consumer_arg,
+    )
+    if qualified is not None:
+        return qualified.group(2) if qualified.group(1) == runtime_role else None
+    return role if consumer_arg == role else None
 
 
 def _validate_mutating_action_paths(
@@ -5561,6 +6050,13 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
         re.I,
     ):
         return "prepare_project_files"
+    if re.match(
+        r"^\s*(?:stop|destroy|terminate|停止|销毁|终止)\b.*"
+        r"(?:platform\s+screens?|screen\s+sessions?|平台.*screen|screen.*会话)",
+        primary,
+        re.I,
+    ):
+        return "stop_platform_screens"
     runtime_role = _atomic_runtime_role(step.title)
     if runtime_role in {"master", "worker"} and re.match(
         r"^\s*(?:stop|terminate|停止|终止)", step.title, re.I,
@@ -5708,6 +6204,43 @@ def _validate_action_contract_consistency(
 ) -> str:
     """Cross-check typed Action arguments against the frozen semantic objective."""
 
+    if action == "stop_platform_screens":
+        platform = str(args.get("platform") or "").strip()
+        root = str(args.get("project_root") or "").rstrip("/")
+        run_as_uid = str(args.get("run_as_uid") or "").strip()
+        contracts = args.get("component_contracts")
+        if not platform or not root.startswith("/"):
+            return "stop_platform_identity_invalid"
+        if not re.fullmatch(r"[1-9]\d{0,9}", run_as_uid):
+            return "stop_platform_run_as_uid_invalid"
+        if not isinstance(contracts, list) or not contracts:
+            return "stop_platform_component_contracts_invalid"
+        seen = set()
+        for item in contracts:
+            if not isinstance(item, dict):
+                return "stop_platform_component_contract_invalid"
+            component = str(item.get("component") or "").strip()
+            session = str(item.get("screen_session") or "").strip()
+            pids = item.get("pids")
+            ports = item.get("ports")
+            if (
+                not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", component)
+                or not session.startswith(platform + "_")
+                or not isinstance(pids, list)
+                or not pids
+                or any(not isinstance(pid, int) or pid <= 1 for pid in pids)
+                or not isinstance(ports, list)
+                or any(
+                    not isinstance(port, int) or not 1 <= port <= 65535
+                    for port in ports
+                )
+                or component in seen
+            ):
+                return "stop_platform_component_contract_invalid=%s" % (
+                    component or "missing"
+                )
+            seen.add(component)
+        return ""
     if action in {"start_screen_component", "restart_screen_component"}:
         text = " ".join(
             [step.title, step.objective, step.reason, *step.expected_changes]
@@ -5728,12 +6261,7 @@ def _validate_action_contract_consistency(
                 project_root or "<missing>", expected_root,
             )
         if expected_root:
-            root_path = Path(expected_root)
             observed_platform = str(args.get("platform") or "").strip()
-            test_instance = (
-                root_path.name == "vemu_uestc" and root_path.parent.name == "test"
-            )
-            expected_platform = "test-qualified" if test_instance else root_path.name
             expected_suffix = {
                 "master": "m", "worker": "w", "celery": "c", "web_terminal": "web",
             }.get(expected_role, "")
@@ -5742,15 +6270,8 @@ def _validate_action_contract_consistency(
                 if expected_suffix else ""
             )
             observed_session = str(args.get("screen_session") or "").strip()
-            platform_matches = (
-                bool(re.search(r"(?:^|[_-])test(?:$|[_-])", observed_platform, re.I))
-                if test_instance
-                else observed_platform == expected_platform
-            )
-            if not platform_matches:
-                return "screen_platform_mismatch=%s expected=%s" % (
-                    observed_platform or "<missing>", expected_platform,
-                )
+            if not observed_platform:
+                return "screen_platform_missing"
             if expected_session and observed_session != expected_session:
                 return "screen_session_mismatch=%s expected=%s" % (
                     observed_session or "<missing>", expected_session,
@@ -6284,6 +6805,76 @@ def _infer_structural_action_args(
     return compiled
 
 
+def _compile_stop_component_args(
+    step: PrivilegedStep,
+    args: dict[str, Any],
+    resources: list[PlanResource],
+) -> dict[str, Any]:
+    """Compile an exact role stop from one frozen semantic resource scope."""
+
+    compiled = dict(args)
+    semantic_text = " ".join(
+        [step.title, step.objective, *step.expected_changes]
+    )
+    role = _atomic_runtime_role(semantic_text)
+    root = _runtime_root_from_frozen_paths(
+        resources, semantic_step_id=step.step_id,
+    ) or _semantic_runtime_root(semantic_text)
+    pid = next(
+        (
+            resource.value
+            for resource in resources
+            if resource.status == "frozen"
+            and resource.kind == "identifier"
+            and str(resource.role or "") == "%s_pid" % role
+            and any(
+                step.step_id == str(consumer).rsplit(".", 1)[0]
+                or step.step_id.startswith(
+                    str(consumer).rsplit(".", 1)[0] + "__"
+                )
+                for consumer in resource.consumers
+            )
+        ),
+        None,
+    )
+    if isinstance(pid, list):
+        candidates = pid
+    elif isinstance(pid, str) and pid.strip().startswith("["):
+        try:
+            parsed = json.loads(pid)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed = []
+        candidates = parsed if isinstance(parsed, list) else []
+    else:
+        candidates = [pid]
+    numeric_pids = []
+    for value in candidates:
+        try:
+            numeric_pids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    port = (
+        _scoped_role_port_value(step, resources, "%s_port" % role)
+        if role in {"master", "worker"} else None
+    )
+    if role:
+        compiled["component"] = role
+    if root:
+        compiled["runtime_cwd"] = root
+    if numeric_pids:
+        compiled["pid"] = min(numeric_pids)
+    else:
+        compiled.pop("pid", None)
+    if port is not None:
+        compiled["port"] = port
+    else:
+        # A model-proposed or prose-derived port is not an implementation
+        # identity.  Let the Action contract reject the missing frozen value.
+        compiled.pop("port", None)
+    return compiled
+
+
 def _canonical_action_preconditions(
     action: str,
     args: dict[str, Any],
@@ -6302,6 +6893,24 @@ def _canonical_action_preconditions(
         # Restart supports both an existing Screen and an orphan runtime.  The
         # registered Action resolves the exact session and root itself.
         return []
+    if action == "stop_klonet_component":
+        component = str(args.get("component") or "").strip()
+        root = str(
+            args.get("runtime_cwd") or args.get("project_root") or ""
+        ).strip()
+        raw_port = args.get("port")
+        result = []
+        if component and root:
+            result.append({
+                "checker": "component_process_project_root",
+                "args": {"component": component, "project_root": root},
+            })
+        if str(raw_port or "").isdigit() and root:
+            result.append({
+                "checker": "port_listener_project_root",
+                "args": {"port": int(raw_port), "project_root": root},
+            })
+        return result
     if action != "start_screen_component":
         return checks
     session = str(args.get("screen_session") or "").strip()
@@ -6327,6 +6936,13 @@ def _canonical_action_postconditions(
     checks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Ground structural Action checks in the finalized, typed Action args."""
+
+    if action == "prepare_project_files":
+        # The registered Action owns both the exact Klonet entry-file set and
+        # its hash-aware acceptance contract.  Model-proposed checks may not
+        # replace that authority with generic framework guesses (manage.py,
+        # directory existence, and similar unrelated markers).
+        return _default_action_postconditions(action, args)
 
     if action in {
         "replace_text_in_file",
@@ -6366,12 +6982,19 @@ def _canonical_action_postconditions(
     if action in {"start_screen_component", "restart_screen_component"}:
         session = str(args.get("screen_session") or "").strip()
         component = str(args.get("component") or "").strip()
-        checks = []
-        if not str(args.get("run_as_uid") or "").strip():
-            checks.append({
-                "checker": "screen_session_exists",
-                "args": {"session": session},
-            })
+        checks = [
+            check for check in checks
+            if str(check.get("checker") or "") not in {
+                "port_listening", "port_listener_project_root",
+                "component_process_project_root", "component_restart_identity",
+            }
+        ]
+        screen_check = {
+            "checker": "screen_session_exists",
+            "args": {"session": session},
+        }
+        if screen_check not in checks:
+            checks.append(screen_check)
         component_port = component_port_arg(args, component)
         if component_port is not None:
             checks.append(
@@ -6407,8 +7030,8 @@ def _canonical_action_postconditions(
                 "component": component,
                 "project_root": str(args.get("project_root") or ""),
             }
-            if str(raw_port or "").isdigit():
-                identity_args["port"] = int(raw_port)
+            if component_port is not None:
+                identity_args["port"] = component_port
             checks.append({
                 "checker": "component_restart_identity",
                 "args": identity_args,
@@ -6491,6 +7114,26 @@ def _infer_semantic_action_args(
                 and _sha256_file(project_root / name)
                 != compiled["entry_sha256s"][name]
             ]
+    if action == "set_python_class_attribute":
+        text = " ".join(
+            [step.title, step.objective, step.reason, *step.expected_changes]
+        )
+        attribute = re.search(
+            r"\bWtxConfig\.?(master_port|worker_port|web_terminal_port|"
+            r"public_port|redis_port|mysql_port|rabbitmq_port|master_ip|"
+            r"mysql_ip|rabbitmq_ip|celery_redis_port_db|"
+            r"celery_rabbitmq_port_db)\b",
+            text,
+            re.I,
+        )
+        if attribute is not None:
+            compiled["attribute"] = attribute.group(1)
+        config_path = re.search(
+            r"(/[A-Za-z0-9._/-]+/vemu_config/config\.py)\b",
+            text,
+        )
+        if config_path is not None:
+            compiled["path"] = config_path.group(1)
     if action in {"start_screen_component", "restart_screen_component"}:
         text = " ".join(
             [step.title, step.objective, step.reason, *step.expected_changes]
@@ -6717,7 +7360,204 @@ def _validate_runtime_recovery_action_coverage(
             "runtime_recovery_action_missing=%s" % ",".join(missing),
             replan_recommended=False,
             category="implementation_contract_invalid",
+            failed_criteria=[
+                (
+                    "语义计划要求恢复 %s，但 Implementation Plan 没有为该角色"
+                    "绑定启动或重启动作。" % role
+                )
+                for role in missing
+            ],
+            replan_context={
+                "step_id": semantic_step.step_id,
+                "missing_roles": missing,
+                "missing_effects": ["%s_runtime_recovery" % role for role in missing],
+                "required_transition": "add_start_or_restart_implementation",
+            },
         )
+
+
+def _validate_semantic_runtime_consistency(step: PrivilegedStep) -> None:
+    """Reject mutually exclusive restart and preservation promises."""
+
+    fragments = [step.title, step.objective, *step.expected_changes]
+    for role in ("master", "celery", "web_terminal", "worker"):
+        restart = any(
+            _fragment_explicitly_restarts_runtime_role(fragment, role)
+            for fragment in fragments
+        )
+        # Preservation must name the role as its object.  Merely finding the
+        # role and a preservation word somewhere in the same broad objective
+        # is not enough: a runtime step can restart master while preserving a
+        # conflicting port listener owned by another instance.  The old
+        # keyword co-occurrence check confused those two decisions.
+        preserve = any(
+            _fragment_explicitly_preserves_runtime_role(fragment, role)
+            for fragment in fragments
+        )
+        if restart and preserve:
+            raise ExecutionBindingError(
+                "runtime_semantic_contradiction=%s restart_and_preserve" % role,
+                replan_recommended=True,
+                category="implementation_contract_invalid",
+            )
+
+
+def _fragment_explicitly_preserves_runtime_role(
+    fragment: Any,
+    role: str,
+) -> bool:
+    """Return whether text explicitly makes the role a preserve target.
+
+    This is deliberately narrower than generic preservation detection.  The
+    invariant is about two decisions for the same runtime role, not about an
+    unrelated listener, port, file, or process being preserved in the same
+    semantic step.
+    """
+
+    text = str(fragment or "")
+    escaped = re.escape(role)
+    role_pattern = r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % escaped
+    preserve_before_role = (
+        r"(?:\b(?:preserv\w*|keep)\b|保持|保留)"
+        r"[^;；。.!?！？\n]{0,48}" + role_pattern
+    )
+    role_before_preserve = (
+        role_pattern
+        + r"[^;；。.!?！？\n]{0,48}"
+        + r"(?:\b(?:remain\w*|unchanged|without\s+restart|"
+          r"do\s+not\s+restart|not\s+restart\w*)\b|"
+          r"保持不变|保留不变|不重启|无需重启)"
+    )
+    return bool(
+        re.search(preserve_before_role, text, re.I)
+        or re.search(role_before_preserve, text, re.I)
+    )
+
+
+def _fragment_explicitly_restarts_runtime_role(
+    fragment: Any,
+    role: str,
+) -> bool:
+    """Return whether text explicitly makes the role a restart target."""
+
+    text = str(fragment or "")
+    escaped = re.escape(role)
+    role_pattern = r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % escaped
+    # Do not let a restart verb cross into a later preserve clause, as in
+    # "restart worker and preserve master".
+    action_gap = (
+        r"(?:(?!\b(?:preserv\w*|keep)\b|保持|保留)"
+        r"[^;；。.!?！？\n]){0,48}"
+    )
+    restart_before_role = r"(?:\brestart\w*\b|重启)" + action_gap + role_pattern
+    role_before_restart = (
+        role_pattern
+        + r"[^;；。.!?！？\n]{0,48}"
+        + r"(?:\brestart\w*\b|重启)"
+    )
+    return bool(
+        re.search(restart_before_role, text, re.I)
+        or re.search(role_before_restart, text, re.I)
+    )
+
+
+def _validate_screen_runtime_acceptance(
+    micro_steps: list[PrivilegedStep],
+) -> None:
+    """A Screen mutation is complete only when the exact session is verified."""
+
+    for step in micro_steps:
+        binding = step.execution_binding
+        if binding is None or binding.action not in {
+            "start_screen_component", "restart_screen_component",
+        }:
+            continue
+        session = str(binding.args.get("screen_session") or "").strip()
+        if not session or not any(
+            check.get("checker") == "screen_session_exists"
+            and str((check.get("args") or {}).get("session") or "") == session
+            for check in binding.postconditions
+        ):
+            raise ExecutionBindingError(
+                "screen_acceptance_missing=%s" % (session or step.step_id),
+                replan_recommended=False,
+                category="implementation_contract_invalid",
+            )
+
+
+def validate_authorizable_change_plan(plan: Any) -> None:
+    """Recheck persisted bindings before an old plan can be authorized.
+
+    The plan hash proves immutability, not validity under the current binding
+    contract.  Keep the authoritative semantic and Screen checks shared with
+    normal binding, then enforce the component-scoped runtime identities that
+    prevent one role from borrowing another role's interpreter or uid.
+    """
+
+    resources = list(getattr(plan, "resources", ()) or ())
+    for change in list(getattr(plan, "steps", ()) or ()):
+        _validate_semantic_runtime_consistency(change)
+        implementation = getattr(change, "implementation_plan", None)
+        micro_steps = (
+            list(getattr(implementation, "steps", ()) or ())
+            if implementation is not None
+            else [change]
+        )
+        for micro_step in micro_steps:
+            binding = getattr(micro_step, "execution_binding", None)
+            if binding is None:
+                raise ExecutionBindingError(
+                    "missing execution binding for %s" % micro_step.step_id,
+                    replan_recommended=True,
+                    category="implementation_contract_invalid",
+                )
+            _validate_binding_semantic_effect(micro_step, binding)
+        _validate_screen_runtime_acceptance(micro_steps)
+        for micro_step in micro_steps:
+            binding = getattr(micro_step, "execution_binding", None)
+            if binding is None or binding.action not in {
+                "start_screen_component", "restart_screen_component",
+            }:
+                continue
+            if str(getattr(micro_step, "status", "") or "") in {
+                "completed", "skipped",
+            }:
+                # This node is persisted goal progress inherited from an
+                # already authorized predecessor, not an action authorized by
+                # the successor.  Its execution identity belongs to the
+                # predecessor evidence and need not be re-declared as a new
+                # frozen resource.
+                continue
+            role = str(binding.args.get("component") or "").strip()
+            if role not in {"master", "celery", "web_terminal", "worker"}:
+                continue
+            for arg_name in ("run_as_uid", "python_executable"):
+                if arg_name not in binding.args:
+                    continue
+                matching = [
+                    resource
+                    for resource in resources
+                    if resource.status == "frozen"
+                    and any(
+                        str(consumer).rsplit(".", 1)[0] == change.step_id
+                        and _runtime_identity_consumer_arg(
+                            resource,
+                            str(consumer).rsplit(".", 1)[1],
+                            role,
+                        ) == arg_name
+                        for consumer in resource.consumers
+                    )
+                ]
+                if not matching or not any(
+                    str(resource.value) == str(binding.args.get(arg_name))
+                    for resource in matching
+                ):
+                    raise ExecutionBindingError(
+                        "component_runtime_identity_not_frozen=%s.%s"
+                        % (role, arg_name),
+                        replan_recommended=True,
+                        category="implementation_contract_invalid",
+                    )
 
 
 def _validate_source_mutation_action_coverage(
@@ -6772,9 +7612,10 @@ def _validate_source_mutation_action_coverage(
 
 def _atomic_runtime_role(text: str) -> str:
     leading = re.search(
-        r"^\s*(?:start|restart|restore|recover|launch|启动|重启|恢复)\w*"
+        r"^\s*(?:start|restart|restore|recover|launch|stop|terminate|"
+        r"启动|重启|恢复|停止|终止)\w*"
         r"[^.!?。！？]{0,40}?\b([A-Za-z][A-Za-z0-9_-]{0,63})\b"
-        r"(?=\s+(?:screen\s+component|component|role)\b)",
+        r"(?=\s+(?:screen\s+component|runtime\s+process|component|process|role)\b)",
         str(text or ""),
         re.I,
     )
@@ -6824,13 +7665,24 @@ def _semantic_runtime_root(text: str) -> str:
     return candidate.rstrip("/")
 
 
-def _runtime_root_from_frozen_paths(resources: list[PlanResource]) -> str:
-    """Derive an existing instance root from typed paths, including entry files."""
+def _runtime_root_from_frozen_paths(
+    resources: list[PlanResource],
+    *,
+    semantic_step_id: str = "",
+) -> str:
+    """Resolve the one frozen instance root owned by a semantic step.
+
+    A multi-instance plan contains several equally valid ``instance_root``
+    resources.  Selecting the first one leaks evidence across semantic steps.
+    Consumer ownership is therefore authoritative; an unscoped caller may use
+    this fallback only when the whole resource set contains one unique root.
+    """
 
     root_roles = {
         "instance_root", "project_root", "platform_root",
         "platform_runtime_root", "runtime_cwd",
     }
+    candidates: list[str] = []
     for resource in resources:
         if (
             resource.status != "frozen"
@@ -6838,17 +7690,27 @@ def _runtime_root_from_frozen_paths(resources: list[PlanResource]) -> str:
             or not str(resource.value).startswith("/")
         ):
             continue
+        if semantic_step_id and not any(
+            semantic_step_id == str(consumer).rsplit(".", 1)[0]
+            or semantic_step_id.startswith(
+                str(consumer).rsplit(".", 1)[0] + "__"
+            )
+            for consumer in resource.consumers
+        ):
+            continue
         value = Path(str(resource.value).rstrip("/"))
-        identity = str(resource.name or resource.role)
+        # ``role`` is the semantic authority; names may be instance-scoped
+        # (for example ``instance_102_instance_root``) solely for uniqueness.
+        identity = str(resource.role or resource.name)
         if identity in root_roles:
             candidate = value.parent if value.name == "mains" else value
         elif value.parent.name == "mains" and value.suffix == ".py":
             candidate = value.parent.parent
         else:
             continue
-        if candidate.is_dir():
-            return str(candidate)
-    return ""
+        if candidate.is_dir() and str(candidate) not in candidates:
+            candidates.append(str(candidate))
+    return candidates[0] if len(candidates) == 1 else ""
 
 
 def _validate_shell_resource_bindings(

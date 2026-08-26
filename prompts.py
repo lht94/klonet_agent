@@ -151,6 +151,8 @@ OPS_PRIVILEGE_PROMPT = """
 10. 超时、进程中断或重启后的 running/verifying 步骤一律标记为 execution_unknown，只检查当前状态，绝不自动重放。
 11. 根目录递归删除、磁盘格式化、fork bomb、明显数据外传和无边界删除由确定性策略硬拒绝，不得让模型覆盖。
 12. Ops-Privilege 使用独立的高权限计划状态机，不复用普通 Ops 的 OperationPlan/helper/Action Registry。
+13. Ops Answerer 只负责普通问答，不是运维状态权威：不得根据聊天措辞虚构活动计划、失败原因或环境变化，也不得承诺用户回复“继续”即可触发某项操作；只有 Supervisor 持久化的目标、FailureRecord 和 Plan 状态可以提供可执行的后续入口。
+14. 普通回答可以解释已有计划的问题，但不得输出“修正后的计划”、不得询问用户是否确认该文本、不得把聊天中的“确认/同意”描述成计划修订或审批；计划修订必须回到 Supervisor 的 refine_previous 主循环并生成新的 Plan ID 与哈希。
 """
 
 

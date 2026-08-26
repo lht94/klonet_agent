@@ -800,6 +800,107 @@ def test_platform_health_reads_ports_from_active_vemu_config_class(monkeypatch):
     assert "overall_status=unchecked" in result
 
 
+def test_runtime_role_listener_binding_distinguishes_code_root_from_runtime_root(
+    monkeypatch, tmp_path,
+):
+    from klonet_agent.tools import environment
+
+    project_root = tmp_path / "vemu_uestc"
+    project_root.mkdir()
+    external_root = tmp_path / "simulation" / "worker101"
+    external_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        environment,
+        "_port_owner_result",
+        lambda _port: environment.ProbeResult(
+            "port_owner", "detected", "port=45552 pid=220 tree_root_pid=220",
+        ),
+    )
+    monkeypatch.setattr(
+        environment,
+        "_process_detail",
+        lambda _pid: {
+            "pgid": "220",
+            "cwd": str(external_root),
+            "cmd": (
+                "/opt/env/bin/python3.8 -m gunicorn --pid "
+                "/srv/docker simulation/worker101/gunicorn.pid -c %s "
+                "worker_main:flask_app"
+            )
+            % (project_root / "mains" / "worker_gun.py"),
+        },
+    )
+
+    binding = environment._runtime_role_listener_binding(
+        project_root, "worker", 45552,
+    )
+
+    assert binding["status"] == "runtime_conflict"
+    assert binding["listener_pid"] == 220
+    assert binding["listener_pgid"] == 220
+    assert binding["runtime_root"] == str(external_root)
+    assert binding["code_root"] == str(project_root)
+
+
+def test_runtime_root_never_falls_back_to_imported_code_path():
+    from klonet_agent.tools.environment import _runtime_root_from_process_row
+
+    row = {
+        "cwd": "?",
+        "cmd": (
+            "python -m gunicorn --chdir /host/home/lzl "
+            "-c /home/lzl/vemu_uestc/mains/worker_gun.py "
+            "vemu_uestc.mains.worker_main:flask_app"
+        ),
+    }
+
+    assert _runtime_root_from_process_row(row) == ""
+
+
+def test_runtime_root_accepts_explicit_screen_cd_contract():
+    from klonet_agent.tools.environment import _runtime_root_from_process_row
+
+    row = {
+        "cwd": "?",
+        "cmd": "SCREEN -dmS alpha_w bash -lc cd /srv/alpha/mains && exec python",
+    }
+
+    assert _runtime_root_from_process_row(row) == "/srv/alpha"
+
+
+def test_runtime_role_listener_binding_confirms_project_mains_cwd(
+    monkeypatch, tmp_path,
+):
+    from klonet_agent.tools import environment
+
+    project_root = tmp_path / "vemu_uestc"
+    (project_root / "mains").mkdir(parents=True)
+    monkeypatch.setattr(
+        environment,
+        "_port_owner_result",
+        lambda _port: environment.ProbeResult(
+            "port_owner", "detected", "port=45552 pid=330",
+        ),
+    )
+    monkeypatch.setattr(
+        environment,
+        "_process_detail",
+        lambda _pid: {
+            "pgid": "329",
+            "cwd": str(project_root / "mains"),
+            "cmd": "gunicorn -c worker_gun.py worker_main:flask_app",
+        },
+    )
+
+    binding = environment._runtime_role_listener_binding(
+        project_root, "worker", 45552,
+    )
+
+    assert binding["status"] == "confirmed"
+    assert binding["listener_pid"] == 330
+    assert binding["listener_pgid"] == 329
+
+
 def test_executor_dispatches_platform_health_tool():
     from klonet_agent.tools.executor import ToolExecutor
 
@@ -1076,7 +1177,20 @@ def test_running_platform_inspection_counts_only_backend_healthy_runtime_roots(m
                 encoding="utf-8",
             )
 
-        monkeypatch.setattr(environment, "_screen_instance_rows", lambda: [])
+        monkeypatch.setattr(
+            environment,
+            "_screen_instance_rows",
+            lambda: [
+                {
+                    "session": "1.vemu_uestc_m", "platform": "vemu_uestc",
+                    "role": "master", "project_root": str(healthy_root),
+                },
+                {
+                    "session": "2.test_m", "platform": "test",
+                    "role": "master", "project_root": str(partial_root),
+                },
+            ],
+        )
         monkeypatch.setattr(
             environment,
             "_process_instance_rows",
@@ -1092,10 +1206,21 @@ def test_running_platform_inspection_counts_only_backend_healthy_runtime_roots(m
                 },
                 {
                     "pid": 2,
+                    "uid": 998,
+                    "executable": "/opt/worker/bin/python3.8",
                     "cwd": str(healthy_root),
                     "cmd": "python -m gunicorn -c worker_gun.py worker_main:flask_app",
                     "platform": "vemu_uestc",
                     "role": "worker",
+                },
+                {
+                    "pid": 4,
+                    "uid": 996,
+                    "executable": "/opt/celery/bin/python3.8",
+                    "cwd": str(healthy_root),
+                    "cmd": "python -m celery -A celery_worker.celery worker",
+                    "platform": "vemu_uestc",
+                    "role": "celery",
                 },
                 {
                     "pid": 3,
@@ -1125,7 +1250,8 @@ def test_running_platform_inspection_counts_only_backend_healthy_runtime_roots(m
     assert "healthy_count=1" in result
     assert "abnormal_count=1" in result
     assert "code_only_count=1" in result
-    assert result.count("platform=vemu_uestc") == 2
+    assert result.count("platform=vemu_uestc") == 1
+    assert result.count("platform=test ") == 1
     assert f"project_root={healthy_root}" in result
     assert "backend_status=healthy" in result
     assert "master_endpoint=healthy http_status=200" in result
@@ -1137,7 +1263,208 @@ def test_running_platform_inspection_counts_only_backend_healthy_runtime_roots(m
     assert f"code_only_root={code_only_root}" in result
     assert "configured_ports=master_port:30101,worker_port:30102" in result
     assert "master_identities=1:997:/usr/bin/python3.8" in result
+    assert "worker_identities=2:998:/opt/worker/bin/python3.8" in result
+    assert "celery_identities=4:996:/opt/celery/bin/python3.8" in result
+    assert "web_terminal_identities=none" in result
     assert "runtime_identities=1:997:/usr/bin/python3.8" in result
+
+
+def test_colliding_runtime_basenames_are_deterministically_path_qualified():
+    from klonet_agent.tools.environment import _qualify_colliding_platform_names
+
+    instances = {
+        "/srv/vemu_uestc": {"platform": "vemu_uestc"},
+        "/srv/lab/vemu_uestc": {"platform": "vemu_uestc"},
+    }
+
+    _qualify_colliding_platform_names(instances, {})
+
+    assert instances["/srv/vemu_uestc"]["platform"] == "vemu_uestc"
+    assert instances["/srv/lab/vemu_uestc"]["platform"] == "lab_vemu_uestc"
+
+
+def test_running_platforms_keeps_unqualified_process_root_as_external_evidence(
+    monkeypatch, tmp_path,
+):
+    from klonet_agent.tools import environment
+
+    platform_root = tmp_path / "platform" / "vemu_uestc"
+    external_root = tmp_path / "simulation" / "worker101"
+    platform_root.mkdir(parents=True)
+    external_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        environment,
+        "_screen_instance_rows",
+        lambda: [{
+            "session": "10.vemu_m", "platform": "vemu", "role": "master",
+            "project_root": str(platform_root),
+        }],
+    )
+    monkeypatch.setattr(
+        environment,
+        "_process_instance_rows",
+        lambda: [
+            {
+                "pid": 10, "uid": 1000, "pgid": 10,
+                "executable": "/opt/python3.8", "cwd": str(platform_root),
+                "cmd": "python -m gunicorn -c gun.py master_main:flask_app",
+                "platform": "vemu", "role": "master",
+            },
+            {
+                "pid": 20, "uid": 0, "pgid": 20,
+                "executable": "/opt/python3.8", "cwd": str(external_root),
+                "cmd": (
+                    "python -m gunicorn -c %s worker_main:flask_app"
+                    % (platform_root / "mains" / "worker_gun.py")
+                ),
+                "platform": "worker101", "role": "worker",
+            },
+        ],
+    )
+    monkeypatch.setattr(environment, "_discover_klonet_code_roots", lambda _roots: [])
+
+    result = environment.inspect_running_platforms()
+
+    assert "runtime_candidate_count=1" in result
+    assert "platform=vemu project_root=%s" % platform_root in result
+    assert "platform=worker101" not in result
+    assert "external_runtime_count=1" in result
+    assert (
+        "external_runtime_root=%s classification=conflict_evidence_only"
+        % external_root
+    ) in result
+
+
+def test_platform_instances_does_not_promote_unqualified_process_cwd(
+    monkeypatch, tmp_path,
+):
+    from klonet_agent.tools import environment
+
+    platform_root = tmp_path / "platform" / "vemu_uestc"
+    external_root = tmp_path / "simulation" / "worker101"
+    platform_root.mkdir(parents=True)
+    external_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        environment,
+        "_screen_instance_rows",
+        lambda: [{
+            "session": "10.vemu_m", "platform": "vemu", "role": "master",
+            "project_root": str(platform_root),
+        }],
+    )
+    monkeypatch.setattr(
+        environment,
+        "_process_instance_rows",
+        lambda: [
+            {
+                "pid": 10, "cwd": str(platform_root), "cmd": "master_main",
+                "platform": "vemu", "role": "master",
+            },
+            {
+                "pid": 20, "cwd": str(external_root), "cmd": "worker_main",
+                "platform": "worker101", "role": "worker",
+            },
+        ],
+    )
+
+    result = environment.inspect_platform_instances()
+
+    assert "instance_count=1" in result
+    assert "platform=vemu" in result
+    assert "platform=worker101" not in result
+    assert "unresolved_process_evidence=roles:worker pids:20" in result
+
+
+def test_unique_runtime_platform_name_is_not_rewritten():
+    from klonet_agent.tools.environment import _qualify_colliding_platform_names
+
+    instances = {
+        "/srv/alpha": {"platform": "alpha"},
+        "/srv/beta": {"platform": "beta"},
+    }
+
+    _qualify_colliding_platform_names(instances, {})
+
+    assert instances == {
+        "/srv/alpha": {"platform": "alpha"},
+        "/srv/beta": {"platform": "beta"},
+    }
+
+
+def test_runtime_http_transport_bypasses_ambient_proxy_for_all_loopback_forms(
+    monkeypatch,
+):
+    from klonet_agent.tools import environment
+
+    opened = []
+
+    class Response:
+        status = 200
+
+    class Opener:
+        def open(self, request, *, timeout):
+            opened.append((request, timeout))
+            return Response()
+
+    handlers = []
+
+    def build_opener(*items):
+        handlers.extend(items)
+        return Opener()
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setattr(environment.urllib.request, "build_opener", build_opener)
+    monkeypatch.setattr(
+        environment.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loopback request used ambient proxy path")
+        ),
+    )
+
+    for url in (
+        "http://127.0.0.1:47001/server_health/",
+        "http://127.9.8.7:47002/server_health/",
+        "http://localhost:45551/server_health/",
+        "http://[::1]:45552/server_health/",
+    ):
+        assert environment.http_transport_for_url(url) == "direct_loopback"
+        assert environment.open_http_request(url, timeout=3).status == 200
+
+    assert len(opened) == 4
+    assert len(handlers) == 4
+    assert all(handler.proxies == {} for handler in handlers)
+
+
+def test_runtime_http_transport_preserves_default_proxy_path_for_remote_url(
+    monkeypatch,
+):
+    from klonet_agent.tools import environment
+
+    calls = []
+
+    class Response:
+        status = 204
+
+    def urlopen(request, *, timeout):
+        calls.append((request, timeout))
+        return Response()
+
+    monkeypatch.setattr(environment.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        environment.urllib.request,
+        "build_opener",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("remote request unexpectedly bypassed proxy policy")
+        ),
+    )
+
+    url = "https://health.example.invalid/status"
+    assert environment.http_transport_for_url(url) == "default"
+    assert environment.open_http_request(url, timeout=7).status == 204
+    assert calls == [(url, 7)]
 
 
 def test_running_platform_inspection_uses_screen_alias_for_runtime_root(monkeypatch):
@@ -1536,6 +1863,68 @@ def test_runtime_port_owner_returns_target_pid_cmd_and_cwd(monkeypatch):
     assert any(call[:2] == ["ss", "-ltnp"] for call in calls)
 
 
+def test_port_owner_keeps_successful_no_listener_result_without_sudo_downgrade(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n",
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="sudo: a password is required",
+        )
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    result = environment._port_owner_result(46551)
+
+    assert result.status == "missing"
+    assert result.detail == "port=46551 not listening"
+    assert calls == [["ss", "-ltnp", "sport = :46551"]]
+
+
+def test_port_owner_uses_sudo_only_to_enrich_listener_without_visible_pid(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["ss", "-ltnp"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="LISTEN 0 128 0.0.0.0:46552 0.0.0.0:*",
+                stderr="",
+            )
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="sudo: a password is required",
+        )
+
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    result = environment._port_owner_result(46552)
+
+    assert result.status == "detected"
+    assert "pid=unchecked" in result.detail
+    assert calls[1][:3] == ["sudo", "-n", "/usr/bin/ss"]
+
+
 def test_runtime_port_owner_prefers_process_tree_root_for_shared_listener(monkeypatch):
     from types import SimpleNamespace
 
@@ -1799,3 +2188,24 @@ def test_privilege_capability_probe_reports_verified_channels(monkeypatch):
     assert "sudo_noninteractive=true" in output
     assert "capability_policy=direct_then_controlled_privilege" in output
     assert "environment unchanged" in output
+
+
+def test_runtime_role_parser_prefers_exact_entrypoint_over_gunicorn_config_substring():
+    from klonet_agent.tools.environment import _role_from_command
+
+    assert _role_from_command(
+        "python3.8 -m gunicorn -c data_server_gun.py "
+        "data_server_main:flask_app"
+    ) == "data_server"
+    assert _role_from_command(
+        "python3.8 -m gunicorn -c gun.py master_main:flask_app"
+    ) == "master"
+    assert _role_from_command(
+        "python3.8 -m gunicorn -c worker_gun.py worker_main:flask_app"
+    ) == "worker"
+
+
+def test_runtime_role_parser_does_not_infer_master_from_unrelated_gun_suffix():
+    from klonet_agent.tools.environment import _role_from_command
+
+    assert _role_from_command("python3.8 helper_data_server_gun.py") == ""

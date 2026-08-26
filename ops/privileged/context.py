@@ -21,6 +21,7 @@ from klonet_agent.ops.privileged.action_runner import (
 )
 from klonet_agent.ops.privileged.environment_facts import (
     EnvironmentFactCollector,
+    REQUIRED_ENTRY_FILES,
     UnifiedEnvironmentFacts,
 )
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
@@ -45,6 +46,72 @@ _EXCLUDED_PLANNER_ACTIONS: set[str] = set()
 _RECOVERY_PROBES = {
     spec.name: spec.handler for spec in DEFAULT_READONLY_PROBES.describe()
 }
+
+
+def klonet_domain_context(role: str) -> str:
+    """Return shared Klonet semantics, narrowed to one workflow responsibility.
+
+    This is vocabulary and invariant context, not evidence about the current
+    host.  Runtime values must still come from Discovery and frozen resources.
+    """
+
+    entries = ", ".join(REQUIRED_ENTRY_FILES)
+    common = (
+        "## KLONET_DOMAIN_CONTEXT (domain semantics; never current-host evidence)\n"
+        "- A Klonet platform instance is identified by RuntimeInventory and its "
+        "frozen project_root; path containment or a Screen name alone is not an "
+        "instance identity.\n"
+        "- Application roles are master, worker, celery, and web_terminal.  "
+        "Their actual presence, interpreter, cwd, argv, ports, and Screen "
+        "sessions must come from runtime evidence or frozen component manifests.\n"
+        "- `mains` may be the canonical source directory.  "
+        "`prepare_project_files` prepares exactly these registered runtime "
+        "entry files in project_root: %s.  Generic framework markers such as "
+        "manage.py are not Klonet readiness criteria.\n"
+        "- Registered Action contracts are authoritative for Action semantics "
+        "and acceptance checks.  Domain knowledge helps interpret a goal but "
+        "must not replace, weaken, or extend those contracts.\n"
+    ) % entries
+    guidance = {
+        "intent": (
+            "- Intent duty: distinguish inspection from mutation and preserve "
+            "explicit user corrections; words such as state/running do not imply restart. "
+            "Moving already-running application roles under Screen management is a "
+            "runtime lifecycle mutation: it uses the existing restart operation because "
+            "the current process must be replaced by a Screen-owned process.  Merely "
+            "listing or inspecting Screen sessions remains read-only."
+        ),
+        "planner": (
+            "- Planner duty: preserve the complete requested scope and describe "
+            "semantic effects.  Do not invent implementation files, commands, "
+            "Action parameters, or Action-specific success criteria."
+        ),
+        "binding": (
+            "- Binding duty: select an implementation and ground its arguments.  "
+            "For registered Actions, use their canonical pre/postconditions; do "
+            "not infer generic application files or redefine Action success."
+        ),
+        "discovery": (
+            "- Discovery duty: collect provenance-bearing host facts.  Prefer "
+            "registered probes and use policy-validated read-only commands only "
+            "for facts the registered result does not cover; never infer state "
+            "from this domain description."
+        ),
+        "synthesis": (
+            "- Synthesis duty: translate supplied evidence into goal-relevant "
+            "claims without treating documentation or vocabulary as runtime facts."
+        ),
+        "verifier": (
+            "- Verifier duty: evaluate the approved canonical checks and the full "
+            "goal.  Never invent additional framework files or reinterpret a "
+            "failed mutation as a different mutation."
+        ),
+        "response": (
+            "- Response duty: render confirmed evidence for the user's goal; do "
+            "not infer omitted roles, health, paths, or remediation from vocabulary."
+        ),
+    }
+    return common + guidance.get(str(role or "").strip().lower(), "")
 
 
 def _omit_knowledge_absolute_paths(value: str) -> str:

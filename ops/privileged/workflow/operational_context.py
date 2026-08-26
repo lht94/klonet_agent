@@ -22,6 +22,7 @@ DYNAMIC_PROBES = frozenset({
     "running_platforms", "platform_health", "ports", "port_owner",
     "process", "process_detail", "process_tree", "process_logs",
     "screen", "screen_session", "http_endpoint", "tcp_connection",
+    "readonly_command",
 })
 
 
@@ -33,9 +34,18 @@ def _safe_component(value: str) -> str:
 @dataclass
 class OperationalContextSnapshot:
     resolved_goal: str = ""
+    base_goal: str = ""
+    decision_history: list[str] = field(default_factory=list)
+    pending_goal_revision: str = ""
+    pending_goal_relation: str = ""
+    active_plan_id: str = ""
+    workflow_intent: str = ""
+    goal_kind: str = ""
+    operation: str = "none"
+    scope: str = "none"
+    components: list[str] = field(default_factory=list)
     output_locale: str = "zh-CN"
     target_roots: list[str] = field(default_factory=list)
-    phase: str = "diagnosing"
     evidence: EvidenceBundle = field(default_factory=lambda: EvidenceBundle(goal=""))
     updated_at: str = field(default_factory=_utc_now)
 
@@ -52,9 +62,18 @@ class OperationalContextSnapshot:
     def to_dict(self) -> dict[str, Any]:
         return {
             "resolved_goal": self.resolved_goal,
+            "base_goal": self.base_goal,
+            "decision_history": list(self.decision_history),
+            "pending_goal_revision": self.pending_goal_revision,
+            "pending_goal_relation": self.pending_goal_relation,
+            "active_plan_id": self.active_plan_id,
+            "workflow_intent": self.workflow_intent,
+            "goal_kind": self.goal_kind,
+            "operation": self.operation,
+            "scope": self.scope,
+            "components": list(self.components),
             "output_locale": self.output_locale,
             "target_roots": list(self.target_roots),
-            "phase": self.phase,
             "updated_at": self.updated_at,
             "evidence": {
                 "goal": self.evidence.goal,
@@ -64,6 +83,10 @@ class OperationalContextSnapshot:
                         "probe": item.request.probe,
                         "args": item.request.args,
                         "purpose": item.request.purpose,
+                        "required_facts": list(item.request.required_facts),
+                        "freshness": item.request.freshness,
+                        "gap_id": item.request.gap_id,
+                        "affected_steps": list(item.request.affected_steps),
                         "output": redact_sensitive_text(item.output),
                         "status": item.status,
                         "collected_at": item.collected_at,
@@ -85,6 +108,10 @@ class OperationalContextSnapshot:
                 str(raw.get("probe") or ""),
                 dict(raw.get("args") or {}),
                 str(raw.get("purpose") or ""),
+                tuple(str(item) for item in raw.get("required_facts") or []),
+                str(raw.get("freshness") or "cached"),
+                str(raw.get("gap_id") or ""),
+                tuple(str(item) for item in raw.get("affected_steps") or []),
             )
             bundle.add(EvidenceRecord(
                 evidence_id=str(raw.get("evidence_id") or "ev-" + request.cache_key[:16]),
@@ -95,9 +122,18 @@ class OperationalContextSnapshot:
             ))
         return cls(
             resolved_goal=str(data.get("resolved_goal") or ""),
+            base_goal=str(data.get("base_goal") or data.get("resolved_goal") or ""),
+            decision_history=[str(item) for item in data.get("decision_history") or []],
+            pending_goal_revision=str(data.get("pending_goal_revision") or ""),
+            pending_goal_relation=str(data.get("pending_goal_relation") or ""),
+            active_plan_id=str(data.get("active_plan_id") or ""),
+            workflow_intent=str(data.get("workflow_intent") or ""),
+            goal_kind=str(data.get("goal_kind") or ""),
+            operation=str(data.get("operation") or "none"),
+            scope=str(data.get("scope") or "none"),
+            components=[str(item) for item in data.get("components") or []],
             output_locale=str(data.get("output_locale") or "zh-CN"),
             target_roots=[str(item) for item in data.get("target_roots") or []],
-            phase=str(data.get("phase") or "diagnosing"),
             evidence=bundle,
             updated_at=str(data.get("updated_at") or _utc_now()),
         )

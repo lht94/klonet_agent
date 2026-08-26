@@ -12,6 +12,23 @@ from klonet_agent.ops.privileged.workflow.contracts import ChangePlan
 class ChangeBindingError(ValueError):
     """A semantic change could not be represented by an executable capability."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "semantic_binding",
+        replan_recommended: bool = True,
+        failed_criteria: list[str] | None = None,
+        missing_decisions: list[str] | None = None,
+        replan_context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.replan_recommended = replan_recommended
+        self.failed_criteria = list(failed_criteria or [])
+        self.missing_decisions = list(missing_decisions or [])
+        self.replan_context = dict(replan_context or {})
+
 
 class ChangeBinder:
     """Narrow adapter around the shared Action/Shell capability binder."""
@@ -52,7 +69,14 @@ class ChangeBinder:
                 grounded_context=grounded_context,
             )
         except ExecutionBindingError as exc:
-            raise ChangeBindingError(str(exc)) from exc
+            raise ChangeBindingError(
+                str(exc),
+                category=exc.category,
+                replan_recommended=exc.replan_recommended,
+                failed_criteria=exc.failed_criteria,
+                missing_decisions=exc.missing_decisions,
+                replan_context=exc.replan_context,
+            ) from exc
         by_id = {step.step_id: step for step in bound.steps}
         for change in plan.steps:
             implementation = by_id[change.step_id]

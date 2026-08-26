@@ -137,6 +137,47 @@ def test_executor_turns_process_launch_error_into_failed_evidence(monkeypatch):
     assert evidence.timed_out is False
 
 
+def test_executor_runs_approved_readonly_shell_without_claiming_environment_change(tmp_path):
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
+    from klonet_agent.ops.privileged.shell_artifact import create_shell_artifact
+
+    artifact = create_shell_artifact(
+        artifact_id="shell-readonly-test",
+        script="pwd",
+        cwd=str(tmp_path),
+        run_as="",
+        timeout=5,
+        environment_fingerprint="",
+        declared_changes=[],
+        rollback="",
+        nonce="readonly-nonce",
+    )
+    artifact.status = "approved"
+    artifact.approved_contract_hash = artifact.contract_hash
+    step = PrivilegedStep(
+        step_id="readonly-shell",
+        title="Read current directory",
+        objective="Observe the current directory without mutation",
+        risk="readonly",
+        execution_binding=ExecutionBinding(
+            kind="shell_artifact",
+            risk="readonly",
+            approval_scope="plan",
+            shell_artifact=artifact,
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        ),
+    )
+
+    evidence = PrivilegedCommandExecutor().execute(step)
+
+    assert evidence.return_code == 0
+    assert evidence.stdout.strip() == str(tmp_path)
+    assert evidence.environment_changed is False
+    assert evidence.commands[0]["changes_state"] is False
+
 def test_readonly_executor_uses_validated_argv_without_shell(monkeypatch):
     from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 
@@ -254,6 +295,65 @@ def test_checker_registry_reports_unknown_or_missing_dependency_as_unavailable()
 
     assert unknown.status == "unavailable"
     assert unavailable.status == "failed"
+
+
+def test_restart_identity_accepts_recovery_from_stale_screen_without_old_pid(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import checkers as module
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+    from klonet_agent.ops.privileged.contracts import ExecutionEvidence
+
+    monkeypatch.setattr(module, "_pid_cwd", lambda pid: str(tmp_path))
+    evidence = ExecutionEvidence(
+        return_code=0,
+        mutation={
+            "kind": "component_restart",
+            "component": "master",
+            "old_pids": "",
+            "new_pids": "202,203",
+        },
+    )
+
+    result = DefaultCheckerRegistry().run(
+        {
+            "checker": "component_restart_identity",
+            "args": {"component": "master", "project_root": str(tmp_path)},
+        },
+        evidence=evidence,
+    )
+
+    assert result.status == "passed"
+    assert "old=none" in result.observed
+
+
+def test_restart_identity_still_rejects_reused_live_process_identity(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import checkers as module
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+    from klonet_agent.ops.privileged.contracts import ExecutionEvidence
+
+    monkeypatch.setattr(module, "_pid_cwd", lambda pid: str(tmp_path))
+    evidence = ExecutionEvidence(
+        return_code=0,
+        mutation={
+            "kind": "component_restart",
+            "component": "worker",
+            "old_pids": "301",
+            "new_pids": "301",
+        },
+    )
+
+    result = DefaultCheckerRegistry().run(
+        {
+            "checker": "component_restart_identity",
+            "args": {"component": "worker", "project_root": str(tmp_path)},
+        },
+        evidence=evidence,
+    )
+
+    assert result.status == "failed"
 
 
 def test_nginx_checker_retries_permission_failure_with_unprivileged_config_copy(
@@ -401,7 +501,7 @@ def test_http_status_checker_accepts_one_of_multiple_expected_codes(monkeypatch)
             return False
 
     monkeypatch.setattr(
-        "klonet_agent.ops.privileged.checkers.urllib.request.urlopen",
+        "klonet_agent.ops.privileged.checkers.open_http_request",
         lambda *args, **kwargs: Response(),
     )
 
@@ -431,7 +531,7 @@ def test_backend_health_checker_requires_http_200_and_code_one(monkeypatch):
             return b'{"code": 1}'
 
     monkeypatch.setattr(
-        "klonet_agent.ops.privileged.checkers.urllib.request.urlopen",
+        "klonet_agent.ops.privileged.checkers.open_http_request",
         lambda *args, **kwargs: Response(),
     )
 
@@ -441,7 +541,7 @@ def test_backend_health_checker_requires_http_200_and_code_one(monkeypatch):
     })
 
     assert result.status == "passed"
-    assert result.observed == "http=200 code=1"
+    assert result.observed == "http=200 code=1 transport=direct_loopback"
 
 
 def test_python_import_checker_uses_requested_interpreter_and_cwd(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 import json
+import logging
 import re
 
 from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
@@ -14,6 +15,8 @@ from klonet_agent.ops.privileged.contracts import (
 )
 from klonet_agent.ops.privileged.action_contracts import _parse_json_object
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+from klonet_agent.ops.privileged.context import klonet_domain_context
+from klonet_agent.tools.environment import redact_sensitive_text
 from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceConclusion,
@@ -34,7 +37,8 @@ bounds: you may explain them but never change them to passed.
 
 Return one JSON object. If more evidence is materially required, use:
 {"status":"need_evidence","probe_requests":[
- {"probe":"registered read-only probe","args":{},"purpose":"..."}
+ {"probe":"preferred read-only capability","args":{},"purpose":"...",
+  "required_facts":[],"freshness":"cached|refresh"}
 ]}
 Otherwise use:
 {
@@ -50,6 +54,7 @@ Never request mutation, invent facts, or expose secrets.
 """.strip()
 
 MAX_VERIFICATION_PROBE_ROUNDS = 2
+LOGGER = logging.getLogger(__name__)
 
 
 GOAL_VERIFIER_SYSTEM_PROMPT = """
@@ -63,7 +68,8 @@ Return exactly one JSON object:
   "reason": "short reason in Chinese",
   "user_question": "only for a genuine user choice",
   "evidence_requests": [
-    {"probe":"registered probe","args":{},"purpose":"..."}
+    {"probe":"preferred capability","args":{},"purpose":"...",
+     "required_facts":[],"freshness":"cached|refresh"}
   ]
 }
 
@@ -72,24 +78,28 @@ Rules:
   diagnosis, diagnosis.status must be cause_confirmed or no_failure_confirmed.
   cause_confirmed requires a supported causal chain from symptom to failure
   point to underlying cause; a list of uncertainties is not a diagnosis.
+- For non-causal goals, independently decide whether each synthesized
+  uncertainty or missing decision is required by the supplied goal. Only a
+  goal-blocking gap prevents achieved; supplementary unknowns and decisions
+  about optional follow-up work do not.
 - Once that causal chain is supported, uncertainties about historical timing
   or which future fix to choose do not prevent a diagnostic goal from being
   achieved. Those are separate change decisions, not missing diagnosis facts.
-- `need_evidence` whenever a missing fact can be obtained with registered
-  read-only probes. Reading logs/source/config, locating files, checking
+- `need_evidence` whenever a missing fact can be obtained through Discovery.
+  Prefer registered probes; Discovery may bind an uncovered long-tail fact to
+  a policy-validated read-only command. Reading logs/source/config, locating files, checking
   process state, reconstructing a traceback, and comparing repository changes
   are technical work, never user decisions.
 - `needs_user_decision` only for an actual target, scope, product, or
   authorization choice that cannot be inferred from evidence. Never ask the
   user to perform a probe.
-- `blocked` only when evidence proves every safe registered route required for
-  the goal is unavailable. One refused path or failed probe is insufficient
-  when another registered route can find the same fact.
+- `blocked` only when evidence proves both registered probes and safe read-only
+  command binding are unavailable. One refused path is insufficient.
 - `need_replan` is valid only in `post_execution` phase, after evidence proves
   the approved plan did not achieve the goal and identifies enough cause to
   safely revise only the unmet effects.
 - Request at most four probes and never repeat an attempted probe key.
-- Use only registered probes. Write user-visible text in Chinese.
+- State required facts precisely; do not emit a command. Write user-visible text in Chinese.
 
 Registered probes:
 %s
@@ -108,8 +118,8 @@ class PrivilegedVerifierAgent:
         self.probe_runner = probe_runner
 
     @staticmethod
-    def verify_execution_outcome(plan: Any) -> GoalOutcome:
-        """Convert fully verified execution evidence into the goal transition."""
+    def verify_plan_execution(plan: Any) -> VerificationDecision:
+        """Aggregate step checks without deciding the user's whole goal."""
 
         incomplete: list[str] = []
         failed: list[str] = []
@@ -138,13 +148,21 @@ class PrivilegedVerifierAgent:
                     failed.append(step_id)
         if incomplete or failed:
             criteria = sorted(set([*incomplete, *failed]))
-            return GoalOutcome(
-                "need_replan",
+            return VerificationDecision(
+                status="failed",
+                step_achieved=False,
+                verification_level=str(
+                    getattr(plan, "verification_level", "standard") or "standard"
+                ),
                 reason="执行计划尚未形成全部通过的验证证据。",
                 failed_criteria=criteria,
             )
-        return GoalOutcome(
-            "achieved",
+        return VerificationDecision(
+            status="passed",
+            step_achieved=True,
+            verification_level=str(
+                getattr(plan, "verification_level", "standard") or "standard"
+            ),
             reason="全部已审批变更及其后置条件均已通过验证。",
         )
 
@@ -217,6 +235,7 @@ class PrivilegedVerifierAgent:
         attempted_keys = set(attempted_keys or set())
         if (
             phase == "readonly"
+            and goal_kind != "causal_diagnosis"
             and runtime_inventory_answers_goal(
                 goal, RuntimeInventory.from_bundle(bundle),
             )
@@ -230,6 +249,9 @@ class PrivilegedVerifierAgent:
             and not conclusion.missing_decisions
         ):
             return GoalOutcome("achieved")
+        transition = self._post_execution_replan_floor(bundle, phase=phase)
+        if transition is not None:
+            return transition
         if self.llm is None:
             return self._goal_fallback(
                 goal, conclusion, phase=phase, goal_kind=goal_kind,
@@ -262,12 +284,15 @@ class PrivilegedVerifierAgent:
         messages = [
             {
                 "role": "system",
-                "content": GOAL_VERIFIER_SYSTEM_PROMPT
-                % DEFAULT_READONLY_PROBES.render(),
+                "content": (
+                    GOAL_VERIFIER_SYSTEM_PROMPT
+                    % DEFAULT_READONLY_PROBES.render()
+                ) + "\n\n" + klonet_domain_context("verifier"),
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
         last_error: Exception | None = None
+        transport_error = False
         for attempt in range(2):
             content = ""
             try:
@@ -278,8 +303,16 @@ class PrivilegedVerifierAgent:
                     temperature=0,
                     extra_body={"thinking": {"type": "disabled"}},
                 )
+            except Exception as exc:
+                # Availability failures are not GoalOutcome contract errors;
+                # retrying them as JSON repair hid transport timeouts for
+                # multiple request windows.
+                last_error = exc
+                transport_error = True
+                break
+            try:
                 content = response.choices[0].message.content or ""
-                return self._goal_outcome(
+                outcome = self._goal_outcome(
                     _parse_json_object(content),
                     attempted_keys,
                     goal=goal,
@@ -287,28 +320,61 @@ class PrivilegedVerifierAgent:
                     phase=phase,
                     goal_kind=goal_kind,
                 )
+                if outcome.status == "need_evidence":
+                    transition = self._post_execution_replan_floor(
+                        bundle, phase=phase,
+                    )
+                    if transition is not None:
+                        return transition
+                return outcome
             except Exception as exc:
                 last_error = exc
                 if attempt == 0:
+                    repair_error = redact_sensitive_text(str(exc))[:1000]
                     messages.extend([
                         {"role": "assistant", "content": content},
                         {
                             "role": "user",
                             "content": (
-                                "修复 GoalOutcome JSON 合同，不要改变证据事实。错误：%s"
-                                % type(exc).__name__
+                                "修复 GoalOutcome JSON 合同，不要改变证据事实。"
+                                "具体合同错误：%s: %s\n"
+                                "若 need_evidence 请求已全部尝试，不得重复请求或返回空请求；"
+                                "请改为提出尚未尝试的新证据，或根据现有证据返回"
+                                " need_replan/needs_user_decision/blocked。"
+                                % (type(exc).__name__, repair_error)
                             ),
                         },
                     ])
+        safe_error = "unknown verifier contract failure"
+        if last_error is not None:
+            safe_error = redact_sensitive_text(str(last_error))[:500]
+            LOGGER.warning(
+                "goal verifier contract invalid after bounded repair: %s: %s",
+                type(last_error).__name__,
+                safe_error,
+            )
+        transition = self._post_execution_replan_floor(bundle, phase=phase)
+        if transition is not None:
+            return transition
         fallback = self._goal_fallback(
             goal, conclusion, phase=phase, goal_kind=goal_kind,
         )
         if fallback.status == "achieved":
             return fallback
+        if transport_error:
+            return GoalOutcome(
+                "blocked",
+                reason=(
+                    "Verifier model request failed; deterministic evidence was"
+                    " insufficient for a terminal decision. error=%s" % safe_error
+                ),
+            )
         return GoalOutcome(
             "blocked",
-            reason="Verifier 无法形成有效的目标级补证合同：%s"
-            % type(last_error).__name__,
+            reason=(
+                "Verifier 在有限次数校正后仍未形成有效的目标级判断。"
+                " contract_error=%s" % safe_error
+            ),
         )
 
     @staticmethod
@@ -325,7 +391,6 @@ class PrivilegedVerifierAgent:
         question = str(data.get("user_question") or "").strip()
         if (
             status == "achieved"
-            and phase == "readonly"
             and goal_kind == "causal_diagnosis"
         ):
             if conclusion.diagnosis.status not in {
@@ -354,6 +419,7 @@ class PrivilegedVerifierAgent:
             ):
                 raise ValueError("need_replan lacks supported failure evidence")
         requests: list[ProbeRequest] = []
+        rejected_attempted: list[str] = []
         for raw in (data.get("evidence_requests") or [])[:4]:
             if not isinstance(raw, dict):
                 continue
@@ -361,15 +427,30 @@ class PrivilegedVerifierAgent:
                 str(raw.get("probe") or ""),
                 dict(raw.get("args") or {}),
             )
-            if DEFAULT_READONLY_PROBES.get(probe) is None:
-                continue
             request = ProbeRequest(
                 probe,
                 args,
                 str(raw.get("purpose") or "补齐目标证据"),
+                tuple(
+                    str(item).strip()
+                    for item in raw.get("required_facts") or []
+                    if str(item).strip()
+                ),
+                str(raw.get("freshness") or "cached"),
             )
-            if request.cache_key not in attempted_keys:
+            if (
+                request.need_key not in attempted_keys
+                and request.cache_key not in attempted_keys
+            ):
                 requests.append(request)
+            else:
+                rejected_attempted.append(request.need_key)
+        if status == "need_evidence" and not requests:
+            raise ValueError(
+                "need_evidence contains no new evidence requests; "
+                "already_attempted=%s"
+                % (",".join(rejected_attempted) or "all supplied requests")
+            )
         return GoalOutcome(
             status,
             reason=str(data.get("reason") or "").strip(),
@@ -381,6 +462,67 @@ class PrivilegedVerifierAgent:
             ],
             next_objective=str(data.get("next_objective") or "").strip(),
         )
+
+    @staticmethod
+    def _post_execution_replan_floor(
+        bundle: EvidenceBundle,
+        *,
+        phase: str,
+    ) -> GoalOutcome | None:
+        """Preserve a safe Replan transition after an explicit step failure.
+
+        This is a control-flow floor, not a second goal verifier: it never
+        declares completion.  Once execution evidence proves that a step is
+        paused and the environment state is known, repeating already consumed
+        Discovery requests cannot turn that failed plan into success.
+        """
+
+        if phase != "post_execution":
+            return None
+        outputs = [
+            str(record.output or "")
+            for record in bundle.records
+            if record.request.probe == "plan_execution"
+        ]
+        for output in outputs:
+            failed_lines = [
+                line for line in output.splitlines()
+                if re.search(r"\bstep=\S+\s+status=(?:paused|failed)\b", line)
+                and re.search(r"\benvironment_changed=(?:true|false)\b", line)
+                and not re.search(r"\btimed_out=True\b", line)
+            ]
+            if failed_lines:
+                return GoalOutcome(
+                    "need_replan",
+                    reason=(
+                        "执行证据已确认具体步骤失败且环境变化状态明确；"
+                        "重复补证不能修复原实施计划，必须重建未满足的效果。"
+                    ),
+                    failed_criteria=[
+                        " ".join(line.split())[:1000] for line in failed_lines[:8]
+                    ],
+                )
+            environment_known = bool(re.search(
+                r"(?m)^plan_environment_changed=(?:true|false)$", output,
+            ))
+            failed_changes = [
+                line for line in output.splitlines()
+                if re.search(r"\bchange=\S+\s+status=(?:paused|failed)\b", line)
+                and re.search(r"\bobservation=\S", line)
+            ]
+            if environment_known and failed_changes:
+                return GoalOutcome(
+                    "need_replan",
+                    reason=(
+                        "执行证据已确认语义步骤验收失败且环境变化状态明确；"
+                        "目标范围已经由已审批计划冻结，应重建未满足效果。"
+                    ),
+                    failed_criteria=[
+                        " ".join(line.split())[:1000]
+                        for line in failed_changes[:8]
+                    ],
+                )
+        return None
 
     @staticmethod
     def _goal_fallback(
@@ -398,11 +540,23 @@ class PrivilegedVerifierAgent:
                 "blocked",
                 reason="诊断尚未形成经过证据支持的完整因果链。",
             )
-        if not conclusion.uncertainties and not conclusion.missing_decisions:
+        # A readonly answer may be completed deterministically from a clean
+        # evidence synthesis.  After mutation, however, an unavailable or
+        # invalid goal Verifier must fail closed: synthesis is not authority
+        # to commit an approved execution plan as completed.
+        if (
+            phase == "readonly"
+            and not conclusion.uncertainties
+            and not conclusion.missing_decisions
+        ):
             return GoalOutcome("achieved")
         return GoalOutcome(
             "blocked",
-            reason="仍存在未解决的目标证据缺口，且 Verifier 不可用。",
+            reason=(
+                "执行后的目标 Verifier 不可用或合同无效，不能推断计划已经完成。"
+                if phase == "post_execution"
+                else "仍存在未解决的目标证据缺口，且 Verifier 不可用。"
+            ),
         )
 
     @staticmethod
@@ -534,7 +688,11 @@ class PrivilegedVerifierAgent:
             "registered_probe_catalog": DEFAULT_READONLY_PROBES.render(),
         }
         messages = [
-            {"role": "system", "content": VERIFIER_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": VERIFIER_SYSTEM_PROMPT
+                + "\n\n" + klonet_domain_context("verifier"),
+            },
             {
                 "role": "user",
                 "content": json.dumps(
@@ -661,22 +819,23 @@ class PrivilegedVerifierAgent:
     def _probe_requests(value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list) or not value:
             raise ValueError("Verifier need_evidence requires probes")
-        known = {
-            spec.name for spec in DEFAULT_READONLY_PROBES.describe()
-        }
         result = []
         for item in value[:3]:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("probe") or "").strip()
-            if name not in known:
-                raise ValueError("Verifier probe not registered=%s" % name)
             args = item.get("args")
             result.append(
                 {
                     "probe": name,
                     "args": args if isinstance(args, dict) else {},
                     "purpose": str(item.get("purpose") or "").strip()[:500],
+                    "required_facts": [
+                        str(value).strip()[:500]
+                        for value in item.get("required_facts") or []
+                        if str(value).strip()
+                    ][:12],
+                    "freshness": str(item.get("freshness") or "cached"),
                 }
             )
         if not result:
@@ -824,15 +983,6 @@ def _strings(value: Any) -> list[str]:
         for item in value[:20]
         if str(item).strip()
     ]
-
-
-def _is_causal_diagnosis_goal(goal: str) -> bool:
-    return bool(re.search(
-        r"为什么|根因|报错|异常|故障|诊断|排查|why|root cause|error|"
-        r"failure|diagnos|troubleshoot",
-        str(goal or ""),
-        re.I,
-    ))
 
 
 def _question_offloads_discoverable_work(question: str) -> bool:

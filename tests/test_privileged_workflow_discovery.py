@@ -577,6 +577,35 @@ def test_synthesis_repairs_unknown_evidence_reference_once():
     assert len(llm.calls) == 2
 
 
+def test_synthesis_transport_timeout_falls_back_without_json_repair_retry():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.evidence_synthesis import (
+        EvidenceSynthesizer,
+    )
+
+    class TimeoutLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            raise TimeoutError("provider timed out")
+
+    bundle = EvidenceBundle(goal="inspect")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("screen", {}, "screen evidence"),
+        "session=test_w status=running",
+    ))
+    llm = TimeoutLLM()
+
+    conclusion = EvidenceSynthesizer(llm).synthesize(bundle.goal, bundle)
+
+    assert llm.calls == 1
+    assert conclusion is not None
+
+
 def test_synthesis_includes_probe_arguments_for_instance_attribution():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
@@ -815,3 +844,213 @@ def test_binding_context_preserves_same_knowledge_evidence_id():
     assert record.evidence_id in context.knowledge_evidence
     assert "startup_shutdown.md" in context.knowledge_evidence
     assert "project_root=/srv/v4e2e" in context.environment_evidence
+
+
+def test_unregistered_evidence_request_binds_safe_readonly_command():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    commands = []
+    llm = FakeLLM([json.dumps({
+        "status": "command", "command": "which screen",
+        "reason": "locate the executable",
+    })])
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: (_ for _ in ()).throw(
+            AssertionError("unknown capability must not reach the probe runner")
+        ),
+        readonly_command_runner=lambda command: commands.append(command) or "/usr/bin/screen",
+    )
+    bundle = EvidenceBundle(goal="确认 screen 命令")
+
+    agent.collect_requests([
+        ProbeRequest(
+            "command_available", {"commands": ["screen"]},
+            "确认 screen 可执行文件", ("screen executable path",),
+        )
+    ], bundle)
+
+    assert commands == ["which screen"]
+    assert [item.request.probe for item in bundle.records] == ["readonly_command"]
+    assert bundle.records[0].status == "available"
+    assert "/usr/bin/screen" in bundle.records[0].output
+
+
+def test_registered_probe_uses_shell_only_after_planner_repeats_unmet_fact():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    commands = []
+    llm = FakeLLM([json.dumps({
+        "status": "command", "command": "ps -p 1234 -o args=",
+        "reason": "registered evidence lacks full cmdline",
+    })])
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: "pid=1234 cwd=unknown cmdline=truncated",
+        readonly_command_runner=lambda command: commands.append(command) or (
+            "/opt/conda/envs/test/bin/python -m gunicorn master_main:flask_app"
+        ),
+    )
+    bundle = EvidenceBundle(goal="重启 test master")
+
+    request = ProbeRequest(
+        "process_detail", {"pids": [1234]}, "继承 master 运行身份",
+        ("full cmdline", "python executable"), "refresh",
+    )
+    agent.collect_requests([request], bundle)
+
+    # The first registered result returns to Planner/Verifier.  Repeating the
+    # still-unmet fact is the explicit signal that a long-tail supplement is
+    # now warranted.
+    assert commands == []
+    agent.collect_requests([
+        ProbeRequest(
+            request.probe, request.args, request.purpose,
+            request.required_facts, "cached",
+        )
+    ], bundle)
+
+    assert commands == ["ps -p 1234 -o args="]
+    assert [item.request.probe for item in bundle.records] == [
+        "process_detail", "readonly_command",
+    ]
+    assert all(item.status == "available" for item in bundle.records)
+
+
+def test_registered_probe_complete_result_does_not_run_shell_fallback():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    llm = FakeLLM([json.dumps({
+        "status": "satisfied",
+        "reason": "all required process identity fields are present",
+    })])
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: (
+            "pid=1234 cwd=/srv/test run_as_uid=1000 "
+            "python_executable=/opt/python cmdline=/opt/python -m gunicorn"
+        ),
+        readonly_command_runner=lambda command: (_ for _ in ()).throw(
+            AssertionError("complete registered evidence must not execute fallback")
+        ),
+    )
+    bundle = EvidenceBundle(goal="inspect")
+
+    agent.collect_requests([
+        ProbeRequest(
+            "process_detail", {"pids": [1234]}, "process identity",
+            ("cwd", "run_as_uid", "python executable", "full cmdline"),
+        )
+    ], bundle)
+
+    assert [item.request.probe for item in bundle.records] == ["process_detail"]
+
+
+def test_running_platforms_required_facts_do_not_trigger_shell_on_first_result():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    class ForbiddenLLM:
+        def complete(self, **kwargs):
+            raise AssertionError("usable registered inventory must not evaluate Shell")
+
+    bundle = EvidenceBundle(goal="检查哪些平台正常运行")
+    agent = DiscoveryAgent(
+        ForbiddenLLM(),
+        probe_runner=lambda requests: (
+            "inspect_running_platforms\nruntime_candidate_count=2\n"
+            "healthy_count=1\nabnormal_count=1\n"
+            "platform=test project_root=/srv/test backend_status=healthy\n"
+            "platform=broken project_root=/srv/broken backend_status=abnormal"
+        ),
+    )
+
+    agent.collect_requests([
+        ProbeRequest(
+            "running_platforms", {}, "根据健康接口分类平台",
+            ("platform_health_status",), "refresh",
+        )
+    ], bundle)
+
+    assert [item.request.probe for item in bundle.records] == ["running_platforms"]
+    assert bundle.records[0].status == "available"
+
+
+def test_readonly_fallback_policy_rejection_is_unavailable_evidence():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    llm = FakeLLM([json.dumps({
+        "status": "command", "command": "ps aux | tee /tmp/processes",
+        "reason": "unsafe candidate",
+    })])
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=lambda requests: "",
+        readonly_command_runner=lambda command: (_ for _ in ()).throw(
+            PermissionError("shell evaluation is not allowed")
+        ),
+    )
+    bundle = EvidenceBundle(goal="inspect")
+
+    agent.collect_requests([
+        ProbeRequest("process_owner", {"pid": 1234}, "owner", ("uid",))
+    ], bundle)
+
+    assert bundle.records[0].request.probe == "readonly_command"
+    assert bundle.records[0].status == "unavailable"
+    assert "PermissionError" in bundle.records[0].output
+
+
+def test_ad_hoc_binding_evidence_joins_active_workflow_bundle():
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    bundle = EvidenceBundle(goal="收编 test worker")
+    discovery = DiscoveryAgent(
+        FakeLLM([]),
+        probe_runner=lambda requests: "pid=1234 cwd=/srv/test",
+    )
+
+    with discovery.evidence_scope(bundle):
+        output = discovery.run_ad_hoc_requests([{
+            "probe": "process_detail",
+            "args": {"project_root": "/srv/test"},
+            "purpose": "确认 worker 运行身份",
+        }])
+
+    assert "pid=1234" in output
+    assert len(bundle.records) == 1
+    assert bundle.records[0].request.probe == "process_detail"
+
+
+def test_ad_hoc_evidence_without_scope_does_not_mutate_unrelated_bundle():
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    unrelated = EvidenceBundle(goal="另一个工作流")
+    discovery = DiscoveryAgent(
+        FakeLLM([]),
+        probe_runner=lambda requests: "pid=5678 cwd=/srv/other",
+    )
+
+    discovery.run_ad_hoc_requests([{
+        "probe": "process_detail",
+        "args": {"project_root": "/srv/other"},
+        "purpose": "验证隔离",
+    }])
+
+    assert unrelated.records == []

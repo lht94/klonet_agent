@@ -37,6 +37,339 @@ class FakeLLM:
         )
 
 
+def test_port_conflict_decision_accepts_planner_normalized_modify_free_port():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _runtime_port_conflict_resolution,
+    )
+
+    decision = (
+        "Keep current occupants; automatically find a free port for "
+        "/home/lzl/vemu_uestc worker, modify its configuration, and continue."
+    )
+
+    assert _runtime_port_conflict_resolution(
+        decision,
+        project_root="/home/lzl/vemu_uestc",
+        role="worker",
+        port=45552,
+    ) == "reassign"
+
+
+def test_port_conflict_decision_does_not_match_parent_or_other_project_path():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _runtime_port_conflict_resolution,
+    )
+
+    decision = (
+        "Keep current occupants; find a free port for "
+        "/home/lzl/vemu_uestc worker and modify it."
+    )
+
+    assert _runtime_port_conflict_resolution(
+        decision,
+        project_root="/home/lzl",
+        role="worker",
+        port=45552,
+    ) == ""
+    assert _runtime_port_conflict_resolution(
+        decision,
+        project_root="/home/lzl/xxy/klonet",
+        role="worker",
+        port=46552,
+    ) == ""
+
+
+def test_missing_role_with_foreign_listener_uses_checked_free_port_policy():
+    import base64
+
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        ChangePlannerAgent,
+        _runtime_port_candidates,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.runtime_inventory import (
+        RuntimeInventory,
+    )
+
+    root = "/srv/target"
+    goal = "把 /srv/target worker 收编到 Screen"
+    encoded = base64.urlsafe_b64encode(json.dumps({
+        "worker": {
+            "role": "worker", "configured_port": 46552,
+            "status": "runtime_conflict", "listener_pid": 220,
+            "listener_pgid": 220, "listener_pids": [220, 221],
+            "observed_role": "worker", "runtime_root": "/srv/other",
+            "code_root": "/srv/other",
+        }
+    }).encode("utf-8")).decode("ascii")
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=target project_root=/srv/target roles=celery "
+        "runtime_identities=10:1000:/opt/python3.8 "
+        "configured_ports=master_port:46551,worker_port:46552,"
+        "public_port:46553,web_terminal_port:43444 "
+        "worker_port=46552 worker_endpoint=not_checked "
+        "reason=role_not_running role_bindings_b64=" + encoded,
+    ))
+    context = {
+        "base_goal": goal,
+        "decision_history": [
+            "For all port conflicts, preserve the current occupant and "
+            "automatically select a checked free port."
+        ],
+        "operation": "restart", "scope": "component",
+        "components": ["worker"],
+    }
+
+    first = ChangePlannerAgent._deterministic_runtime_restart(
+        goal, bundle, intent_context=context,
+    )
+
+    assert first["status"] == "need_evidence"
+    assert first["reason"] == "checked_free_replacement_port_required=worker"
+    requested = first["probe_requests"][0]["args"]["ports"]
+    assert requested == _runtime_port_candidates(
+        46552, RuntimeInventory.from_bundle(bundle),
+    )
+
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": requested}, "candidate availability"),
+        "all requested ports are not listening",
+    ))
+    ready = ChangePlannerAgent._deterministic_runtime_restart(
+        goal, bundle, intent_context=context,
+    )
+
+    assert ready["status"] == "ready"
+    replacement = requested[0]
+    assert any(
+        item["role"] == "worker_port"
+        and item["value"] == replacement
+        and item["source"] == "checked_free_replacement"
+        for item in ready["resources"]
+    )
+    assert "start missing worker role at %s" % replacement in str(
+        ready["changes"]
+    )
+
+
+def test_missing_role_with_proved_free_configured_port_keeps_that_port():
+    import base64
+
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    encoded = base64.urlsafe_b64encode(json.dumps({
+        "worker": {
+            "role": "worker", "configured_port": 46552,
+            "status": "not_listening",
+        }
+    }).encode("utf-8")).decode("ascii")
+    goal = "把 /srv/target worker 收编到 Screen"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=target project_root=/srv/target roles=celery "
+        "runtime_identities=10:1000:/opt/python3.8 "
+        "configured_ports=worker_port:46552 worker_port=46552 "
+        "worker_endpoint=not_checked reason=role_not_running "
+        "role_bindings_b64=" + encoded,
+    ))
+
+    ready = ChangePlannerAgent._deterministic_runtime_restart(
+        goal, bundle,
+        intent_context={
+            "base_goal": goal, "operation": "restart",
+            "scope": "component", "components": ["worker"],
+        },
+    )
+
+    assert ready["status"] == "ready"
+    assert "start missing worker role at 46552" in str(ready["changes"])
+
+
+def test_change_planner_transport_timeout_stops_before_contract_repair_retries():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion,
+    )
+
+    class TimeoutLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            raise TimeoutError("provider timed out")
+
+    llm = TimeoutLLM()
+    outcome = ChangePlannerAgent(llm).plan(
+        "deploy a new isolated platform",
+        EvidenceBundle(goal="deploy a new isolated platform"),
+        EvidenceConclusion(),
+    )
+
+    assert llm.calls == 1
+    assert outcome.status == "blocked"
+    assert "model request failed" in outcome.reason
+
+
+def test_existing_planner_classifies_local_recovery_reply_without_replacing_goal():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    llm = FakeLLM([json.dumps({
+        "relation": "supplement",
+        "reason": "the reply supplies the worker runtime contract",
+        "normalized_decision": "test worker uses /opt/worker-python",
+        "candidate_base_goal": "",
+        "conflicts": [],
+    })])
+    planner = ChangePlannerAgent(llm)
+
+    result = planner.classify_reply_relation(
+        base_goal="把所有平台的所有角色收编进 screen",
+        decision_history=[],
+        reply="test worker 用 /opt/worker-python，其他平台和角色不变",
+        pending_question="test worker 用哪个 Python？",
+    )
+
+    assert result["relation"] == "supplement"
+    assert result["candidate_base_goal"] == ""
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert payload["base_goal"] == "把所有平台的所有角色收编进 screen"
+
+
+def test_existing_planner_marks_scope_replacement_for_explicit_confirmation():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    planner = ChangePlannerAgent(FakeLLM([json.dumps({
+        "relation": "revise",
+        "reason": "user explicitly excludes all platforms except test",
+        "normalized_decision": "只处理 test",
+        "candidate_base_goal": "只把 test 平台所有角色收编进 screen",
+        "conflicts": ["removes every non-test platform from scope"],
+    })]))
+
+    result = planner.classify_reply_relation(
+        base_goal="把所有平台的所有角色收编进 screen",
+        decision_history=[], reply="其他平台都取消，只处理 test",
+    )
+
+    assert result["relation"] == "revise"
+    assert result["candidate_base_goal"] == "只把 test 平台所有角色收编进 screen"
+
+
+def test_existing_planner_cannot_replace_goal_when_reply_freezes_other_scope():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    base_goal = "把所有平台的所有应用角色收编进 screen"
+    reply = (
+        "当前计划的 vemu worker 改用 45556 验收，"
+        "保持完整目标和其他步骤不变"
+    )
+    planner = ChangePlannerAgent(FakeLLM([json.dumps({
+        "relation": "revise",
+        "reason": "changes worker acceptance",
+        "normalized_decision": "vemu worker uses 45556",
+        "candidate_base_goal": base_goal + "；vemu worker uses 45556",
+        "conflicts": ["old worker acceptance removed"],
+    })]))
+
+    result = planner.classify_reply_relation(
+        base_goal=base_goal,
+        decision_history=[],
+        reply=reply,
+    )
+
+    assert result["relation"] == "supplement"
+    assert result["candidate_base_goal"] == ""
+    assert result["normalized_decision"] == "vemu worker uses 45556"
+
+
+def test_all_application_roles_scope_dominates_local_worker_refinement():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    base_goal = (
+        "把所有正在运行的 Klonet 平台的所有应用角色都收编为 Screen 管理，"
+        "可以先停掉再重启。对于 /srv/alpha worker，使用新端口验收。"
+    )
+    bundle = EvidenceBundle(goal=base_goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime"),
+        "platform=alpha project_root=/srv/alpha "
+        "roles=celery,master,web_terminal,worker "
+        "configured_ports=master_port:47001,worker_port:47002,"
+        "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+        "worker_port=47002 worker_endpoint=healthy "
+        "runtime_identities=10:1000:/opt/python3.8",
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        base_goal,
+        bundle,
+        intent_context={
+            "operation": "restart",
+            "scope": "platform",
+            "base_goal": base_goal,
+            "decision_history": ["alpha worker uses a replacement port"],
+        },
+    )
+
+    assert data is not None and data["status"] == "ready"
+    text = " ".join([
+        data["changes"][0]["objective"],
+        *data["changes"][0]["expected_changes"],
+    ])
+    for role in ("master", "celery", "web_terminal", "worker"):
+        assert role in text
+
+
+def test_replan_only_changes_steps_affected_by_active_evidence_gap():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    def step(step_id, objective):
+        return ChangeStep(
+            step_id=step_id, title=objective, objective=objective, risk="medium",
+            expected_changes=[objective],
+            postconditions=[{"checker": "process_running", "args": {
+                "pattern": step_id,
+            }}],
+        )
+
+    candidate = ChangePlan(
+        plan_id="priv-ops-candidate", goal="adopt all", risk="medium",
+        steps=[step("restart-master", "restart master"),
+               step("restart-worker", "restart worker")],
+    )
+    valid = ChangePlan(
+        plan_id="priv-ops-revised", goal="adopt all", risk="medium",
+        steps=[step("restart-master", "restart master"),
+               step("restart-worker", "restart worker with confirmed python")],
+    )
+    ChangePlannerAgent._validate_candidate_plan_preservation(
+        candidate, valid, allowed_steps={"restart-worker"},
+    )
+
+    invalid = ChangePlan(
+        plan_id="priv-ops-invalid", goal="adopt all", risk="medium",
+        steps=[step("restart-master", "silently omit original master semantics"),
+               step("restart-worker", "restart worker with confirmed python")],
+    )
+    with pytest.raises(ValueError, match="outside active evidence gap"):
+        ChangePlannerAgent._validate_candidate_plan_preservation(
+            candidate, invalid, allowed_steps={"restart-worker"},
+        )
+
+
 def test_completed_execution_renders_step_receipt_instead_of_generic_success():
     from klonet_agent.ops.privileged.contracts import (
         CheckResult, ExecutionBinding, ExecutionEvidence, ImplementationPlan,
@@ -142,6 +475,738 @@ def test_platform_restart_compiler_keeps_all_managed_application_components():
     assert knowledge.evidence_id in data["changes"][0]["evidence_refs"]
 
 
+def test_all_platform_restart_expands_each_inventory_instance_once():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="全部平台，所有角色都进 screen，可以停掉再重启")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+            "worker_port=47002 worker_endpoint=healthy web_terminal_port=47003 "
+            "runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 master_port=48001 master_endpoint=healthy "
+            "worker_port=48002 worker_endpoint=healthy web_terminal_port=48003 "
+            "runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        bundle.goal,
+        bundle,
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert data["status"] == "ready"
+    assert [item["step_id"] for item in data["changes"]] == [
+        "restart-alpha-backend-roles",
+        "restart-beta-backend-roles",
+    ]
+    assert {item["role"] for item in data["resources"] if item["role"] == "instance_root"} == {
+        "instance_root"
+    }
+    assert {item["value"] for item in data["resources"] if item["role"] == "instance_root"} == {
+        "/srv/alpha", "/srv/beta",
+    }
+    assert len({item["name"] for item in data["resources"]}) == len(data["resources"])
+
+    llm = FakeLLM([])
+    outcome = ChangePlannerAgent(llm).plan(
+        bundle.goal,
+        bundle,
+        EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert outcome.status == "need_execution"
+    assert len(outcome.plan.steps) == 2
+    assert llm.calls == []
+
+
+def test_explicit_port_decision_replaces_inventory_port_before_freezing_plan():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    root = "/srv/vemu"
+    goal = (
+        "把 /srv/vemu worker 收编到 Screen；对于 /srv/vemu worker，"
+        "使用新端口 45556，不再验收旧端口 45552"
+    )
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=vemu project_root=/srv/vemu roles=worker "
+        "configured_ports=worker_port:45552 worker_port=45552 "
+        "worker_endpoint=healthy worker_identities=20:1000:/opt/python3.8 "
+        "runtime_identities=20:1000:/opt/python3.8",
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": [45556]}, "target availability"),
+        "environment unchanged",
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(goal, bundle)
+
+    assert data["status"] == "ready"
+    target = [
+        item for item in data["resources"]
+        if item["role"] == "worker_port"
+        and item["consumers"] == ["restart-backend-roles.worker_port"]
+    ]
+    assert [item["value"] for item in target] == [45556]
+    assert target[0]["source"] == "checked_free_replacement"
+    assert "worker role at 45552" not in str(data["changes"])
+    assert "worker role at 45556" in str(data["changes"])
+
+
+def test_explicit_port_decision_requests_fresh_availability_before_plan():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "把 /srv/vemu worker 收编到 Screen，使用新端口 45556"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=vemu project_root=/srv/vemu roles=worker "
+        "configured_ports=worker_port:45552 worker_identities="
+        "20:1000:/opt/python3.8 runtime_identities=20:1000:/opt/python3.8",
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(goal, bundle)
+
+    assert data["status"] == "need_evidence"
+    assert data["reason"] == "explicit_target_port_requires_fresh_check=worker:45556"
+    assert data["probe_requests"][0]["probe"] == "ports"
+    assert data["probe_requests"][0]["args"] == {"ports": [45556]}
+
+
+def test_all_platform_child_evidence_gap_uses_expanded_semantic_step_id():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = (
+        "全部平台所有应用角色收编到 Screen；"
+        "对于 /srv/beta worker 使用新端口 48006"
+    )
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 "
+            "worker_identities=10:1000:/opt/python3.8 "
+            "runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 "
+            "worker_identities=20:1000:/opt/python3.8 "
+            "runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        goal, bundle,
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert data["status"] == "need_evidence"
+    assert data["probe_requests"][0]["affected_steps"] == [
+        "restart-beta-backend-roles"
+    ]
+
+
+def test_all_platform_plan_allocates_unique_checked_port_for_duplicate_roles():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "全部平台所有应用角色收编到 Screen；所有端口冲突自动选择空闲端口"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:5114 runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta roles=celery,master,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:5114 runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": [5115]}, "candidate availability"),
+        "environment unchanged",
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        goal, bundle,
+        intent_context={
+            "operation": "restart", "scope": "platform",
+            "base_goal": goal,
+        },
+    )
+
+    assert data["status"] == "ready"
+    web_ports = sorted(
+        item["value"] for item in data["resources"]
+        if item["role"] == "web_terminal_port"
+        and not any("old_web_terminal_port" in value for value in item["consumers"])
+    )
+    assert web_ports == [5114, 5115]
+    assert "web_terminal role at 5115" in str(data["changes"])
+
+
+def test_all_platform_duplicate_port_requires_decision_without_auto_policy():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "全部平台所有应用角色收编到 Screen"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha roles=web_terminal "
+            "configured_ports=web_terminal_port:5114 "
+            "runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta roles=none "
+            "configured_ports=web_terminal_port:5114 "
+            "runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        goal, bundle,
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert data["status"] == "blocked"
+    assert data["reason"] == "plan_wide_port_collision=5114"
+    assert "自动选择" in data["missing_decisions"][0]
+
+
+def test_all_platform_recovery_plans_only_authoritative_unfinished_roots():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "把全部平台的全部角色收编进 Screen"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 master_endpoint=healthy worker_endpoint=healthy "
+            "runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 master_endpoint=healthy worker_endpoint=healthy "
+            "runtime_identities=20:1000:/opt/python3.8",
+            "platform=gamma project_root=/srv/gamma "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:49001,worker_port:49002,"
+            "web_terminal_port:49003 master_endpoint=healthy worker_endpoint=healthy "
+            "runtime_identities=30:1000:/opt/python3.8",
+        ]),
+    ))
+    planner = ChangePlannerAgent(FakeLLM([]))
+    original = planner.plan(
+        goal, bundle, EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    ).plan
+    original.steps[0].status = "completed"
+    original.steps[1].status = "paused"
+    original.steps[2].status = "pending"
+
+    outcome = planner.plan(
+        goal, bundle, EvidenceConclusion(), candidate_plan=original,
+        intent_context={
+            "operation": "restart",
+            "scope": "platform",
+            "base_goal": goal,
+            "recovery_scope_authoritative": True,
+            "recovery_source_plan_id": original.plan_id,
+            "recovery_required_step_ids": [
+                "restart-beta-backend-roles",
+                "restart-gamma-backend-roles",
+            ],
+            "recovery_required_project_roots": ["/srv/beta", "/srv/gamma"],
+            "active_gap_affected_steps": [
+                "restart-beta-backend-roles",
+                "restart-gamma-backend-roles",
+            ],
+        },
+    )
+
+    assert outcome.status == "need_execution"
+    assert {step.step_id for step in outcome.plan.steps} == {
+        "restart-beta-backend-roles", "restart-gamma-backend-roles",
+    }
+    assert {
+        item.value for item in outcome.plan.resources
+        if item.role == "instance_root"
+    } == {"/srv/beta", "/srv/gamma"}
+    assert planner.llm.calls == []
+
+
+def test_recovery_keeps_frozen_instance_alias_when_runtime_alias_degrades():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "把全部平台的全部角色收编进 Screen"
+    initial = EvidenceBundle(goal=goal)
+    initial.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "initial inventory"),
+        "\n".join([
+            "platform=test project_root=/srv/test/vemu_uestc "
+            "roles=celery,master,worker configured_ports=master_port:45554,"
+            "worker_port:45555,web_terminal_port:5114 master_endpoint=healthy "
+            "worker_endpoint=healthy runtime_identities=10:1000:/opt/test-python",
+            "platform=vemu_uestc project_root=/srv/vemu_uestc "
+            "roles=celery,master,worker configured_ports=master_port:45551,"
+            "worker_port:45552,web_terminal_port:5115 master_endpoint=healthy "
+            "worker_endpoint=healthy runtime_identities=20:1000:/opt/python",
+        ]),
+    ))
+    planner = ChangePlannerAgent(FakeLLM([]))
+    predecessor = planner.plan(
+        goal, initial, EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    ).plan
+
+    refreshed = EvidenceBundle(goal=goal)
+    refreshed.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "refreshed inventory"),
+        "\n".join([
+            # The test_w Screen disappeared, so the volatile probe falls back
+            # to the directory basename and now reports the wrong alias.
+            "platform=vemu_uestc project_root=/srv/test/vemu_uestc "
+            "roles=celery,master,worker configured_ports=master_port:45554,"
+            "worker_port:45555,web_terminal_port:5114 master_endpoint=healthy "
+            "worker_endpoint=healthy runtime_identities=30:1000:/opt/test-python",
+            "platform=vemu_uestc project_root=/srv/vemu_uestc "
+            "roles=celery,master,worker configured_ports=master_port:45551,"
+            "worker_port:45552,web_terminal_port:5115 master_endpoint=healthy "
+            "worker_endpoint=healthy runtime_identities=40:1000:/opt/python",
+        ]),
+    ))
+    required_steps = [step.step_id for step in predecessor.steps]
+    outcome = planner.plan(
+        goal, refreshed, EvidenceConclusion(), candidate_plan=predecessor,
+        intent_context={
+            "operation": "restart", "scope": "platform", "base_goal": goal,
+            "recovery_scope_authoritative": True,
+            "recovery_required_step_ids": required_steps,
+            "recovery_required_project_roots": [
+                "/srv/test/vemu_uestc", "/srv/vemu_uestc",
+            ],
+            "recovery_instance_identifiers_by_root": {
+                "/srv/test/vemu_uestc": "test",
+                "/srv/vemu_uestc": "vemu_uestc",
+            },
+            "active_gap_affected_steps": required_steps,
+        },
+    )
+
+    assert outcome.status == "need_execution"
+    assert {step.step_id for step in outcome.plan.steps} == {
+        "restart-test-backend-roles", "restart-vemu-uestc-backend-roles",
+    }
+    identifiers = {
+        item.value for item in outcome.plan.resources
+        if item.role == "instance_identifier"
+    }
+    assert identifiers == {"test", "vemu_uestc"}
+    test_step = next(
+        step for step in outcome.plan.steps
+        if step.step_id == "restart-test-backend-roles"
+    )
+    assert "test 的应用组件" in test_step.title
+    assert planner.llm.calls == []
+
+
+def test_screen_adoption_uses_existing_runtime_lifecycle_compiler_without_restart_label():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "把当前服务器上全部 Klonet 平台的所有应用角色收编为 Screen 管理"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+            "worker_port=47002 worker_endpoint=healthy web_terminal_port=47003 "
+            "runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 master_port=48001 master_endpoint=healthy "
+            "worker_port=48002 worker_endpoint=healthy web_terminal_port=48003 "
+            "runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+    llm = FakeLLM([])
+
+    outcome = ChangePlannerAgent(llm).plan(
+        goal,
+        bundle,
+        EvidenceConclusion(),
+        intent_context={"operation": "none", "scope": "platform"},
+    )
+
+    assert outcome.status == "need_execution"
+    assert {step.step_id for step in outcome.plan.steps} == {
+        "restart-alpha-backend-roles", "restart-beta-backend-roles",
+    }
+    assert llm.calls == []
+
+
+def test_readonly_screen_inventory_does_not_enter_runtime_lifecycle_compiler():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
+
+    goal = "查看当前有哪些 Screen 会话"
+
+    assert ChangePlannerAgent._deterministic_runtime_restart(
+        goal,
+        EvidenceBundle(goal=goal),
+        intent_context={"operation": "inspect", "scope": "platform"},
+    ) is None
+
+
+def test_all_platform_base_goal_cannot_be_narrowed_by_focused_recovery_decision():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    base_goal = "全部平台，所有角色都进 screen，可以停掉再重启"
+    decision = "alpha worker 必须复用 alpha_w 会话"
+    bundle = EvidenceBundle(goal=base_goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        "%s；进一步要求：%s" % (base_goal, decision),
+        bundle,
+        intent_context={
+            "operation": "restart",
+            "scope": "component",
+            "components": ["worker"],
+            "resolved_project_root": "/srv/alpha",
+            "base_goal": base_goal,
+            "decision_history": [decision],
+        },
+    )
+
+    assert data["status"] == "ready"
+    assert {item["step_id"] for item in data["changes"]} == {
+        "restart-alpha-backend-roles", "restart-beta-backend-roles",
+    }
+    for change in data["changes"]:
+        text = " ".join([change["objective"], *change["expected_changes"]])
+        for role in ("master", "celery", "web_terminal", "worker"):
+            assert role in text
+
+
+def test_recovery_restart_keeps_stopped_code_only_target_from_failed_plan():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "全部平台，所有角色都进 screen，可以停掉再重启"
+    initial = EvidenceBundle(goal=goal)
+    initial.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:47001,worker_port:47002,"
+            "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+            "worker_port=47002 worker_endpoint=healthy web_terminal_port=47003 "
+            "runtime_identities=10:1000:/opt/python3.8",
+            "platform=beta project_root=/srv/beta "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 master_port=48001 master_endpoint=healthy "
+            "worker_port=48002 worker_endpoint=healthy web_terminal_port=48003 "
+            "runtime_identities=20:1000:/opt/python3.8",
+        ]),
+    ))
+    planner = ChangePlannerAgent(FakeLLM([]))
+    original = planner.plan(
+        goal, initial, EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    ).plan
+    original.steps[0].expected_changes.append(
+        "restart unhealthy worker role at 47002 and backend health succeeds"
+    )
+
+    refreshed = EvidenceBundle(goal=goal)
+    refreshed.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "refreshed runtime inventory"),
+        "\n".join([
+            "platform=beta project_root=/srv/beta "
+            "roles=celery,master,web_terminal,worker "
+            "configured_ports=master_port:48001,worker_port:48002,"
+            "web_terminal_port:48003 master_port=48001 master_endpoint=healthy "
+            "worker_port=48002 worker_endpoint=healthy web_terminal_port=48003 "
+            "runtime_identities=20:1000:/opt/python3.8",
+            "code_only_root=/srv/alpha",
+        ]),
+    ))
+    required_steps = [item.step_id for item in original.steps]
+    outcome = planner.plan(
+        goal, refreshed, EvidenceConclusion(),
+        candidate_plan=original,
+        intent_context={
+            "operation": "restart",
+            "scope": "platform",
+            "recovery_scope_authoritative": True,
+            "recovery_required_step_ids": required_steps,
+            "recovery_required_project_roots": ["/srv/alpha", "/srv/beta"],
+            "active_gap_affected_steps": required_steps,
+        },
+    )
+
+    assert outcome.status == "need_execution"
+    roots = {
+        item.value for item in outcome.plan.resources
+        if item.role == "instance_root"
+    }
+    assert roots == {"/srv/alpha", "/srv/beta"}
+    assert {item.step_id for item in outcome.plan.steps} == set(required_steps)
+    alpha = next(
+        item for item in outcome.plan.steps
+        if item.step_id == "restart-alpha-backend-roles"
+    )
+    assert "启动缺失的" in alpha.objective
+    assert all(
+        not item.startswith("restart requested ")
+        for item in alpha.expected_changes
+    )
+    assert all(
+        not item.startswith("restart unhealthy ")
+        for item in alpha.expected_changes
+    )
+    assert all(
+        item.startswith("start missing ") for item in alpha.expected_changes
+    )
+    second = planner.plan(
+        goal, refreshed, EvidenceConclusion(), candidate_plan=outcome.plan,
+        intent_context={
+            "operation": "restart", "scope": "platform",
+            "recovery_scope_authoritative": True,
+            "recovery_required_step_ids": required_steps,
+            "recovery_required_project_roots": ["/srv/alpha", "/srv/beta"],
+            "active_gap_affected_steps": ["restart-beta-backend-roles"],
+        },
+    )
+    assert second.status == "need_execution"
+    assert next(
+        item.reason for item in second.plan.steps
+        if item.step_id == "restart-alpha-backend-roles"
+    ) == alpha.reason
+    assert planner.llm.calls == []
+
+
+def test_recovery_restart_rejects_disappeared_target_without_presence_evidence():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "重启全部平台"
+    original_bundle = EvidenceBundle(goal=goal)
+    original_bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "original runtime inventory"),
+        "platform=alpha project_root=/srv/alpha "
+        "roles=celery,web_terminal,worker "
+        "configured_ports=master_port:47001,worker_port:47002,"
+        "web_terminal_port:47003 master_port=47001 master_endpoint=not_checked "
+        "reason=role_not_running "
+        "worker_port=47002 worker_endpoint=healthy web_terminal_port=47003 "
+        "runtime_identities=10:1000:/opt/python3.8",
+    ))
+    candidate = ChangePlannerAgent(FakeLLM([])).plan(
+        goal, original_bundle, EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    ).plan
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=beta project_root=/srv/beta roles=master,worker "
+        "configured_ports=master_port:48001,worker_port:48002,"
+        "web_terminal_port:48003 master_port=48001 master_endpoint=healthy "
+        "worker_port=48002 worker_endpoint=healthy "
+        "runtime_identities=20:1000:/opt/python3.8",
+    ))
+
+    with pytest.raises(
+        ValueError, match="replan dropped authoritative recovery targets=/srv/alpha"
+    ):
+        ChangePlannerAgent(FakeLLM([])).plan(
+            goal, bundle, EvidenceConclusion(), candidate_plan=candidate,
+            intent_context={
+                "operation": "restart", "scope": "platform",
+                "recovery_scope_authoritative": True,
+                "recovery_required_step_ids": ["restart-alpha-backend-roles"],
+                "recovery_required_project_roots": ["/srv/alpha"],
+                "active_gap_affected_steps": ["restart-alpha-backend-roles"],
+            },
+        )
+
+
+def test_post_execution_existing_screen_promotes_only_failed_start_to_restart():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="恢复全部平台")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("plan_execution", {"plan_id": "priv-ops-test"}, "execution"),
+        "step=restart-alpha-backend-roles__start-master status=paused "
+        "execution_output=screen_session_already_exists=alpha_m "
+        "environment_changed=false",
+    ))
+    data = {"changes": [{
+        "step_id": "restart-alpha-backend-roles",
+        "reason": "runtime is missing",
+        "expected_changes": [
+            "start missing master role at 47001 and backend health succeeds",
+            "start missing worker role at 47002 and backend health succeeds",
+        ],
+    }]}
+
+    ChangePlannerAgent._normalize_post_execution_screen_recovery(data, bundle)
+
+    assert data["changes"][0]["expected_changes"] == [
+        "restart requested master role at 47001 and backend health succeeds",
+        "start missing worker role at 47002 and backend health succeeds",
+    ]
+    assert "restart 生命周期" in data["changes"][0]["reason"]
+
+
+def test_recovery_restart_omits_component_already_proved_completed():
+    import base64
+    import json
+
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = "重启 alpha 平台所有角色"
+    bundle = EvidenceBundle(goal=goal)
+    specs = base64.urlsafe_b64encode(json.dumps([
+        {"name": "master", "screen_suffix": "m"},
+        {"name": "celery", "screen_suffix": "c"},
+        {"name": "web_terminal", "screen_suffix": "web"},
+        {"name": "worker", "screen_suffix": "w"},
+    ]).encode()).decode().rstrip("=")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=alpha project_root=/srv/alpha "
+        "roles=celery,master,web_terminal,worker "
+        "configured_ports=master_port:47001,worker_port:47002,"
+        "web_terminal_port:47003 master_port=47001 master_endpoint=healthy "
+        "worker_port=47002 worker_endpoint=healthy web_terminal_port=47003 "
+        "runtime_identities=10:1000:/opt/python3.8 "
+        "component_specs_b64=%s" % specs,
+    ))
+
+    outcome = ChangePlannerAgent(FakeLLM([])).plan(
+        goal, bundle, EvidenceConclusion(),
+        intent_context={
+            "operation": "restart", "scope": "platform",
+            "resolved_project_root": "/srv/alpha",
+            "recovery_completed_components_by_root": {
+                "/srv/alpha": ["master"],
+            },
+        },
+    )
+
+    assert outcome.status == "need_execution"
+    expected = outcome.plan.steps[0].expected_changes
+    assert not any(" master " in " %s " % item for item in expected)
+    assert any("celery" in item for item in expected)
+    assert any("worker" in item for item in expected)
+
+def test_plan_resource_name_normalizes_numeric_and_long_instance_aliases():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _plan_resource_name,
+    )
+
+    numeric = _plan_resource_name("102", "instance_root")
+    long_name = _plan_resource_name("x" * 100, "python_executable")
+
+    assert numeric == "instance_102_instance_root"
+    assert len(long_name) <= 64
+    assert long_name[0].isalpha()
+    assert _plan_resource_name("x" * 99 + "a", "python_executable") != (
+        _plan_resource_name("x" * 99 + "b", "python_executable")
+    )
+
+
+def test_change_planner_preserves_unregistered_semantic_evidence_for_discovery_binding():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    requests = ChangePlannerAgent._probe_requests([{
+        "probe": "command_available",
+        "args": {"commands": ["screen"]},
+        "purpose": "find screen",
+        "required_facts": ["screen executable path"],
+        "freshness": "refresh",
+    }])
+
+    assert requests[0].probe == "command_available"
+    assert requests[0].required_facts == ("screen executable path",)
+    assert requests[0].freshness == "refresh"
+
+
 def test_healthy_role_normalization_never_rewrites_platform_restart():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
     from klonet_agent.ops.privileged.workflow.contracts import (
@@ -162,14 +1227,74 @@ def test_healthy_role_normalization_never_rewrites_platform_restart():
         "帮我重启 v4e2e 平台", bundle,
     )
 
-    ChangePlannerAgent._normalize_healthy_runtime_role_changes(
-        data, bundle, goal="帮我重启 v4e2e 平台",
+    errors = ChangePlannerAgent._healthy_runtime_role_contract_errors(
+        data, bundle,
+        intent_context={"operation": "restart", "scope": "platform"},
     )
 
     serialized = str(data)
+    assert errors == []
     assert "preserve healthy" not in serialized
     assert "restart requested master" in serialized
     assert "restart requested worker" in serialized
+
+
+def test_recognized_deterministic_restart_contract_error_does_not_fall_back_to_llm(
+    monkeypatch,
+):
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion,
+    )
+
+    invalid = {
+        "status": "ready", "resources": [], "changes": [{
+            "step_id": "restart", "title": "Restart", "objective": "Restart",
+            "reason": "requested", "risk": "readonly",
+            "expected_changes": [], "postconditions": [],
+        }],
+    }
+    monkeypatch.setattr(
+        ChangePlannerAgent, "_deterministic_runtime_restart",
+        staticmethod(lambda *args, **kwargs: invalid),
+    )
+
+    class ForbiddenLLM:
+        def complete(self, **kwargs):
+            raise AssertionError("recognized restart must not switch planners")
+
+    with pytest.raises(ValueError, match="ChangeStep cannot be readonly"):
+        ChangePlannerAgent(ForbiddenLLM()).plan(
+            "重启 test celery", EvidenceBundle(goal="重启 test celery"),
+            EvidenceConclusion(),
+        )
+
+
+def test_structured_all_platform_restart_requests_authoritative_inventory_first():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion,
+    )
+
+    class ForbiddenLLM:
+        def complete(self, **kwargs):
+            raise AssertionError("structured restart must request inventory directly")
+
+    outcome = ChangePlannerAgent(ForbiddenLLM()).plan(
+        "帮我把所有平台的所有角色收编进screen管理",
+        EvidenceBundle(goal="收编全部平台"), EvidenceConclusion(),
+        intent_context={
+            "operation": "restart", "scope": "platform", "components": [],
+        },
+    )
+
+    assert outcome.status == "need_evidence"
+    assert [item.probe for item in outcome.evidence_requests] == [
+        "running_platforms"
+    ]
+    assert "runtime instance project roots" in (
+        outcome.evidence_requests[0].required_facts
+    )
 
 
 def test_v4_e2e_alias_uses_deterministic_restart_and_existing_ports():
@@ -322,6 +1447,10 @@ def test_runtime_repair_plan_covers_every_unhealthy_backend_role():
     )
     data = {
         "resources": [{
+            "name": "formal_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/home/lzl/vemu_uestc",
+            "source": "evidence", "consumers": ["change-2.instance_root"],
+        }, {
             "name": "formal_master_port",
             "kind": "port",
             "status": "frozen",
@@ -372,7 +1501,87 @@ def test_runtime_repair_plan_covers_every_unhealthy_backend_role():
     assert "not restarted" not in combined
 
 
-def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
+def test_runtime_repair_uses_exact_instance_root_not_parent_path_substring():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="repair test")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "\n".join([
+            "platform=parent project_root=/home/lzl backend_status=abnormal "
+            "master_port=41001 master_endpoint=unreachable "
+            "worker_port=41002 worker_endpoint=healthy",
+            "platform=test project_root=/home/lzl/test/vemu_uestc "
+            "backend_status=abnormal master_port=45554 master_endpoint=healthy "
+            "worker_port=45555 worker_endpoint=not_checked reason=role_not_running",
+        ]),
+    ))
+    data = {
+        "resources": [{
+            "name": "test_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/home/lzl/test/vemu_uestc",
+            "source": "inventory", "consumers": ["repair-test.instance_root"],
+        }],
+        "changes": [{
+            "step_id": "repair-test", "title": "Restore test worker",
+            "objective": "Restore worker", "expected_changes": ["worker starts"],
+            "postconditions": [],
+        }],
+    }
+
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+
+    serialized = str(data["changes"][0])
+    assert "start missing worker role at 45555" in serialized
+    assert "41001" not in serialized
+    assert "restart unhealthy master" not in serialized
+
+
+def test_component_restart_never_injects_other_abnormal_roles():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="重启 test celery")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "platform=test project_root=/srv/test backend_status=abnormal "
+        "roles=celery master_port=45554 master_endpoint=unreachable "
+        "worker_port=45555 worker_endpoint=not_checked reason=role_not_running",
+    ))
+    data = {
+        "resources": [{
+            "name": "test_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/srv/test", "source": "inventory",
+            "consumers": ["restart-celery.instance_root"],
+        }],
+        "changes": [{
+            "step_id": "restart-celery", "title": "Restart celery",
+            "objective": "Restart test celery", "expected_changes": ["celery restarts"],
+            "postconditions": [{"checker": "process_running", "args": {
+                "pattern": "celery", "cwd": "/srv/test",
+            }}],
+        }],
+    }
+
+    ChangePlannerAgent._normalize_runtime_repair_coverage(
+        data, bundle,
+        intent_context={
+            "operation": "restart", "scope": "component",
+            "components": ["celery"],
+        },
+    )
+
+    serialized = str(data)
+    assert "master role" not in serialized
+    assert "worker role" not in serialized
+
+
+def test_missing_roles_request_startup_identity_instead_of_borrowing_unrelated_process():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
     )
@@ -402,17 +1611,222 @@ def test_explicit_v4e2e_restart_compiles_without_llm_or_rediscovery():
         bundle.goal, bundle, EvidenceConclusion(),
     )
 
-    assert outcome.status == "need_execution"
+    assert outcome.status == "need_evidence"
     assert llm.calls == []
-    assert outcome.plan is not None
-    assert outcome.plan.steps[0].expected_changes == [
-        "start missing master role at 47001 and backend health succeeds",
-        "start missing worker role at 47002 and backend health succeeds",
-    ]
-    assert {resource.role for resource in outcome.plan.resources} >= {
-        "instance_root", "instance_identifier", "master_port", "worker_port",
-        "run_as_uid", "python_executable",
+    assert outcome.evidence_requests[0].probe == "runtime_startup_identity"
+    assert outcome.evidence_requests[0].args == {
+        "project_root": "/home/lzl/klonet_workflow_e2e",
+        "component": "master",
     }
+
+
+def test_missing_component_inherits_identity_only_from_manifest_dependency():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _runtime_component_identity,
+    )
+
+    line = (
+        "platform=demo project_root=/srv/demo "
+        "celery_identities=10:1000:/envs/app/bin/python3.8 "
+        "worker_identities=20:0:/envs/worker/bin/python3.8 "
+        "web_terminal_identities=none runtime_identities="
+        "10:1000:/envs/app/bin/python3.8,20:0:/envs/worker/bin/python3.8"
+    )
+
+    assert _runtime_component_identity(
+        "web_terminal", project_root="/srv/demo", inventory_line=line,
+        evidence_text=line, fallback_roles=("celery",),
+    ) == (1000, "/envs/app/bin/python3.8")
+    assert _runtime_component_identity(
+        "web_terminal", project_root="/srv/demo", inventory_line=line,
+        evidence_text=line,
+    ) is None
+
+
+def test_running_web_terminal_identity_recognizes_the_registered_app_factory():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _runtime_component_identity,
+    )
+
+    evidence = (
+        "current_uid=1000\n"
+        "pid=41 uid=1000 cwd=/srv/alpha "
+        "cmdline=/opt/web-env/bin/python3.8 -c "
+        "'from package.app_factory import create_web_terminal_app; app=...'")
+
+    assert _runtime_component_identity(
+        "web_terminal",
+        project_root="/srv/alpha",
+        inventory_line=(
+            "platform=alpha project_root=/srv/alpha "
+            "web_terminal_identities=none runtime_identities=none"
+        ),
+        evidence_text=evidence,
+    ) == (1000, "/opt/web-env/bin/python3.8")
+
+
+def test_web_terminal_identity_never_borrows_an_unrelated_project_process():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _runtime_component_identity,
+    )
+
+    evidence = (
+        "current_uid=1000\n"
+        "pid=42 uid=1000 cwd=/srv/beta "
+        "cmdline=/opt/beta-env/bin/python3.8 -c "
+        "'from package.app_factory import create_web_terminal_app; app=...'")
+
+    assert _runtime_component_identity(
+        "web_terminal",
+        project_root="/srv/alpha",
+        inventory_line=(
+            "platform=alpha project_root=/srv/alpha "
+            "web_terminal_identities=none runtime_identities=none"
+        ),
+        evidence_text=evidence,
+    ) is None
+
+
+def test_all_platform_planner_compacts_identical_runtime_identity_resources():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    resources = ChangePlannerAgent._compact_runtime_identity_resources([
+        {
+            "name": "master_uid", "kind": "identifier", "status": "frozen",
+            "role": "master_uid", "value": 1000, "source": "runtime_evidence",
+            "consumers": ["restart-backend-roles.run_as_uid"],
+        },
+        {
+            "name": "celery_uid", "kind": "identifier", "status": "frozen",
+            "role": "celery_uid", "value": 1000, "source": "runtime_evidence",
+            "consumers": ["restart-backend-roles.run_as_uid"],
+        },
+        {
+            "name": "master_python", "kind": "path", "status": "frozen",
+            "role": "master_python_executable", "value": "/env/bin/python3.8",
+            "source": "runtime_evidence",
+            "consumers": ["restart-backend-roles.python_executable"],
+        },
+        {
+            "name": "celery_python", "kind": "path", "status": "frozen",
+            "role": "celery_python_executable", "value": "/env/bin/python3.8",
+            "source": "runtime_evidence",
+            "consumers": ["restart-backend-roles.python_executable"],
+        },
+    ], "restart-backend-roles")
+
+    assert len(resources) == 2
+    by_role = {item["role"]: item for item in resources}
+    assert by_role["run_as_uid"]["consumers"] == [
+        "restart-backend-roles.master_run_as_uid",
+        "restart-backend-roles.celery_run_as_uid",
+    ]
+    assert by_role["python_executable"]["consumers"] == [
+        "restart-backend-roles.master_python_executable",
+        "restart-backend-roles.celery_python_executable",
+    ]
+
+
+def test_shared_runtime_identity_resource_injects_only_matching_atomic_role():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _inject_frozen_resource_args,
+    )
+
+    resources = [
+        PlanResource(
+            name="shared_uid", kind="identifier", status="frozen",
+            role="run_as_uid", value=1000, source="runtime_evidence",
+            consumers=[
+                "restart-all.master_run_as_uid",
+                "restart-all.celery_run_as_uid",
+            ],
+        ),
+        PlanResource(
+            name="master_python", kind="path", status="frozen",
+            role="python_executable", value="/env/master/bin/python3.8",
+            source="runtime_evidence",
+            consumers=["restart-all.master_python_executable"],
+        ),
+    ]
+    master = PrivilegedStep(
+        step_id="restart-all__master", title="Restart master Screen component",
+        objective="restart master", risk="medium",
+    )
+    celery = PrivilegedStep(
+        step_id="restart-all__celery", title="Restart celery Screen component",
+        objective="restart celery", risk="medium",
+    )
+
+    assert _inject_frozen_resource_args(master, {}, resources) == {
+        "run_as_uid": 1000,
+        "python_executable": "/env/master/bin/python3.8",
+    }
+    assert _inject_frozen_resource_args(celery, {}, resources) == {
+        "run_as_uid": 1000,
+    }
+
+
+def test_runtime_repair_reuses_compacted_identity_resource_per_step():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="restart all")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "\n".join([
+            "platform=a project_root=/srv/a backend_status=abnormal "
+            "worker_port=41002 worker_endpoint=http_error worker_pids=11 "
+            "worker_identities=11:1000:/env/bin/python3.8",
+            "platform=b project_root=/srv/b backend_status=abnormal "
+            "worker_port=42002 worker_endpoint=http_error worker_pids=22 "
+            "worker_identities=22:1000:/env/bin/python3.8",
+        ]),
+    ))
+    data = {"changes": [], "resources": []}
+    for alias, root, port in (("a", "/srv/a", 41002), ("b", "/srv/b", 42002)):
+        step_id = "restart-%s" % alias
+        data["changes"].append({
+            "step_id": step_id, "title": "Restart worker",
+            "objective": "Restart worker in %s" % root,
+            "expected_changes": ["restart worker role"],
+            "postconditions": [],
+        })
+        data["resources"].extend([
+            {
+                "name": "%s_root" % alias, "kind": "path",
+                "status": "frozen", "role": "instance_root", "value": root,
+                "source": "running_platforms",
+                "consumers": [step_id + ".project_root"],
+            },
+            {
+                "name": "%s_uid" % alias, "kind": "identifier",
+                "status": "frozen", "role": "run_as_uid", "value": 1000,
+                "source": "runtime_evidence",
+                "consumers": [step_id + ".worker_run_as_uid"],
+            },
+            {
+                "name": "%s_python" % alias, "kind": "path",
+                "status": "frozen", "role": "python_executable",
+                "value": "/env/bin/python3.8", "source": "runtime_evidence",
+                "consumers": [step_id + ".worker_python_executable"],
+            },
+            {
+                "name": "%s_worker_port" % alias, "kind": "port",
+                "status": "frozen", "role": "worker_port", "value": port,
+                "source": "existing_runtime",
+                "consumers": [step_id + ".worker_port"],
+            },
+        ])
+
+    ChangePlannerAgent._normalize_runtime_repair_coverage(
+        data, bundle, intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert len([r for r in data["resources"] if r["role"] == "run_as_uid"]) == 2
+    assert len({r["name"] for r in data["resources"]}) == len(data["resources"])
 
 
 def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
@@ -442,10 +1856,95 @@ def test_explicit_restart_inherits_identity_from_selected_roots_other_role():
     assert outcome.status == "need_execution"
     assert outcome.plan is not None
     resources = {item.role: item.value for item in outcome.plan.resources}
-    assert resources["run_as_uid"] == "1000"
-    assert resources["python_executable"] == (
+    assert resources["master_uid"] == "1000"
+    assert resources["worker_uid"] == "1000"
+    assert resources["master_python_executable"] == (
         "/home/lzl/miniconda3/envs/klonet-py38/bin/python3.8"
     )
+    assert resources["worker_python_executable"] == (
+        "/home/lzl/miniconda3/envs/klonet-py38/bin/python3.8"
+    )
+
+
+def test_component_restart_freezes_each_roles_observed_runtime_identity():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    root = "/home/lzl/test/vemu_uestc"
+    bundle = EvidenceBundle(goal="重启 test 的 master celery worker")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=test project_root=%s roles=celery,master,worker "
+        "master_identities=3035709:1000:/envs/test/bin/python3.8 "
+        "worker_identities=3075473:1000:/envs/klonet-py38/bin/python3.8 "
+        "runtime_identities=3035709:1000:/envs/test/bin/python3.8,"
+        "3075473:1000:/envs/klonet-py38/bin/python3.8 "
+        "master_port=45554 master_endpoint=healthy "
+        "worker_port=45555 worker_endpoint=healthy" % root,
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("process_detail", {}, "component identities"),
+        "current_uid=1000\n"
+        "process_details: detected - pid=2562051 "
+        "cmd=/envs/test/bin/python3.8 -m celery -A celery_worker.celery "
+        "cwd=%s" % root,
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        bundle.goal,
+        bundle,
+        intent_context={
+            "operation": "restart", "scope": "component",
+            "components": ["master", "celery", "worker"],
+            "resolved_project_root": root,
+        },
+    )
+
+    assert data is not None
+    resources = {item["role"]: item["value"] for item in data["resources"]}
+    assert resources["master_python_executable"] == "/envs/test/bin/python3.8"
+    assert resources["celery_python_executable"] == "/envs/test/bin/python3.8"
+    assert resources["worker_python_executable"] == (
+        "/envs/klonet-py38/bin/python3.8"
+    )
+    assert "python_executable" not in resources
+    assert "run_as_uid" not in resources
+
+
+def test_platform_restart_uses_authoritative_celery_identity_without_requery():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    root = "/home/lzl/test/vemu_uestc"
+    bundle = EvidenceBundle(goal="把所有平台的所有角色收编进screen管理")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "runtime_candidate_count=1\nhealthy_count=1\nabnormal_count=0\n"
+        "code_only_count=0\n"
+        "platform=test project_root=%s roles=celery,master,worker "
+        "managed_components=master,celery,worker "
+        "component_specs_b64=W3sibmFtZSI6Im1hc3RlciIsImNhdGVnb3J5IjoiYXBwbGljYXRpb24iLCJtYW5hZ2VkIjp0cnVlLCJkZWZhdWx0X3Jlc3RhcnQiOnRydWUsInNjcmVlbl9zdWZmaXgiOiJtIiwic3RhcnRfYWZ0ZXIiOltdfSx7Im5hbWUiOiJjZWxlcnkiLCJjYXRlZ29yeSI6ImFwcGxpY2F0aW9uIiwibWFuYWdlZCI6dHJ1ZSwiZGVmYXVsdF9yZXN0YXJ0Ijp0cnVlLCJzY3JlZW5fc3VmZml4IjoiYyIsInN0YXJ0X2FmdGVyIjpbIm1hc3RlciJdfSx7Im5hbWUiOiJ3b3JrZXIiLCJjYXRlZ29yeSI6ImFwcGxpY2F0aW9uIiwibWFuYWdlZCI6dHJ1ZSwiZGVmYXVsdF9yZXN0YXJ0Ijp0cnVlLCJzY3JlZW5fc3VmZml4IjoidyIsInN0YXJ0X2FmdGVyIjpbImNlbGVyeSJdfV0= "
+        "master_identities=10:1000:/envs/test/bin/python3.8 "
+        "celery_identities=20:1000:/envs/test/bin/python3.8 "
+        "worker_identities=30:1000:/envs/worker/bin/python3.8 "
+        "master_port=45554 master_endpoint=healthy "
+        "worker_port=45555 worker_endpoint=healthy" % root,
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        bundle.goal,
+        bundle,
+        intent_context={"operation": "restart", "scope": "platform", "components": []},
+    )
+
+    assert data is not None
+    assert data["status"] == "ready"
+    resources = {item["role"]: item["value"] for item in data["resources"]}
+    assert resources["celery_python_executable"] == "/envs/test/bin/python3.8"
 
 
 def test_runtime_repair_replaces_legacy_http_checks_with_backend_health_contract():
@@ -462,7 +1961,11 @@ def test_runtime_repair_replaces_legacy_http_checks_with_backend_health_contract
         "worker_port=45552 worker_endpoint=not_checked reason=role_not_running",
     ))
     data = {
-        "resources": [],
+        "resources": [{
+            "name": "formal_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/home/lzl/vemu_uestc",
+            "source": "evidence", "consumers": ["repair.instance_root"],
+        }],
         "changes": [{
             "step_id": "repair",
             "title": "Restore formal master and worker",
@@ -504,7 +2007,11 @@ def test_runtime_repair_freezes_pid_for_unhealthy_live_role():
         )
     )
     data = {
-        "resources": [],
+        "resources": [{
+            "name": "runtime_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/srv/102",
+            "source": "evidence", "consumers": ["repair.instance_root"],
+        }],
         "changes": [
             {
                 "step_id": "repair", "title": "Restart master",
@@ -525,18 +2032,18 @@ def test_runtime_repair_freezes_pid_for_unhealthy_live_role():
     assert pid["value"] == 1239000
     assert pid["source"] == "running_platforms"
     assert pid["consumers"] == ["repair.master_pid"]
-    uid = next(item for item in data["resources"] if item["role"] == "master_uid")
+    uid = next(item for item in data["resources"] if item["role"] == "run_as_uid")
     python = next(
         item for item in data["resources"]
-        if item["role"] == "master_python_executable"
+        if item["role"] == "python_executable"
     )
     assert uid["value"] == 997
-    assert uid["consumers"] == ["repair.run_as_uid"]
+    assert uid["consumers"] == ["repair.master_run_as_uid"]
     assert python["value"] == "/usr/bin/python3.8"
-    assert python["consumers"] == ["repair.python_executable"]
+    assert python["consumers"] == ["repair.master_python_executable"]
 
 
-def test_authoritative_healthy_worker_restart_is_compiled_to_verification():
+def test_out_of_scope_healthy_worker_mutation_is_rejected_not_rewritten():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
@@ -549,7 +2056,12 @@ def test_authoritative_healthy_worker_restart_is_compiled_to_verification():
         "master_port=27694 master_endpoint=unreachable "
         "worker_port=27695 worker_endpoint=healthy",
     ))
-    data = {"changes": [
+    data = {"resources": [{
+        "name": "runtime_root", "kind": "path", "status": "frozen",
+        "role": "instance_root", "value": "/home/klonet-agent/102",
+        "source": "evidence",
+        "consumers": ["master.instance_root", "worker.instance_root"],
+    }], "changes": [
         {
             "step_id": "master", "title": "Repair and restart master",
             "objective": "Repair master for /home/klonet-agent/102",
@@ -562,19 +2074,21 @@ def test_authoritative_healthy_worker_restart_is_compiled_to_verification():
         },
     ]}
 
-    ChangePlannerAgent._normalize_healthy_runtime_role_changes(data, bundle)
+    errors = ChangePlannerAgent._healthy_runtime_role_contract_errors(
+        data, bundle,
+        intent_context={
+            "operation": "repair", "scope": "component",
+            "components": ["master"],
+        },
+    )
 
     worker = data["changes"][1]
-    assert worker["title"] == "Verify healthy worker backend"
-    assert worker["risk"] == "readonly"
-    assert worker["expected_changes"] == []
-    assert worker["postconditions"] == [{
-        "checker": "backend_health",
-        "args": {
-            "url": "http://127.0.0.1:27695/server_health/",
-            "expected_code": 1,
-        },
-    }]
+    assert errors == [
+        "change[worker] mutates healthy out-of-scope role=worker "
+        "at project_root=/home/klonet-agent/102"
+    ]
+    assert worker["title"] == "Restart worker and verify"
+    assert worker["expected_changes"] == ["worker restarts"]
 
 
 def test_migrated_healthy_worker_is_rechecked_on_its_new_port():
@@ -851,6 +2365,25 @@ def test_workflow_store_recovers_interrupted_hierarchical_step_without_reexecuti
     assert recovered.status == "paused"
     assert nested.status == "execution_unknown"
     assert nested.execution_attempts == 1
+
+
+def test_workflow_store_skips_invalid_historical_draft_when_listing(tmp_path):
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+
+    store = ChangePlanStore(tmp_path, user_id="u", project_id="p")
+    store.plan_dir.mkdir(parents=True)
+    (store.plan_dir / "priv-ops-invalid.json").write_text(
+        json.dumps({
+            "schema_version": 4,
+            "plan_id": "priv-ops-invalid",
+            "goal": "restart test",
+            "risk": "medium",
+            "steps": [],
+        }),
+        encoding="utf-8",
+    )
+
+    assert store.list() == []
 
 
 def test_change_planner_returns_structured_evidence_gap_without_plan():
@@ -1181,6 +2714,33 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
     assert "Discovery or Binding" in llm.calls[1]["messages"][-1]["content"]
 
 
+def test_change_planner_allows_user_scope_decision_after_listener_is_discovered():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    bundle, conclusion, _evidence_id = _bundle_and_conclusion()
+    blocked = json.dumps({
+        "status": "blocked",
+        "reason": (
+            "worker configured port 45552 is owned by listener PGID 220 "
+            "outside the target instance"
+        ),
+        "missing_decisions": [
+            "是否允许把占用 45552 端口且不属于目标实例的外部进程纳入本次变更范围"
+        ],
+    })
+    llm = FakeLLM([blocked])
+
+    outcome = ChangePlannerAgent(llm).plan(
+        "change an isolated service", bundle, conclusion,
+    )
+
+    assert outcome.status == "blocked"
+    assert outcome.missing_decisions == [
+        "是否允许把占用 45552 端口且不属于目标实例的外部进程纳入本次变更范围"
+    ]
+    assert len(llm.calls) == 1
+
+
 def test_change_planner_allows_three_bounded_contract_repairs():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
@@ -1264,7 +2824,7 @@ def test_change_planner_repairs_impossible_logs_request_for_missing_process():
     assert outcome.status == "need_execution"
 
 
-def test_existing_runtime_role_port_overrides_source_literal_for_repair():
+def test_existing_runtime_role_port_uses_structured_root_without_path_in_prose():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
@@ -1289,7 +2849,7 @@ def test_existing_runtime_role_port_overrides_source_literal_for_repair():
                 "step_id": "repair",
                 "title": "Restart 102 master",
                 "objective": (
-                    "Restart master for /home/klonet-agent/102 and verify worker "
+                    "Restart master for the selected 102 instance and verify worker "
                     "on mistakenly inferred port 12000"
                 ),
                 "postconditions": [
@@ -1301,22 +2861,26 @@ def test_existing_runtime_role_port_overrides_source_literal_for_repair():
             }
         ]
     }
-    resource = PlanResource(
-        name="worker_port",
-        kind="port",
-        status="frozen",
-        role="worker_port",
-        value=12000,
-        source="planner_decision",
-        consumers=["repair.worker_port"],
-    )
+    resources = [
+        PlanResource(
+            name="instance_root", kind="path", status="frozen",
+            role="instance_root", value="/home/klonet-agent/102",
+            source="running_platforms", consumers=["repair.project_root"],
+        ),
+        PlanResource(
+            name="worker_port", kind="port", status="frozen",
+            role="worker_port", value=12000, source="planner_decision",
+            consumers=["repair.worker_port"],
+        ),
+    ]
 
-    ChangePlannerAgent._compile_existing_runtime_role_ports(
+    ChangePlannerAgent._normalize_existing_runtime_ports(
         data,
-        [resource],
+        resources,
         bundle,
     )
 
+    resource = resources[1]
     assert resource.value == 27695
     assert resource.source == "existing_runtime"
     assert data["changes"][0]["postconditions"][0]["args"]["url"] == (
@@ -1660,8 +3224,10 @@ def test_planner_compiles_canonical_container_names_and_runtime_entry_source():
     assert data["resources"][1]["value"] == "v4e2e-mysql"
     assert data["changes"][0]["postconditions"][0]["args"]["name"] == "v4e2e-mysql"
     mains = next(item for item in resources if item.role == "runtime_mains_root")
+    root = next(item for item in resources if item.role == "instance_root")
     assert mains.value == "/home/lzl/klonet_workflow_e2e/mains"
     assert mains.consumers == ["master.source_root"]
+    assert root.consumers == ["master.project_root"]
 
 
 def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
@@ -1697,8 +3263,10 @@ def test_planner_uses_existing_nested_backend_mains_for_runtime_root():
         )
 
     mains = next(item for item in normalized if item.role == "runtime_mains_root")
+    root = next(item for item in normalized if item.role == "instance_root")
     assert mains.value == str(nested_mains)
     assert mains.consumers == ["start.source_root"]
+    assert root.consumers == ["start.project_root"]
 
 
 def test_planner_derives_config_path_after_checker_path_normalization():
@@ -1988,6 +3556,11 @@ def test_planner_preserves_occupied_ports_owned_by_repaired_runtime_root():
     }
     resources = [
         PlanResource(
+            "formal_root", "path", "frozen", "instance_root",
+            "/home/lzl/vemu_uestc", "evidence",
+            consumers=["formal.project_root"],
+        ),
+        PlanResource(
             "formal_master_port", "port", "frozen", "master_port", 45551,
             "evidence", consumers=["formal.master_port"],
         ),
@@ -1997,11 +3570,11 @@ def test_planner_preserves_occupied_ports_owned_by_repaired_runtime_root():
         ),
     ]
 
-    ChangePlannerAgent._mark_existing_runtime_ports(data, resources, bundle)
+    ChangePlannerAgent._normalize_existing_runtime_ports(data, resources, bundle)
     ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
 
-    assert [resource.value for resource in resources] == [45551, 45552]
-    assert {resource.source for resource in resources} == {"existing_runtime"}
+    assert [resource.value for resource in resources[1:]] == [45551, 45552]
+    assert {resource.source for resource in resources[1:]} == {"existing_runtime"}
     assert data["changes"][0]["postconditions"][0]["args"]["port"] == 45552
 
 
@@ -2033,12 +3606,60 @@ def test_generic_derived_port_matching_repaired_root_is_existing_runtime():
         "derived", consumers=["formal.port_45551"],
     )
 
-    ChangePlannerAgent._mark_existing_runtime_ports(data, [resource], bundle)
-    ChangePlannerAgent._normalize_occupied_host_ports(data, [resource], bundle)
+    root = PlanResource(
+        "formal_root", "path", "frozen", "instance_root",
+        "/home/lzl/vemu_uestc", "runtime", consumers=["formal.project_root"],
+    )
+    ChangePlannerAgent._normalize_existing_runtime_ports(
+        data, [root, resource], bundle,
+    )
+    ChangePlannerAgent._normalize_occupied_host_ports(data, [root, resource], bundle)
 
     assert resource.value == 45551
     assert resource.source == "existing_runtime"
     assert resource.role == "master_port"
+
+
+def test_explicit_port_migration_is_not_rewritten_to_the_current_role_port():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    bundle = EvidenceBundle(goal="将 test Master 端口迁移到 47000")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime"),
+        "platform=test project_root=/home/lzl/test/vemu_uestc "
+        "backend_status=healthy master_port=45554 worker_port=45555",
+    ))
+    data = {"changes": [{
+        "step_id": "master",
+        "title": "Migrate master port",
+        "objective": "Move the selected test master port to 47000",
+        "postconditions": [
+            {"checker": "port_listening", "args": {"port": 47000}},
+        ],
+    }]}
+    resources = [
+        PlanResource(
+            "test_root", "path", "frozen", "instance_root",
+            "/home/lzl/test/vemu_uestc", "running_platforms",
+            consumers=["master.project_root"],
+        ),
+        PlanResource(
+            "master_port", "port", "frozen", "master_port", 47000,
+            "user_requested", consumers=["master.master_port"],
+        ),
+    ]
+
+    ChangePlannerAgent._normalize_existing_runtime_ports(
+        data, resources, bundle,
+    )
+
+    assert resources[1].value == 47000
+    assert resources[1].source == "user_requested"
+    assert data["changes"][0]["postconditions"][0]["args"]["port"] == 47000
 
 
 def test_planner_reassigns_new_port_that_collides_with_another_active_config_role():
@@ -2076,6 +3697,11 @@ def test_planner_reassigns_new_port_that_collides_with_another_active_config_rol
     ]}
     resources = [
         PlanResource(
+            "formal_root", "path", "frozen", "instance_root",
+            "/home/lzl/vemu_uestc", "inventory",
+            consumers=["formal.project_root"],
+        ),
+        PlanResource(
             "test_master", "port", "frozen", "master_port", 45553,
             "evidence", consumers=["test.master_port"],
         ),
@@ -2085,12 +3711,12 @@ def test_planner_reassigns_new_port_that_collides_with_another_active_config_rol
         ),
     ]
 
-    ChangePlannerAgent._mark_existing_config_ports(data, resources, bundle)
+    ChangePlannerAgent._normalize_existing_runtime_ports(data, resources, bundle)
     ChangePlannerAgent._normalize_occupied_host_ports(data, resources, bundle)
 
-    assert resources[0].value == 45554
-    assert resources[1].value == 45553
-    assert resources[1].source == "existing_config"
+    assert resources[1].value == 45554
+    assert resources[2].value == 45553
+    assert resources[2].source == "existing_runtime"
     assert data["changes"][0]["postconditions"][0]["args"]["port"] == 45554
     assert "45553" in data["changes"][1]["objective"]
 
@@ -2184,6 +3810,8 @@ def test_runtime_stop_scope_uses_authoritative_goal_root_and_worker_port():
 
 
 def test_combined_migration_freezes_worker_pgid_from_running_inventory():
+    import base64
+    import json
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
     )
@@ -2191,11 +3819,22 @@ def test_combined_migration_freezes_worker_pgid_from_running_inventory():
 
     goal = "stop /home/lzl/test/vemu_uestc worker on 45552 then move it to 45555"
     bundle = EvidenceBundle(goal=goal)
+    binding = base64.urlsafe_b64encode(json.dumps({
+        "worker": {
+            "role": "worker", "configured_port": 45552,
+            "status": "confirmed", "listener_pid": 3049898,
+            "listener_pgid": 3049898, "listener_pids": [3049898, 3049923],
+            "observed_role": "worker",
+            "runtime_root": "/home/lzl/test/vemu_uestc",
+            "code_root": "/home/lzl/test/vemu_uestc",
+        }
+    }).encode("utf-8")).decode("ascii")
     bundle.add(EvidenceRecord.from_probe(
         ProbeRequest("running_platforms", {}, "runtime"),
         "platform=vemu project_root=/home/lzl/test/vemu_uestc roles=master,worker "
         "worker_pids=3049898,3049923 worker_pgids=3049898 "
-        "backend_status=healthy master_port=45554 worker_port=45552",
+        "backend_status=healthy master_port=45554 worker_port=45552 "
+        "role_bindings_b64=" + binding,
     ))
     data = {
         "changes": [{
@@ -2222,6 +3861,45 @@ def test_combined_migration_freezes_worker_pgid_from_running_inventory():
     )
 
 
+def test_runtime_stop_scope_never_guesses_first_worker_group_when_owner_is_ambiguous():
+    import base64
+    import json
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    goal = "stop /home/lzl/vemu_uestc worker on 45552"
+    binding = base64.urlsafe_b64encode(json.dumps({
+        "worker": {
+            "role": "worker", "configured_port": 45552,
+            "status": "owner_ambiguous",
+        }
+    }).encode("utf-8")).decode("ascii")
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime"),
+        "platform=vemu project_root=/home/lzl/vemu_uestc roles=worker "
+        "worker_pids=100,200 worker_pgids=100,200 backend_status=abnormal "
+        "worker_port=45552 role_bindings_b64=" + binding,
+    ))
+    data = {
+        "changes": [{
+            "step_id": "stop-worker", "title": "Stop worker listener",
+            "objective": "Stop /home/lzl/vemu_uestc worker on port 45552",
+            "expected_changes": [], "postconditions": [],
+        }],
+        "resources": [],
+    }
+
+    ChangePlannerAgent._normalize_runtime_stop_scope(data, goal, bundle)
+
+    assert not any(
+        resource.get("role") == "worker_pid"
+        for resource in data["resources"]
+    )
+
+
 def test_runtime_health_recovery_is_attached_to_later_start_not_stop_step():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
@@ -2240,7 +3918,14 @@ def test_runtime_health_recovery_is_attached_to_later_start_not_stop_step():
     data = {
         "resources": [
             {
-                "name": "test_master", "role": "master_port", "value": 45555,
+                "name": "test_root", "kind": "path", "status": "frozen",
+                "role": "instance_root", "value": "/home/lzl/test/vemu_uestc",
+                "source": "evidence",
+                "consumers": ["stop-test.instance_root", "start-test.instance_root"],
+            },
+            {
+                "name": "test_master", "kind": "port", "status": "frozen",
+                "role": "master_port", "value": 45555,
                 "consumers": ["start-test.master_port"],
             }
         ],
@@ -2278,7 +3963,11 @@ def test_generic_healthy_outcome_does_not_hide_restart_unhealthy_disposition():
         "worker_endpoint=not_checked reason=role_not_running",
     ))
     data = {
-        "resources": [],
+        "resources": [{
+            "name": "formal_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/home/lzl/vemu_uestc",
+            "source": "evidence", "consumers": ["formal.instance_root"],
+        }],
         "changes": [{
             "step_id": "formal",
             "title": "Restore production instance master and worker",
@@ -2295,12 +3984,96 @@ def test_generic_healthy_outcome_does_not_hide_restart_unhealthy_disposition():
     assert any("start missing worker role at 45552" in item for item in expected)
 
 
+def test_runtime_repair_uses_migrated_port_as_the_only_worker_acceptance():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    root = "/home/lzl/vemu_uestc"
+    step_id = "restart-vemu"
+    bundle = EvidenceBundle(goal="move worker to a free port and restart")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "platform=vemu project_root=%s backend_status=abnormal "
+        "master_port=45551 master_endpoint=healthy worker_port=45552 "
+        "worker_endpoint=unreachable" % root,
+    ))
+    data = {
+        "resources": [
+            {
+                "name": "root", "kind": "path", "status": "frozen",
+                "role": "instance_root", "value": root,
+                "source": "evidence", "consumers": [step_id + ".instance_root"],
+            },
+            {
+                "name": "old_worker_port", "kind": "port", "status": "frozen",
+                "role": "worker_port", "value": 45552,
+                "source": "conflicting_existing_listener",
+                "consumers": [step_id + ".old_worker_port"],
+            },
+            {
+                "name": "worker_port", "kind": "port", "status": "frozen",
+                "role": "worker_port", "value": 45556,
+                "source": "checked_free_replacement",
+                "consumers": [step_id + ".worker_port"],
+            },
+        ],
+        "changes": [{
+            "step_id": step_id,
+            "title": "Restart vemu worker",
+            "objective": "Restart worker on 45556 and preserve the old listener",
+            "expected_changes": [
+                "worker_port changes from 45552 to checked-free port 45556",
+                "restart requested worker role at 45556 and backend health succeeds",
+                "restart unhealthy worker role at 45552 and backend health succeeds",
+            ],
+            "postconditions": [
+                {"checker": "backend_health", "args": {
+                    "url": "http://127.0.0.1:45552/server_health/",
+                    "expected_code": 1,
+                }},
+                {"checker": "backend_health", "args": {
+                    "url": "http://127.0.0.1:45556/server_health/",
+                    "expected_code": 1,
+                }},
+            ],
+        }],
+    }
+
+    ChangePlannerAgent._normalize_runtime_repair_coverage(data, bundle)
+    resources = [PlanResource.from_dict(item) for item in data["resources"]]
+    ChangePlannerAgent._normalize_backend_role_health_contracts(data, resources)
+
+    expected = " | ".join(data["changes"][0]["expected_changes"])
+    assert "worker role at 45552" not in expected
+    assert expected.count("worker role at 45556") == 1
+    health_urls = [
+        item["args"]["url"]
+        for item in data["changes"][0]["postconditions"]
+        if item["checker"] == "backend_health"
+    ]
+    assert health_urls == ["http://127.0.0.1:45556/server_health/"]
+
+
 def test_same_root_master_worker_recovery_changes_are_merged():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     data = {
         "resources": [{
-            "name": "worker_port", "consumers": ["worker.worker_port"],
+            "name": "test_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/home/lzl/test/vemu_uestc",
+            "source": "evidence", "consumers": ["test.instance_root"],
+        }, {
+            "name": "formal_root", "kind": "path", "status": "frozen",
+            "role": "instance_root", "value": "/home/lzl/vemu_uestc",
+            "source": "evidence",
+            "consumers": ["worker.instance_root", "master.instance_root"],
+        }, {
+            "name": "worker_port", "kind": "port", "status": "frozen",
+            "role": "worker_port", "value": 45552,
+            "source": "evidence", "consumers": ["worker.worker_port"],
         }],
         "changes": [
             {
@@ -2330,7 +4103,10 @@ def test_same_root_master_worker_recovery_changes_are_merged():
 
     assert [item["step_id"] for item in data["changes"]] == ["test", "worker"]
     assert "master restarts" in data["changes"][1]["expected_changes"]
-    assert data["resources"][0]["consumers"] == ["worker.worker_port"]
+    worker_port = next(
+        item for item in data["resources"] if item["role"] == "worker_port"
+    )
+    assert worker_port["consumers"] == ["worker.worker_port"]
 
 
 def test_same_root_duplicate_stop_is_folded_into_recovery_owner():
@@ -2446,7 +4222,7 @@ def test_same_root_recovery_changes_merge_for_arbitrary_project_name():
     assert data["resources"][0]["consumers"] == ["edit.project_root"]
 
 
-def test_instance_root_consumers_are_grounded_to_the_exact_sibling_change():
+def test_ambiguous_instance_root_consumers_are_rejected_not_text_repaired():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
@@ -2469,7 +4245,17 @@ def test_instance_root_consumers_are_grounded_to_the_exact_sibling_change():
     ChangePlannerAgent._normalize_resource_consumer_owners(data, resources)
 
     assert resources[0].consumers == ["test.instance_root"]
-    assert resources[1].consumers == ["formal.instance_root"]
+    assert resources[1].consumers == [
+        "test.instance_root_2", "formal.instance_root",
+    ]
+    errors = ChangePlannerAgent._instance_root_contract_errors({
+        "changes": data["changes"],
+        "resources": [item.to_dict() for item in resources],
+    })
+    assert errors == [
+        "change[test] has multiple instance_root identities="
+        "/home/lzl/test/vemu_uestc,/home/lzl/vemu_uestc"
+    ]
 
 
 def test_instance_prefixed_port_roles_are_canonicalized_before_health_coverage():

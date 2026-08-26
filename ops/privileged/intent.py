@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from klonet_agent.ops.privileged.action_contracts import _parse_json_object
+from klonet_agent.ops.privileged.context import klonet_domain_context
 from klonet_agent.tools.environment import redact_sensitive_text
 
 
@@ -21,10 +22,11 @@ INTENTS = {
 }
 GOAL_CLARITIES = {"clear", "discoverable", "missing"}
 ACTION_INTENTS = {"readonly_action", "mutating_action"}
-GOAL_RELATIONS = {"new", "continue_previous", "refine_previous"}
+GOAL_RELATIONS = {
+    "new", "continue_previous", "refine_previous", "supersede_previous",
+}
 GOAL_KINDS = {
-    "conversation", "execution", "status_query", "health_check",
-    "causal_diagnosis",
+    "conversation", "execution", "health_check", "causal_diagnosis",
 }
 OPERATIONS = {"none", "restart", "repair", "start", "stop", "inspect"}
 SCOPES = {"none", "platform", "component"}
@@ -59,19 +61,53 @@ Important:
   ambiguous.
 - For readonly_action, command is optional. Provide it only when one concrete,
   deterministically read-only command follows safely from the request.
-- Use resume_plan for natural-language references to an earlier unfinished
-  plan, such as "继续上次部署", "恢复刚才的任务", or "接着之前的计划".
+- Use resume_plan only for explicit references to an earlier unfinished plan,
+  such as "继续上次部署", "恢复刚才的任务", "接着之前的计划", or
+  "刚才的计划执行完了吗".
   Set plan_reference to an explicit priv-* id when supplied or when exactly
   one matching id is visible in the unfinished-plan context; otherwise use
   "latest". Never turn resume_plan into a new deploy, restart, or repair goal.
+  Use operation=inspect when the user only asks to inspect that plan.
+- A conversational recap such as "刚才我们进行到哪一步了", "刚才聊了什么",
+  or "前面说到哪里了" is conversation, not resume_plan, unless the current
+  wording explicitly refers to a change plan, its approval, or its execution.
+- A request to actually repeat a previous inspection, such as "重新检查一次"
+  or "再试一次刚才的检查", keeps the previous action intent and uses
+  goal_relation=continue_previous. Never label a recap as an action, and never
+  rely on Coordinator to promote conversation into an action.
 - clarification_question must be a concise Chinese question and is required only
   for goal_clarity=missing.
 - goal_relation describes how the current request relates to the persisted
-  operational goal shown in recent context: new, continue_previous, or
-  refine_previous. Referential follow-ups such as "这个报错是为什么",
+  operational goal shown in recent context: new, continue_previous,
+  refine_previous, or supersede_previous. Referential follow-ups such as
+  "这个报错是为什么",
   "那具体原因呢", and "继续查到根因" refine the previous goal rather than
   starting a new one.
-- goal_kind is one of conversation, execution, status_query, health_check, or
+- continue_previous means replaying the same requested result without adding
+  a new fact, predicate, comparison, scope, or expected output.  If the user
+  keeps the previous target but asks a new question about it, classify the
+  turn as refine_previous even when goal_kind and operation remain unchanged.
+  For example, after listing runtime platforms, asking which of those
+  platforms are healthy is a refinement: the target is inherited but the
+  requested result has changed.
+- A follow-up that challenges a previous operational conclusion with the
+  user's own runtime observation is operational inspection, not a concept
+  question. If it asks why the observations differ, use readonly_action,
+  refine_previous, and causal_diagnosis so the discrepancy is checked against
+  current evidence.
+- When an awaiting-confirmation plan exists, a user who identifies incorrect
+  resources, missing acceptance checks, contradictory effects, or components
+  that must be added/removed is requesting a replacement plan: use
+  mutating_action + refine_previous.  Critiquing a plan does not approve it,
+  and the ordinary Answerer must never draft the replacement.
+- For a component-scoped refinement, components contains only the roles the
+  replacement plan is authorized to change.  Do not include a component that
+  the user explicitly excludes merely because it appears in the discussion.
+- Use supersede_previous when the user rejects or corrects the previous goal,
+  including when the same turn supplies a replacement goal. A self-contained
+  current request does not inherit the previous goal merely because historical
+  context exists.
+- goal_kind is one of conversation, execution, health_check, or
   causal_diagnosis. It describes the user's request, never wrapper text added
   by another workflow stage.
 - operation is one of none, restart, repair, start, stop, or inspect.
@@ -79,15 +115,56 @@ Important:
   named application components; leave it empty for a platform-wide operation.
 - "重启平台" means restart the complete managed application-component set.
   It is not a repair request and healthy components must not be preserved.
-- Questions such as "执行完了吗" and "刚才做了什么" are status_query, not a
-  refinement of the operational goal.
+- Moving existing Klonet application roles under Screen management (for example
+  "全部角色收编为 Screen 管理") is mutating_action + operation=restart: the
+  requested invariant requires replacing any non-Screen-owned runtime with a
+  Screen-owned runtime.  This does not approve execution; the resulting exact
+  plan still requires user confirmation.  In contrast, asking which Screen
+  sessions exist is readonly_action + operation=inspect.
+- Questions about a previous plan use resume_plan + operation=inspect + a
+  non-empty plan_reference. Questions about server, platform, process, port, or
+  component runtime state use readonly_action + health_check + operation=inspect
+  and must leave plan_reference empty.
+- A question such as "我之前不是修订过这个计划了吗" asks the plan domain to
+  reconcile conversation history with persisted plan state. Use resume_plan,
+  operation=inspect, goal_relation=refine_previous. It is not a request to dump
+  the old plan and does not itself authorize a replacement.
+- The persisted operational goal is historical context only. Inherit it only
+  when the current request explicitly continues, refines, or supersedes it.
 
 Examples:
 - "帮我部署一个平台" -> mutating_action, discoverable
 - "检查 Klonet 为什么没启动" -> readonly_action, discoverable
 - "查看 Python 版本" -> readonly_action, clear
 - "什么是 tc qdisc" -> conversation, clear
-- "继续上次的部署计划" -> resume_plan, clear, plan_reference="latest"
+- "继续上次的部署计划" -> resume_plan, clear, operation=none,
+  plan_reference="latest"
+- "刚才的重启计划执行完了吗" -> resume_plan, clear, operation=inspect,
+  plan_reference="latest"
+- "刚刚我们进行到哪一步了" -> conversation, clear,
+  goal_relation=continue_previous, operation=none, plan_reference=""
+- "重新检查一次刚才的平台状态" -> readonly_action, discoverable,
+  goal_relation=continue_previous, goal_kind=health_check, operation=inspect,
+  plan_reference=""
+- "这些平台里哪些现在是健康的" after a runtime inventory ->
+  readonly_action, discoverable, goal_relation=refine_previous,
+  goal_kind=health_check, operation=inspect, plan_reference=""
+- "看看服务器上有哪些平台在运行" -> readonly_action, clear,
+  goal_relation=new, goal_kind=health_check, operation=inspect,
+  plan_reference=""
+- "不是重启，只检查运行平台" with a persisted restart goal ->
+  readonly_action, clear, goal_relation=supersede_previous,
+  goal_kind=health_check, operation=inspect, plan_reference=""
+- "不要重启了" with a persisted restart goal -> conversation, clear,
+  goal_relation=supersede_previous, plan_reference=""
+- "这个计划的 worker 环境错了，并且必须检查 Screen，请按这些修正" with
+  an awaiting plan -> mutating_action, discoverable,
+  goal_relation=refine_previous, goal_kind=execution, operation=restart
+- "把所有平台的所有应用角色收编为 Screen 管理" -> mutating_action,
+  discoverable, goal_relation=new, goal_kind=execution, operation=restart,
+  scope=platform, components=[]
+- "我之前不是修订过这个计划了吗" -> resume_plan, clear,
+  goal_relation=refine_previous, operation=inspect, plan_reference="latest"
 - "把它删掉" with no referent in recent context -> ambiguous, missing
 - "帮我处理一下" -> ambiguous, missing
 
@@ -132,7 +209,11 @@ class PrivilegedIntentClassifier:
         conversation_context: str = "",
     ) -> PrivilegedIntentDecision:
         messages = [
-            {"role": "system", "content": INTENT_CLASSIFIER_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": INTENT_CLASSIFIER_SYSTEM_PROMPT
+                + "\n\n" + klonet_domain_context("intent"),
+            },
             {
                 "role": "user",
                 "content": (
@@ -226,6 +307,8 @@ class PrivilegedIntentClassifier:
         operation = str(data.get("operation") or "none").strip().lower()
         if operation not in OPERATIONS:
             raise ValueError("invalid operation: %s" % operation)
+        if intent == "conversation" and operation != "none":
+            raise ValueError("conversation cannot request an operation")
         scope = str(data.get("scope") or "none").strip().lower()
         if scope not in SCOPES:
             raise ValueError("invalid scope: %s" % scope)
@@ -237,6 +320,15 @@ class PrivilegedIntentClassifier:
             for item in raw_components
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9 _-]{0,63}", str(item).strip())
         )
+        plan_reference = str(data.get("plan_reference") or "").strip()[:500]
+        if intent == "resume_plan" and not plan_reference:
+            raise ValueError("resume_plan requires plan_reference")
+        if intent != "resume_plan" and plan_reference:
+            raise ValueError("only resume_plan may reference a plan")
+        if intent == "resume_plan" and operation == "inspect":
+            goal_kind = "conversation"
+        if goal_kind == "health_check" and intent != "readonly_action":
+            raise ValueError("health_check requires readonly_action")
         return PrivilegedIntentDecision(
             intent=intent,
             requires_execution=requires_execution,
@@ -247,7 +339,7 @@ class PrivilegedIntentClassifier:
             clarification_question=str(
                 data.get("clarification_question") or ""
             ).strip(),
-            plan_reference=str(data.get("plan_reference") or "").strip()[:500],
+            plan_reference=plan_reference,
             goal_relation=goal_relation,
             goal_kind=goal_kind,
             operation=operation,

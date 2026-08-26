@@ -12,6 +12,24 @@ def test_probe_request_cache_key_is_stable_across_argument_order():
     assert left.cache_key == right.cache_key
 
 
+def test_evidence_gap_identity_does_not_change_with_probe_wording():
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
+
+    left = ProbeRequest(
+        "process_detail", {"pid": 42}, "locate runtime",
+        ("worker cwd",), "refresh", "gap-worker-runtime",
+        ("restart-worker",),
+    )
+    right = ProbeRequest(
+        "screen_session", {"session": "test_w"}, "locate same runtime",
+        ("worker process tree and executable",), "refresh",
+        "gap-worker-runtime", ("restart-worker",),
+    )
+
+    assert left.cache_key != right.cache_key
+    assert left.need_key == right.need_key == "gap-worker-runtime"
+
+
 def test_evidence_bundle_reuses_identical_probe_result():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
@@ -140,6 +158,60 @@ def test_change_plan_does_not_duplicate_user_decision_state():
         )
 
 
+def test_change_plan_merges_equivalent_resource_declarations():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    step = ChangeStep(
+        step_id="restart-worker", title="restart worker",
+        objective="restart worker", risk="medium",
+        expected_changes=["worker restarts"],
+        postconditions=[{"checker": "process_running", "args": {"pattern": "worker"}}],
+    )
+    shared = dict(
+        name="project_root", kind="path", status="frozen",
+        role="project_root", value="/srv/test", source="ev-runtime",
+    )
+    plan = ChangePlan(
+        plan_id="priv-ops-resource-merge", goal="restart worker",
+        risk="medium", steps=[step], resources=[
+            PlanResource(**shared, consumers=["restart-worker.project_root"]),
+            PlanResource(**shared, consumers=["restart-worker.cwd"]),
+        ],
+    )
+
+    assert len(plan.resources) == 1
+    assert plan.resources[0].consumers == [
+        "restart-worker.project_root", "restart-worker.cwd",
+    ]
+
+
+def test_change_plan_rejects_conflicting_duplicate_resource_values():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    step = ChangeStep(
+        step_id="restart-worker", title="restart worker",
+        objective="restart worker", risk="medium",
+        expected_changes=["worker restarts"],
+        postconditions=[{"checker": "process_running", "args": {"pattern": "worker"}}],
+    )
+    with pytest.raises(ValueError, match="conflicting duplicate plan resource"):
+        ChangePlan(
+            plan_id="priv-ops-resource-conflict", goal="restart worker",
+            risk="medium", steps=[step], resources=[
+                PlanResource(
+                    name="worker_port", kind="port", status="frozen",
+                    role="worker_port", value=45555, source="ev-a",
+                ),
+                PlanResource(
+                    name="worker_port", kind="port", status="frozen",
+                    role="worker_port", value=47002, source="ev-a",
+                ),
+            ],
+        )
+
+
 def test_component_port_contract_is_role_generic_without_fixed_port_aliases():
     from klonet_agent.ops.privileged.contracts import component_port_arg
 
@@ -205,17 +277,35 @@ def test_failure_record_round_trips_user_recovery_options():
         summary="停止动作缺少根目录约束",
         technical_reason="project_root consumer missing",
         options=[RecoveryOption(
-            option_id="component_restart",
-            label="逐组件重启",
-            description="按根目录逐组件重启",
-            action="component_restart",
+            option_id="provide_direction",
+            label="调整目标或处理范围",
+            description="补充边界并返回原工作流",
+            action="provide_direction",
             recommended=True,
         )],
+        selected_option_id="provide_direction",
+        user_direction="保留 master 和 worker，排除 web_terminal",
         goal="重启平台",
+        goal_kind="execution",
         plan_id="priv-ops-plan1",
+        missing_decisions=["是否允许停止并重启 worker"],
     )
 
     restored = FailureRecord.from_dict(failure.to_dict())
 
     assert restored == failure
     assert restored.options[0].recommended is True
+    assert restored.user_direction == "保留 master 和 worker，排除 web_terminal"
+    assert restored.missing_decisions == ["是否允许停止并重启 worker"]
+
+
+def test_recovery_contract_rejects_planner_strategy_as_user_control():
+    from klonet_agent.ops.privileged.workflow.contracts import RecoveryOption
+
+    with pytest.raises(ValueError, match="invalid recovery option action"):
+        RecoveryOption(
+            option_id="component_restart",
+            label="逐组件重启",
+            description="不应成为失败恢复状态",
+            action="component_restart",
+        )

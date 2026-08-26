@@ -14,13 +14,20 @@ from klonet_agent.ops.privileged.workflow.contracts import (
 )
 from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
 from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
+from klonet_agent.ops.privileged.context import klonet_domain_context
 
 
 SYNTHESIS_SYSTEM_PROMPT = """
 You are the Klonet Ops-Privilege Evidence Synthesizer.
 Use only the supplied read-only evidence. Never request tools, propose commands,
 write files, or claim facts without evidence references.
-Return one JSON object with confirmed_facts, uncertainties, missing_decisions.
+Return one JSON object with confirmed_facts, uncertainties, missing_decisions,
+and gap_assessments. Each gap assessment is
+{"gap_id":"gap-...","status":"resolved|unresolved|ambiguous",
+ "evidence_refs":["ev-..."]}. A gap is resolved only when the evidence proves
+the requested result, not merely because a Probe returned output. Reuse the
+gap_id supplied with the evidence. Use ambiguous when evidence proves multiple
+valid values require a user choice.
 Each fact is {"text":"...","evidence_refs":["ev-..."]}.
 Also return diagnosis as
 {"status":"not_applicable|incomplete|symptom_confirmed|cause_confirmed|no_failure_confirmed",
@@ -50,13 +57,21 @@ class EvidenceSynthesizer:
                 "probe": item.request.probe,
                 "args": item.request.args,
                 "purpose": item.request.purpose,
+                "required_facts": list(item.request.required_facts),
+                "freshness": item.request.freshness,
+                "gap_id": item.request.need_key,
+                "affected_steps": list(item.request.affected_steps),
                 "status": item.status,
                 "output": item.output[:7000],
             }
             for item in bundle.records
         ]
         messages = [
-            {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": SYNTHESIS_SYSTEM_PROMPT
+                + "\n\n" + klonet_domain_context("synthesis"),
+            },
             {
                 "role": "user",
                 "content": "Goal:\n%s\n\nEvidence:\n%s\n\nBudget exhausted: %s"
@@ -68,6 +83,7 @@ class EvidenceSynthesizer:
             },
         ]
         for attempt in range(2):
+            content = ""
             try:
                 response = self.llm.complete(
                     messages=messages,
@@ -76,13 +92,18 @@ class EvidenceSynthesizer:
                     temperature=0,
                     extra_body={"thinking": {"type": "disabled"}},
                 )
+            except Exception:
+                # No model response means there is no JSON contract to repair.
+                # The deterministic synthesis fallback is authoritative here.
+                break
+            try:
                 content = response.choices[0].message.content or ""
                 conclusion = self._conclusion(parse_json_object(content))
                 conclusion.validate_against(bundle)
                 return self._with_deterministic_claims(goal, bundle, conclusion)
             except Exception as exc:
                 if attempt == 0:
-                    messages.append({"role": "assistant", "content": content if 'content' in locals() else ""})
+                    messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {
                             "role": "user",
@@ -208,6 +229,24 @@ class EvidenceSynthesizer:
             ]
 
         missing = data.get("missing_decisions")
+        assessments = data.get("gap_assessments")
+        assessments = assessments if isinstance(assessments, list) else []
+        resolved_gaps = {
+            str(item.get("gap_id")): [
+                str(ref) for ref in item.get("evidence_refs") or []
+            ]
+            for item in assessments
+            if isinstance(item, dict)
+            and str(item.get("status") or "") == "resolved"
+            and str(item.get("gap_id") or "").startswith("gap-")
+        }
+        unresolved_gaps = [
+            str(item.get("gap_id"))
+            for item in assessments
+            if isinstance(item, dict)
+            and str(item.get("status") or "") in {"unresolved", "ambiguous"}
+            and str(item.get("gap_id") or "").startswith("gap-")
+        ]
         raw_diagnosis = data.get("diagnosis")
         raw_diagnosis = raw_diagnosis if isinstance(raw_diagnosis, dict) else {}
         return EvidenceConclusion(
@@ -225,6 +264,8 @@ class EvidenceSynthesizer:
                     str(ref) for ref in raw_diagnosis.get("evidence_refs", [])
                 ] if isinstance(raw_diagnosis.get("evidence_refs"), list) else [],
             ),
+            resolved_gaps=resolved_gaps,
+            unresolved_gaps=unresolved_gaps,
         )
 
     @staticmethod
@@ -250,4 +291,8 @@ class EvidenceSynthesizer:
             confirmed_facts=facts,
             uncertainties=uncertainties,
             missing_decisions=[bundle.blocked_reason] if bundle.blocked_reason else [],
+            unresolved_gaps=list(dict.fromkeys(
+                item.request.need_key for item in bundle.records
+                if item.request.gap_id and item.status != "available"
+            )),
         )

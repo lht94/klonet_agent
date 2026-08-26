@@ -109,6 +109,29 @@ def test_verifier_goal_requests_registered_evidence_for_discoverable_gap():
     assert outcome.user_question == ""
 
 
+def test_verifier_transport_timeout_is_not_retried_as_contract_repair():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    class TimeoutLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, **kwargs):
+            self.calls += 1
+            raise TimeoutError("provider timed out")
+
+    bundle, conclusion = _diagnostic_goal_state()
+    llm = TimeoutLLM()
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion, goal_kind="causal_diagnosis",
+    )
+
+    assert llm.calls == 1
+    assert outcome.status == "blocked"
+    assert "model request failed" in outcome.reason
+
+
 def test_verifier_goal_requires_causal_evidence_before_achieved():
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
@@ -132,6 +155,61 @@ def test_verifier_goal_requires_causal_evidence_before_achieved():
 
     assert outcome.status == "need_evidence"
     assert len(llm.calls) == 2
+
+
+@pytest.mark.parametrize("residual", ["uncertainty", "missing_decision"])
+def test_goal_contract_does_not_override_noncausal_verifier_completion(residual):
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceClaim, EvidenceConclusion,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, _ = _diagnostic_goal_state()
+    evidence_id = bundle.records[0].evidence_id
+    conclusion = EvidenceConclusion(
+        confirmed_facts=[EvidenceClaim("当前平台清单已经确认", [evidence_id])],
+        uncertainties=(
+            [EvidenceClaim("某异常实例的历史启动时间未知", [evidence_id])]
+            if residual == "uncertainty" else []
+        ),
+        missing_decisions=(
+            ["是否继续修复异常实例"]
+            if residual == "missing_decision" else []
+        ),
+    )
+    llm = FakeLLM([
+        json.dumps({"status": "achieved", "reason": "平台清单已经完整回答"}),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        "列出当前运行的平台", bundle, conclusion, goal_kind="health_check",
+    )
+
+    assert outcome.status == "achieved"
+    assert len(llm.calls) == 1
+
+
+def test_noncausal_verifier_can_still_request_evidence_for_a_blocking_gap():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    llm = FakeLLM([json.dumps({
+        "status": "need_evidence",
+        "reason": "仍缺少完成清单所需的状态事实",
+        "evidence_requests": [{
+            "probe": "running_platforms",
+            "args": {},
+            "purpose": "补齐全部实例的运行状态",
+        }],
+    }, ensure_ascii=False)])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        "列出当前运行的平台", bundle, conclusion, goal_kind="health_check",
+    )
+
+    assert outcome.status == "need_evidence"
+    assert outcome.evidence_requests[0].probe == "running_platforms"
+    assert len(llm.calls) == 1
 
 
 def test_verifier_does_not_treat_unknown_root_cause_text_as_causal_evidence():
@@ -287,6 +365,259 @@ def test_verifier_goal_does_not_repeat_attempted_evidence_request():
 
     assert [item.probe for item in outcome.evidence_requests] == ["ops_file"]
     assert len(llm.calls) == 2
+
+
+def test_verifier_exhausted_contract_never_exposes_raw_value_error():
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    repeated = ProbeRequest(
+        "logs", {"path": "/srv/app/logs/master.log"}, "读取底层异常",
+    )
+    response = json.dumps({
+        "status": "need_evidence",
+        "evidence_requests": [{
+            "probe": repeated.probe,
+            "args": repeated.args,
+            "purpose": repeated.purpose,
+        }],
+    }, ensure_ascii=False)
+
+    llm = FakeLLM([response, response])
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal,
+        bundle,
+        conclusion,
+        attempted_keys={repeated.cache_key},
+    )
+
+    assert outcome.status == "blocked"
+    assert "ValueError" not in outcome.reason
+    assert "有限次数校正" in outcome.reason
+    assert "no new evidence requests" in outcome.reason
+    assert len(llm.calls) == 2
+
+
+def test_verifier_contract_repair_receives_exact_duplicate_request_error():
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    repeated = ProbeRequest(
+        "process_detail", {"pid": 1234}, "核验运行身份",
+    )
+    llm = FakeLLM([
+        json.dumps({
+            "status": "need_evidence",
+            "evidence_requests": [{
+                "probe": repeated.probe,
+                "args": repeated.args,
+                "purpose": repeated.purpose,
+            }],
+        }, ensure_ascii=False),
+        json.dumps({
+            "status": "blocked",
+            "reason": "没有尚未尝试且能安全取得的新事实",
+        }, ensure_ascii=False),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal,
+        bundle,
+        conclusion,
+        attempted_keys={repeated.need_key},
+    )
+
+    assert outcome.status == "blocked"
+    repair = llm.calls[1]["messages"][-1]["content"]
+    assert "need_evidence contains no new evidence requests" in repair
+    assert "already_attempted=" in repair
+    assert "ValueError" in repair
+
+
+def test_post_execution_duplicate_evidence_exhaustion_falls_to_replan():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle = EvidenceBundle(goal="把目标 worker 收编到 Screen")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("plan_execution", {}, "执行结果"),
+        "\n".join([
+            "plan_id=priv-1 status=paused",
+            "step=stop-worker status=paused attempts=1 return_code=2 "
+            "timed_out=False environment_changed=false "
+            "observation=component_pid_state_drift",
+        ]),
+    ))
+    repeated = ProbeRequest("process_detail", {"pid": 1234}, "核验进程")
+    response = json.dumps({
+        "status": "need_evidence",
+        "evidence_requests": [{
+            "probe": repeated.probe,
+            "args": repeated.args,
+            "purpose": repeated.purpose,
+        }],
+    }, ensure_ascii=False)
+    llm = FakeLLM([response, response])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal,
+        bundle,
+        EvidenceConclusion(),
+        attempted_keys={repeated.need_key},
+        phase="post_execution",
+        goal_kind="execution",
+    )
+
+    assert outcome.status == "need_replan"
+    assert outcome.failed_criteria
+
+
+def test_post_execution_explicit_step_failure_routes_to_replan_before_probe_loop():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle = EvidenceBundle(goal="把全部角色收编到 Screen")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("plan_execution", {}, "执行结果"),
+        "\n".join([
+            "plan_id=priv-2 status=paused",
+            "step=prepare-files status=paused attempts=1 return_code=1 "
+            "timed_out=False environment_changed=true "
+            "observation=permission denied execution_output=permission denied",
+        ]),
+    ))
+    llm = FakeLLM([json.dumps({
+        "status": "need_evidence",
+        "reason": "继续检查路径权限",
+        "evidence_requests": [{
+            "probe": "path_permissions",
+            "args": {"path": "/srv/instance"},
+            "purpose": "核验写权限",
+        }],
+    }, ensure_ascii=False)])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal,
+        bundle,
+        EvidenceConclusion(),
+        phase="post_execution",
+        goal_kind="execution",
+    )
+
+    assert outcome.status == "need_replan"
+    assert llm.calls == []
+
+
+def test_post_execution_semantic_failure_routes_to_replan_without_scope_question():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle = EvidenceBundle(goal="把全部平台的全部角色收编到 Screen")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("plan_execution", {}, "执行结果"),
+        "\n".join([
+            "plan_id=priv-3 status=paused",
+            "plan_environment_changed=true",
+            "change=restart-alpha status=paused "
+            "observation=worker backend health returned 502",
+            "step=restart-worker status=completed attempts=1 return_code=0 "
+            "timed_out=False environment_changed=true observation=passed",
+            "change=restart-beta status=pending observation=",
+        ]),
+    ))
+    llm = FakeLLM([json.dumps({
+        "status": "needs_user_decision",
+        "user_question": "beta 是否也属于全部平台范围？",
+    }, ensure_ascii=False)])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, EvidenceConclusion(),
+        phase="post_execution", goal_kind="execution",
+    )
+
+    assert outcome.status == "need_replan"
+    assert "语义步骤验收失败" in outcome.reason
+    assert llm.calls == []
+
+
+def test_readonly_duplicate_evidence_exhaustion_does_not_enter_replan():
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle, conclusion = _diagnostic_goal_state()
+    repeated = ProbeRequest("process_detail", {"pid": 1234}, "核验进程")
+    response = json.dumps({
+        "status": "need_evidence",
+        "evidence_requests": [{
+            "probe": repeated.probe,
+            "args": repeated.args,
+            "purpose": repeated.purpose,
+        }],
+    }, ensure_ascii=False)
+    llm = FakeLLM([response, response])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal,
+        bundle,
+        conclusion,
+        attempted_keys={repeated.need_key},
+        phase="readonly",
+        goal_kind="causal_diagnosis",
+    )
+
+    assert outcome.status == "blocked"
+
+
+def test_goal_fallback_may_complete_readonly_but_never_post_execution():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle = EvidenceBundle(goal="检查平台状态")
+    conclusion = EvidenceConclusion()
+    verifier = PrivilegedVerifierAgent(None)
+
+    readonly = verifier.verify_goal(
+        bundle.goal, bundle, conclusion, phase="readonly",
+        goal_kind="health_check",
+    )
+    post_execution = verifier.verify_goal(
+        "把平台收编到 Screen", bundle, conclusion,
+        phase="post_execution", goal_kind="execution",
+    )
+
+    assert readonly.status == "achieved"
+    assert post_execution.status == "blocked"
+    assert "不能推断计划已经完成" in post_execution.reason
+
+
+def test_step_verifier_preserves_long_tail_evidence_need_for_discovery():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    requests = PrivilegedVerifierAgent._probe_requests([{
+        "probe": "proc_environment_identity",
+        "args": {"pid": 1234},
+        "purpose": "resolve interpreter environment",
+        "required_facts": ["python executable", "run_as uid"],
+        "freshness": "refresh",
+    }])
+
+    assert requests == [{
+        "probe": "proc_environment_identity",
+        "args": {"pid": 1234},
+        "purpose": "resolve interpreter environment",
+        "required_facts": ["python executable", "run_as uid"],
+        "freshness": "refresh",
+    }]
 
 
 def test_verifier_goal_decides_replan_after_supported_execution_failure():
@@ -556,7 +887,7 @@ def test_verifier_marks_timeout_blocked_and_does_not_reexecute():
     assert decision.next_action == "inspect current state; do not auto-reexecute"
 
 
-def test_goal_completion_is_issued_only_for_fully_verified_execution():
+def test_plan_execution_passes_only_for_fully_verified_steps():
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
     step = SimpleNamespace(
@@ -571,14 +902,14 @@ def test_goal_completion_is_issued_only_for_fully_verified_execution():
         implementation_plan=SimpleNamespace(steps=[step]),
     )
 
-    outcome = PrivilegedVerifierAgent.verify_execution_outcome(
+    outcome = PrivilegedVerifierAgent.verify_plan_execution(
         SimpleNamespace(steps=[change]),
     )
 
-    assert outcome.status == "achieved"
+    assert outcome.status == "passed"
 
 
-def test_goal_completion_rejects_incomplete_or_failed_execution_evidence():
+def test_plan_execution_rejects_incomplete_or_failed_step_evidence():
     from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
 
     step = SimpleNamespace(
@@ -593,9 +924,9 @@ def test_goal_completion_rejects_incomplete_or_failed_execution_evidence():
         implementation_plan=SimpleNamespace(steps=[step]),
     )
 
-    outcome = PrivilegedVerifierAgent.verify_execution_outcome(
+    outcome = PrivilegedVerifierAgent.verify_plan_execution(
         SimpleNamespace(steps=[change]),
     )
 
-    assert outcome.status == "need_replan"
+    assert outcome.status == "failed"
     assert set(outcome.failed_criteria) == {"recover-runtime", "restart-worker"}

@@ -235,6 +235,8 @@ def test_ops_privilege_prompt_describes_adaptive_pev_boundary():
     assert "轻量模型 Intent Classifier" in OPS_PRIVILEGE_PROMPT
     assert "普通问答、只读操作、变更操作或不确定" in OPS_PRIVILEGE_PROMPT
     assert "不确定时必须澄清且不得执行" in OPS_PRIVILEGE_PROMPT
+    assert "Ops Answerer 只负责普通问答，不是运维状态权威" in OPS_PRIVILEGE_PROMPT
+    assert "不得输出“修正后的计划”" in OPS_PRIVILEGE_PROMPT
 
 
 def test_ops_privilege_profile_declares_supervisor_single_entry_workflow():

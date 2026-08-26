@@ -99,6 +99,31 @@ class PrivilegedRiskPolicy:
             return None, "empty command is not read-only"
         return argv, reason
 
+    def readonly_script_argvs(
+        self,
+        script: str,
+    ) -> tuple[list[list[str]] | None, str]:
+        """Validate a bounded Shell body as only deterministic read commands.
+
+        Shell artifacts are normalized with ``set -euo pipefail``.  Every
+        remaining executable line must independently pass the same
+        ``readonly_argv`` boundary used by Discovery; no second, weaker notion
+        of read-only Shell is introduced here.
+        """
+
+        commands = []
+        for raw_line in str(script or "").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line == "set -euo pipefail":
+                continue
+            argv, reason = self.readonly_argv(line)
+            if argv is None:
+                return None, "readonly shell line rejected: %s" % reason
+            commands.append(argv)
+        if not commands:
+            return None, "readonly shell has no executable inspection command"
+        return commands, "all shell lines are deterministically read-only"
+
     def evaluate(self, goal: str, steps: list[PrivilegedStep]) -> RiskDecision:
         del goal
         highest = 0

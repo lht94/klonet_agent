@@ -152,12 +152,14 @@ def build_live_runtime(*, llm, root, executor):
     synthesis = EvidenceSynthesizer(llm)
     verifier = PrivilegedVerifierAgent(
         llm,
-        probe_runner=_run_registered_probes,
+        probe_runner=discovery.run_ad_hoc_requests,
     )
     workflow = MutationWorkflow(
         planner=ChangePlannerAgent(llm),
         binder=ChangeBinder(
-            PrivilegedExecutionAgent(llm, probe_runner=_run_registered_probes)
+            PrivilegedExecutionAgent(
+                llm, probe_runner=discovery.run_ad_hoc_requests,
+            )
         ),
         store=ChangePlanStore(
             root,

@@ -84,6 +84,36 @@ class RecordingToolExecutor:
         return "unexpected tool result"
 
 
+def test_ops_privilege_agents_share_the_same_bounded_workflow_client(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.agents.profile import get_profile
+    from klonet_agent import orchestrator as module
+    from klonet_agent.session import AgentSession
+
+    monkeypatch.setattr(module, "MEMORY_DIR", tmp_path)
+    agent = module.AgentOrchestrator(
+        profile=get_profile("ops-privilege"),
+        session=AgentSession(
+            mode="ops-privilege", user_id="timeout-test", project_id="wiring",
+        ),
+    )
+    coordinator = agent.privileged_supervisor
+    workflow = coordinator.mutation_workflow
+    clients = [
+        coordinator.discovery.llm,
+        coordinator.synthesis.llm,
+        coordinator.verifier.llm,
+        coordinator.response.llm,
+        workflow.planner.llm,
+        workflow.binder.capability_binder.llm,
+    ]
+
+    assert all(client is clients[0] for client in clients)
+    assert clients[0]._client_options == {"timeout": 30.0, "max_retries": 0}
+    assert coordinator.classifier.llm._client_options["timeout"] > 0
+    assert coordinator.classifier.llm._client_options["max_retries"] == 0
+
 class BatchSearchLLM:
     """模拟模型在同一轮批量发起多次知识检索。"""
 
@@ -345,6 +375,32 @@ class PlatformStartIntentAnalyzer:
                     "confidence": 0.95,
                 }
             ),
+            token_usage=0,
+        )
+
+
+class OpsIntentAnalyzer:
+    """Return one structured read-only Ops intent without keyword routing."""
+
+    def __init__(self, *, target, symptom="", task_type="troubleshooting"):
+        self.target = target
+        self.symptom = symptom
+        self.task_type = task_type
+
+    def analyze(self, user_input, *, recent_history=None):
+        from klonet_agent.knowledge.intent import QueryIntent
+        from klonet_agent.knowledge.intent_analyzer import IntentAnalysis
+
+        return IntentAnalysis(
+            intent=QueryIntent.from_mapping({
+                "scope": "klonet",
+                "task_type": self.task_type,
+                "operation": "unknown",
+                "target": self.target,
+                "symptom": self.symptom,
+                "requires_environment_diagnosis": True,
+                "confidence": 0.95,
+            }),
             token_usage=0,
         )
 
@@ -1094,6 +1150,7 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
             tool_executor=executor,
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=OpsIntentAnalyzer(target="platform_runtime"),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat("帮我看看有哪些平台", history, 0)
@@ -1109,6 +1166,30 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
     assert "工具结果摘要" not in output
     assert "下一步：" not in output
     assert "思考摘要" not in output
+
+
+def test_privileged_conversation_context_keeps_earlier_plan_revision():
+    """Plan management must see prior corrections beyond a tiny recent window."""
+
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    history = [
+        {"role": "user", "content": "修订计划：worker 必须继续使用 klonet-py38 环境"},
+        {"role": "assistant", "content": "已讨论该修订，但尚未生成新的正式计划。"},
+    ]
+    for index in range(8):
+        history.extend(
+            [
+                {"role": "user", "content": f"补充证据 {index}"},
+                {"role": "assistant", "content": f"已记录证据 {index}"},
+            ]
+        )
+
+    context = AgentOrchestrator._privileged_conversation_context(history)
+
+    assert "worker 必须继续使用 klonet-py38 环境" in context
+    assert "尚未生成新的正式计划" in context
+    assert "补充证据 7" in context
 
 
 def test_ops_progress_uses_route_summary_not_generic_task_type(capsys):
@@ -1142,6 +1223,9 @@ def test_ops_progress_uses_route_summary_not_generic_task_type(capsys):
             tool_executor=executor,
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=OpsIntentAnalyzer(
+                target="web_terminal", symptom="port_conflict",
+            ),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat(user_input, history, 0)
@@ -1182,6 +1266,7 @@ def test_ops_scope_message_injects_tool_routing_plan():
     from klonet_agent.knowledge import route_query
     from klonet_agent.ops.routing import route_ops_request
     from klonet_agent.orchestrator import AgentOrchestrator
+    from types import SimpleNamespace
 
     user_input = (
         "我在 `/home/adminis/lht/102_project` 里再次启动 `web_terminal_main.py`，"
@@ -1192,7 +1277,14 @@ def test_ops_scope_message_injects_tool_routing_plan():
     orchestrator._query_route = route_query(user_input)
     orchestrator._turn_intent = None
     orchestrator._intent_decision = None
-    orchestrator._ops_route = route_ops_request(user_input)
+    orchestrator._ops_route = route_ops_request(
+        user_input,
+        intent=SimpleNamespace(
+            operation="unknown", task_type="troubleshooting",
+            target="web_terminal", symptom="port_conflict",
+            requires_environment_diagnosis=True,
+        ),
+    )
 
     content = orchestrator._build_turn_scope_message(user_input)["content"]
 
@@ -1596,6 +1688,7 @@ def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):
             tool_executor=StaticOpsExecutor(),
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            intent_analyzer=PlatformStartIntentAnalyzer(),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat("我怎么启动 Klonet", history, 0)

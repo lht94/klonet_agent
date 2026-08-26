@@ -88,6 +88,7 @@ TOOLS = [
                             "platform_start",
                             "platform_stop",
                             "platform_restart",
+                            "platform_destroy",
                             "topology_deploy",
                             "acceptance_check",
                         ],

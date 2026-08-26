@@ -24,6 +24,7 @@ from klonet_agent.ops.privileged.shell_artifact import (
     artifact_is_expired,
     build_shell_environment,
 )
+from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
 from klonet_agent.tools.environment import redact_sensitive_text
 
 
@@ -151,6 +152,19 @@ class PrivilegedCommandExecutor:
                 finished_at=utc_now(),
                 environment_changed=False,
             )
+        readonly_shell = binding is not None and binding.risk == "readonly"
+        if readonly_shell:
+            _argvs, readonly_problem = PrivilegedRiskPolicy().readonly_script_argvs(
+                artifact.script
+            )
+            if _argvs is None:
+                return ExecutionEvidence(
+                    return_code=2,
+                    stderr=readonly_problem,
+                    started_at=started_at,
+                    finished_at=utc_now(),
+                    environment_changed=False,
+                )
         current_fingerprint = self.environment_fingerprint_provider()
         if (
             artifact.environment_fingerprint
@@ -208,12 +222,16 @@ class PrivilegedCommandExecutor:
                 "command": script_display,
                 "cwd": artifact.cwd,
                 "execution": "shell_artifact",
-                "changes_state": True,
+                "changes_state": not readonly_shell,
             })
             if self.on_start:
                 self.on_start(
-                    "实际受控脚本（cwd=%s）：\n%s"
-                    % (artifact.cwd, script_display)
+                    "%s（cwd=%s）：\n%s"
+                    % (
+                        "实际受控只读脚本" if readonly_shell else "实际受控脚本",
+                        artifact.cwd,
+                        script_display,
+                    )
                 )
             evidence = self._execute(
                 step,
@@ -230,7 +248,7 @@ class PrivilegedCommandExecutor:
             else "failed"
         )
         artifact.executed_at = utc_now()
-        evidence.environment_changed = True
+        evidence.environment_changed = not readonly_shell
         evidence.commands = list(self._command_events)
         return evidence
 

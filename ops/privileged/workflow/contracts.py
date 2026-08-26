@@ -21,7 +21,7 @@ from klonet_agent.ops.privileged.contracts import (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def _canonical_json(value: Any) -> str:
@@ -39,17 +39,35 @@ class ProbeRequest:
     probe: str
     args: dict[str, Any]
     purpose: str
+    required_facts: tuple[str, ...] = ()
+    freshness: str = "cached"
+    gap_id: str = ""
+    affected_steps: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.probe or "").strip():
             raise ValueError("probe is required")
         if not isinstance(self.args, dict):
             raise ValueError("probe args must be an object")
+        if self.freshness not in {"cached", "refresh"}:
+            raise ValueError("probe freshness must be cached or refresh")
+        if any(not str(item or "").strip() for item in self.required_facts):
+            raise ValueError("required_facts cannot contain empty values")
+        if self.gap_id and not re.fullmatch(r"gap-[-A-Za-z0-9_.:]{3,160}", self.gap_id):
+            raise ValueError("invalid evidence gap id")
+        if any(not str(item or "").strip() for item in self.affected_steps):
+            raise ValueError("affected_steps cannot contain empty values")
 
     @property
     def cache_key(self) -> str:
         payload = {"probe": self.probe.strip(), "args": self.args}
         return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+    @property
+    def need_key(self) -> str:
+        """Identify one stable semantic gap independently of prompt wording."""
+
+        return self.gap_id or "gap-" + self.cache_key[:24]
 
 
 def normalize_probe_request(
@@ -141,6 +159,16 @@ class EvidenceBundle:
         )
         if existing is not None:
             return existing
+        self.records.append(record)
+        return record
+
+    def refresh(self, record: EvidenceRecord) -> EvidenceRecord:
+        """Replace one volatile observation without creating a parallel fact path."""
+
+        for index, existing in enumerate(self.records):
+            if existing.request.cache_key == record.request.cache_key:
+                self.records[index] = record
+                return record
         self.records.append(record)
         return record
 
@@ -259,6 +287,8 @@ class EvidenceConclusion:
     uncertainties: list[EvidenceClaim] = field(default_factory=list)
     missing_decisions: list[str] = field(default_factory=list)
     diagnosis: DiagnosisAssessment = field(default_factory=DiagnosisAssessment)
+    resolved_gaps: dict[str, list[str]] = field(default_factory=dict)
+    unresolved_gaps: list[str] = field(default_factory=list)
 
     def validate_against(self, bundle: EvidenceBundle) -> None:
         known = bundle.evidence_ids
@@ -276,6 +306,15 @@ class EvidenceConclusion:
                 "unknown diagnosis evidence reference: %s"
                 % ", ".join(unknown_diagnosis_refs)
             )
+        for gap_id, refs in self.resolved_gaps.items():
+            if not str(gap_id).startswith("gap-"):
+                raise ValueError("invalid resolved evidence gap id")
+            unknown = [ref for ref in refs if ref not in known]
+            if unknown:
+                raise ValueError(
+                    "unknown resolved gap evidence reference: %s"
+                    % ", ".join(unknown)
+                )
 
 
 GOAL_OUTCOME_STATUSES = {
@@ -301,6 +340,7 @@ class GoalOutcome:
     plan: ChangePlan | None = None
     candidate_plan: ChangePlan | None = None
     missing_decisions: list[str] = field(default_factory=list)
+    replan_context: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.status not in GOAL_OUTCOME_STATUSES:
@@ -331,7 +371,7 @@ class DiscoveryBudget:
         unique: list[ProbeRequest] = []
         round_keys: set[str] = set()
         for request in requests:
-            key = request.cache_key
+            key = request.need_key
             if key in self.seen_keys or key in round_keys:
                 continue
             round_keys.add(key)
@@ -451,8 +491,7 @@ class RecoveryOption:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{1,63}", self.option_id):
             raise ValueError("invalid recovery option id")
         if self.action not in {
-            "component_restart", "collect_more_evidence", "retry_planning",
-            "provide_direction", "cancel",
+            "continue_current_goal", "provide_direction", "cancel",
         }:
             raise ValueError("invalid recovery option action")
         if not self.label.strip() or not self.description.strip():
@@ -496,9 +535,13 @@ class FailureRecord:
     automatic_recovery_exhausted: bool = True
     options: list[RecoveryOption] = field(default_factory=list)
     selected_option_id: str = ""
+    user_direction: str = ""
     created_at: str = field(default_factory=_utc_now)
     goal: str = ""
+    goal_kind: str = ""
     plan_id: str = ""
+    evidence_requests: list[ProbeRequest] = field(default_factory=list)
+    missing_decisions: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"failure-[A-Za-z0-9_-]{1,64}", self.failure_id):
@@ -510,6 +553,8 @@ class FailureRecord:
             raise ValueError("invalid failure stage")
         if self.environment_changed not in {"true", "false", "unknown"}:
             raise ValueError("invalid environment_changed state")
+        if self.goal_kind not in {"execution", "health_check", "causal_diagnosis"}:
+            raise ValueError("invalid failure goal kind")
         if not self.summary.strip() or not self.technical_reason.strip():
             raise ValueError("failure outcome requires reasons")
         if not self.options:
@@ -531,9 +576,24 @@ class FailureRecord:
             "automatic_recovery_exhausted": self.automatic_recovery_exhausted,
             "options": [item.to_dict() for item in self.options],
             "selected_option_id": self.selected_option_id,
+            "user_direction": self.user_direction,
             "created_at": self.created_at,
             "goal": self.goal,
+            "goal_kind": self.goal_kind,
             "plan_id": self.plan_id,
+            "evidence_requests": [
+                {
+                    "probe": item.probe,
+                    "args": item.args,
+                    "purpose": item.purpose,
+                    "required_facts": list(item.required_facts),
+                    "freshness": item.freshness,
+                    "gap_id": item.gap_id,
+                    "affected_steps": list(item.affected_steps),
+                }
+                for item in self.evidence_requests
+            ],
+            "missing_decisions": list(self.missing_decisions),
         }
 
     @classmethod
@@ -562,9 +622,31 @@ class FailureRecord:
                 if isinstance(item, dict)
             ],
             selected_option_id=str(data.get("selected_option_id") or ""),
+            user_direction=str(data.get("user_direction") or ""),
             created_at=str(data.get("created_at") or _utc_now()),
             goal=str(data.get("goal") or ""),
+            goal_kind=str(data.get("goal_kind") or ""),
             plan_id=str(data.get("plan_id") or ""),
+            evidence_requests=[
+                ProbeRequest(
+                    str(item.get("probe") or ""),
+                    dict(item.get("args") or {}),
+                    str(item.get("purpose") or "补齐失败恢复所需事实"),
+                    tuple(
+                        str(value) for value in item.get("required_facts") or []
+                        if str(value).strip()
+                    ),
+                    str(item.get("freshness") or "cached"),
+                    str(item.get("gap_id") or ""),
+                    tuple(str(value) for value in item.get("affected_steps") or []),
+                )
+                for item in data.get("evidence_requests") or []
+                if isinstance(item, dict)
+            ],
+            missing_decisions=[
+                str(item) for item in data.get("missing_decisions") or []
+                if str(item).strip()
+            ],
         )
 
 
@@ -594,6 +676,44 @@ class ChangePlan:
             raise ValueError("change plan requires steps")
         if self.status not in CHANGE_PLAN_STATUSES:
             raise ValueError("invalid change plan status: %s" % self.status)
+        # The semantic ChangePlan is the sole owner of its resource manifest.
+        # Normalize byte-for-byte equivalent declarations here so persisted
+        # drafts and every caller observe the same invariant before Binding.
+        canonical: list[PlanResource] = []
+        by_name: dict[str, PlanResource] = {}
+        identity_fields = (
+            "kind", "status", "role", "value", "source", "reason",
+            "resolve_before",
+        )
+        for resource in self.resources:
+            existing = by_name.get(resource.name)
+            if existing is None:
+                resource.consumers = list(dict.fromkeys(resource.consumers))
+                by_name[resource.name] = resource
+                canonical.append(resource)
+                continue
+            if any(
+                getattr(existing, field) != getattr(resource, field)
+                for field in identity_fields
+            ):
+                raise ValueError(
+                    "conflicting duplicate plan resource name: %s"
+                    % resource.name
+                )
+            existing.consumers = list(dict.fromkeys([
+                *existing.consumers,
+                *resource.consumers,
+            ]))
+        self.resources = canonical
+        owners: dict[str, str] = {}
+        for resource in self.resources:
+            for consumer in resource.consumers:
+                previous = owners.setdefault(consumer, resource.name)
+                if previous != resource.name:
+                    raise ValueError(
+                        "plan resource consumer has multiple owners: %s"
+                        % consumer
+                    )
 
     @classmethod
     def new(
@@ -629,6 +749,35 @@ class ChangePlan:
     @property
     def is_authorized(self) -> bool:
         return bool(self.authorized_hash) and self.authorized_hash == self.content_hash
+
+    @property
+    def completion_gaps(self) -> list[str]:
+        """Return the incomplete nodes in the one authoritative plan tree."""
+
+        gaps: list[str] = []
+        for change in self.steps:
+            if change.status == "skipped":
+                continue
+            if change.status != "completed":
+                gaps.append("change:%s=%s" % (change.step_id, change.status))
+            implementation = change.implementation_plan
+            if implementation is None:
+                continue
+            if implementation.status != "completed":
+                gaps.append(
+                    "implementation:%s=%s"
+                    % (implementation.implementation_id, implementation.status)
+                )
+            for step in implementation.steps:
+                if step.status not in {"completed", "skipped"}:
+                    gaps.append("step:%s=%s" % (step.step_id, step.status))
+        return gaps
+
+    @property
+    def execution_is_complete(self) -> bool:
+        """Whether every non-skipped node in the approved plan is complete."""
+
+        return not self.completion_gaps
 
     def authorize(self) -> None:
         self.authorized_hash = self.content_hash

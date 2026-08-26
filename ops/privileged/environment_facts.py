@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shlex
 import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,6 +25,55 @@ REQUIRED_ENTRY_FILES = (
     "worker_gun.py",
     "worker_main.py",
 )
+
+
+def process_belongs_to_project_root(
+    *,
+    cwd: str,
+    cmdline: str,
+    project_root: str | Path,
+) -> bool:
+    """Return whether deterministic process facts bind it to one project root.
+
+    Klonet processes are normally started with the instance root as their
+    working directory.  Older/manual launches may instead keep an unrelated
+    cwd while passing an absolute, instance-owned config or entry path (for
+    example ``gunicorn -c /instance/mains/worker_gun.py``).  Both are valid
+    project identity evidence; a mere substring match is not.
+    """
+
+    try:
+        root = Path(project_root).resolve(strict=False)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+    if not root.is_absolute():
+        return False
+
+    def under_root(raw: str) -> bool:
+        if not raw:
+            return False
+        try:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                return False
+            candidate.resolve(strict=False).relative_to(root)
+            return True
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    if under_root(str(cwd or "")):
+        return True
+    try:
+        tokens = shlex.split(str(cmdline or ""), posix=True)
+    except ValueError:
+        return False
+    for token in tokens:
+        # Support ordinary argv as well as deterministic --config=/abs/path
+        # style arguments without accepting an arbitrary substring.
+        candidate = token.partition("=")[2] if "=" in token else token
+        if under_root(candidate):
+            return True
+    return False
 
 
 @dataclass(frozen=True)

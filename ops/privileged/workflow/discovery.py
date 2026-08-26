@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import re
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
+from klonet_agent.ops.privileged.context import klonet_domain_context
 from klonet_agent.ops.privileged.workflow.contracts import (
     DiscoveryBudget,
     DiscoveryBudgetExceeded,
@@ -23,11 +25,14 @@ from klonet_agent.ops.privileged.workflow.runtime_inventory import (
 
 DISCOVERY_SYSTEM_PROMPT = """
 You are the Klonet Ops-Privilege Discovery Agent.
-You may request only registered read-only probes. Never propose actions, shell,
-configuration changes, plans, or user confirmation.
+Prefer registered read-only probes. For a long-tail fact that the catalog does
+not cover, you may name the intended read-only capability and precisely state
+required_facts; the deterministic Discovery boundary will bind it to a safe
+read-only command. Never propose mutations, plans, or user confirmation.
 
 Return one JSON object with status `need_evidence`, `ready`, or `blocked`.
-For need_evidence return at most four probe_requests with probe, args, purpose.
+For need_evidence return at most four probe_requests with probe, args, purpose,
+required_facts, and optional freshness (`cached` or `refresh`).
 Request only facts materially needed for the current goal. Do not repeat an
 identical probe and arguments after evidence was returned.
 
@@ -42,6 +47,21 @@ Do not request screen_session or broad process probes to rediscover that source.
 
 Registered probes:
 %s
+""".strip()
+
+
+READONLY_FALLBACK_SYSTEM_PROMPT = """
+You bind one unresolved evidence request to a deterministic read-only command.
+The command is only a candidate: policy will parse it into argv and reject shell
+evaluation or mutations. Never use pipes, redirects, command substitution,
+background execution, sudo password input, network access, or write operations.
+
+Return exactly one JSON object:
+- {"status":"satisfied","reason":"..."} when the supplied registered-probe
+  output already contains every required fact;
+- {"status":"command","command":"one non-interactive read-only command",
+   "reason":"..."} when a supplemental command can obtain the missing facts;
+- {"status":"blocked","reason":"..."} only when no safe command can do so.
 """.strip()
 
 
@@ -83,6 +103,7 @@ class DiscoveryAgent:
         self.budget_factory = budget_factory
         self.on_progress = on_progress
         self.knowledge_search = knowledge_search
+        self._active_evidence_bundle: EvidenceBundle | None = None
 
     def collect_knowledge(self, goal: str, bundle: EvidenceBundle) -> None:
         """Collect one reusable, provenance-bearing Klonet knowledge record."""
@@ -139,50 +160,17 @@ class DiscoveryAgent:
     ) -> EvidenceBundle:
         """Collect a bounded Planner-requested evidence increment."""
 
-        known_keys = {item.request.cache_key for item in bundle.records}
-        fresh: list[ProbeRequest] = []
-        for request in requests:
-            if request.cache_key in known_keys:
-                continue
-            if DEFAULT_READONLY_PROBES.get(request.probe) is None:
-                bundle.add(
-                    EvidenceRecord.from_probe(
-                        request,
-                        "probe refused: probe_not_registered=%s" % request.probe,
-                        status="unavailable",
-                    )
-                )
-                known_keys.add(request.cache_key)
-                continue
-            fresh.append(request)
-            known_keys.add(request.cache_key)
-        if len(fresh) > 4:
+        bounded = list(requests[:4])
+        if len(requests) > 4:
             bundle.budget_exhausted = True
-            fresh = fresh[:4]
-        for request in fresh:
-            if self.on_progress is not None:
-                self.on_progress("正在收集只读证据：%s" % request.probe)
-            try:
-                output = (
-                    self.probe_runner(
-                        [{"probe": request.probe, "args": request.args, "purpose": request.purpose}]
-                    )
-                    if self.probe_runner is not None
-                    else "probe runner unavailable"
-                )
-                status = "available" if self.probe_runner is not None else "unavailable"
-            except Exception as exc:
-                output = "probe failed: %s" % type(exc).__name__
-                status = "unavailable"
-            record = bundle.add(
-                EvidenceRecord.from_probe(request, output, status=status)
-            )
-            self._add_derived_screen_source(bundle, record)
+        collected: list[EvidenceRecord] = []
+        for request in bounded:
+            collected.extend(self._collect_request(request, bundle))
         if derive_traceback_sources and any(
-            request.probe in {"logs", "process_logs"} for request in fresh
+            request.probe in {"logs", "process_logs"} for request in bounded
         ):
             self.collect_traceback_source_evidence(bundle)
-        if any(request.probe == "running_platforms" for request in fresh):
+        if any(request.probe == "running_platforms" for request in bounded):
             process_log_requests = _selected_master_process_log_requests(bundle)
             if process_log_requests:
                 self.collect_requests(process_log_requests, bundle)
@@ -194,6 +182,206 @@ class DiscoveryAgent:
                     derive_traceback_sources=False,
                 )
         return bundle
+
+    def run_ad_hoc_requests(self, values: list[dict[str, Any]]) -> str:
+        """Expose the same Discovery boundary to Binder and step Verifier."""
+
+        requests = self._requests(values)
+        bundle = self._active_evidence_bundle or EvidenceBundle(
+            goal="补齐实施或验证所需的只读事实"
+        )
+        self.collect_requests(requests, bundle)
+        return "\n\n".join(
+            "evidence_id=%s probe=%s status=%s required_facts=%s\n%s"
+            % (
+                record.evidence_id,
+                record.request.probe,
+                record.status,
+                ",".join(record.request.required_facts) or "none",
+                record.output[:7000],
+            )
+            for record in bundle.records
+        ) or "no read-only evidence was produced"
+
+    @contextmanager
+    def evidence_scope(self, bundle: EvidenceBundle):
+        """Make Binder/Verifier probes contribute to the workflow evidence."""
+
+        previous = self._active_evidence_bundle
+        self._active_evidence_bundle = bundle
+        try:
+            yield
+        finally:
+            self._active_evidence_bundle = previous
+
+    def _collect_request(
+        self,
+        request: ProbeRequest,
+        bundle: EvidenceBundle,
+    ) -> list[EvidenceRecord]:
+        existing = next(
+            (
+                item for item in bundle.records
+                if item.request.cache_key == request.cache_key
+            ),
+            None,
+        )
+        had_registered_evidence = existing is not None
+        registered = DEFAULT_READONLY_PROBES.get(request.probe) is not None
+        records: list[EvidenceRecord] = []
+        if registered and (existing is None or request.freshness == "refresh"):
+            if self.on_progress is not None:
+                self.on_progress("正在收集只读证据：%s" % request.probe)
+            try:
+                output = (
+                    self.probe_runner([{
+                        "probe": request.probe,
+                        "args": request.args,
+                        "purpose": request.purpose,
+                    }])
+                    if self.probe_runner is not None
+                    else "probe runner unavailable"
+                )
+                status = "available" if self.probe_runner is not None else "unavailable"
+            except Exception as exc:
+                output = "probe failed: %s" % type(exc).__name__
+                status = "unavailable"
+            record = EvidenceRecord.from_probe(request, output, status=status)
+            record = (
+                bundle.refresh(record)
+                if request.freshness == "refresh"
+                else bundle.add(record)
+            )
+            self._add_derived_screen_source(bundle, record)
+            records.append(record)
+            existing = record
+        elif existing is not None:
+            records.append(existing)
+
+        # ``required_facts`` describes the evidence contract; it is not proof
+        # that a registered probe failed to satisfy that contract.  A usable
+        # registered result returns to Planner/Verifier, which alone decides
+        # whether another fact is still missing.  Shell is only the capability
+        # fallback for an absent/unavailable implementation, or for the same
+        # fact explicitly requested again after registered evidence was seen.
+        if (
+            not registered
+            or (existing is not None and existing.status != "available")
+            or (had_registered_evidence and bool(request.required_facts))
+        ):
+            fallback = self._collect_readonly_fallback(
+                request,
+                bundle,
+                prior_record=existing,
+                registered=registered,
+            )
+            if fallback is not None:
+                records.append(fallback)
+        return records
+
+    def _collect_readonly_fallback(
+        self,
+        request: ProbeRequest,
+        bundle: EvidenceBundle,
+        *,
+        prior_record: EvidenceRecord | None,
+        registered: bool,
+    ) -> EvidenceRecord | None:
+        if self.on_progress is not None:
+            self.on_progress(
+                "注册 Probe %s%s，正在评估安全只读命令补证。"
+                % (
+                    request.probe,
+                    "未覆盖所需事实" if registered else "不存在",
+                )
+            )
+        prior = (
+            prior_record.output[:9000]
+            if prior_record is not None
+            else "No registered probe output is available."
+        )
+        payload = {
+            "requested_capability": request.probe,
+            "args": request.args,
+            "purpose": request.purpose,
+            "required_facts": list(request.required_facts),
+            "registered_probe_output": prior,
+        }
+        try:
+            data = parse_json_object(self._complete([
+                {
+                    "role": "system",
+                    "content": READONLY_FALLBACK_SYSTEM_PROMPT
+                    + "\n\n" + klonet_domain_context("discovery"),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                },
+            ]))
+            status = str(data.get("status") or "").strip().lower()
+            if status == "satisfied" and prior_record is not None:
+                return None
+            if status != "command":
+                raise ValueError(str(data.get("reason") or "no safe read-only command"))
+            command = str(data.get("command") or "").strip()
+            if not command:
+                raise ValueError("empty read-only command candidate")
+            fallback_request = ProbeRequest(
+                "readonly_command",
+                {
+                    "command": command,
+                    "source_probe": request.probe,
+                    "source_need_key": request.need_key,
+                },
+                "补齐未被注册 Probe 覆盖的事实：%s" % request.purpose,
+                request.required_facts,
+                request.freshness,
+                request.need_key,
+                request.affected_steps,
+            )
+            existing = next(
+                (
+                    item for item in bundle.records
+                    if item.request.cache_key == fallback_request.cache_key
+                ),
+                None,
+            )
+            if existing is not None and request.freshness != "refresh":
+                return existing
+            if self.readonly_command_runner is None:
+                raise RuntimeError("read-only command boundary unavailable")
+            if self.on_progress is not None:
+                self.on_progress("只读命令候选已生成，正在进行确定性安全校验并执行。")
+            output = self.readonly_command_runner(command)
+            record = EvidenceRecord.from_probe(
+                fallback_request, output, status="available",
+            )
+            return (
+                bundle.refresh(record)
+                if request.freshness == "refresh"
+                else bundle.add(record)
+            )
+        except Exception as exc:
+            failed_request = ProbeRequest(
+                "readonly_command",
+                {
+                    "source_probe": request.probe,
+                    "source_need_key": request.need_key,
+                },
+                "无法安全绑定只读补证：%s" % request.purpose,
+                request.required_facts,
+                request.freshness,
+                request.need_key,
+                request.affected_steps,
+            )
+            record = EvidenceRecord.from_probe(
+                failed_request,
+                "read-only fallback unavailable: %s: %s"
+                % (type(exc).__name__, str(exc)[:500]),
+                status="unavailable",
+            )
+            return bundle.add(record)
 
     def collect_traceback_source_evidence(
         self,
@@ -285,7 +473,9 @@ class DiscoveryAgent:
         messages = [
             {
                 "role": "system",
-                "content": DISCOVERY_SYSTEM_PROMPT % DEFAULT_READONLY_PROBES.render(),
+                "content": (
+                    DISCOVERY_SYSTEM_PROMPT % DEFAULT_READONLY_PROBES.render()
+                ) + "\n\n" + klonet_domain_context("discovery"),
             },
             {
                 "role": "user",
@@ -354,38 +544,16 @@ class DiscoveryAgent:
             for request in fresh:
                 if self.on_progress is not None:
                     self.on_progress("正在执行只读检查：%s" % request.probe)
-                try:
-                    output = (
-                        self.probe_runner(
-                            [
-                                {
-                                    "probe": request.probe,
-                                    "args": request.args,
-                                    "purpose": request.purpose,
-                                }
-                            ]
+                for record in self._collect_request(request, bundle):
+                    evidence_sections.append(
+                        "%s (%s, %s):\n%s"
+                        % (
+                            record.evidence_id,
+                            record.request.probe,
+                            record.status,
+                            record.output[:7000],
                         )
-                        if self.probe_runner is not None
-                        else "probe runner unavailable"
                     )
-                    status_value = (
-                        "available" if self.probe_runner is not None else "unavailable"
-                    )
-                except Exception as exc:
-                    output = "probe failed: %s" % type(exc).__name__
-                    status_value = "unavailable"
-                record = bundle.add(
-                    EvidenceRecord.from_probe(
-                        request,
-                        output,
-                        status=status_value,
-                    )
-                )
-                self._add_derived_screen_source(bundle, record)
-                evidence_sections.append(
-                    "%s (%s):\n%s"
-                    % (record.evidence_id, request.probe, record.output[:7000])
-                )
             messages.append(
                 {
                     "role": "user",
@@ -467,10 +635,22 @@ class DiscoveryAgent:
                 probe=normalized_probe,
                 args=normalized_args,
                 purpose=str(item.get("purpose") or "collect required fact"),
+                required_facts=tuple(
+                    str(value).strip()
+                    for value in item.get("required_facts") or []
+                    if str(value).strip()
+                ),
+                freshness=str(item.get("freshness") or "cached"),
+                gap_id=str(item.get("gap_id") or ""),
+                affected_steps=tuple(
+                    str(value).strip()
+                    for value in item.get("affected_steps") or []
+                    if str(value).strip()
+                ),
             )
-            if request.cache_key in known_keys:
+            if request.need_key in known_keys:
                 continue
-            known_keys.add(request.cache_key)
+            known_keys.add(request.need_key)
             requests.append(request)
         return requests
 

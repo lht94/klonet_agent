@@ -182,3 +182,21 @@ def test_unknown_single_mutation_needs_confirmation_without_rollback():
         ],
     )
     assert claimed_rollback.auto_authorized is False
+
+
+def test_readonly_shell_uses_same_argv_policy_for_every_command():
+    from klonet_agent.ops.privileged.policy import PrivilegedRiskPolicy
+
+    policy = PrivilegedRiskPolicy()
+
+    commands, reason = policy.readonly_script_argvs(
+        "set -euo pipefail\nps -ef\nss -lnt\n"
+    )
+    assert commands == [["ps", "-ef"], ["ss", "-lnt"]]
+    assert "deterministically read-only" in reason
+
+    commands, reason = policy.readonly_script_argvs(
+        "set -euo pipefail\nps -ef\nsystemctl restart nginx\n"
+    )
+    assert commands is None
+    assert "read-only" in reason or "mutating" in reason

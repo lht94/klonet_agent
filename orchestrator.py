@@ -103,6 +103,7 @@ class AgentOrchestrator:
         self.session = session or AgentSession(mode=self.profile.name)
         supplied_llm = llm
         self.llm = llm or LLMClient()
+        self._ops_semantic_routing = intent_analyzer is not None or supplied_llm is None
         self.answer_style = answer_style
         if intent_analyzer is not None:
             self.intent_analyzer = intent_analyzer
@@ -203,10 +204,6 @@ class AgentOrchestrator:
                     context_builder.current_environment_fingerprint
                 ),
             )
-            verifier = PrivilegedVerifierAgent(
-                self.llm,
-                probe_runner=probe_runner,
-            )
             discovery = DiscoveryAgent(
                 planner_llm,
                 probe_runner=probe_runner,
@@ -214,13 +211,21 @@ class AgentOrchestrator:
                 on_progress=privileged_progress("Discovery"),
                 knowledge_search=context_builder.knowledge_search,
             )
-            synthesis = EvidenceSynthesizer(self.llm)
+            verifier = PrivilegedVerifierAgent(
+                planner_llm,
+                probe_runner=discovery.run_ad_hoc_requests,
+            )
+            synthesis = EvidenceSynthesizer(planner_llm)
+            # Ops responses share the bounded workflow client so a secondary
+            # presentation call can always fall back instead of hanging the
+            # failure-reporting path indefinitely.
+            response_agent = ResponseAgent(planner_llm)
             mutation_workflow = MutationWorkflow(
                 planner=ChangePlannerAgent(planner_llm),
                 binder=ChangeBinder(
                     PrivilegedExecutionAgent(
                         planner_llm,
-                        probe_runner=probe_runner,
+                        probe_runner=discovery.run_ad_hoc_requests,
                         on_progress=privileged_progress(
                             "实施绑定"
                         ),
@@ -235,13 +240,14 @@ class AgentOrchestrator:
                 verifier=verifier,
                 discovery=discovery,
                 synthesis=synthesis,
+                response=response_agent,
             )
             self.privileged_workflow = mutation_workflow
             self.privileged_supervisor = PrivilegedOpsCoordinator(
                 classifier=PrivilegedIntentClassifier(classifier_llm),
                 discovery=discovery,
                 synthesis=synthesis,
-                response=ResponseAgent(self.llm),
+                response=response_agent,
                 mutation_workflow=mutation_workflow,
                 verifier=verifier,
                 context_store=OperationalContextStore(
@@ -249,6 +255,7 @@ class AgentOrchestrator:
                     user_id=self.session.user_id,
                     project_id=self.session.project_id,
                 ),
+                on_progress=privileged_progress("Klonet Agent"),
             )
 
     def init_history(self) -> list[dict]:
@@ -551,7 +558,10 @@ class AgentOrchestrator:
 
         # 设定对话消息。消息列表中的每个消息都包含 role 和 content。
         # role 可以是 system、user、assistant、tool。
-        recent_history_for_intent = self._recent_dialogue_history(history)
+        recent_history_for_intent = self._recent_dialogue_history(
+            history,
+            limit=20 if self.profile.name == "ops-privilege" else 6,
+        )
         history.append({"role": "user", "content": user_input})
         self.memory_store.append_history({"role": "user", "content": user_input})
 
@@ -588,7 +598,8 @@ class AgentOrchestrator:
             assistant_msg = {"role": "assistant", "content": privileged_reply}
             history.append(assistant_msg)
             self.memory_store.append_history(assistant_msg)
-            print(f"工作流协调器：{privileged_reply}")
+            self._record_privileged_turn(user_input, privileged_result)
+            print(f"Klonet Agent：{privileged_reply}")
             return privileged_reply, history, token
 
         thinking_prompt = "Klonet Agent\uff1a\u6b63\u5728\u601d\u8003..."
@@ -643,22 +654,10 @@ class AgentOrchestrator:
                 ),
             }
             history.append(turn_resume_message)
-        else:
-            pre_decision = (
-                decide_pre_llm_clarification(user_input)
-                if self.profile.name == "mentor"
-                else None
-            )
-            if pre_decision is not None and pre_decision.should_stop:
-                reply = pre_decision.reply
-                assistant_msg = {"role": "assistant", "content": reply}
-                history.append(assistant_msg)
-                self.memory_store.append_history(assistant_msg)
-                clear_thinking_prompt()
-                print(f"Klonet Agent\uff1a{reply}")
-                return reply, history, token
-
-        if self.profile.name == "mentor" and not resume_previous_turn:
+        if (
+            self.profile.name == "mentor"
+            or self.profile.name == "ops" and self._ops_semantic_routing
+        ) and not resume_previous_turn:
             try:
                 print_progress("正在理解你的问题...")
                 analysis = self.intent_analyzer.analyze(
@@ -684,6 +683,10 @@ class AgentOrchestrator:
                     recent_history=recent_history_for_intent,
                     semantic_frame=semantic_frame,
                 )
+                if self.profile.name == "ops":
+                    self._ops_route = route_ops_request(
+                        user_input, intent=self._turn_intent,
+                    )
                 print_progress(self._progress_intent_summary())
             except Exception:
                 self._query_route = route_query(user_input)
@@ -694,16 +697,38 @@ class AgentOrchestrator:
                     user_input,
                     recent_history=recent_history_for_intent,
                 )
+                if self.profile.name == "ops":
+                    self._ops_route = route_ops_request(
+                        user_input, intent=self._turn_intent,
+                    )
                 print_progress(self._progress_intent_summary())
         elif not resume_previous_turn:
             self._query_route = route_query(user_input)
-            if self.profile.name == "ops":
-                self._ops_route = route_ops_request(user_input)
             self._refresh_turn_plan(
                 user_input,
                 recent_history=recent_history_for_intent,
             )
+            if self.profile.name == "ops":
+                self._ops_route = route_ops_request(
+                    user_input, intent=self._turn_intent,
+                )
             print_progress(self._progress_intent_summary())
+
+        if (
+            self.profile.name == "mentor"
+            and self._query_intent is not None
+            and self._query_intent.task_type == "credential_boundary"
+            and not resume_previous_turn
+        ):
+            credential_boundary = decide_pre_llm_clarification(user_input)
+            if credential_boundary.should_stop:
+                reply = credential_boundary.reply
+                assistant_msg = {"role": "assistant", "content": reply}
+                history.append(assistant_msg)
+                self.memory_store.append_history(assistant_msg)
+                clear_thinking_prompt()
+                print(f"Klonet Agent\uff1a{reply}")
+                return reply, history, token
 
         if (
             self.profile.name == "mentor"
@@ -1029,15 +1054,15 @@ class AgentOrchestrator:
         """Return a small dialogue-only context for pronoun and continuation recovery."""
 
         lines = []
-        for message in history[-8:]:
+        for message in history[-20:]:
             role = str(message.get("role") or "")
             if role not in {"user", "assistant"}:
                 continue
             content = " ".join(str(message.get("content") or "").split())
             if not content:
                 continue
-            lines.append("%s: %s" % (role, content[:600]))
-        return "\n".join(lines)[-3000:]
+            lines.append("%s: %s" % (role, content[:900]))
+        return "\n".join(lines)[-12000:]
 
     def _record_privileged_event(self, event: str, payload: dict) -> None:
         self.trace_logger.record_privileged_event(
@@ -1047,6 +1072,95 @@ class AgentOrchestrator:
             event=event,
             payload=payload,
         )
+
+    def _record_privileged_turn(self, user_input: str, result) -> None:
+        """Persist the canonical privileged result through existing memory/log stores."""
+
+        plan = getattr(result, "plan", None)
+        failure = getattr(result, "failure", None)
+        outcome = getattr(result, "outcome", None)
+        evidence = getattr(result, "evidence", None)
+        records = list(getattr(evidence, "records", ()) or ())
+        plan_id = str(getattr(plan, "plan_id", "") or "")
+        failure_id = str(getattr(failure, "failure_id", "") or "")
+        payload = {
+            "kind": str(getattr(result, "kind", "") or "unknown"),
+            "plan_id": plan_id,
+            "plan_status": str(getattr(plan, "status", "") or ""),
+            "failure_id": failure_id,
+            "failure_stage": str(getattr(failure, "stage", "") or ""),
+            "goal_status": str(getattr(outcome, "status", "") or ""),
+            "evidence_count": len(records),
+        }
+        self._record_privileged_event("privileged_workflow_result", payload)
+
+        if not any((plan is not None, failure is not None, records)):
+            return
+        goal = str(
+            getattr(plan, "goal", "")
+            or getattr(failure, "goal", "")
+            or getattr(evidence, "goal", "")
+            or user_input
+        ).strip()
+        roots = sorted({
+            str(resource.value)
+            for resource in list(getattr(plan, "resources", ()) or ())
+            if str(getattr(resource, "role", "") or "")
+            in {"instance_root", "target_root", "deployment_root"}
+        })
+        probe_names = list(dict.fromkeys(
+            str(getattr(getattr(record, "request", None), "probe", "") or "")
+            for record in records
+            if str(getattr(getattr(record, "request", None), "probe", "") or "")
+        ))
+        episode_lines = [
+            "## Ops-Privilege 工作流记录",
+            "- goal: %s" % self._compact_observation_text(goal, 500),
+            "- result: %s" % payload["kind"],
+        ]
+        if plan_id:
+            episode_lines.append(
+                "- plan: %s (%s)" % (plan_id, payload["plan_status"] or "unknown")
+            )
+        if failure_id:
+            episode_lines.append(
+                "- failure: %s (%s)" % (
+                    failure_id, payload["failure_stage"] or "unknown",
+                )
+            )
+        if roots:
+            episode_lines.append("- target_roots: %s" % ", ".join(roots))
+        if probe_names:
+            episode_lines.append("- evidence_probes: %s" % ", ".join(probe_names))
+        episode_lines.append(
+            "- conclusion: %s"
+            % self._compact_observation_text(str(getattr(result, "message", "") or ""), 700)
+        )
+        self.memory_store.append_episode("\n".join(episode_lines))
+
+        if records:
+            evidence_lines = [
+                "%s: status=%s evidence_id=%s" % (
+                    str(getattr(getattr(record, "request", None), "probe", "") or "unknown"),
+                    str(getattr(record, "status", "") or "unknown"),
+                    str(getattr(record, "evidence_id", "") or "none"),
+                )
+                for record in records[:12]
+            ]
+            self.memory_store.append_shared_ops_record(
+                question=user_input,
+                intent="ops-privilege / %s" % payload["kind"],
+                target=", ".join(roots) or "未确认",
+                tools=probe_names,
+                evidence=evidence_lines,
+                conclusion=str(getattr(result, "message", "") or ""),
+                confidence=(
+                    "high" if payload["goal_status"] == "achieved" else "medium"
+                ),
+                caveat=(
+                    "运行态证据会过期；再次执行或引用端口、进程和 Screen 状态前必须刷新。"
+                ),
+            )
 
     def _parse_tool_arguments(self, tool_call) -> tuple[dict, str]:
         """Parse model tool JSON without allowing malformed output to crash the CLI."""
