@@ -1,6 +1,39 @@
 # Klonet Agent
 **Klonet 专用教学协作 Agent**
 
+开发或让 Coding Agent 修改本项目之前，请先阅读
+[`docs/DEVELOPMENT_GUIDELINES.md`](docs/DEVELOPMENT_GUIDELINES.md)。该文档是当前架构收敛、状态边界、证据合同、Shell 安全和测试验收的统一开发规范；带日期的历史设计稿不能覆盖它与当前代码/测试合同。
+
+## 聊天模型供应商
+
+聊天模型统一通过 `llm.LLMClient` 调用。默认按北京时间选择供应商：
+
+- 每日 21:00（含）至次日 09:00（不含）：并行科技 `GLM-5.2`；
+- 其余时段：OpenAI 兼容接口 `https://api.yyds168.net/v1` 的 `minimax-m3`。
+
+本地 `.env` 可配置：
+
+```dotenv
+CHAT_LLM_API_KEY=...
+CHAT_LLM_BASE_URL=https://api.yyds168.net/v1
+CHAT_LLM_MODEL=minimax-m3
+PARATERA_API_KEY_1=...
+PARATERA_API_KEY_2=...
+PARATERA_BASE_URL=https://llmapi.paratera.com/v1
+PARATERA_MODEL=GLM-5.2
+PARATERA_MIN_TIMEOUT_SECONDS=120
+PARATERA_RATE_LIMIT_MAX_ATTEMPTS=14
+PARATERA_RATE_LIMIT_BACKOFF_SECONDS=1
+PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS=8
+DEFAULT_LLM_TIMEOUT_SECONDS=60
+DEFAULT_LLM_MAX_RETRIES=0
+LLM_NIGHT_TIMEZONE=Asia/Shanghai
+LLM_NIGHT_START_HOUR=21
+LLM_NIGHT_END_HOUR=9
+```
+
+两个并行科技密钥只在认证、额度或限流错误时顺序切换；业务合同错误不会触发换钥重试。Embedding 与 Rerank 使用各自专用模型，不经过聊天模型路由。
+
 ## 更新：Klonet 专用教学协作 Agent 第一版
 这一版开始从通用的 `agent_v7` 迁移成 `klonet_agent`，目标也从“个人对话 agent”变成“面向 Klonet 的教学协作 agent”。
 
@@ -190,7 +223,7 @@ Git 历史。需要在多台机器间分发时，推荐使用 Git LFS、Release 
 ### 多阶段 RAG
 
 Mentor 的 `search_knowledge` 默认使用 `multi_stage` 流程。每轮已有的前置
-理解调用改用 `deepseek-v4-flash`，并在同一次 JSON 响应中生成结构化
+理解调用使用全局聊天模型（当前默认 `minimax-m3`），并在同一次 JSON 响应中生成结构化
 `RetrievalPlan`，其中直接包含
 公共文档库和源码库的检索任务、BM25 查询、语义查询和精确词，不再先做一次
 意图分类再调用另一个模型改写 query。后续工具调用复用该计划，不进行第二次
@@ -208,7 +241,7 @@ weighted RRF 融合去重；融合 Top 20 可交给 DashScope `qwen3-rerank` 统
 
 ```bash
 RAG_PIPELINE_MODE=multi_stage
-RAG_QUERY_PLANNER_MODEL=deepseek-v4-flash
+RAG_QUERY_PLANNER_MODEL=minimax-m3
 RAG_QUERY_PLANNER_TIMEOUT_SECONDS=6
 RAG_RECALL_TOP_K=30
 RAG_FUSION_TOP_K=20
