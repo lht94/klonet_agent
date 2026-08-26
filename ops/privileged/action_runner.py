@@ -1063,12 +1063,22 @@ class DirectPrivilegedActionRunner:
                 "completed", "orphan_component_groups_already_stopped=true",
             )
 
+        def frozen_group_processes() -> list[dict[str, int | str]]:
+            """Inspect only process groups anchored by the approved PID set."""
+
+            by_pid: dict[int, dict[str, int | str]] = {}
+            for pid in sorted(frozen):
+                for proc in _klonet_runtime_processes(
+                    root,
+                    command_runner=self._command,
+                    expected_pid=pid,
+                    allow_command_root_identity=True,
+                ):
+                    by_pid[int(proc["pid"])] = proc
+            return list(by_pid.values())
+
         def matching_groups() -> tuple[list[dict[str, int]], str]:
-            processes = _klonet_runtime_processes(
-                root,
-                command_runner=self._command,
-                allow_command_root_identity=True,
-            )
+            processes = frozen_group_processes()
             live_frozen = {
                 int(proc["pid"]) for proc in processes
                 if int(proc["pid"]) in frozen
@@ -1117,11 +1127,7 @@ class DirectPrivilegedActionRunner:
         while time.monotonic() < deadline:
             live = {
                 int(proc["pid"])
-                for proc in _klonet_runtime_processes(
-                    root,
-                    command_runner=self._command,
-                    allow_command_root_identity=True,
-                )
+                for proc in frozen_group_processes()
             }
             if frozen.isdisjoint(live):
                 return DirectActionResult(

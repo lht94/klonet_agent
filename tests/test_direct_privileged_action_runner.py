@@ -491,6 +491,45 @@ def test_restart_orphan_cleanup_stops_only_frozen_same_role_group(
     assert "pids=101" in result.output
 
 
+def test_orphan_cleanup_never_scans_unrelated_runtime_groups(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import DirectPrivilegedActionRunner
+
+    calls = []
+    processes = [{
+        "pid": 121, "pgid": 121,
+        "cmdline": "python web_terminal_main.py",
+        "cwd": str(tmp_path),
+    }]
+
+    def scoped_processes(root, **kwargs):
+        calls.append(kwargs.get("expected_pid"))
+        assert kwargs.get("expected_pid") == 121
+        return list(processes)
+
+    monkeypatch.setattr(module, "_klonet_runtime_processes", scoped_processes)
+    monkeypatch.setattr(module, "_component_pids", lambda *_args: [])
+    monkeypatch.setattr(module, "_proc_uid", lambda _pid: 1000)
+    monkeypatch.setattr(module.os, "geteuid", lambda: 1000, raising=False)
+
+    def command_runner(argv, **kwargs):
+        assert argv[:1] != ["sudo"]
+        processes.clear()
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    result = DirectPrivilegedActionRunner(
+        command_runner=command_runner,
+    )._stop_frozen_component_groups(
+        tmp_path, "web_terminal", [121],
+        _step("restart_screen_component", {}, risk="high"),
+    )
+
+    assert result.status == "completed", result.output
+    assert calls and set(calls) == {121}
+
+
 def test_restart_orphan_cleanup_rejects_mixed_role_process_group(
     tmp_path, monkeypatch,
 ):
