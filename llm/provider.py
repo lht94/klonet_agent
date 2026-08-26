@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from klonet_agent.config import (
     CHAT_LLM_API_KEY_ENV,
+    CHAT_LLM_MIN_TIMEOUT_SECONDS,
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
     LLM_NIGHT_END_HOUR,
@@ -48,6 +49,7 @@ class ProviderRouter:
         paratera_keys: tuple[str, ...],
         daytime_base_url: str = DEFAULT_BASE_URL,
         daytime_model: str = DEFAULT_MODEL,
+        daytime_min_timeout_seconds: float = CHAT_LLM_MIN_TIMEOUT_SECONDS,
         paratera_base_url: str = PARATERA_BASE_URL,
         paratera_model: str = PARATERA_MODEL,
         paratera_min_timeout_seconds: float = PARATERA_MIN_TIMEOUT_SECONDS,
@@ -66,6 +68,9 @@ class ProviderRouter:
         ))
         self.daytime_base_url = daytime_base_url.rstrip("/")
         self.daytime_model = daytime_model.strip()
+        self.daytime_min_timeout_seconds = max(
+            1.0, float(daytime_min_timeout_seconds),
+        )
         self.paratera_base_url = paratera_base_url.rstrip("/")
         self.paratera_model = paratera_model
         self.paratera_min_timeout_seconds = max(
@@ -114,7 +119,7 @@ class ProviderRouter:
         return (
             ProviderTarget(
                 "daytime", self.daytime_base_url, self.daytime_model,
-                self.daytime_key,
+                self.daytime_key, self.daytime_min_timeout_seconds,
             ),
         )
 

@@ -324,7 +324,13 @@ class PrivilegedIntentClassifier:
         if intent == "resume_plan" and not plan_reference:
             raise ValueError("resume_plan requires plan_reference")
         if intent != "resume_plan" and plan_reference:
-            raise ValueError("only resume_plan may reference a plan")
+            # ``plan_reference`` is routing authority only for resume_plan.
+            # Some providers redundantly echo "latest" while correctly
+            # classifying a refinement as mutating_action/readonly_action.
+            # Discarding that powerless field preserves the valid semantic
+            # classification without allowing it to select or resume a plan;
+            # persisted Coordinator state remains the sole plan authority.
+            plan_reference = ""
         if intent == "resume_plan" and operation == "inspect":
             goal_kind = "conversation"
         if goal_kind == "health_check" and intent != "readonly_action":

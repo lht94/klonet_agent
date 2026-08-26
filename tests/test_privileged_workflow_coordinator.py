@@ -3246,10 +3246,6 @@ def test_unclear_supersession_never_aborts_before_user_confirms_meaning():
     "payload, error",
     [
         ({
-            "intent": "readonly_action", "goal_kind": "health_check",
-            "operation": "inspect", "plan_reference": "latest",
-        }, "only resume_plan may reference a plan"),
-        ({
             "intent": "resume_plan", "operation": "inspect",
             "plan_reference": "",
         }, "resume_plan requires plan_reference"),
@@ -3266,6 +3262,36 @@ def test_intent_contract_rejects_plan_and_environment_status_overlap(payload, er
 
     with pytest.raises(ValueError, match=error):
         PrivilegedIntentClassifier._decision(payload)
+
+
+@pytest.mark.parametrize("intent", ["readonly_action", "mutating_action"])
+def test_non_resume_intent_discards_redundant_plan_reference(intent):
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    decision = PrivilegedIntentClassifier._decision({
+        "intent": intent,
+        "goal_relation": "refine_previous",
+        "goal_kind": "health_check" if intent == "readonly_action" else "execution",
+        "operation": "inspect" if intent == "readonly_action" else "restart",
+        "plan_reference": "latest",
+    })
+
+    assert decision.intent == intent
+    assert decision.goal_relation == "refine_previous"
+    assert decision.plan_reference == ""
+
+
+def test_resume_plan_keeps_its_explicit_reference():
+    from klonet_agent.ops.privileged.intent import PrivilegedIntentClassifier
+
+    decision = PrivilegedIntentClassifier._decision({
+        "intent": "resume_plan",
+        "goal_relation": "continue_previous",
+        "operation": "inspect",
+        "plan_reference": "priv-ops-existing",
+    })
+
+    assert decision.plan_reference == "priv-ops-existing"
 
 
 def test_intent_contract_accepts_semantic_supersession_without_new_decision_type():

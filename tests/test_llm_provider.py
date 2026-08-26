@@ -27,7 +27,8 @@ def test_provider_router_uses_the_single_global_daytime_model():
     target = _router_at(12).resolve("caller-specific-model")[0]
 
     assert target.base_url == "https://api.yyds168.net/v1"
-    assert target.model == "minimax-m3"
+    assert target.model == "gemini-3.7-flash"
+    assert target.min_timeout_seconds == 90.0
 
 
 def test_provider_router_preserves_two_night_keys_without_exposing_them():

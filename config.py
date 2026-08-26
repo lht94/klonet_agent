@@ -24,8 +24,11 @@ if load_dotenv is not None:
 CHAT_LLM_BASE_URL = os.getenv(
     "CHAT_LLM_BASE_URL", "https://api.yyds168.net/v1",
 ).strip().rstrip("/")
-CHAT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "minimax-m3").strip()
+CHAT_LLM_MODEL = os.getenv("CHAT_LLM_MODEL", "gemini-3.7-flash").strip()
 CHAT_LLM_API_KEY_ENV = "CHAT_LLM_API_KEY"
+CHAT_LLM_MIN_TIMEOUT_SECONDS = max(
+    1.0, float(os.getenv("CHAT_LLM_MIN_TIMEOUT_SECONDS", "90")),
+)
 DEFAULT_MODEL = CHAT_LLM_MODEL
 DEFAULT_BASE_URL = CHAT_LLM_BASE_URL
 DEFAULT_EMBEDDING_MODEL = os.getenv(
