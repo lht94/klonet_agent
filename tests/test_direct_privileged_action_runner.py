@@ -687,6 +687,60 @@ def test_restart_creates_missing_screen_when_component_is_not_running(
     assert "restart_state=missing_screen_created" in result.output
 
 
+def test_restart_rehomes_exact_root_listener_when_screen_ancestry_is_hidden(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectActionResult, DirectPrivilegedActionRunner,
+    )
+
+    _write_runtime_entries(tmp_path)
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "", "",
+        )
+    )
+    monkeypatch.setattr(
+        runner, "_screen_session_targets", lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        module, "_screen_owner_targets_for_pids", lambda _pids: ([], False),
+    )
+    listener_snapshots = iter([[501], [601]])
+    monkeypatch.setattr(
+        module, "_listener_pids_for_port", lambda _port: next(listener_snapshots),
+    )
+    monkeypatch.setattr(module, "_proc_cwd", lambda _pid: str(tmp_path))
+    monkeypatch.setattr(module, "_wait_tcp_released", lambda *_a, **_k: True)
+    stopped = []
+    monkeypatch.setattr(
+        runner, "_stop_frozen_component_groups",
+        lambda root, component, pids, step: stopped.append(list(pids))
+        or DirectActionResult("completed", "stopped exact frozen group"),
+    )
+    monkeypatch.setattr(
+        runner, "_start_one_component",
+        lambda *_args: DirectActionResult(
+            "completed", "action=start_screen_component environment_changed=true",
+        ),
+    )
+
+    result = runner(_step(
+        "restart_screen_component",
+        {
+            "platform": "klonet", "component": "web_terminal",
+            "screen_session": "klonet_web", "project_root": str(tmp_path),
+            "web_terminal_port": 43444,
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "completed", result.output
+    assert stopped == [[501]]
+    assert "old_pids=501" in result.output
+
+
 def test_restart_does_not_create_parallel_screen_when_stale_cleanup_fails(
     tmp_path, monkeypatch,
 ):

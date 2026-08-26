@@ -55,6 +55,9 @@ You bind one unresolved evidence request to a deterministic read-only command.
 The command is only a candidate: policy will parse it into argv and reject shell
 evaluation or mutations. Never use pipes, redirects, command substitution,
 background execution, sudo password input, network access, or write operations.
+Inspect prior_fallback_attempts. Never return an identical command that already
+failed to add the requested facts; choose a materially different read-only
+inspection or return blocked.
 
 Return exactly one JSON object:
 - {"status":"satisfied","reason":"..."} when the supplied registered-probe
@@ -300,12 +303,24 @@ class DiscoveryAgent:
             if prior_record is not None
             else "No registered probe output is available."
         )
+        prior_fallbacks = [
+            {
+                "command": str(item.request.args.get("command") or ""),
+                "status": item.status,
+                "output": item.output[:3000],
+            }
+            for item in bundle.records
+            if item.request.probe == "readonly_command"
+            and str(item.request.args.get("source_need_key") or "")
+            == request.need_key
+        ]
         payload = {
             "requested_capability": request.probe,
             "args": request.args,
             "purpose": request.purpose,
             "required_facts": list(request.required_facts),
             "registered_probe_output": prior,
+            "prior_fallback_attempts": prior_fallbacks,
         }
         try:
             data = parse_json_object(self._complete([
@@ -327,6 +342,12 @@ class DiscoveryAgent:
             command = str(data.get("command") or "").strip()
             if not command:
                 raise ValueError("empty read-only command candidate")
+            if command in {
+                str(item.get("command") or "") for item in prior_fallbacks
+            }:
+                raise ValueError(
+                    "read-only fallback repeated a command that made no progress"
+                )
             fallback_request = ProbeRequest(
                 "readonly_command",
                 {

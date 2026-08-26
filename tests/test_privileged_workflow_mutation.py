@@ -1612,6 +1612,44 @@ def test_missing_component_inherits_identity_only_from_manifest_dependency():
     ) is None
 
 
+def test_replan_reuses_approved_identity_only_for_exact_role_and_root():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _approved_component_identity,
+    )
+
+    resources = [
+        SimpleNamespace(
+            status="frozen", role="instance_root", value="/srv/klonet",
+            consumers=["restart-klonet-backend-roles.instance_root"],
+        ),
+        SimpleNamespace(
+            status="frozen", role="run_as_uid", value="1000",
+            consumers=["restart-klonet-backend-roles.worker_run_as_uid"],
+        ),
+        SimpleNamespace(
+            status="frozen", role="python_executable",
+            value="/opt/klonet/bin/python3.8",
+            consumers=[
+                "restart-klonet-backend-roles.worker_python_executable"
+            ],
+        ),
+    ]
+    candidate = SimpleNamespace(resources=resources)
+
+    assert _approved_component_identity(
+        candidate, project_root="/srv/klonet",
+        role="worker",
+    ) == (1000, "/opt/klonet/bin/python3.8")
+    assert _approved_component_identity(
+        candidate, project_root="/srv/other",
+        role="worker",
+    ) is None
+    assert _approved_component_identity(
+        candidate, project_root="/srv/klonet",
+        role="master",
+    ) is None
+
+
 def test_running_web_terminal_identity_recognizes_the_registered_app_factory():
     from klonet_agent.ops.privileged.workflow.change_planner import (
         _runtime_component_identity,

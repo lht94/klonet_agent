@@ -2096,6 +2096,52 @@ def test_planner_discovery_stops_after_one_no_progress_replan(tmp_path):
     assert any("Planner 返回 need_evidence" in item for item in progress)
 
 
+def test_post_execution_replan_failure_preserves_changed_environment():
+    from klonet_agent.ops.privileged.contracts import ExecutionEvidence
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, GoalOutcome, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+
+    predecessor = _change_plan()
+    predecessor.status = "paused"
+    predecessor.steps[0].status = "paused"
+    predecessor.steps[0].evidence = ExecutionEvidence(
+        return_code=1, environment_changed=True,
+    )
+    gap = GoalOutcome(
+        status="need_evidence",
+        evidence_requests=[ProbeRequest(
+            "runtime_startup_identity", {"project_root": "/srv/app"},
+            "recover missing role", ("run_as_uid",),
+            "refresh", "gap-runtime",
+        )],
+    )
+    workflow = MutationWorkflow(
+        planner=FakePlanner([gap, gap]),
+        binder=FakeBinder(), store=MemoryStore(), executor=FakeExecutor(),
+        verifier=FakeVerifier(),
+        discovery=SimpleNamespace(
+            collect_requests=lambda requests, evidence_bundle: evidence_bundle
+        ),
+        synthesis=SimpleNamespace(
+            synthesize=lambda goal, evidence_bundle: SimpleNamespace()
+        ),
+        max_replanning_rounds=4,
+    )
+
+    result = _submit(
+        workflow, "recover app",
+        evidence_bundle=EvidenceBundle(goal="recover app"),
+        evidence_conclusion=SimpleNamespace(),
+        initial_candidate_plan=predecessor,
+    )
+
+    assert result.failure.category == "planning_evidence_no_progress"
+    assert result.failure.environment_changed == "true"
+    assert result.failure.plan_id == predecessor.plan_id
+
+
 def test_default_discovery_budget_allows_four_rounds_then_ready(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
     from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome

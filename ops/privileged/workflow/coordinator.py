@@ -724,6 +724,18 @@ class PrivilegedOpsCoordinator:
         persistent_candidate = (
             outcome.plan or outcome.candidate_plan or initial_candidate_plan
         )
+
+        def recovery_failure_context() -> dict[str, Any]:
+            """Preserve predecessor effects across every Replan failure exit."""
+
+            if initial_candidate_plan is None:
+                return {}
+            return {
+                "plan": initial_candidate_plan,
+                "environment_changed": _paused_plan_environment_changed(
+                    initial_candidate_plan
+                ),
+            }
         active_gap_steps = merge_gap_steps(
             initial_active_gap_steps,
             outcome.replan_context.get("active_gap_affected_steps"),
@@ -732,6 +744,7 @@ class PrivilegedOpsCoordinator:
             if outcome.status == "need_evidence":
                 if replanning_rounds >= workflow.max_replanning_rounds:
                     return workflow.failure_result(
+                        **recovery_failure_context(),
                         stage="planning",
                         category="planning_evidence_budget_exhausted",
                         summary="规划补证达到安全上限，尚未形成可审批计划。",
@@ -746,6 +759,7 @@ class PrivilegedOpsCoordinator:
                     )
                 if self.discovery is None or self.synthesis is None:
                     return workflow.failure_result(
+                        **recovery_failure_context(),
                         stage="planning",
                         category="planning_discovery_unavailable",
                         summary="Planner 需要补证，但当前补证能力不可用。",
@@ -840,6 +854,7 @@ class PrivilegedOpsCoordinator:
                         )
                         continue
                     return workflow.failure_result(
+                        **recovery_failure_context(),
                         stage="planning",
                         category="planning_evidence_no_progress",
                         summary="规划请求的补证没有产生新的可用事实，已停止重复查询。",
@@ -906,6 +921,7 @@ class PrivilegedOpsCoordinator:
             if outcome.status != "need_execution" or outcome.plan is None:
                 if binding_attempt:
                     return workflow.failure_result(
+                        **recovery_failure_context(),
                         stage="binding",
                         category="binding_replan_unresolved",
                         summary=(
@@ -934,6 +950,7 @@ class PrivilegedOpsCoordinator:
                         ])),
                     )
                 return workflow.failure_result(
+                    **recovery_failure_context(),
                     stage="planning",
                     category="planning_contract_unresolved",
                     summary="变更规划在有限次数校正后仍未形成安全、可审批的计划。",

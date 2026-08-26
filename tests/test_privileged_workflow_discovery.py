@@ -923,6 +923,45 @@ def test_registered_probe_uses_shell_only_after_planner_repeats_unmet_fact():
     assert all(item.status == "available" for item in bundle.records)
 
 
+def test_readonly_fallback_does_not_repeat_no_progress_command():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    commands = []
+    llm = FakeLLM([
+        json.dumps({
+            "status": "command", "command": "ls -la /srv/klonet",
+            "reason": "inspect root",
+        }),
+        json.dumps({
+            "status": "command", "command": "ls -la /srv/klonet",
+            "reason": "repeat inspection",
+        }),
+    ])
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=None,
+        readonly_command_runner=lambda command: commands.append(command) or "files",
+    )
+    bundle = EvidenceBundle(goal="find runtime identity")
+    request = ProbeRequest(
+        "runtime_startup_identity", {"project_root": "/srv/klonet"},
+        "find runtime identity", ("run_as_uid", "python executable"),
+        "refresh", "gap-runtime-identity",
+    )
+
+    agent.collect_requests([request], bundle)
+    agent.collect_requests([request], bundle)
+
+    assert commands == ["ls -la /srv/klonet"]
+    assert bundle.records[-1].status == "unavailable"
+    assert "repeated a command" in bundle.records[-1].output
+    second_payload = json.loads(llm.calls[1]["messages"][1]["content"])
+    assert second_payload["prior_fallback_attempts"][0]["command"] == commands[0]
+
+
 def test_registered_probe_complete_result_does_not_run_shell_fallback():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, ProbeRequest,

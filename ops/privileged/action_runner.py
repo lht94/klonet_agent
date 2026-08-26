@@ -1241,6 +1241,17 @@ class DirectPrivilegedActionRunner:
             )
             if per_pid_observed and not per_pid_owners:
                 proven_orphan_pids.append(pid)
+        # Rehoming a precisely frozen role does not depend on Screen ancestry
+        # being observable.  If there is no designated Screen at all, the
+        # target-root/target-role PID set is itself the ownership boundary.
+        # ``old_pids`` was derived from the frozen component port (or the
+        # root-scoped component matcher), and port listeners were rejected
+        # above unless their cwd belongs to this exact instance.
+        if old_pids and not targets and not ownership_observed:
+            proven_orphan_pids = list(dict.fromkeys([
+                *proven_orphan_pids,
+                *old_pids,
+            ]))
         if proven_orphan_pids:
             orphan_cleanup = self._stop_frozen_component_groups(
                 root, component, proven_orphan_pids, step,

@@ -612,6 +612,56 @@ def _explicit_runtime_port_decision(
     return None
 
 
+def _approved_component_identity(
+    candidate_plan: ChangePlan | None,
+    *,
+    project_root: str,
+    role: str,
+) -> tuple[int, str] | None:
+    """Reuse an approved static startup identity for the exact pending role.
+
+    Runtime evidence remains authoritative for live processes.  During an
+    execution Replan, however, a missing role must not rediscover immutable
+    UID/interpreter decisions already frozen in the approved predecessor.
+    """
+
+    if candidate_plan is None:
+        return None
+    root_steps = {
+        str(consumer).partition(".")[0]
+        for resource in candidate_plan.resources
+        if resource.status == "frozen"
+        and resource.role == "instance_root"
+        and str(resource.value).rstrip("/") == project_root.rstrip("/")
+        for consumer in resource.consumers
+        if str(consumer).partition(".")[0]
+    }
+    if not root_steps:
+        return None
+
+    def exact_value(resource_role: str, argument: str) -> str | None:
+        values = {
+            str(resource.value)
+            for resource in candidate_plan.resources
+            if resource.status == "frozen"
+            and resource.role == resource_role
+            and any(
+                "%s.%s_%s" % (owner_step, role, argument)
+                in resource.consumers
+                for owner_step in root_steps
+            )
+        }
+        return next(iter(values)) if len(values) == 1 else None
+
+    uid = exact_value("run_as_uid", "run_as_uid")
+    python = exact_value("python_executable", "python_executable")
+    if uid is None or python is None or not uid.isdigit():
+        return None
+    if not python.startswith("/") or "python" not in python.lower():
+        return None
+    return int(uid), python
+
+
 def _automatic_conflict_port_policy(decision_text: str) -> bool:
     """Return only a user-authored, plan-wide automatic port decision."""
 
@@ -844,7 +894,10 @@ the complete proposed replacement goal and list what would be superseded.
             # healthy role is not incorrectly treated as out of scope.
             effective_intent_context["operation"] = "restart"
         deterministic = self._deterministic_runtime_restart(
-            goal, bundle, intent_context=effective_intent_context,
+            goal,
+            bundle,
+            intent_context=effective_intent_context,
+            candidate_plan=candidate_plan,
         )
         if deterministic is not None:
             self._restore_authoritative_recovery_targets(
@@ -1231,6 +1284,7 @@ the complete proposed replacement goal and list what would be superseded.
         goal: str,
         bundle: EvidenceBundle,
         intent_context: dict[str, Any] | None = None,
+        candidate_plan: ChangePlan | None = None,
     ) -> dict[str, Any] | None:
         """Compile one runtime lifecycle intent without degrading into repair.
 
@@ -1765,6 +1819,12 @@ the complete proposed replacement goal and list what would be superseded.
                     if role in component_specs else ()
                 ),
             )
+            if identity is None:
+                identity = _approved_component_identity(
+                    candidate_plan,
+                    project_root=root,
+                    role=role,
+                )
             if identity is None:
                 spec = component_specs.get(role)
                 command = list(spec.command_argv) if spec is not None else []
