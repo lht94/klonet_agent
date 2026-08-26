@@ -1910,6 +1910,102 @@ def test_successful_plan_execution_requires_whole_goal_verification_before_compl
     assert plan.status == "completed"
 
 
+def test_post_execution_replan_failure_resumes_goal_verification_not_planning():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, FailureRecord, GoalOutcome,
+        RecoveryOption,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator, WorkflowResult,
+    )
+
+    goal = "把目标平台全部角色收编到 Screen"
+    plan = SimpleNamespace(
+        plan_id="priv-ops-executed", goal=goal, status="paused",
+        steps=[], resources=[],
+    )
+    failure = FailureRecord(
+        failure_id="failure-post-execution-replan",
+        stage="planning",
+        category="post_execution_replan_failure",
+        summary="执行后局部重规划异常",
+        technical_reason="replan changed completed candidate",
+        goal=goal,
+        goal_kind="execution",
+        plan_id=plan.plan_id,
+        selected_option_id="continue_current_goal",
+        options=[RecoveryOption(
+            option_id="continue_current_goal",
+            label="继续处理",
+            description="恢复原目标",
+            action="continue_current_goal",
+            recommended=True,
+        )],
+    )
+
+    class Workflow:
+        def __init__(self):
+            self.completed = []
+            self.planned = False
+
+        def handle_control(self, text):
+            return WorkflowResult(
+                True, "failure_option_selected", "selected", failure=failure,
+            )
+
+        def load_plan(self, plan_id):
+            assert plan_id == plan.plan_id
+            return plan
+
+        def plan_once(self, *args, **kwargs):
+            self.planned = True
+            raise AssertionError("completed execution must not return to planning")
+
+        def complete_goal(self, completed_plan, outcome):
+            self.completed.append((completed_plan, outcome))
+            completed_plan.status = "completed"
+            return WorkflowResult(
+                True, "completed", "目标已完成", plan=completed_plan,
+                outcome=outcome,
+            )
+
+    class Discovery:
+        def collect(
+            self, requested_goal, *, command="", conversation_context="",
+            seed_bundle=None, preload_capabilities=False,
+        ):
+            assert "验证已审批任务是否已经达到完整用户目标" in requested_goal
+            return seed_bundle or EvidenceBundle(goal=requested_goal)
+
+        def collect_requests(self, requests, bundle):
+            raise AssertionError("goal evidence is complete")
+
+    class Verifier:
+        def verify_goal(
+            self, requested_goal, bundle, conclusion, attempted_keys=None,
+            phase="readonly", goal_kind="health_check",
+        ):
+            assert requested_goal == goal
+            assert phase == "post_execution"
+            return GoalOutcome("achieved", reason="当前目标效果已满足")
+
+    workflow = Workflow()
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier("conversation"),
+        discovery=Discovery(),
+        synthesis=StubSynthesis(EvidenceConclusion()),
+        response=StubResponse(), mutation_workflow=workflow,
+        verifier=Verifier(),
+    )
+
+    result = coordinator.handle("选择 1")
+
+    assert result.kind == "completed"
+    assert plan.status == "completed"
+    assert workflow.planned is False
+    assert workflow.completed[0][0] is plan
+
+
 def test_workflow_coordinator_applies_goal_guard_to_mutating_intent():
     from klonet_agent.ops.privileged.intent import PrivilegedIntentDecision
     from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator

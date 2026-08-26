@@ -1606,6 +1606,29 @@ class PrivilegedOpsCoordinator:
         if (
             option.action == "continue_current_goal"
             and recovery_plan is not None
+            and str(failure.category or "").startswith("post_execution_")
+        ):
+            # The reported stage may be planning because the Replan call
+            # itself raised, but the durable resume point is still the
+            # executed plan's goal-verification loop.  Sending this case to
+            # ordinary planning discards successful action/check evidence and
+            # can propose executing the same effects again.
+            self._emit_progress(
+                "正在恢复已执行计划的目标终验，不会重复执行已完成动作"
+            )
+            return self._continue_post_execution(
+                WorkflowResult(
+                    True,
+                    "goal_verification",
+                    str(failure.technical_reason or failure.summary or ""),
+                    plan=recovery_plan,
+                ),
+                snapshot=snapshot,
+                conversation_context=conversation_context,
+            )
+        if (
+            option.action == "continue_current_goal"
+            and recovery_plan is not None
         ):
             retry_unchanged = getattr(
                 self.mutation_workflow,
