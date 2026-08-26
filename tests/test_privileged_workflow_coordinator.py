@@ -1912,11 +1912,14 @@ def test_successful_plan_execution_requires_whole_goal_verification_before_compl
 
 def test_post_execution_replan_failure_resumes_goal_verification_not_planning():
     from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceBundle, EvidenceConclusion, FailureRecord, GoalOutcome,
-        RecoveryOption,
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, FailureRecord,
+        GoalOutcome, ProbeRequest, RecoveryOption,
     )
     from klonet_agent.ops.privileged.workflow.coordinator import (
         PrivilegedOpsCoordinator, WorkflowResult,
+    )
+    from klonet_agent.ops.privileged.workflow.operational_context import (
+        OperationalContextSnapshot,
     )
 
     goal = "把目标平台全部角色收编到 Screen"
@@ -1942,6 +1945,24 @@ def test_post_execution_replan_failure_resumes_goal_verification_not_planning():
             recommended=True,
         )],
     )
+    stale_plan = SimpleNamespace(
+        plan_id="priv-ops-stale", goal=goal, status="paused",
+        steps=[], resources=[],
+    )
+    stale_evidence = EvidenceBundle(goal=goal)
+    stale_evidence.add(EvidenceRecord.from_probe(
+        ProbeRequest(
+            "plan_execution",
+            {"plan_id": stale_plan.plan_id, "status": "paused"},
+            "历史执行结果",
+        ),
+        "plan_id=priv-ops-stale status=paused "
+        "step=old status=paused environment_changed=true",
+    ))
+    snapshot = OperationalContextSnapshot(
+        resolved_goal=goal, base_goal=goal,
+        active_plan_id=stale_plan.plan_id, evidence=stale_evidence,
+    )
 
     class Workflow:
         def __init__(self):
@@ -1954,8 +1975,10 @@ def test_post_execution_replan_failure_resumes_goal_verification_not_planning():
             )
 
         def load_plan(self, plan_id):
-            assert plan_id == plan.plan_id
-            return plan
+            return {
+                plan.plan_id: plan,
+                stale_plan.plan_id: stale_plan,
+            }[plan_id]
 
         def plan_once(self, *args, **kwargs):
             self.planned = True
@@ -1990,12 +2013,20 @@ def test_post_execution_replan_failure_resumes_goal_verification_not_planning():
             return GoalOutcome("achieved", reason="当前目标效果已满足")
 
     workflow = Workflow()
+
+    class ContextStore:
+        def load(self):
+            return snapshot
+
+        def save(self, value):
+            self.saved = value
+
     coordinator = PrivilegedOpsCoordinator(
         classifier=StubClassifier("conversation"),
         discovery=Discovery(),
         synthesis=StubSynthesis(EvidenceConclusion()),
         response=StubResponse(), mutation_workflow=workflow,
-        verifier=Verifier(),
+        verifier=Verifier(), context_store=ContextStore(),
     )
 
     result = coordinator.handle("选择 1")
@@ -2004,6 +2035,7 @@ def test_post_execution_replan_failure_resumes_goal_verification_not_planning():
     assert plan.status == "completed"
     assert workflow.planned is False
     assert workflow.completed[0][0] is plan
+    assert stale_plan.status == "paused"
 
 
 def test_workflow_coordinator_applies_goal_guard_to_mutating_intent():

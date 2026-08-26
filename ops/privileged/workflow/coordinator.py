@@ -1598,7 +1598,7 @@ class PrivilegedOpsCoordinator:
             self._refinement_predecessor(snapshot)
             if snapshot is not None else None
         )
-        if executed_predecessor is not None and str(
+        if recovery_plan is None and executed_predecessor is not None and str(
             getattr(executed_predecessor, "status", "") or ""
         ) in {"paused", "blocked", "executing", "verifying"}:
             recovery_plan = executed_predecessor
