@@ -30,25 +30,6 @@ _CREDENTIAL_TERMS = (
     "\u771f\u5b9e ip",
     "\u670d\u52a1\u5668 ip",
 )
-_DEPLOY_TERMS = ("\u90e8\u7f72",)
-_DEPLOY_SPECIFIC_TERMS = (
-    "\u73af\u5883",
-    "\u5b89\u88c5",
-    "\u542f\u52a8",
-    "\u8fd0\u884c",
-    "\u524d\u7aef",
-    "\u540e\u7aef",
-    "worker",
-    "master",
-    "nginx",
-    "redis",
-    "\u505c\u6b62",
-    "\u91cd\u542f",
-    "\u62d3\u6251",
-    "\u5b9e\u73b0",
-    "topology",
-    "topo",
-)
 
 
 def decide_pre_llm_clarification(
@@ -128,16 +109,6 @@ def decide_model_intent_clarification(
 
 def _looks_like_credential_question(text: str) -> bool:
     return any(term in text for term in _CREDENTIAL_TERMS)
-
-
-def _looks_like_ambiguous_klonet_deploy(text: str, route: QueryRoute | None) -> bool:
-    if route is not None and route.hard_disable_rag:
-        return False
-    if "klonet" not in text.lower():
-        return False
-    if not any(term in text for term in _DEPLOY_TERMS):
-        return False
-    return not any(term in text for term in _DEPLOY_SPECIFIC_TERMS)
 
 
 def _looks_like_low_information_input(

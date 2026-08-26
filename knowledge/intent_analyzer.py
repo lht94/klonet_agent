@@ -26,7 +26,7 @@ from klonet_agent.knowledge.semantic_understanding import (
 
 
 INTENT_ANALYSIS_PROMPT = """
-你是 Klonet Mentor 的前置意图解析器。你的任务不是回答用户问题，
+你是 Klonet 对话与运维模式共用的前置意图解析器。你的任务不是回答用户问题，
 而是把用户原始输入解析为一个稳定 JSON 对象，供后续路由、检索和回答策略使用。
 
 只输出 JSON，不要输出 Markdown，不要解释。
@@ -34,7 +34,7 @@ INTENT_ANALYSIS_PROMPT = """
 字段：
 - scope: klonet | general | mixed
 - task_type: concept | deployment_preparation | deployment_guidance | credential_boundary | operation_guide | troubleshooting | code_lookup | development | project_progress | general
-- operation: unknown | environment_setup | dependency_install | platform_start | platform_stop | platform_restart | acceptance_check
+- operation: unknown | environment_setup | dependency_install | platform_start | platform_stop | platform_restart | platform_destroy | acceptance_check
 - target: 用户要处理的对象，例如 klonet_platform、web_terminal、redis、topology
 - symptom: 故障现象，例如 address_already_in_use、import_error、port_conflict
 - excluded_intents: 用户明确否定的方向数组
@@ -94,6 +94,11 @@ INTENT_ANALYSIS_PROMPT += """
 6. 如果当前输入只是“klonet平台/这个平台/平台”等短补充，而上文正在确认“使用哪个平台/普通用户使用/浏览器使用”，应理解为补充上一轮对象，优先解析为 platform_usage，不要重新追问首次安装还是启动平台。
 7. 当用户目标是了解目标机器的真实运行状态、故障现场或当前环境事实，而不是询问标准安装/启动步骤时，使用 perspective=debugging_runtime 或 action_goal=inspect_error，并设置 requires_environment_diagnosis=true。
 8. 只输出 JSON，不要输出 Markdown，不要解释。
+9. 历史、否定、引用和条件中的动作词不是当前操作。例如“为什么之前会判断为重启”、
+   “不要重启，只检查状态”和“如果失败就停止”都不能仅因出现动作词而归类为当前重启或停止。
+10. 只有索取真实用户名、密码、token、密钥或服务器 IP 的请求属于 credential_boundary。
+    解释凭据安全策略、询问配置字段或排查脱敏问题不是索取秘密，应按 concept、code_lookup
+    或 troubleshooting 理解。
 """
 
 

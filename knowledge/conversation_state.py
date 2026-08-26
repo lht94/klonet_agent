@@ -240,6 +240,7 @@ def _phase_from_operation(operation: str) -> str:
         "platform_start": "platform_startup",
         "platform_stop": "platform_shutdown",
         "platform_restart": "platform_restart",
+        "platform_destroy": "platform_shutdown",
         "topology_deploy": "topology_deploy",
     }.get(operation, "")
 

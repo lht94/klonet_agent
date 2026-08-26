@@ -75,6 +75,7 @@ class TurnIntent:
                 "platform_start",
                 "platform_stop",
                 "platform_restart",
+                "platform_destroy",
                 "topology_deploy",
             }
         )
@@ -642,6 +643,7 @@ def _phase_from_operation(operation: str) -> str:
         "platform_start": "platform_startup",
         "platform_stop": "platform_shutdown",
         "platform_restart": "platform_restart",
+        "platform_destroy": "platform_shutdown",
         "topology_deploy": "topology_deploy",
     }.get(operation, "")
 

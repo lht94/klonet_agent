@@ -26,6 +26,7 @@ ALLOWED_OPERATIONS = {
     "platform_start",
     "platform_stop",
     "platform_restart",
+    "platform_destroy",
     "topology_deploy",
     "acceptance_check",
 }
@@ -33,6 +34,7 @@ _OPERATION_QUERY_TERMS = {
     "platform_start": "启动顺序 Redis Master Gunicorn Celery Web Terminal Worker Nginx 标准命令",
     "platform_stop": "停止顺序 Master Celery Web Terminal Worker 标准命令",
     "platform_restart": "重启顺序 Master Celery Web Terminal Worker Nginx 验证",
+    "platform_destroy": "销毁平台 实例资源 清理边界 风险确认",
     "topology_deploy": "拓扑部署 TopoDeployAPI Celery Redis Worker Docker OVS KVM 进度条",
     "environment_setup": "首次安装 依赖 Docker Redis MySQL RabbitMQ 镜像仓库 环境验收",
     "dependency_install": "依赖安装 Python Docker OVS Redis MySQL RabbitMQ",
@@ -41,6 +43,7 @@ _OPERATION_MIN_TOP_K = {
     "platform_start": 8,
     "platform_stop": 5,
     "platform_restart": 6,
+    "platform_destroy": 6,
     "topology_deploy": 8,
     "environment_setup": 5,
     "dependency_install": 5,

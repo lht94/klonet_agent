@@ -68,6 +68,18 @@ def test_query_intent_rejects_unknown_enum_values_and_clamps_confidence():
     assert intent.confidence == 1.0
 
 
+def test_structured_intent_supports_destroy_without_keyword_promotion():
+    from klonet_agent.knowledge.intent import QueryIntent
+    from klonet_agent.knowledge.intent_analyzer import INTENT_ANALYSIS_PROMPT
+
+    intent = QueryIntent.from_mapping({"operation": "platform_destroy"})
+
+    assert intent.operation == "platform_destroy"
+    assert "历史、否定、引用和条件中的动作词不是当前操作" in (
+        INTENT_ANALYSIS_PROMPT
+    )
+
+
 def test_troubleshooting_ops_terms_enable_environment_diagnosis():
     """模型漏填新字段时，运维类故障也应进入环境诊断分支。"""
 

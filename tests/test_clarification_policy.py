@@ -543,9 +543,16 @@ def test_b_option_inherits_platform_start_and_runtime_path_guard(capsys):
     assert "只执行当前机器实际存在的一套命令" in second_call_messages
 
 
-def test_credential_question_uses_safety_boundary_without_llm_or_retrieval(capsys):
+def test_credential_question_uses_semantic_safety_boundary(capsys):
     with local_temp_dir() as temp_dir:
-        llm = ShouldNotCallLLM()
+        llm = SequentialLLM([
+            _response(
+                '{"scope":"klonet","task_type":"credential_boundary",'
+                '"operation":"unknown","target":"vm_credentials",'
+                '"requires_retrieval":false,"confidence":0.98}',
+                tokens=5,
+            ),
+        ])
         executor = RecordingToolExecutor()
         orchestrator = _mentor_orchestrator(temp_dir, llm=llm, executor=executor)
         history = orchestrator.init_history()
@@ -557,6 +564,30 @@ def test_credential_question_uses_safety_boundary_without_llm_or_retrieval(capsy
     assert "账号" in reply or "密码" in reply
     assert reply in output
     assert history[-1]["content"] == reply
-    assert token == 0
-    assert llm.calls == []
+    assert token == 5
+    assert len(llm.calls) == 1
     assert executor.calls == []
+
+
+def test_credential_terms_in_policy_question_do_not_force_secret_refusal(capsys):
+    with local_temp_dir() as temp_dir:
+        llm = SequentialLLM([
+            _response(
+                '{"scope":"klonet","task_type":"concept",'
+                '"operation":"unknown","target":"credential_policy",'
+                '"requires_retrieval":false,"confidence":0.95}',
+                tokens=5,
+            ),
+            _response("密码字段应使用占位符，并在输出前脱敏。", tokens=7),
+        ])
+        executor = RecordingToolExecutor()
+        orchestrator = _mentor_orchestrator(temp_dir, llm=llm, executor=executor)
+        history = orchestrator.init_history()
+
+        reply, _, token = orchestrator.single_chat(
+            "为什么回答里不能直接展示密码？", history, 0,
+        )
+
+    assert reply == "密码字段应使用占位符，并在输出前脱敏。"
+    assert token == 12
+    assert len(llm.calls) == 2

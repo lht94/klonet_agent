@@ -102,3 +102,15 @@ def test_platform_start_plan_proceeds_when_no_conflict_and_paths_verified():
     assert "step=ports action=proceed" in plan
     assert "step=gunicorn action=proceed" in plan
     assert "step=screen action=verify" in plan
+
+
+def test_action_words_cannot_override_non_start_semantic_operation():
+    from klonet_agent.ops.planner import build_ops_environment_plan
+
+    plan = build_ops_environment_plan(
+        user_input="为什么之前把‘不要启动平台’错误地生成了启动计划？",
+        operation="unknown",
+        tool_events=[],
+    )
+
+    assert plan == ""

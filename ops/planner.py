@@ -26,7 +26,7 @@ def build_ops_environment_plan(
 ) -> str:
     """Build a system-message friendly Ops plan from tool evidence."""
 
-    if not _is_platform_start(user_input, operation):
+    if not _is_platform_start(operation):
         return ""
 
     events = list(tool_events or [])
@@ -100,9 +100,11 @@ def build_ops_environment_plan(
     return "\n".join(decisions)
 
 
-def _is_platform_start(user_input: str, operation: str) -> bool:
-    text = user_input or ""
-    return operation == "platform_start" or any(term in text for term in ("启动", "部署", "新 Klonet", "新平台"))
+def _is_platform_start(operation: str) -> bool:
+    # The semantic operation is authoritative. Raw words may describe,
+    # negate, or quote an earlier action and must never promote the turn into
+    # an environment-changing startup plan.
+    return operation == "platform_start"
 
 
 def _service_decision(step: str, evidence: str, running_reason: str) -> str:

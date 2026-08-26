@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List
 
 
 PORT_RE = re.compile(r"(?<![\dA-Za-z_.-])([1-9]\d{1,4})(?![\dA-Za-z_.-])")
@@ -43,15 +43,24 @@ class OpsRoute:
         return f"目标：{self.goal}{clue_text}；模式：{self.mode}"
 
 
-def route_ops_request(user_input: str) -> OpsRoute:
-    """Extract operational goal and slots without using Mentor task_type labels."""
+def route_ops_request(user_input: str, *, intent: Any | None = None) -> OpsRoute:
+    """Extract slots while taking the requested action from structured intent.
+
+    Text markers remain useful read-only probe hints.  They are not authority
+    to turn a negated, quoted, historical, or explanatory phrase into a state
+    changing OperationPlan.
+    """
 
     text = user_input or ""
-    lowered = text.lower()
     ports = _extract_ports(text)
     paths = _dedupe(PATH_RE.findall(text))
     components = _dedupe(match.group(0) for match in COMPONENT_RE.finditer(text))
-    action = _action_for(lowered)
+    action = _action_for_intent(intent)
+    semantic = " ".join([
+        str(getattr(intent, "task_type", "") or ""),
+        str(getattr(intent, "target", "") or ""),
+        str(getattr(intent, "symptom", "") or ""),
+    ]).lower()
 
     if action in {"restart", "deploy", "destroy", "stop"}:
         return OpsRoute(
@@ -65,7 +74,10 @@ def route_ops_request(user_input: str) -> OpsRoute:
             recommended_tools=["create_ops_operation_plan"],
         )
 
-    if ports and any(term in lowered for term in ("address already in use", "占用", "pid", "cwd", "端口")):
+    if ports and any(
+        term in semantic
+        for term in ("address_already_in_use", "port_conflict", "port", "端口")
+    ):
         return OpsRoute(
             goal="端口占用诊断",
             mode="只读诊断",
@@ -75,7 +87,10 @@ def route_ops_request(user_input: str) -> OpsRoute:
             recommended_tools=["inspect_process_detail", "inspect_klonet_runtime"],
         )
 
-    if any(term in lowered for term in ("traceback", "日志", "error.log", "报错")):
+    if any(
+        term in semantic
+        for term in ("traceback", "log", "日志", "error")
+    ):
         return OpsRoute(
             goal="日志故障诊断",
             mode="只读诊断",
@@ -85,7 +100,7 @@ def route_ops_request(user_input: str) -> OpsRoute:
             recommended_tools=["inspect_screen_session", "read_klonet_logs"],
         )
 
-    if any(term in lowered for term in ("有哪些平台", "运行", "screen", "服务", "进程")):
+    if bool(getattr(intent, "requires_environment_diagnosis", False)):
         return OpsRoute(
             goal="运行态盘点",
             mode="只读诊断",
@@ -132,31 +147,19 @@ def _looks_like_platform_number(text: str, start: int, end: int) -> bool:
     )
 
 
-def _action_for(lowered: str) -> str:
-    action_text = _strip_conditional_stop_constraints(lowered)
-    if any(term in lowered for term in ("销毁", "destroy", "删除平台")):
-        return "destroy"
-    if any(term in lowered for term in ("部署", "新平台", "deploy")):
-        return "deploy"
-    if any(term in lowered for term in ("重启", "restart")):
-        return "restart"
-    if any(term in action_text for term in ("kill", "停止", "停掉", "stop")):
-        return "stop"
-    return "inspect"
+def _action_for_intent(intent: Any | None) -> str:
+    """Map an already interpreted operation to an Ops action."""
 
-
-def _strip_conditional_stop_constraints(text: str) -> str:
-    """Remove safety constraints such as "stop if it fails" before action routing."""
-
-    patterns = [
-        r"(?:如果|若|如若|一旦|遇到|碰到|发现)[^。；;\n]*(?:失败|报错|错误|异常|阻塞|blocked)[^。；;\n]*(?:停止|停下|暂停|stop)",
-        r"(?:失败|报错|错误|异常|阻塞|blocked)[^。；;\n]*(?:停止|停下|暂停|stop)",
-        r"(?:不要|别|禁止)[^。；;\n]*(?:继续|自行|自动)[^。；;\n]*(?:执行|推进|运行)",
-    ]
-    cleaned = text
-    for pattern in patterns:
-        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
-    return cleaned
+    operation = str(getattr(intent, "operation", "") or "").strip().lower()
+    return {
+        "platform_restart": "restart",
+        "platform_start": "deploy",
+        "environment_setup": "deploy",
+        "dependency_install": "deploy",
+        "topology_deploy": "deploy",
+        "platform_stop": "stop",
+        "platform_destroy": "destroy",
+    }.get(operation, "inspect")
 
 
 def _dedupe(items) -> List[str]:
