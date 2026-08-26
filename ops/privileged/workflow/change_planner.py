@@ -280,7 +280,7 @@ def _request_rechecks_confirmed_missing_role(
     request: ProbeRequest,
     missing: list[tuple[str, str, set[str]]],
 ) -> bool:
-    if request.probe not in {"process", "process_detail", "screen", "screen_session"}:
+    if request.probe not in {"process", "process_detail"}:
         return False
     text = "%s %s" % (
         json.dumps(request.args, ensure_ascii=False),
@@ -1636,6 +1636,17 @@ the complete proposed replacement goal and list what would be superseded.
                 "consumers": [step_id + ".platform"],
             },
         ]
+        for role in requested_roles:
+            session = selected.screen_session(role)
+            if not session:
+                continue
+            resources.append({
+                "name": _plan_resource_name(step_id, role, "screen_session"),
+                "kind": "identifier", "status": "frozen",
+                "role": "screen_session", "value": session,
+                "source": "running_platforms",
+                "consumers": [step_id + ".screen_session"],
+            })
         expected = []
         postconditions = []
         running_roles = observed_running_roles
@@ -2472,10 +2483,9 @@ the complete proposed replacement goal and list what would be superseded.
             if redundant_absence_requests and len(redundant_absence_requests) == len(requests):
                 raise ValueError(
                     "running_platforms already proves the requested runtime role is "
-                    "role_not_running for its project_root. Do not re-query process or "
-                    "screen presence for that role; start_screen_component handles a "
-                    "stale/dead target session safely. Return a ready plan or a genuine "
-                    "non-presence blocker."
+                    "role_not_running for its project_root. Do not re-query the same "
+                    "process absence. Screen ownership is a separate runtime fact and "
+                    "must remain available to Binding when it is not already present."
                 )
             if redundant_absence_requests:
                 requests = [
@@ -2561,7 +2571,6 @@ the complete proposed replacement goal and list what would be superseded.
         self._normalize_runtime_repair_coverage(
             data, bundle, intent_context=intent_context,
         )
-        self._normalize_post_execution_screen_recovery(data, bundle)
         self._collapse_redundant_runtime_repair_changes(data)
         resources = [
             PlanResource.from_dict(item)
@@ -3939,74 +3948,6 @@ the complete proposed replacement goal and list what would be superseded.
             coverage = "; ".join(additions)
             if coverage and coverage not in objective:
                 change["objective"] = "%s; %s for %s" % (objective, coverage, root)
-
-    @staticmethod
-    def _normalize_post_execution_screen_recovery(
-        data: dict[str, Any],
-        bundle: EvidenceBundle,
-    ) -> None:
-        """Compile an existing-session start failure into a Screen restart."""
-
-        failed: list[tuple[str, str]] = []
-        suffix_roles = {
-            "m": "master", "master": "master",
-            "c": "celery", "celery": "celery",
-            "web": "web_terminal", "web_terminal": "web_terminal",
-            "w": "worker", "worker": "worker",
-        }
-        for record in bundle.records:
-            if (
-                record.status != "available"
-                or record.request.probe != "plan_execution"
-            ):
-                continue
-            for line in str(record.output or "").splitlines():
-                step_match = re.search(
-                    r"\bstep=([^\s]+)\s+status=(?:paused|failed)\b", line,
-                )
-                session_match = re.search(
-                    r"screen_session_already_exists=([A-Za-z0-9_.-]+)", line,
-                )
-                if step_match is None or session_match is None:
-                    continue
-                suffix = session_match.group(1).rsplit("_", 1)[-1].lower()
-                role = suffix_roles.get(suffix, "")
-                if role:
-                    failed.append((step_match.group(1), role))
-        if not failed:
-            return
-        changes = data.get("changes")
-        if not isinstance(changes, list):
-            return
-        for change in changes:
-            if not isinstance(change, dict):
-                continue
-            semantic_id = str(change.get("step_id") or "")
-            roles = {
-                role for micro_id, role in failed
-                if micro_id == semantic_id or micro_id.startswith(semantic_id + "__")
-            }
-            if not roles:
-                continue
-            expected = [str(item) for item in change.get("expected_changes") or []]
-            for role in roles:
-                expected = [
-                    re.sub(
-                        r"^start missing %s\b" % re.escape(role),
-                        "restart requested %s" % role,
-                        item,
-                        flags=re.I,
-                    )
-                    for item in expected
-                ]
-            change["expected_changes"] = list(dict.fromkeys(expected))
-            marker = (
-                "执行证据确认目标 Screen 会话已存在，恢复动作必须复用其"
-                "注册 restart 生命周期"
-            )
-            reason = str(change.get("reason") or "").rstrip("；。")
-            if marker not in reason:
-                change["reason"] = "%s；%s" % (reason, marker)
 
     @staticmethod
     def _collapse_redundant_runtime_repair_changes(data: dict[str, Any]) -> None:

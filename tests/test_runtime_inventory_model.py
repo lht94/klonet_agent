@@ -87,6 +87,49 @@ def test_runtime_inventory_parses_authoritative_role_listener_binding():
     assert binding.runtime_root == "/srv/simulation/worker101"
 
 
+def test_runtime_inventory_keeps_root_bound_screen_ownership():
+    from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
+
+    encoded = base64.urlsafe_b64encode(json.dumps({
+        "master": ["vemu_m"],
+        "web_terminal": ["vemu_web"],
+    }).encode("utf-8")).decode("ascii")
+    output = "\n".join([
+        "runtime_candidate_count=1", "healthy_count=0", "abnormal_count=1",
+        "code_only_count=0",
+        "platform=vemu project_root=/srv/vemu roles=master "
+        "backend_status=abnormal missing_roles=worker "
+        "screen_sessions_b64=" + encoded,
+    ])
+
+    instance = RuntimeInventory.from_bundle(_bundle(output)).instances[0]
+
+    assert instance.screen_sessions == {
+        "master": ("vemu_m",),
+        "web_terminal": ("vemu_web",),
+    }
+    assert instance.screen_session("web_terminal") == "vemu_web"
+    assert instance.screen_session("worker") == ""
+
+
+def test_runtime_inventory_never_guesses_between_duplicate_role_sessions():
+    from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
+
+    encoded = base64.urlsafe_b64encode(json.dumps({
+        "master": ["legacy_m", "other_m"],
+    }).encode("utf-8")).decode("ascii")
+    output = "\n".join([
+        "runtime_candidate_count=1", "healthy_count=0", "abnormal_count=1",
+        "code_only_count=0",
+        "platform=vemu project_root=/srv/vemu roles=worker "
+        "backend_status=abnormal screen_sessions_b64=" + encoded,
+    ])
+
+    instance = RuntimeInventory.from_bundle(_bundle(output)).instances[0]
+
+    assert instance.screen_session("master") == ""
+
+
 def test_runtime_inventory_overlays_later_port_owner_evidence():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,

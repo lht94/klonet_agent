@@ -1341,6 +1341,89 @@ def test_unhealthy_role_disposition_rewrites_prefixed_start_title_to_restart():
     assert result[1]["title"] == "Start worker screen component"
 
 
+def test_missing_runtime_with_existing_screen_uses_restart_lifecycle():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _normalize_runtime_role_recovery_verbs,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="restore-vemu",
+        title="Restore vemu roles",
+        objective="Restore /srv/vemu",
+        expected_changes=[
+            "start missing web_terminal role at 5115 and listener readiness succeeds",
+        ],
+        risk="medium",
+    )
+    items = [{
+        "id": "web", "title": "Start web_terminal screen component",
+        "objective": "restore web", "depends_on": [],
+    }]
+    resources = [PlanResource(
+        "restore_vemu_web_screen", "identifier", "frozen",
+        "screen_session", "vemu_web", "running_platforms",
+        consumers=["restore-vemu.screen_session"],
+    )]
+
+    result = _normalize_runtime_role_recovery_verbs(items, semantic, resources)
+
+    assert result[0]["title"] == "Restart web_terminal screen component"
+
+
+def test_missing_runtime_without_existing_screen_keeps_start_lifecycle():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _normalize_runtime_role_recovery_verbs,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="restore-vemu", title="Restore vemu roles",
+        objective="Restore /srv/vemu",
+        expected_changes=[
+            "start missing worker role at 45556 and backend health succeeds",
+        ],
+        risk="medium",
+    )
+    items = [{
+        "id": "worker", "title": "Start worker screen component",
+        "objective": "restore worker", "depends_on": [],
+    }]
+
+    result = _normalize_runtime_role_recovery_verbs(items, semantic, [])
+
+    assert result[0]["title"] == "Start worker screen component"
+
+
+def test_screen_from_another_semantic_step_cannot_change_action_lifecycle():
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _normalize_runtime_role_recovery_verbs,
+    )
+
+    semantic = PrivilegedStep(
+        step_id="restore-target", title="Restore target roles",
+        objective="Restore /srv/target",
+        expected_changes=[
+            "start missing worker role at 45556 and backend health succeeds",
+        ],
+        risk="medium",
+    )
+    items = [{
+        "id": "worker", "title": "Start worker screen component",
+        "objective": "restore worker", "depends_on": [],
+    }]
+    resources = [PlanResource(
+        "other_worker_screen", "identifier", "frozen",
+        "screen_session", "other_w", "running_platforms",
+        consumers=["restore-other.screen_session"],
+    )]
+
+    result = _normalize_runtime_role_recovery_verbs(items, semantic, resources)
+
+    assert result[0]["title"] == "Start worker screen component"
+
+
 def test_backend_port_repair_does_not_inherit_public_port_deployment_requirement():
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding, PlanResource, PrivilegedStep,

@@ -730,6 +730,22 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         for row in screen_rows
         if str(row.get("project_root") or "").startswith("/")
     }
+    screen_sessions_by_root: dict[str, dict[str, list[str]]] = {}
+    for row in screen_rows:
+        root_text = str(row.get("project_root") or "").strip()
+        role = str(row.get("role") or "").strip()
+        session_token = str(row.get("session") or "").strip()
+        session = session_token.split(".", 1)[1] if "." in session_token else session_token
+        if (
+            not root_text.startswith("/")
+            or not role
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", session)
+        ):
+            continue
+        root = str(_canonical_runtime_root(Path(root_text)).resolve())
+        screen_sessions_by_root.setdefault(root, {}).setdefault(role, []).append(
+            session
+        )
     screen_roots = set(root_aliases)
     external_runtime_rows: list[dict] = []
     for row in process_rows:
@@ -841,8 +857,9 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
             "master_identities=%s worker_identities=%s "
             "celery_identities=%s web_terminal_identities=%s "
             "runtime_identities=%s "
-            "role_bindings_b64=%s "
-            "backend_status=%s missing_roles=%s configured_ports=%s "
+                "role_bindings_b64=%s "
+                "screen_sessions_b64=%s "
+                "backend_status=%s missing_roles=%s configured_ports=%s "
             "managed_components=%s component_specs_b64=%s %s %s"
             % (
                 entry["platform"],
@@ -864,6 +881,17 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                 })) or "none",
                 base64.urlsafe_b64encode(json.dumps(
                     role_bindings,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).decode("ascii"),
+                base64.urlsafe_b64encode(json.dumps(
+                    {
+                        role: sorted(set(sessions))
+                        for role, sessions in screen_sessions_by_root.get(
+                            root_text, {}
+                        ).items()
+                    },
                     ensure_ascii=True,
                     sort_keys=True,
                     separators=(",", ":"),

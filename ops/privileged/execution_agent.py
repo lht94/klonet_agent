@@ -690,7 +690,9 @@ class PrivilegedExecutionAgent:
         items = _drop_runtime_stops_covered_by_same_step_restart(items)
         items = _ensure_runtime_migration_stop_item(items, semantic_step)
         items = _ensure_runtime_role_recovery_items(items, semantic_step)
-        items = _normalize_runtime_role_recovery_verbs(items, semantic_step)
+        items = _normalize_runtime_role_recovery_verbs(
+            items, semantic_step, plan.resources,
+        )
         items = _drop_runtime_stops_covered_by_same_step_restart(items)
         items = _expand_unhealthy_role_restarts(items, semantic_step)
         items = _collapse_redundant_runtime_role_mutations(items)
@@ -3565,6 +3567,10 @@ def _deterministic_runtime_recovery_items(
         previous = item_id
 
     for role, verb in dispositions.items():
+        if verb == "Start" and _frozen_screen_session_for_role(
+            plan.resources, semantic_step, role,
+        ):
+            verb = "Restart"
         item_id = "%s-%s" % (verb.lower(), role.replace("_", "-"))
         items.append({
             "id": item_id,
@@ -4588,6 +4594,7 @@ def _collapse_redundant_runtime_role_mutations(
 def _normalize_runtime_role_recovery_verbs(
     items: list[dict[str, Any]],
     semantic_step: PrivilegedStep,
+    resources: list[PlanResource] | tuple[PlanResource, ...] = (),
 ) -> list[dict[str, Any]]:
     """Compile evidence disposition (restart unhealthy/start missing) into Action verbs."""
 
@@ -4603,8 +4610,41 @@ def _normalize_runtime_role_recovery_verbs(
             re.I,
         ):
             continue
-        item["title"] = "%s %s screen component" % (dispositions[role], role)
+        verb = dispositions[role]
+        if verb == "Start" and _frozen_screen_session_for_role(
+            resources, semantic_step, role,
+        ):
+            verb = "Restart"
+        item["title"] = "%s %s screen component" % (verb, role)
     return items
+
+
+def _frozen_screen_session_for_role(
+    resources: list[PlanResource] | tuple[PlanResource, ...],
+    semantic_step: PrivilegedStep,
+    role: str,
+) -> str:
+    """Resolve existing Screen ownership from the frozen runtime identity."""
+
+    suffix = {
+        "master": "_m", "celery": "_c",
+        "web_terminal": "_web", "worker": "_w",
+    }.get(str(role or "").strip().lower(), "")
+    if not suffix:
+        return ""
+    scoped = []
+    for resource in resources:
+        if resource.status != "frozen" or resource.role != "screen_session":
+            continue
+        if not str(resource.value).endswith(suffix):
+            continue
+        if not any(
+            str(consumer).partition(".")[0] == semantic_step.step_id
+            for consumer in resource.consumers
+        ):
+            continue
+        scoped.append(str(resource.value))
+    return scoped[0] if len(scoped) == 1 else ""
 
 
 def _runtime_component_dispositions(

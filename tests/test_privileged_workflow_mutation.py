@@ -1099,37 +1099,6 @@ def test_recovery_restart_rejects_disappeared_target_without_presence_evidence()
         )
 
 
-def test_post_execution_existing_screen_promotes_only_failed_start_to_restart():
-    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
-    from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceBundle, EvidenceRecord, ProbeRequest,
-    )
-
-    bundle = EvidenceBundle(goal="恢复全部平台")
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("plan_execution", {"plan_id": "priv-ops-test"}, "execution"),
-        "step=restart-alpha-backend-roles__start-master status=paused "
-        "execution_output=screen_session_already_exists=alpha_m "
-        "environment_changed=false",
-    ))
-    data = {"changes": [{
-        "step_id": "restart-alpha-backend-roles",
-        "reason": "runtime is missing",
-        "expected_changes": [
-            "start missing master role at 47001 and backend health succeeds",
-            "start missing worker role at 47002 and backend health succeeds",
-        ],
-    }]}
-
-    ChangePlannerAgent._normalize_post_execution_screen_recovery(data, bundle)
-
-    assert data["changes"][0]["expected_changes"] == [
-        "restart requested master role at 47001 and backend health succeeds",
-        "start missing worker role at 47002 and backend health succeeds",
-    ]
-    assert "restart 生命周期" in data["changes"][0]["reason"]
-
-
 def test_recovery_restart_omits_component_already_proved_completed():
     import base64
     import json
@@ -2888,7 +2857,7 @@ def test_existing_runtime_role_port_uses_structured_root_without_path_in_prose()
     )
 
 
-def test_change_planner_repairs_recheck_of_confirmed_missing_role():
+def test_change_planner_preserves_screen_ownership_check_for_missing_runtime():
     from klonet_agent.ops.privileged.workflow.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
@@ -2912,28 +2881,17 @@ def test_change_planner_repairs_recheck_of_confirmed_missing_role():
             }
         ],
     }
-    ready = {
-        "status": "ready", "goal": "start missing master", "resources": [],
-        "changes": [
-            {
-                "step_id": "start", "title": "Start missing master",
-                "objective": "Start master for /srv/demo", "reason": "role missing",
-                "evidence_refs": [evidence_id], "depends_on": [], "risk": "medium",
-                "expected_changes": ["master starts"],
-                "postconditions": [
-                    {"checker": "process_running", "args": {"pattern": "master_main"}}
-                ],
-            }
-        ],
-    }
-    llm = FakeLLM([json.dumps(invalid), json.dumps(ready)])
+    llm = FakeLLM([json.dumps(invalid)])
 
     outcome = ChangePlannerAgent(llm).plan(
         "start missing master", bundle, conclusion
     )
 
-    assert outcome.status == "need_execution"
-    assert len(llm.calls) == 2
+    assert outcome.status == "need_evidence"
+    assert [request.probe for request in outcome.evidence_requests] == [
+        "screen_session"
+    ]
+    assert len(llm.calls) == 1
 
 
 def test_change_planner_bounds_model_output_and_omits_runaway_repair_context():

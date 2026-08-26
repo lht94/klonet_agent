@@ -108,6 +108,30 @@ def _decode_role_bindings(value: str) -> dict[str, RuntimeRoleBinding]:
     return result
 
 
+def _decode_screen_sessions(value: str) -> dict[str, tuple[str, ...]]:
+    if not value or value == "none":
+        return {}
+    try:
+        padding = "=" * (-len(value) % 4)
+        raw = json.loads(base64.urlsafe_b64decode(value + padding).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, tuple[str, ...]] = {}
+    for role, sessions in raw.items():
+        if not isinstance(sessions, list):
+            continue
+        valid = tuple(dict.fromkeys(
+            str(session)
+            for session in sessions
+            if re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(session or ""))
+        ))
+        if valid:
+            result[str(role)] = valid
+    return result
+
+
 @dataclass(frozen=True)
 class RuntimeInstance:
     platform: str
@@ -119,6 +143,7 @@ class RuntimeInstance:
     configured_ports: dict[str, int] = field(default_factory=dict)
     endpoints: dict[str, str] = field(default_factory=dict)
     role_bindings: dict[str, RuntimeRoleBinding] = field(default_factory=dict)
+    screen_sessions: dict[str, tuple[str, ...]] = field(default_factory=dict)
     fields: dict[str, str] = field(default_factory=dict)
     raw_line: str = ""
     evidence_id: str = ""
@@ -158,6 +183,9 @@ class RuntimeInstance:
             configured_ports=ports,
             endpoints=endpoints,
             role_bindings=_decode_role_bindings(_field(line, "role_bindings_b64")),
+            screen_sessions=_decode_screen_sessions(
+                _field(line, "screen_sessions_b64")
+            ),
             fields=fields,
             raw_line=line.strip(),
             evidence_id=evidence_id,
@@ -165,6 +193,21 @@ class RuntimeInstance:
 
     def role_binding(self, role: str) -> RuntimeRoleBinding | None:
         return self.role_bindings.get(str(role or "").strip().lower())
+
+    def screen_session(self, role: str) -> str:
+        """Return one root-bound role session, never guess among duplicates."""
+
+        normalized = str(role or "").strip().lower().replace("-", "_")
+        sessions = self.screen_sessions.get(normalized, ())
+        suffix = {
+            "master": "_m", "celery": "_c",
+            "web_terminal": "_web", "worker": "_w",
+        }.get(normalized, "")
+        expected = "%s%s" % (self.platform, suffix) if suffix else ""
+        exact = [session for session in sessions if session == expected]
+        if len(exact) == 1:
+            return exact[0]
+        return sessions[0] if len(sessions) == 1 else ""
 
     @property
     def aliases(self) -> tuple[str, ...]:

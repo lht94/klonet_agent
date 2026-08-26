@@ -1267,6 +1267,7 @@ def test_running_platform_inspection_counts_only_backend_healthy_runtime_roots(m
     assert "celery_identities=4:996:/opt/celery/bin/python3.8" in result
     assert "web_terminal_identities=none" in result
     assert "runtime_identities=1:997:/usr/bin/python3.8" in result
+    assert "screen_sessions_b64=" in result
 
 
 def test_colliding_runtime_basenames_are_deterministically_path_qualified():
