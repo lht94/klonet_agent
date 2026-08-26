@@ -530,6 +530,27 @@ def test_orphan_cleanup_never_scans_unrelated_runtime_groups(
     assert calls and set(calls) == {121}
 
 
+def test_runtime_role_recognizes_web_terminal_script_and_module_forms():
+    from klonet_agent.ops.privileged.action_runner import (
+        _is_klonet_runtime_command, _klonet_component_for_command,
+    )
+
+    commands = [
+        "python web_terminal_main.py",
+        "python /srv/klonet/web_terminal_main.py --port 43444",
+        "python -m vemu_uestc.mains.web_terminal_main",
+    ]
+    assert all(
+        _klonet_component_for_command(command) == "web_terminal"
+        for command in commands
+    )
+    assert all(_is_klonet_runtime_command(command) for command in commands)
+    assert _klonet_component_for_command(
+        "python -m tools.web_terminal_main_backup"
+    ) == ""
+    assert not _is_klonet_runtime_command("python worker_helper.py")
+
+
 def test_restart_orphan_cleanup_rejects_mixed_role_process_group(
     tmp_path, monkeypatch,
 ):

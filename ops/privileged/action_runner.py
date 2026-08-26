@@ -5524,23 +5524,7 @@ def _proc_cwd(
 
 
 def _is_klonet_runtime_command(cmdline: str) -> bool:
-    text = cmdline or ""
-    if "gunicorn" in text and any(
-        marker in text
-        for marker in (
-            "master_main:flask_app",
-            "worker_main:flask_app",
-            "data_server_main:flask_app",
-        )
-    ):
-        return True
-    return any(
-        marker in text
-        for marker in (
-            "web_terminal_main.py",
-            "celery_worker.celery",
-        )
-    )
+    return bool(_klonet_component_for_command(cmdline))
 
 
 def _klonet_component_for_command(cmdline: str) -> str:
@@ -5551,7 +5535,11 @@ def _klonet_component_for_command(cmdline: str) -> str:
         return "worker"
     if "data_server_main:flask_app" in text:
         return "data_server"
-    if "web_terminal_main.py" in text:
+    if re.search(
+        r"(?:^|\s)(?:\S*/)?web_terminal_main\.py(?:\s|$)|"
+        r"(?:^|\s)-m\s+[A-Za-z0-9_.]*web_terminal_main(?:\s|$)",
+        text,
+    ):
         return "web_terminal"
     if "celery_worker.celery" in text:
         return "celery"
