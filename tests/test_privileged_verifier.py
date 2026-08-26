@@ -634,6 +634,7 @@ def test_verifier_goal_decides_replan_after_supported_execution_failure():
     llm = FakeLLM([json.dumps({
         "status": "need_replan",
         "reason": "根因已确认，需要修订未完成步骤",
+        "failed_criteria": ["目标日志目录仍不存在"],
     }, ensure_ascii=False)])
 
     outcome = PrivilegedVerifierAgent(llm).verify_goal(
@@ -644,6 +645,50 @@ def test_verifier_goal_decides_replan_after_supported_execution_failure():
     )
 
     assert outcome.status == "need_replan"
+
+
+def test_verifier_rejects_replan_inferred_only_from_failure_wording():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceClaim, EvidenceConclusion, EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+
+    bundle = EvidenceBundle(goal="把目标 worker 收编到 Screen")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("plan_execution", {}, "执行结果"),
+        "\n".join([
+            "plan_id=priv-ok status=paused",
+            "change=restart-worker status=completed observation=passed",
+            "step=start-worker status=completed attempts=1 return_code=0 "
+            "timed_out=False environment_changed=true observation=passed",
+            "check=screen_session_exists status=passed observed=worker_w",
+        ]),
+    ))
+    conclusion = EvidenceConclusion(confirmed_facts=[EvidenceClaim(
+        "执行后的检查已经通过；顶层计划正在等待完成提交",
+        [bundle.records[0].evidence_id],
+    )])
+    llm = FakeLLM([
+        json.dumps({
+            "status": "need_replan",
+            "reason": "诊断任务提到了失败，所以重新规划",
+        }, ensure_ascii=False),
+        json.dumps({
+            "status": "achieved",
+            "reason": "当前目标效果和 Screen 验收均已满足",
+        }, ensure_ascii=False),
+    ])
+
+    outcome = PrivilegedVerifierAgent(llm).verify_goal(
+        bundle.goal, bundle, conclusion,
+        phase="post_execution", goal_kind="execution",
+    )
+
+    assert outcome.status == "achieved"
+    assert "explicit current failed criteria" in (
+        llm.calls[1]["messages"][-1]["content"]
+    )
 
 
 def test_verifier_goal_prioritizes_referenced_evidence_with_a_bounded_payload():

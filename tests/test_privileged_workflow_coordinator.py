@@ -1549,7 +1549,8 @@ def test_paused_confirm_result_automatically_diagnoses_and_replans():
     )
     assert submitted["intent_context"]["operation"] == "restart"
     assert submitted["intent_context"]["scope"] == "platform"
-    assert "自动诊断" in discovery.goal
+    assert "验证已审批任务是否已经达到完整用户目标" in discovery.goal
+    assert "未达到目标的原因" not in discovery.goal
 
 
 def test_unknown_execution_reconciled_as_unmet_skips_goal_probe_loop_and_replans():

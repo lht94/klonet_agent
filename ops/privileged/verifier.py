@@ -67,6 +67,7 @@ Return exactly one JSON object:
   "status": "achieved|need_evidence|need_replan|needs_user_decision|blocked",
   "reason": "short reason in Chinese",
   "user_question": "only for a genuine user choice",
+  "failed_criteria": ["only current, evidence-proven unmet goal criteria"],
   "evidence_requests": [
     {"probe":"preferred capability","args":{},"purpose":"...",
      "required_facts":[],"freshness":"cached|refresh"}
@@ -97,7 +98,10 @@ Rules:
   command binding are unavailable. One refused path is insufficient.
 - `need_replan` is valid only in `post_execution` phase, after evidence proves
   the approved plan did not achieve the goal and identifies enough cause to
-  safely revise only the unmet effects.
+  safely revise only the unmet effects. It must include non-empty
+  `failed_criteria` naming those current unmet effects. A transitional plan
+  status such as paused/verifying, historical failure, or a diagnostic prompt
+  is not itself an unmet goal criterion.
 - Request at most four probes and never repeat an attempted probe key.
 - State required facts precisely; do not emit a command. Write user-visible text in Chinese.
 
@@ -410,6 +414,15 @@ class PrivilegedVerifierAgent:
         if status == "need_replan":
             if phase != "post_execution":
                 raise ValueError("need_replan is only valid after execution")
+            failed_criteria = [
+                str(item).strip()
+                for item in data.get("failed_criteria", [])
+                if str(item).strip()
+            ]
+            if not failed_criteria:
+                raise ValueError(
+                    "need_replan lacks explicit current failed criteria"
+                )
             facts = " ".join(item.text for item in conclusion.confirmed_facts)
             if not re.search(
                 r"失败|未达到|根因|原因(?:是|为)|导致|由于|failed|unmet|"

@@ -1284,7 +1284,14 @@ class PrivilegedOpsCoordinator:
             execution_request,
             _paused_plan_evidence(control),
         ))
-        recovery_goal = "自动诊断已审批任务未达到目标的原因，并补齐恢复规划证据：%s" % goal
+        # Do not assert failure before the sole goal Verifier has made its
+        # decision.  This text is consumed by Discovery, Synthesis and the
+        # knowledge retriever; wording it as an already-failed task turns a
+        # transitional ``paused`` plan into synthetic failure evidence.
+        recovery_goal = (
+            "验证已审批任务是否已经达到完整用户目标；仅当当前证据证明仍有"
+            "未满足效果时，定位该具体缺口并补齐局部恢复规划证据：%s" % goal
+        )
         begin = getattr(self.discovery, "begin_probe_session", None)
         end = getattr(self.discovery, "end_probe_session", None)
         if begin is not None:
