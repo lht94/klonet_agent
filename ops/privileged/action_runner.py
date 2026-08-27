@@ -175,6 +175,28 @@ class DirectActionResult:
     metadata: dict[str, str] = field(default_factory=dict)
 
 
+def _result_with_environment_changed(
+    result: DirectActionResult,
+    changed: bool,
+) -> DirectActionResult:
+    """Replace, rather than append, the authoritative mutation observation."""
+
+    output = re.sub(
+        r"(?:^|\s)environment_changed=(?:true|false|unknown)(?=\s|$)",
+        "",
+        result.output,
+    ).strip()
+    return DirectActionResult(
+        result.status,
+        "%s environment_changed=%s" % (
+            output,
+            "true" if changed else "false",
+        ),
+        result.next_required_action,
+        dict(result.metadata or {}),
+    )
+
+
 class DirectPrivilegedActionRunner:
     """Execute one confirmed action without the ordinary Ops helper."""
 
@@ -1196,6 +1218,11 @@ class DirectPrivilegedActionRunner:
         run_as_uid = _runtime_run_as_uid(step.args)
         if run_as_uid is None:
             return self._blocked("invalid_run_as_uid")
+        preflight_failure = self._check_component_preflight(
+            component, root, step,
+        )
+        if preflight_failure is not None:
+            return preflight_failure
         dead_targets, cleanup_error = self._clean_dead_screen_session(
             session, run_as_uid,
         )
@@ -1464,9 +1491,14 @@ class DirectPrivilegedActionRunner:
                 "inspect_runtime",
             )
         started = self._start_one_component(
-            component, session, root, step
+            component, session, root, step, True,
         )
         if started.status != "completed":
+            changed_before_start = bool(
+                proven_orphan_pids or cleanup_targets
+            )
+            if changed_before_start:
+                return _result_with_environment_changed(started, True)
             return started
         new_pids = (
             _listener_pids_for_port(port)
@@ -3884,6 +3916,7 @@ class DirectPrivilegedActionRunner:
         session: str,
         root: Path,
         step: PrivilegedStep,
+        preflight_checked: bool = False,
     ) -> DirectActionResult:
         python = _python_executable(step.args)
         if not python:
@@ -3900,45 +3933,12 @@ class DirectPrivilegedActionRunner:
         command = _component_command(component, python, step.args)
         if not command:
             return self._blocked("component_command_missing")
-        preflight = {
-            "master": [
-                python, "-m", "gunicorn", "--check-config",
-                "-c", "gun.py", "master_main:flask_app",
-            ],
-            "worker": [
-                python, "-m", "gunicorn", "--check-config",
-                "-c", "worker_gun.py", "worker_main:flask_app",
-            ],
-            "celery": [python, "-c", "from celery_worker import celery"],
-            "web_terminal": [
-                python,
-                "-c",
-                "from vemu_uestc.webserver.app_factory import create_web_terminal_app; "
-                "from vemu_uestc.vemu_config.config import PROJ_CONFIG; "
-                "from gevent import pywsgi; "
-                "from geventwebsocket.handler import WebSocketHandler",
-            ],
-        }.get(component) or list(step.args.get("preflight_argv") or [])
-        if not preflight:
-            return self._blocked("component_preflight_missing")
-        checked = self._command(
-            _runtime_user_argv(preflight, run_as_uid, runtime_env),
-            cwd=root,
-            env=runtime_env,
-            timeout=min(step.timeout, 30),
-        )
-        if checked.returncode != 0:
-            return DirectActionResult(
-                "failed",
-                "startup_preflight_failed component=%s returncode=%s stderr=%s "
-                "environment_changed=false"
-                % (
-                    component,
-                    checked.returncode,
-                    _one_line(checked.stderr or checked.stdout, 10000),
-                ),
-                "inspect_project_layout",
+        if not preflight_checked:
+            preflight_failure = self._check_component_preflight(
+                component, root, step,
             )
+            if preflight_failure is not None:
+                return preflight_failure
         self._emit_command(command, cwd=root, execution="screen_foreground")
         control_rc = _runtime_screen_control_path(root, session)
         rc_content = _interactive_screen_rc(
@@ -4015,6 +4015,65 @@ class DirectPrivilegedActionRunner:
             "session_mode=interactive_foreground control_rc=%s environment_changed=true"
             % (component, session, control_rc),
         )
+
+    def _check_component_preflight(
+        self,
+        component: str,
+        root: Path,
+        step: PrivilegedStep,
+    ) -> DirectActionResult | None:
+        python = _python_executable(step.args)
+        if not python:
+            return self._blocked("python3.8_not_found")
+        try:
+            runtime_env = _runtime_python_env(root)
+        except OSError as exc:
+            return self._blocked(
+                "runtime_python_alias_failed=%s" % exc.__class__.__name__
+            )
+        run_as_uid = _runtime_run_as_uid(step.args)
+        if run_as_uid is None:
+            return self._blocked("invalid_run_as_uid")
+        preflight = {
+            "master": [
+                python, "-m", "gunicorn", "--check-config",
+                "-c", "gun.py", "master_main:flask_app",
+            ],
+            "worker": [
+                python, "-m", "gunicorn", "--check-config",
+                "-c", "worker_gun.py", "worker_main:flask_app",
+            ],
+            "celery": [python, "-c", "from celery_worker import celery"],
+            "web_terminal": [
+                python,
+                "-c",
+                "from vemu_uestc.webserver.app_factory import create_web_terminal_app; "
+                "from vemu_uestc.vemu_config.config import PROJ_CONFIG; "
+                "from gevent import pywsgi; "
+                "from geventwebsocket.handler import WebSocketHandler",
+            ],
+        }.get(component) or list(step.args.get("preflight_argv") or [])
+        if not preflight:
+            return self._blocked("component_preflight_missing")
+        checked = self._command(
+            _runtime_user_argv(preflight, run_as_uid, runtime_env),
+            cwd=root,
+            env=runtime_env,
+            timeout=min(step.timeout, 30),
+        )
+        if checked.returncode != 0:
+            return DirectActionResult(
+                "failed",
+                "startup_preflight_failed component=%s returncode=%s stderr=%s "
+                "environment_changed=false"
+                % (
+                    component,
+                    checked.returncode,
+                    _one_line(checked.stderr or checked.stdout, 10000),
+                ),
+                "inspect_project_layout",
+            )
+        return None
 
     def _screen_ls_text(self, run_as_uid: str = "") -> str:
         result = self._command(

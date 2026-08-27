@@ -795,6 +795,10 @@ def test_runtime_component_inventory_freezes_safe_observed_custom_argv(tmp_path)
         "/opt/envs/test/bin/python3.8", "-m", "gunicorn", "-c",
         "data_server_gun.py", "data_server_main:flask_app",
     ]
+    assert data_server["preflight_argv"] == [
+        "/opt/envs/test/bin/python3.8", "-m", "gunicorn", "--check-config",
+        "-c", "data_server_gun.py", "data_server_main:flask_app",
+    ]
 
 
 def test_discovery_collects_reusable_klonet_knowledge_before_host_probes():

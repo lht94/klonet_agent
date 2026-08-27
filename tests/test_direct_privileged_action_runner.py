@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -801,6 +802,111 @@ def test_restart_rehomes_exact_root_listener_when_screen_ancestry_is_hidden(
     assert "old_pids=501" in result.output
 
 
+def test_restart_custom_component_rejects_missing_preflight_before_cleanup(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectPrivilegedActionRunner,
+    )
+
+    _write_runtime_entries(tmp_path)
+    runner = DirectPrivilegedActionRunner()
+    cleanup_attempts = []
+    monkeypatch.setattr(
+        runner,
+        "_clean_dead_screen_session",
+        lambda *_args: cleanup_attempts.append(True) or ([], ""),
+    )
+
+    result = runner(_step(
+        "restart_screen_component",
+        {
+            "platform": "test",
+            "component": "data_server",
+            "screen_suffix": "data_server",
+            "screen_session": "test_data_server",
+            "project_root": str(tmp_path),
+            "command_argv": [sys.executable, "-m", "data_server"],
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "blocked"
+    assert "component_preflight_missing" in result.output
+    assert "environment_changed=false" in result.output
+    assert cleanup_attempts == []
+
+
+def test_restart_reports_changed_when_start_fails_after_orphan_cleanup(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectActionResult, DirectPrivilegedActionRunner,
+    )
+
+    _write_runtime_entries(tmp_path)
+    events = []
+
+    def command_runner(argv, **kwargs):
+        events.append(("command", list(argv)))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    runner = DirectPrivilegedActionRunner(command_runner=command_runner)
+    monkeypatch.setattr(
+        runner, "_clean_dead_screen_session", lambda *_args: ([], ""),
+    )
+    monkeypatch.setattr(
+        runner, "_screen_session_targets", lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        module, "_component_pids", lambda *_args: [501],
+    )
+    monkeypatch.setattr(
+        module, "_screen_owner_targets_for_pids", lambda _pids: ([], False),
+    )
+    monkeypatch.setattr(module, "_proc_cwd", lambda _pid: str(tmp_path))
+
+    def stop_groups(*_args):
+        events.append(("stop", [501]))
+        return DirectActionResult(
+            "completed", "stopped environment_changed=true",
+        )
+
+    monkeypatch.setattr(runner, "_stop_frozen_component_groups", stop_groups)
+    monkeypatch.setattr(
+        runner,
+        "_start_one_component",
+        lambda *_args: DirectActionResult(
+            "failed",
+            "screen_start_failed environment_changed=false",
+            "inspect_runtime",
+        ),
+    )
+
+    result = runner(_step(
+        "restart_screen_component",
+        {
+            "platform": "test",
+            "component": "data_server",
+            "screen_suffix": "data_server",
+            "screen_session": "test_data_server",
+            "project_root": str(tmp_path),
+            "python": sys.executable,
+            "command_argv": [sys.executable, "-m", "data_server"],
+            "preflight_argv": [sys.executable, "-c", "import sys"],
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "failed"
+    assert result.output.count("environment_changed=") == 1
+    assert "environment_changed=true" in result.output
+    assert [kind for kind, _value in events].index("command") < [
+        kind for kind, _value in events
+    ].index("stop")
+
+
 def test_restart_does_not_create_parallel_screen_when_stale_cleanup_fails(
     tmp_path, monkeypatch,
 ):
@@ -898,7 +1004,10 @@ def test_restart_refuses_parallel_session_when_dead_socket_cannot_be_cleaned(
     _write_runtime_entries(tmp_path)
     runner = DirectPrivilegedActionRunner(
         command_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
-            argv, 1, "", "socket is still owned",
+            argv,
+            1 if "-wipe" in argv else 0,
+            "",
+            "socket is still owned" if "-wipe" in argv else "",
         )
     )
     monkeypatch.setattr(

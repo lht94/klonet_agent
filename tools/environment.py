@@ -2061,6 +2061,11 @@ def _runtime_component_specs(
             }
             if observed_argv:
                 discovered["command_argv"] = observed_argv
+                observed_preflight = _observed_runtime_component_preflight(
+                    observed_argv,
+                )
+                if observed_preflight:
+                    discovered["preflight_argv"] = observed_preflight
             by_name[role] = discovered
     return list(by_name.values())
 
@@ -2113,6 +2118,38 @@ def _observed_runtime_component_argv(
         if executable.startswith("/") and Path(argv[0]).name != Path(executable).name:
             continue
         return argv
+    return []
+
+
+def _observed_runtime_component_preflight(argv: list[str]) -> list[str]:
+    """Derive a non-mutating startup check from a frozen runtime command.
+
+    Gunicorn provides a deterministic configuration check that loads the same
+    config and application target without starting a listener.  Discovery may
+    freeze this contract because it is derived from the exact observed argv;
+    unsupported launchers remain without a preflight and must be resolved by
+    the normal Binding/Discovery path rather than guessed here.
+    """
+
+    values = [str(item) for item in argv]
+    if "--check-config" in values:
+        return values
+    try:
+        module_index = values.index("-m")
+    except ValueError:
+        module_index = -1
+    if (
+        module_index >= 0
+        and module_index + 1 < len(values)
+        and values[module_index + 1] == "gunicorn"
+    ):
+        return [
+            *values[: module_index + 2],
+            "--check-config",
+            *values[module_index + 2 :],
+        ]
+    if values and Path(values[0]).name.startswith("gunicorn"):
+        return [values[0], "--check-config", *values[1:]]
     return []
 
 
