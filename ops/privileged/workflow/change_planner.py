@@ -1403,7 +1403,10 @@ the complete proposed replacement goal and list what would be superseded.
                 "reason": "runtime_inventory_required_for_structured_restart",
                 "probe_requests": [{
                     "probe": "running_platforms",
-                    "args": ({"project_roots": [resolved_root]} if resolved_root else {}),
+                    "args": {
+                        **({"project_roots": [resolved_root]} if resolved_root else {}),
+                        "allow_interactive_sudo": True,
+                    },
                     "purpose": (
                         "按精确项目根目录取得所有目标实例、受管角色、现有端口和"
                         "运行身份，形成确定性 Screen 重启计划"
@@ -1475,7 +1478,10 @@ the complete proposed replacement goal and list what would be superseded.
                 "reason": "target_runtime_identity_unresolved",
                 "probe_requests": [{
                     "probe": "running_platforms",
-                    "args": ({"project_roots": [resolved_root]} if resolved_root else {}),
+                    "args": {
+                        **({"project_roots": [resolved_root]} if resolved_root else {}),
+                        "allow_interactive_sudo": True,
+                    },
                     "purpose": "刷新目标实例的精确项目根目录和运行角色",
                     "required_facts": [
                         "exact target project_root", "managed component roles",

@@ -535,6 +535,15 @@ class DefaultCheckerRegistry:
     def _screen_session_exists(self, args, evidence):
         del evidence
         session = str(args["session"])
+        process_pids = _screen_session_process_pids(session)
+        if process_pids:
+            return CheckResult(
+                "screen_session_exists",
+                "passed",
+                expected=session,
+                observed="pids=%s" % ",".join(str(pid) for pid in process_pids),
+                evidence="cross-user Screen process identity verified",
+            )
         return self._command_check(
             "screen_session_exists",
             ["screen", "-S", session, "-Q", "select", "."],
@@ -544,13 +553,21 @@ class DefaultCheckerRegistry:
     def _screen_session_absent(self, args, evidence):
         del evidence
         session = str(args["session"])
+        process_pids = _screen_session_process_pids(session)
+        if process_pids:
+            return CheckResult(
+                "screen_session_absent",
+                "failed",
+                expected="session absent",
+                observed="pids=%s" % ",".join(str(pid) for pid in process_pids),
+                evidence="cross-user Screen process identity verified",
+            )
         return self._command_check(
             "screen_session_absent",
             ["screen", "-S", session, "-Q", "select", "."],
             expected="session absent",
             success=lambda item: item.returncode != 0,
         )
-
     def _container_running(self, args, evidence):
         del evidence
         name = str(args["container"])
@@ -1207,6 +1224,37 @@ class DefaultCheckerRegistry:
         )
 
 
+def _screen_session_process_pids(session: str) -> list[int]:
+    """Find an exact detached Screen session even when owned by another uid."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", session):
+        return []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return []
+    matches: list[int] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [
+                item.decode("utf-8", errors="replace")
+                for item in (entry / "cmdline").read_bytes().split(b"\x00")
+                if item
+            ]
+        except OSError:
+            continue
+        if not argv or Path(argv[0]).name not in {"SCREEN", "screen"}:
+            continue
+        if any(
+            argv[index] == "-dmS" and argv[index + 1] == session
+            for index in range(len(argv) - 1)
+        ):
+            matches.append(int(entry.name))
+    return sorted(matches)
+
+
 def infer_postconditions(command: str) -> list[dict[str, Any]]:
     """为已知命令族补充结果检查，不信任单独的退出码。"""
 
@@ -1295,29 +1343,43 @@ def _listener_pids(port: int) -> list[int]:
     ss = shutil.which("ss")
     if not ss:
         return []
-    try:
-        result = subprocess.run(
-            [ss, "-ltnp"], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    pids = []
-    for line in (result.stdout or "").splitlines():
-        if not re.search(r":%s\b" % int(port), line):
+    pids: list[int] = []
+    for command in ([ss, "-ltnp"], ["sudo", "-n", ss, "-ltnp"]):
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
             continue
-        for value in re.findall(r"pid=(\d+)", line):
-            pid = int(value)
-            if pid not in pids:
-                pids.append(pid)
+        for line in (result.stdout or "").splitlines():
+            if not re.search(r":%s\b" % int(port), line):
+                continue
+            for value in re.findall(r"pid=(\d+)", line):
+                pid = int(value)
+                if pid not in pids:
+                    pids.append(pid)
+        if pids:
+            break
     return pids
 
 
 def _pid_cwd(pid: int) -> str:
     try:
-        return str(Path("/proc/%s/cwd" % int(pid)).resolve())
+        resolved = str(Path("/proc/%s/cwd" % int(pid)).resolve())
     except (OSError, ValueError):
+        resolved = ""
+    if resolved and not resolved.endswith("/cwd"):
+        return resolved
+    try:
+        result = subprocess.run(
+            ["sudo", "-n", "readlink", "-f", "/proc/%s/cwd" % int(pid)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
         return ""
+    return (result.stdout or "").strip() if result.returncode == 0 else ""
 
 
 def _bool_arg(value: Any, *, default: bool) -> bool:

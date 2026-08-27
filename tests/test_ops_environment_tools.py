@@ -1,5 +1,8 @@
 """Read-only environment diagnostic tool tests."""
 
+import base64
+import json
+import re
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -1529,6 +1532,115 @@ def test_process_rows_inherit_cross_user_cwd_only_through_observed_parent_chain(
     assert by_pid[101]["cwd"] == "/srv/102/mains"
     assert by_pid[102]["cwd"] == "/srv/102/mains"
     assert by_pid[101]["platform"] == "102"
+
+
+def test_cross_user_runtime_inventory_authenticates_sudo_once(monkeypatch):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    output = "\n".join([
+        "pid=100 pgid=100 ppid=1 uid=997 exe=/usr/bin/python3.8 cwd=? "
+        "cmd=/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+        "pid=101 pgid=101 ppid=1 uid=997 exe=/usr/bin/python3.8 cwd=? "
+        "cmd=/usr/bin/python3.8 -m gunicorn -c worker_gun.py worker_main:flask_app",
+    ])
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv == ["probe"]:
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+        if argv == ["sudo", "-n", "-v"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="password required")
+        if argv == ["sudo", "-v"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if argv[:3] == ["sudo", "-n", "readlink"]:
+            root = "/srv/alpha" if argv[-1].startswith("/proc/100/") else "/srv/beta"
+            return SimpleNamespace(returncode=0, stdout=root + "\n", stderr="")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(environment, "_probe_command", lambda name: ["probe"])
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+    monkeypatch.setattr(environment.sys.stdin, "isatty", lambda: True)
+
+    rows = environment._process_instance_rows(allow_interactive_sudo=True)
+
+    assert [row["cwd"] for row in rows] == ["/srv/alpha", "/srv/beta"]
+    assert calls.count(["sudo", "-n", "-v"]) == 1
+    assert calls.count(["sudo", "-v"]) == 1
+
+
+def test_cross_user_runtime_inventory_does_not_prompt_without_explicit_permission(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from klonet_agent.tools import environment
+
+    output = (
+        "pid=100 pgid=100 ppid=1 uid=997 exe=/usr/bin/python3.8 cwd=? "
+        "cmd=/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app"
+    )
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if argv == ["probe"]:
+            return SimpleNamespace(returncode=0, stdout=output, stderr="")
+        if argv[:3] == ["sudo", "-n", "readlink"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="password required")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(environment, "_probe_command", lambda name: ["probe"])
+    monkeypatch.setattr(environment.subprocess, "run", fake_run)
+
+    rows = environment._process_instance_rows()
+
+    assert rows[0]["cwd"] == "?"
+    assert ["sudo", "-v"] not in calls
+
+
+def test_running_platforms_recovers_cross_user_screen_ownership_from_process(
+    monkeypatch, tmp_path,
+):
+    from klonet_agent.tools import environment
+
+    root = tmp_path / "alpha"
+    mains = root / "mains"
+    mains.mkdir(parents=True)
+    (mains / "master_main.py").write_text("# master\n", encoding="utf-8")
+    (mains / "worker_main.py").write_text("# worker\n", encoding="utf-8")
+    rows = [{
+        "pid": 100, "uid": 997, "pgid": 100, "ppid": 1,
+        "executable": "SCREEN", "cwd": str(mains),
+        "cmd": "SCREEN -dmS alpha_m bash -lc run",
+        "platform": "alpha", "role": "master",
+    }, {
+        "pid": 101, "uid": 997, "pgid": 101, "ppid": 100,
+        "executable": "/usr/bin/python3.8", "cwd": str(mains),
+        "cmd": "/usr/bin/python3.8 -m gunicorn -c gun.py master_main:flask_app",
+        "platform": "alpha", "role": "master",
+    }]
+    monkeypatch.setattr(
+        environment, "_process_instance_rows", lambda **_kwargs: rows,
+    )
+    monkeypatch.setattr(environment, "_screen_instance_rows", lambda: [])
+    monkeypatch.setattr(environment, "_default_code_search_roots", lambda: [])
+    monkeypatch.setattr(
+        environment, "_probe_backend_endpoint",
+        lambda _port: ("not_checked", 0, "missing"),
+    )
+
+    result = environment.inspect_running_platforms(
+        {"allow_interactive_sudo": True},
+    )
+
+    line = next(item for item in result.splitlines() if item.startswith("platform="))
+    assert "project_root=%s" % root in line
+    encoded = re.search(r"\bscreen_sessions_b64=([^\s]+)", line).group(1)
+    decoded = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    assert decoded == {"master": ["alpha_m"]}
 
 
 def test_running_platform_inspection_enumerates_default_code_only_roots(monkeypatch):

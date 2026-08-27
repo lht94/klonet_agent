@@ -12,6 +12,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.error
@@ -723,7 +724,11 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
 
     args = args or {}
     instances: dict[str, dict] = {}
-    process_rows = _process_instance_rows()
+    process_rows = (
+        _process_instance_rows(allow_interactive_sudo=True)
+        if args.get("allow_interactive_sudo") is True
+        else _process_instance_rows()
+    )
     screen_rows = _screen_instance_rows()
     root_aliases = {
         str(_canonical_runtime_root(Path(row["project_root"])).resolve()): row["platform"]
@@ -741,6 +746,25 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
             or not role
             or not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", session)
         ):
+            continue
+        root = str(_canonical_runtime_root(Path(root_text)).resolve())
+        screen_sessions_by_root.setdefault(root, {}).setdefault(role, []).append(
+            session
+        )
+    # ``screen -ls`` is intentionally scoped to the caller's account.  When
+    # the runtime belongs to another user, recover the same ownership fact
+    # from the already-filtered Screen process and its verified cwd instead
+    # of treating the session as absent or scanning names independently.
+    for row in process_rows:
+        command = str(row.get("cmd") or "")
+        root_text = _runtime_root_from_process_row(row)
+        match = re.search(r"(?:^|\s)-dmS\s+(\S+)", command)
+        parsed = _platform_role_from_name(match.group(1)) if match else None
+        if not root_text or parsed is None:
+            continue
+        _platform, role = parsed
+        session = match.group(1)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", session):
             continue
         root = str(_canonical_runtime_root(Path(root_text)).resolve())
         screen_sessions_by_root.setdefault(root, {}).setdefault(role, []).append(
@@ -1433,9 +1457,16 @@ def inspect_screen_session(args: Optional[dict] = None) -> str:
             delete=False,
         ) as handle:
             snapshot_path = Path(handle.name)
+        snapshot_path.chmod(0o666)
 
+        owner_uid = _screen_session_owner_uid(session)
+        command = [
+            "screen", "-S", session, "-X", "hardcopy", "-h", str(snapshot_path),
+        ]
+        if owner_uid is not None and owner_uid != os.geteuid():
+            command = ["sudo", "-n", "-u", "#%s" % owner_uid, *command]
         completed = subprocess.run(
-            ["screen", "-S", session, "-X", "hardcopy", str(snapshot_path)],
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -1483,6 +1514,35 @@ def inspect_screen_session(args: Optional[dict] = None) -> str:
                 snapshot_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _screen_session_owner_uid(session: str) -> int | None:
+    """Resolve the owner of one exact detached Screen process."""
+
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = [
+                item.decode("utf-8", errors="replace")
+                for item in (entry / "cmdline").read_bytes().split(b"\x00")
+                if item
+            ]
+            uid = entry.stat().st_uid
+        except OSError:
+            continue
+        if not argv or Path(argv[0]).name not in {"SCREEN", "screen"}:
+            continue
+        if any(
+            argv[index] == "-dmS" and argv[index + 1] == session
+            for index in range(len(argv) - 1)
+        ):
+            return uid
+    return None
 
 
 def _platform_entry(instances: dict, platform: str, *, identity: str = "") -> dict:
@@ -1666,7 +1726,7 @@ def _qualify_colliding_platform_names(
             used.add(candidate)
 
 
-def _process_instance_rows() -> list:
+def _process_instance_rows(*, allow_interactive_sudo: bool = False) -> list:
     command = _probe_command("processes")
     if command is None:
         return []
@@ -1690,6 +1750,7 @@ def _process_instance_rows() -> list:
         return []
     rows = []
     privileged_cwds: dict[int, str] = {}
+    sudo_ready: bool | None = None
     for raw_line in (completed.stdout or "").splitlines():
         match = re.search(
             r"\bpid=(\d+)(?:\s+pgid=(\d+))?(?:\s+ppid=(\d+))?"
@@ -1713,6 +1774,8 @@ def _process_instance_rows() -> list:
         if cwd == "?":
             process_group = int(pgid) if pgid and pgid.isdigit() else pid
             if process_group not in privileged_cwds:
+                if allow_interactive_sudo and sudo_ready is None:
+                    sudo_ready = _authenticate_readonly_sudo_once()
                 privileged_cwds[process_group] = _privileged_process_cwd(pid)
             cwd = privileged_cwds[process_group]
         row = {
@@ -1750,6 +1813,46 @@ def _process_instance_rows() -> list:
         if not changed:
             break
     return rows
+
+
+def _authenticate_readonly_sudo_once() -> bool:
+    """Authenticate one explicitly privileged read-only inventory probe.
+
+    The password remains attached to the terminal and is never captured.  A
+    successful validation only establishes sudo's credential cache; every
+    subsequent metadata read still uses ``sudo -n`` and therefore cannot
+    create a prompt loop.
+    """
+
+    if os.name == "nt" or shutil.which("sudo") is None:
+        return False
+    options = {
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "check": False,
+        "timeout": PROBE_TIMEOUT_SECONDS,
+    }
+    try:
+        cached = subprocess.run(
+            ["sudo", "-n", "-v"], capture_output=True, **options,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if cached.returncode == 0:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    try:
+        authenticated = subprocess.run(
+            ["sudo", "-v"],
+            stdout=subprocess.DEVNULL,
+            stderr=None,
+            **{**options, "timeout": 120},
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return authenticated.returncode == 0
 
 
 def _is_runtime_process_executable(executable: str, command: str) -> bool:

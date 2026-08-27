@@ -614,7 +614,7 @@ def _recovery_probe_path_problem(
                 resolved = Path(raw).expanduser().resolve()
             except OSError:
                 return "invalid_path"
-            if roots and not any(
+            if not roots or not any(
                 resolved == root
                 or root in resolved.parents
                 or resolved in root.parents

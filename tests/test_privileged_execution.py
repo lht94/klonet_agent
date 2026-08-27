@@ -297,6 +297,41 @@ def test_checker_registry_reports_unknown_or_missing_dependency_as_unavailable()
     assert unavailable.status == "failed"
 
 
+def test_screen_checker_accepts_exact_cross_user_screen_process(monkeypatch):
+    from klonet_agent.ops.privileged import checkers as module
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    monkeypatch.setattr(
+        module, "_screen_session_process_pids", lambda session: [27717]
+        if session == "vemu_uestc_m" else [],
+    )
+
+    result = DefaultCheckerRegistry().run({
+        "checker": "screen_session_exists",
+        "args": {"session": "vemu_uestc_m"},
+    })
+
+    assert result.status == "passed"
+    assert result.observed == "pids=27717"
+
+
+def test_screen_absent_checker_rejects_cross_user_screen_process(monkeypatch):
+    from klonet_agent.ops.privileged import checkers as module
+    from klonet_agent.ops.privileged.checkers import DefaultCheckerRegistry
+
+    monkeypatch.setattr(
+        module, "_screen_session_process_pids", lambda _session: [27717],
+    )
+
+    result = DefaultCheckerRegistry().run({
+        "checker": "screen_session_absent",
+        "args": {"session": "vemu_uestc_m"},
+    })
+
+    assert result.status == "failed"
+    assert result.observed == "pids=27717"
+
+
 def test_restart_identity_accepts_recovery_from_stale_screen_without_old_pid(
     tmp_path, monkeypatch,
 ):
