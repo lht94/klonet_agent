@@ -115,6 +115,30 @@ def _ordered_default_restart_components(
     return ordered
 
 
+def _runtime_component_resource_payload(
+    spec: RuntimeComponentSpec,
+) -> dict[str, Any]:
+    """Serialize one component contract without inventing empty capabilities."""
+
+    payload: dict[str, Any] = {
+        "name": spec.name,
+        "category": spec.category,
+        "managed": spec.managed,
+        "default_restart": spec.default_restart,
+        "screen_suffix": spec.screen_suffix,
+    }
+    for key, values in (
+        ("command_argv", spec.command_argv),
+        ("preflight_argv", spec.preflight_argv),
+        ("ports", spec.ports),
+        ("health_checks", spec.health_checks),
+        ("start_after", spec.start_after),
+    ):
+        if values:
+            payload[key] = list(values)
+    return payload
+
+
 def _frozen_step_role_port(
     resources: list[Any],
     step_id: str,
@@ -1837,18 +1861,11 @@ the complete proposed replacement goal and list what would be superseded.
                     "name": "component_%s_spec" % role,
                     "kind": "string", "status": "frozen",
                     "role": "runtime_component_spec:%s" % role,
-                    "value": json.dumps({
-                        "name": spec.name,
-                        "category": spec.category,
-                        "managed": spec.managed,
-                        "default_restart": spec.default_restart,
-                        "screen_suffix": spec.screen_suffix,
-                        "command_argv": list(spec.command_argv),
-                        "preflight_argv": list(spec.preflight_argv),
-                        "ports": list(spec.ports),
-                        "health_checks": list(spec.health_checks),
-                        "start_after": list(spec.start_after),
-                    }, ensure_ascii=False, sort_keys=True),
+                    "value": json.dumps(
+                        _runtime_component_resource_payload(spec),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
                     "source": "runtime_component_inventory",
                     "consumers": [step_id + ".component_spec"],
                 })

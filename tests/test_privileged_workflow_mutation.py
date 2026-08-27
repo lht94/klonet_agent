@@ -1434,6 +1434,9 @@ def test_component_scoped_custom_runtime_never_expands_to_standard_roles():
     assert "data_server_main:flask_app" in resources[
         "runtime_component_spec:data_server"
     ]["value"]
+    assert "preflight_argv" not in json.loads(resources[
+        "runtime_component_spec:data_server"
+    ]["value"])
 
 
 def _bundle_and_conclusion():
