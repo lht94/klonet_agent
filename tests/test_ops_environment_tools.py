@@ -1319,6 +1319,19 @@ def test_component_ownership_distinguishes_screen_group_from_orphan(
     }]
 
 
+def test_screen_session_parser_recognizes_data_server_without_regressing_roles():
+    from klonet_agent.tools.environment import _platform_role_from_name
+
+    assert _platform_role_from_name("test_data_server") == (
+        "test", "data_server",
+    )
+    assert _platform_role_from_name("lab_alpha_data_server") == (
+        "lab_alpha", "data_server",
+    )
+    assert _platform_role_from_name("test_w") == ("test", "worker")
+    assert _platform_role_from_name("test_data_server_backup") is None
+
+
 def test_inline_web_terminal_factory_is_classified_as_web_terminal():
     from klonet_agent.tools.environment import _role_from_command
 

@@ -2067,6 +2067,7 @@ def _discover_klonet_code_roots(search_roots: Iterable[Path]) -> list[Path]:
 
 def _platform_role_from_name(name: str) -> Optional[tuple]:
     suffix_roles = (
+        ("_data_server", "data_server"),
         ("_web", "web_terminal"),
         ("_t", "web_terminal"),
         ("_m", "master"),
