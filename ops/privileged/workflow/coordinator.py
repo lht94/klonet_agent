@@ -2096,13 +2096,10 @@ def _authoritative_recovery_scope(plan: Any) -> dict[str, Any]:
     """
 
     plan_steps = list(getattr(plan, "steps", []) or [])
-    if (
-        str(getattr(plan, "status", "") or "") == "draft"
-        and all(
-            str(getattr(step, "status", "pending") or "pending") == "pending"
-            and int(getattr(step, "execution_attempts", 0) or 0) == 0
-            for step in plan_steps
-        )
+    if all(
+        str(getattr(step, "status", "pending") or "pending") == "pending"
+        and int(getattr(step, "execution_attempts", 0) or 0) == 0
+        for step in plan_steps
     ):
         return {}
     unfinished = {

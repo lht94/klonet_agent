@@ -1858,6 +1858,69 @@ def test_unexecuted_draft_is_not_authoritative_recovery_state():
     assert _authoritative_recovery_scope(plan) == {}
 
 
+def test_unexecuted_aborted_plan_is_not_authoritative_recovery_state():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan, ChangeStep, PlanResource,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        _authoritative_recovery_scope,
+    )
+
+    plan = ChangePlan(
+        plan_id="priv-ops-aborted", goal="create platform", risk="medium",
+        steps=[ChangeStep(
+            step_id="create-platform", title="create platform",
+            objective="create /srv/create_e2e", risk="medium",
+            expected_changes=["new isolated platform"],
+            postconditions=[{
+                "checker": "file_exists",
+                "args": {"path": "/srv/create_e2e"},
+            }],
+        )],
+        resources=[PlanResource(
+            name="instance_root", kind="path", status="frozen",
+            role="instance_root", value="/srv/create_e2e",
+            consumers=["create-platform.path"],
+        )],
+        status="aborted",
+    )
+
+    assert _authoritative_recovery_scope(plan) == {}
+
+
+def test_attempted_aborted_plan_remains_authoritative_recovery_state():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan, ChangeStep, PlanResource,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        _authoritative_recovery_scope,
+    )
+
+    plan = ChangePlan(
+        plan_id="priv-ops-attempted", goal="create platform", risk="medium",
+        steps=[ChangeStep(
+            step_id="create-platform", title="create platform",
+            objective="create /srv/create_e2e", risk="medium",
+            expected_changes=["new isolated platform"],
+            postconditions=[{
+                "checker": "file_exists",
+                "args": {"path": "/srv/create_e2e"},
+            }],
+            status="paused", execution_attempts=1,
+        )],
+        resources=[PlanResource(
+            name="instance_root", kind="path", status="frozen",
+            role="instance_root", value="/srv/create_e2e",
+            consumers=["create-platform.path"],
+        )],
+        status="aborted",
+    )
+
+    assert _authoritative_recovery_scope(plan)[
+        "recovery_required_project_roots"
+    ] == ["/srv/create_e2e"]
+
+
 def test_successful_plan_execution_requires_whole_goal_verification_before_completion():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceConclusion, GoalOutcome,

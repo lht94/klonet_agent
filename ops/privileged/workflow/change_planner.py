@@ -818,6 +818,20 @@ def _requests_screen_management_transition(text: str) -> bool:
     )
 
 
+def _requests_new_platform_deployment(text: str) -> bool:
+    """Recognize creation as a deployment lifecycle, never a restart."""
+
+    value = str(text or "")
+    return bool(
+        re.search(
+            r"\b(?:create|deploy|provision|clone)\b|创建|新建|部署|克隆",
+            value,
+            re.I,
+        )
+        and re.search(r"\b(?:klonet|platform|instance)\b|平台|实例", value, re.I)
+    )
+
+
 def _reply_preserves_existing_goal_scope(text: str) -> bool:
     """Return whether the user explicitly freezes the existing objective."""
 
@@ -980,7 +994,12 @@ the complete proposed replacement goal and list what would be superseded.
         authoritative_goal = str(
             effective_intent_context.get("base_goal") or goal
         )
-        if _requests_screen_management_transition(authoritative_goal):
+        if _requests_new_platform_deployment(authoritative_goal):
+            # A later implementation refinement may mention restarting or
+            # Screen-owning the roles it will create.  The immutable base goal
+            # still owns the lifecycle: this is deployment, not runtime restart.
+            effective_intent_context["operation"] = "none"
+        elif _requests_screen_management_transition(authoritative_goal):
             # Screen adoption is implemented by the existing restart lifecycle.
             # Normalize the semantic operation before all contract checks so a
             # healthy role is not incorrectly treated as out of scope.
@@ -1067,7 +1086,7 @@ the complete proposed replacement goal and list what would be superseded.
                     )
                 ),
             })
-        if intent_context:
+        if effective_intent_context:
             messages.append(
                 {
                     "role": "user",
@@ -1083,7 +1102,7 @@ the complete proposed replacement goal and list what would be superseded.
                         " verifiable implementation effects, and do not repeat rejected"
                         " evidence needs unchanged."
                         % json.dumps(
-                            intent_context,
+                            effective_intent_context,
                             ensure_ascii=False,
                             sort_keys=True,
                             default=str,
@@ -1105,7 +1124,7 @@ the complete proposed replacement goal and list what would be superseded.
                 data, normalized_content = self._planner_payload(response)
                 content = normalized_content or content
                 return self._outcome(
-                    data, goal, bundle, intent_context=intent_context,
+                    data, goal, bundle, intent_context=effective_intent_context,
                     candidate_plan=candidate_plan,
                 )
             except (AttributeError, KeyError, TypeError, ValueError) as exc:
@@ -4961,9 +4980,7 @@ the complete proposed replacement goal and list what would be superseded.
         original_goal = str(goal or "")
         planned_goal = str(data.get("goal") or "")
         goal_text = "%s\n%s" % (original_goal, planned_goal)
-        deployment = bool(
-            re.search(r"\b(?:deploy|deployment|clone)\b|部署|克隆", goal_text, re.I)
-        )
+        deployment = _requests_new_platform_deployment(goal_text)
         if not deployment:
             return errors
         frozen = [item for item in resources if item.status == "frozen"]

@@ -226,6 +226,44 @@ def test_change_planner_transport_timeout_stops_before_contract_repair_retries()
     assert "model request failed" in outcome.reason
 
 
+def test_platform_creation_is_not_routed_to_runtime_restart_by_refinement_metadata():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion,
+    )
+
+    class TimeoutLLM:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, **kwargs):
+            self.calls.append(kwargs)
+            raise TimeoutError("provider timed out")
+
+    goal = "帮我创建一个新的 Klonet 平台"
+    llm = TimeoutLLM()
+    outcome = ChangePlannerAgent(llm).plan(
+        goal,
+        EvidenceBundle(goal=goal),
+        EvidenceConclusion(),
+        intent_context={
+            "base_goal": goal,
+            "operation": "restart",
+            "scope": "platform",
+            "components": ["master", "celery", "web_terminal", "worker"],
+            "decision_history": [
+                "新平台的四个角色必须使用独立 Screen 会话",
+            ],
+        },
+    )
+
+    assert len(llm.calls) == 1
+    directive = llm.calls[0]["messages"][-1]["content"]
+    assert '"operation": "none"' in directive
+    assert outcome.status == "blocked"
+    assert "model request failed" in outcome.reason
+
+
 def test_existing_planner_classifies_local_recovery_reply_without_replacing_goal():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
