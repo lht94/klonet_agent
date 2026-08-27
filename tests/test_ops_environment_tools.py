@@ -1287,6 +1287,45 @@ def test_colliding_runtime_basenames_are_deterministically_path_qualified():
     assert instances["/srv/lab/vemu_uestc"]["platform"] == "lab_vemu_uestc"
 
 
+def test_component_ownership_distinguishes_screen_group_from_orphan(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.tools import environment
+
+    parent_by_pid = {101: 11, 11: 10, 201: 1}
+    monkeypatch.setattr(
+        environment,
+        "_proc_parent_pid",
+        lambda pid: parent_by_pid.get(pid, 0),
+    )
+    ownership = environment._runtime_component_ownership(
+        tmp_path,
+        {"celery": [
+            {"pid": 101, "pgid": 100},
+            {"pid": 201, "pgid": 200},
+        ]},
+        [{
+            "pid": 10,
+            "session": "10.test_c",
+            "project_root": str(tmp_path.resolve()),
+        }],
+    )
+
+    assert ownership["celery"]["managed_groups"] == [{
+        "pgid": 100, "pids": [101], "screen_session": "test_c",
+    }]
+    assert ownership["celery"]["orphan_groups"] == [{
+        "pgid": 200, "pids": [201], "screen_session": "",
+    }]
+
+
+def test_inline_web_terminal_factory_is_classified_as_web_terminal():
+    from klonet_agent.tools.environment import _role_from_command
+
+    assert _role_from_command(
+        "python -c 'from package.app_factory import create_web_terminal_app'"
+    ) == "web_terminal"
+
 def test_running_platforms_keeps_unqualified_process_root_as_external_evidence(
     monkeypatch, tmp_path,
 ):

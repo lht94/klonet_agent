@@ -885,6 +885,19 @@ def _validate_action_semantics(action: str, args: dict[str, Any]) -> str:
         run_as_uid = str(args.get("run_as_uid") or "").strip()
         if run_as_uid and not re.fullmatch(r"[1-9]\d{0,9}", run_as_uid):
             return "action=%s invalid_run_as_uid" % action
+        lifecycle_mode = str(args.get("lifecycle_mode") or "restart")
+        if lifecycle_mode not in {"restart", "screen_adoption"}:
+            return "action=%s invalid_lifecycle_mode" % action
+        orphan_pids = args.get("orphan_pids")
+        if orphan_pids is not None and (
+            not isinstance(orphan_pids, list)
+            or not orphan_pids
+            or any(
+                not str(pid).isdigit() or int(pid) <= 1
+                for pid in orphan_pids
+            )
+        ):
+            return "action=%s invalid_orphan_pids" % action
     if action == "stop_klonet_component":
         component = str(args.get("component") or "").strip()
         if component not in {"master", "worker"}:

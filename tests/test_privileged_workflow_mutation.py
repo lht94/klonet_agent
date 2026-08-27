@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from types import SimpleNamespace
 
@@ -35,6 +36,12 @@ class FakeLLM:
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content=output))]
         )
+
+
+def _encoded_runtime_value(value):
+    return base64.urlsafe_b64encode(
+        json.dumps(value).encode("utf-8")
+    ).decode("ascii")
 
 
 def test_port_conflict_decision_accepts_planner_normalized_modify_free_port():
@@ -891,6 +898,176 @@ def test_screen_adoption_uses_existing_runtime_lifecycle_compiler_without_restar
         "restart-alpha-backend-roles", "restart-beta-backend-roles",
     }
     assert llm.calls == []
+
+
+def test_screen_adoption_skips_compliant_instances_and_plans_only_orphans():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    def encoded(value):
+        return base64.urlsafe_b64encode(
+            json.dumps(value).encode("utf-8")
+        ).decode("ascii")
+
+    specs = [
+        {"name": "master", "screen_suffix": "m"},
+        {"name": "celery", "screen_suffix": "c", "start_after": ["master"]},
+    ]
+    managed = {
+        "master": {
+            "managed_groups": [{
+                "pgid": 10, "pids": [11], "screen_session": "alpha_m",
+            }],
+            "orphan_groups": [],
+        },
+        "celery": {
+            "managed_groups": [{
+                "pgid": 20, "pids": [21], "screen_session": "alpha_c",
+            }],
+            "orphan_groups": [],
+        },
+    }
+    mixed = {
+        **managed,
+        "celery": {
+            "managed_groups": [{
+                "pgid": 30, "pids": [31], "screen_session": "beta_c",
+            }],
+            "orphan_groups": [{
+                "pgid": 40, "pids": [41], "screen_session": "",
+            }],
+        },
+    }
+    goal = "把全部平台的所有应用角色收编为 Screen 管理"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "\n".join([
+            "platform=alpha project_root=/srv/alpha roles=celery,master "
+            "backend_status=healthy runtime_identities=11:1000:/opt/python3.8 "
+            "component_specs_b64=%s component_ownership_b64=%s "
+            "screen_sessions_b64=%s" % (
+                encoded(specs), encoded(managed),
+                encoded({"master": ["alpha_m"], "celery": ["alpha_c"]}),
+            ),
+            "platform=beta project_root=/srv/beta roles=celery,master "
+            "backend_status=healthy runtime_identities=31:1000:/opt/python3.8 "
+            "component_specs_b64=%s component_ownership_b64=%s "
+            "screen_sessions_b64=%s" % (
+                encoded(specs), encoded(mixed),
+                encoded({"master": ["beta_m"], "celery": ["beta_c"]}),
+            ),
+        ]),
+    ))
+
+    outcome = ChangePlannerAgent(FakeLLM([])).plan(
+        goal,
+        bundle,
+        EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert outcome.status == "need_execution"
+    assert [step.step_id for step in outcome.plan.steps] == [
+        "restart-beta-backend-roles",
+    ]
+    assert "celery" in outcome.plan.steps[0].objective
+    assert "master" not in outcome.plan.steps[0].objective
+
+
+def test_screen_adoption_asks_before_including_running_optional_component():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    specs = [
+        {"name": "master", "screen_suffix": "m"},
+        {
+            "name": "data_server", "screen_suffix": "data_server",
+            "default_restart": False,
+        },
+    ]
+    ownership = {
+        "master": {
+            "managed_groups": [{
+                "pgid": 10, "pids": [11], "screen_session": "test_m",
+            }],
+            "orphan_groups": [],
+        },
+        "data_server": {
+            "managed_groups": [],
+            "orphan_groups": [{
+                "pgid": 20, "pids": [21], "screen_session": "",
+            }],
+        },
+    }
+    goal = "把 test 平台纳入 Screen 管理"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=test project_root=/srv/test roles=data_server,master "
+        "backend_status=healthy runtime_identities=11:1000:/opt/python3.8 "
+        "component_specs_b64=%s component_ownership_b64=%s "
+        "screen_sessions_b64=%s" % (
+            _encoded_runtime_value(specs),
+            _encoded_runtime_value(ownership),
+            _encoded_runtime_value({"master": ["test_m"]}),
+        ),
+    ))
+
+    outcome = ChangePlannerAgent(FakeLLM([])).plan(
+        goal,
+        bundle,
+        EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert outcome.status == "blocked"
+    assert "data_server" in " ".join(outcome.missing_decisions)
+
+
+def test_screen_adoption_all_roles_includes_running_optional_component():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceConclusion, EvidenceRecord, ProbeRequest,
+    )
+
+    specs = [{
+        "name": "data_server", "screen_suffix": "data_server",
+        "default_restart": False,
+    }]
+    ownership = {
+        "data_server": {
+            "managed_groups": [],
+            "orphan_groups": [{
+                "pgid": 20, "pids": [21], "screen_session": "",
+            }],
+        },
+    }
+    goal = "把 test 平台所有应用角色收编为 Screen 管理"
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=test project_root=/srv/test roles=data_server "
+        "backend_status=healthy runtime_identities=21:1000:/opt/python3.8 "
+        "component_specs_b64=%s component_ownership_b64=%s" % (
+            _encoded_runtime_value(specs),
+            _encoded_runtime_value(ownership),
+        ),
+    ))
+
+    outcome = ChangePlannerAgent(FakeLLM([])).plan(
+        goal,
+        bundle,
+        EvidenceConclusion(),
+        intent_context={"operation": "restart", "scope": "platform"},
+    )
+
+    assert outcome.status == "need_execution"
+    assert "data_server" in outcome.plan.steps[0].objective
 
 
 def test_readonly_screen_inventory_does_not_enter_runtime_lifecycle_compiler():

@@ -6708,6 +6708,26 @@ def _infer_structural_action_args(
             str(compiled.get("component") or "").strip(),
         )
         compiled["component"] = component
+        lifecycle_resource = next(
+            (
+                resource for resource in resources
+                if resource.status == "frozen"
+                and resource.role == "runtime_component_lifecycle:%s" % component
+            ),
+            None,
+        )
+        if lifecycle_resource is not None:
+            compiled["lifecycle_mode"] = str(lifecycle_resource.value)
+        orphan_resource = next(
+            (
+                resource for resource in resources
+                if resource.status == "frozen"
+                and resource.role == "runtime_component_orphan_pids:%s" % component
+            ),
+            None,
+        )
+        if orphan_resource is not None:
+            compiled["orphan_pids"] = list(orphan_resource.value or [])
         if component not in {"master", "celery", "web_terminal", "worker"}:
             component_resource = next(
                 (

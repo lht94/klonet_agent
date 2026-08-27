@@ -74,7 +74,9 @@ SHELL_ARTIFACT_STATUSES = {
     "expired",
 }
 PLAN_RESOURCE_STATUSES = {"frozen", "deferred", "disputed"}
-PLAN_RESOURCE_KINDS = {"path", "port", "url", "identifier", "string"}
+PLAN_RESOURCE_KINDS = {
+    "path", "port", "url", "identifier", "string", "pid_set",
+}
 
 
 def utc_now() -> str:
@@ -127,6 +129,17 @@ class PlanResource:
                 raise ValueError("disputed plan resource keeps its previous value")
         if self.value in (None, ""):
             raise ValueError("frozen plan resource requires a value")
+        if self.kind == "pid_set":
+            if (
+                not isinstance(self.value, list)
+                or not self.value
+                or any(
+                    not str(pid).isdigit() or int(pid) <= 1
+                    for pid in self.value
+                )
+            ):
+                raise ValueError("frozen pid_set resource must be non-empty")
+            self.value = sorted({int(pid) for pid in self.value})
         if self.kind == "path":
             value = str(self.value)
             expanded = Path(value).expanduser()

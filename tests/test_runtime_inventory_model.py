@@ -130,6 +130,62 @@ def test_runtime_inventory_never_guesses_between_duplicate_role_sessions():
     assert instance.screen_session("master") == ""
 
 
+def test_runtime_inventory_keeps_component_group_screen_ownership():
+    from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
+
+    encoded = base64.urlsafe_b64encode(json.dumps({
+        "celery": {
+            "managed_groups": [{
+                "pgid": 100, "pids": [101, 102],
+                "screen_session": "test_c",
+            }],
+            "orphan_groups": [{
+                "pgid": 200, "pids": [200, 201], "screen_session": "",
+            }],
+        },
+        "master": {
+            "managed_groups": [{
+                "pgid": 300, "pids": [301], "screen_session": "test_m",
+            }],
+            "orphan_groups": [],
+        },
+    }).encode("utf-8")).decode("ascii")
+    output = "\n".join([
+        "runtime_candidate_count=1", "healthy_count=1", "abnormal_count=0",
+        "code_only_count=0",
+        "platform=test project_root=/srv/test roles=celery,master "
+        "backend_status=healthy component_ownership_b64=" + encoded,
+    ])
+
+    instance = RuntimeInventory.from_bundle(_bundle(output)).instances[0]
+
+    assert instance.component_orphan_pids("celery") == (200, 201)
+    assert not instance.component_is_fully_screen_managed("celery")
+    assert instance.component_is_fully_screen_managed("master")
+
+
+def test_component_orphan_pids_are_runtime_members_not_process_group_id():
+    from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInstance
+
+    instance = RuntimeInstance(
+        platform="test",
+        project_root="/srv/test",
+        backend_status="healthy",
+        component_ownership={
+            "celery": {
+                "managed_groups": (),
+                "orphan_groups": ({
+                    "pgid": 200,
+                    "pids": (201, 202),
+                    "screen_session": "",
+                },),
+            },
+        },
+    )
+
+    assert instance.component_orphan_pids("celery") == (201, 202)
+
+
 def test_runtime_inventory_overlays_later_port_owner_evidence():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,

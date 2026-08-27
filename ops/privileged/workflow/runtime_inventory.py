@@ -132,6 +132,56 @@ def _decode_screen_sessions(value: str) -> dict[str, tuple[str, ...]]:
     return result
 
 
+def _decode_component_ownership(
+    value: str,
+) -> dict[str, dict[str, tuple[dict[str, Any], ...]]]:
+    if not value or value == "none":
+        return {}
+    try:
+        padding = "=" * (-len(value) % 4)
+        raw = json.loads(base64.urlsafe_b64decode(value + padding).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, tuple[dict[str, Any], ...]]] = {}
+    for role, ownership in raw.items():
+        if not isinstance(ownership, dict):
+            continue
+        normalized: dict[str, tuple[dict[str, Any], ...]] = {}
+        for state in ("managed_groups", "orphan_groups"):
+            groups = []
+            for item in ownership.get(state) or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    pgid = int(item.get("pgid") or 0)
+                    pids = tuple(sorted({
+                        int(pid) for pid in item.get("pids") or []
+                        if int(pid) > 1
+                    }))
+                except (TypeError, ValueError):
+                    continue
+                session = str(item.get("screen_session") or "")
+                if (
+                    pgid <= 1
+                    or not pids
+                    or (
+                        session
+                        and not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", session)
+                    )
+                ):
+                    continue
+                groups.append({
+                    "pgid": pgid,
+                    "pids": pids,
+                    "screen_session": session,
+                })
+            normalized[state] = tuple(groups)
+        result[str(role)] = normalized
+    return result
+
+
 @dataclass(frozen=True)
 class RuntimeInstance:
     platform: str
@@ -144,6 +194,9 @@ class RuntimeInstance:
     endpoints: dict[str, str] = field(default_factory=dict)
     role_bindings: dict[str, RuntimeRoleBinding] = field(default_factory=dict)
     screen_sessions: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    component_ownership: dict[
+        str, dict[str, tuple[dict[str, Any], ...]]
+    ] = field(default_factory=dict)
     fields: dict[str, str] = field(default_factory=dict)
     raw_line: str = ""
     evidence_id: str = ""
@@ -186,6 +239,9 @@ class RuntimeInstance:
             screen_sessions=_decode_screen_sessions(
                 _field(line, "screen_sessions_b64")
             ),
+            component_ownership=_decode_component_ownership(
+                _field(line, "component_ownership_b64")
+            ),
             fields=fields,
             raw_line=line.strip(),
             evidence_id=evidence_id,
@@ -208,6 +264,26 @@ class RuntimeInstance:
         if len(exact) == 1:
             return exact[0]
         return sessions[0] if len(sessions) == 1 else ""
+
+    def component_orphan_pids(self, role: str) -> tuple[int, ...]:
+        ownership = self.component_ownership.get(
+            str(role or "").strip().lower().replace("-", "_"), {}
+        )
+        return tuple(sorted({
+            int(pid)
+            for group in ownership.get("orphan_groups", ())
+            for pid in group.get("pids", ())
+            if int(pid) > 1
+        }))
+
+    def component_is_fully_screen_managed(self, role: str) -> bool:
+        normalized = str(role or "").strip().lower().replace("-", "_")
+        ownership = self.component_ownership.get(normalized)
+        return bool(
+            ownership
+            and ownership.get("managed_groups")
+            and not ownership.get("orphan_groups")
+        )
 
     @property
     def aliases(self) -> tuple[str, ...]:

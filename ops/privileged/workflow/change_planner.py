@@ -115,6 +115,31 @@ def _ordered_default_restart_components(
     return ordered
 
 
+def _ordered_managed_running_components(
+    specs: dict[str, RuntimeComponentSpec],
+    running_roles: set[str],
+) -> list[str]:
+    selected = {
+        name: spec for name, spec in specs.items()
+        if spec.category == "application"
+        and spec.managed
+        and name in running_roles
+    }
+    ordered: list[str] = []
+    pending = dict(selected)
+    while pending:
+        ready = sorted(
+            name for name, spec in pending.items()
+            if all(dep not in selected or dep in ordered for dep in spec.start_after)
+        )
+        if not ready:
+            return []
+        for name in ready:
+            ordered.append(name)
+            pending.pop(name)
+    return ordered
+
+
 def _runtime_component_resource_payload(
     spec: RuntimeComponentSpec,
 ) -> dict[str, Any]:
@@ -1549,7 +1574,29 @@ the complete proposed replacement goal and list what would be superseded.
             line, evidence_ref=selected.evidence_id,
         )
         if platform_wide and component_specs:
-            requested_roles = _ordered_default_restart_components(component_specs)
+            if screen_lifecycle and all_roles_requested:
+                requested_roles = _ordered_managed_running_components(
+                    component_specs, set(selected.roles),
+                )
+            else:
+                requested_roles = _ordered_default_restart_components(component_specs)
+        if screen_lifecycle and platform_wide and not all_roles_requested:
+            optional_running = sorted(
+                name for name, spec in component_specs.items()
+                if spec.category == "application"
+                and spec.managed
+                and not spec.default_restart
+                and name in set(selected.roles)
+            )
+            if optional_running:
+                return {
+                    "status": "blocked",
+                    "reason": "optional_running_components_require_scope_decision",
+                    "missing_decisions": [
+                        "检测到非默认应用角色 %s 正在运行；请确认是否也将其收编到 Screen，或明确排除"
+                        % "、".join(optional_running)
+                    ],
+                }
         if component_scoped and component_specs:
             requested_roles = [
                 role for role in requested_roles
@@ -1563,6 +1610,19 @@ the complete proposed replacement goal and list what would be superseded.
         requested_roles = [
             role for role in requested_roles if role not in completed_roles
         ]
+        if screen_lifecycle and selected.component_ownership:
+            requested_roles = [
+                role for role in requested_roles
+                if not selected.component_is_fully_screen_managed(role)
+            ]
+        if screen_lifecycle and not requested_roles:
+            return {
+                "status": "achieved",
+                "reason": (
+                    "runtime inventory proves all requested application "
+                    "components are already fully Screen-managed"
+                ),
+            }
         step_id = "restart-backend-roles"
         decision_text = "\n".join([
             base_goal,
@@ -1786,6 +1846,33 @@ the complete proposed replacement goal and list what would be superseded.
                 "source": "running_platforms",
                 "consumers": [step_id + ".screen_session"],
             })
+            if screen_lifecycle:
+                resources.append({
+                    "name": _plan_resource_name(
+                        step_id, role, "screen_lifecycle_mode",
+                    ),
+                    "kind": "identifier", "status": "frozen",
+                    "role": "runtime_component_lifecycle:%s" % role,
+                    "value": "screen_adoption",
+                    "source": "user_screen_management_goal",
+                    "consumers": [
+                        step_id + ".%s_lifecycle_mode" % role,
+                    ],
+                })
+                orphan_pids = list(selected.component_orphan_pids(role))
+                if orphan_pids:
+                    resources.append({
+                        "name": _plan_resource_name(
+                            step_id, role, "orphan_group_leaders",
+                        ),
+                        "kind": "pid_set", "status": "frozen",
+                        "role": "runtime_component_orphan_pids:%s" % role,
+                        "value": orphan_pids,
+                        "source": "running_platforms_component_ownership",
+                        "consumers": [
+                            step_id + ".%s_orphan_pids" % role,
+                        ],
+                    })
         expected = []
         postconditions = []
         running_roles = observed_running_roles
@@ -1799,7 +1886,12 @@ the complete proposed replacement goal and list what would be superseded.
                 str(item) for item in decisions
             )
         for role in requested_roles:
-            disposition = "restart requested" if role in running_roles else "start missing"
+            disposition = (
+                "adopt running"
+                if screen_lifecycle and role in running_roles
+                else "restart requested" if role in running_roles
+                else "start missing"
+            )
             port_key = role + "_port"
             port_match = re.search(r"\b%s=(\d{1,5})" % port_key, line)
             existing_port = (
@@ -1997,11 +2089,15 @@ the complete proposed replacement goal and list what would be superseded.
             "resources": resources,
             "changes": [{
                 "step_id": step_id,
-                "title": "重启 %s 的应用组件" % alias,
+                "title": (
+                    "收编 %s 的应用组件（仅非合规项）" % alias
+                    if screen_lifecycle else "重启 %s 的应用组件" % alias
+                ),
                 "objective": (
-                    "按项目根目录 %s 重启 %s%s"
+                    "按项目根目录 %s %s %s%s"
                     % (
                         root,
+                        "仅收编" if screen_lifecycle else "重启",
                         " 和 ".join(requested_roles),
                         (
                             "；修改端口 %s，保留冲突端口的当前占用者"
@@ -2017,7 +2113,11 @@ the complete proposed replacement goal and list what would be superseded.
                         ),
                     )
                 ),
-                "reason": "用户明确要求重启，运行清单已绑定实例根目录和角色端口",
+                "reason": (
+                    "用户要求 Screen 收编；运行清单已区分 Screen 托管进程组和游离进程组"
+                    if screen_lifecycle
+                    else "用户明确要求重启，运行清单已绑定实例根目录和角色端口"
+                ),
                 "evidence_refs": [
                     selected.evidence_id,
                     *[
@@ -2215,6 +2315,8 @@ the complete proposed replacement goal and list what would be superseded.
                         % instance.project_root,
                     ],
                 }
+            if child.get("status") == "achieved":
+                continue
             if child.get("status") != "ready":
                 reason = str(child.get("reason") or "runtime contract unresolved")
                 child["reason"] = "%s; project_root=%s" % (
@@ -2251,6 +2353,14 @@ the complete proposed replacement goal and list what would be superseded.
                     for item in change.get("depends_on") or []
                 ]
                 changes.append(change)
+        if not changes:
+            return {
+                "status": "achieved",
+                "reason": (
+                    "runtime inventory proves every requested application "
+                    "component is already fully Screen-managed"
+                ),
+            }
         if len(changes) > 12 or len(resources) > 64:
             return {
                 "status": "blocked",
@@ -2584,6 +2694,11 @@ the complete proposed replacement goal and list what would be superseded.
         if isinstance(resources, list) and len(resources) > 64:
             raise ValueError("planner resources exceed bounded contract")
         status = str(data.get("status") or "").strip().lower()
+        if status == "achieved":
+            return GoalOutcome(
+                status="achieved",
+                reason=str(data.get("reason") or "goal already satisfied"),
+            )
         if status == "need_evidence":
             requests = self._probe_requests(data.get("probe_requests"))
             impossible_process_logs = [

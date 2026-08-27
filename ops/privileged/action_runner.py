@@ -1243,6 +1243,21 @@ class DirectPrivilegedActionRunner:
             _listener_pids_for_port(port)
             if port else _component_pids(root, component)
         )
+        explicit_orphan_pids = sorted({
+            int(pid) for pid in step.args.get("orphan_pids") or []
+            if str(pid).isdigit() and int(pid) > 1
+        })
+        stale_or_wrong_orphans = []
+        if explicit_orphan_pids:
+            current_component_pids = set(_component_pids(root, component))
+            stale_or_wrong_orphans = sorted(
+                set(explicit_orphan_pids) - current_component_pids
+            )
+        if stale_or_wrong_orphans:
+            return self._blocked(
+                "frozen_orphan_pid_not_current_component=%s"
+                % ",".join(str(pid) for pid in stale_or_wrong_orphans)
+            )
         if port:
             allowed = _allowed_runtime_cwds(root)
             wrong = [
@@ -1274,6 +1289,10 @@ class DirectPrivilegedActionRunner:
             )
             if per_pid_observed and not per_pid_owners:
                 proven_orphan_pids.append(pid)
+        proven_orphan_pids = list(dict.fromkeys([
+            *proven_orphan_pids,
+            *explicit_orphan_pids,
+        ]))
         # Rehoming a precisely frozen role does not depend on Screen ancestry
         # being observable.  If there is no designated Screen at all, the
         # target-root/target-role PID set is itself the ownership boundary.
@@ -1297,6 +1316,29 @@ class DirectPrivilegedActionRunner:
                     % (component, orphan_cleanup.output),
                     "inspect_process",
                 )
+        if (
+            str(step.args.get("lifecycle_mode") or "") == "screen_adoption"
+            and targets
+            and target_owns_runtime
+            and not foreign_owner_targets
+        ):
+            return DirectActionResult(
+                "completed",
+                "action=restart_screen_component component=%s session=%s "
+                "adoption_only=true preserved_managed_screen=true "
+                "cleaned_orphan_pids=%s environment_changed=%s"
+                % (
+                    component,
+                    session,
+                    ",".join(str(pid) for pid in proven_orphan_pids) or "none",
+                    "true" if proven_orphan_pids else "false",
+                ),
+                metadata={
+                    "kind": "component_adoption",
+                    "component": component,
+                    "session": session,
+                },
+            )
         # A named Screen can outlive the foreground service it manages, and a
         # role can also be owned by a differently named Screen from an older
         # convention.  Screen presence alone is never process ownership.

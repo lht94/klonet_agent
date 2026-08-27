@@ -880,6 +880,11 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         component_specs = _runtime_component_specs(
             root, roles, entry.get("role_rows", {}),
         )
+        component_ownership = _runtime_component_ownership(
+            root,
+            entry.get("role_rows", {}),
+            screen_rows,
+        )
         custom_identity_fields = " ".join(
             "%s_identities=%s" % (
                 role,
@@ -898,6 +903,7 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
             "runtime_identities=%s %s "
                 "role_bindings_b64=%s "
                 "screen_sessions_b64=%s "
+                "component_ownership_b64=%s "
                 "backend_status=%s missing_roles=%s configured_ports=%s "
             "managed_components=%s component_specs_b64=%s %s %s"
             % (
@@ -936,6 +942,12 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                     sort_keys=True,
                     separators=(",", ":"),
                 ).encode("utf-8")).decode("ascii"),
+                base64.urlsafe_b64encode(json.dumps(
+                    component_ownership,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).decode("ascii"),
                 backend_status,
                 ",".join(missing_roles) or "none",
                 ",".join(
@@ -946,7 +958,6 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                     spec["name"] for spec in component_specs
                     if spec.get("category") == "application"
                     and spec.get("managed")
-                    and spec.get("default_restart")
                 ) or "none",
                 base64.urlsafe_b64encode(json.dumps(
                     component_specs,
@@ -1686,6 +1697,87 @@ def _screen_instance_rows() -> list:
     return rows
 
 
+def _proc_parent_pid(pid: int) -> int:
+    try:
+        text = Path("/proc/%s/status" % int(pid)).read_text(
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, ValueError):
+        return 0
+    match = re.search(r"(?m)^PPid:\s*(\d+)\s*$", text)
+    return int(match.group(1)) if match else 0
+
+
+def _screen_ancestor_session(pid: int, screen_rows: list[dict]) -> str:
+    """Return the exact observed Screen ancestor for one runtime PID."""
+
+    sessions = {
+        int(row["pid"]): str(row.get("session") or "").split(".", 1)[-1]
+        for row in screen_rows
+        if str(row.get("pid") or "").isdigit()
+        and str(row.get("session") or "")
+    }
+    current = int(pid)
+    visited: set[int] = set()
+    for _depth in range(32):
+        if current in sessions:
+            return sessions[current]
+        if current <= 1 or current in visited:
+            break
+        visited.add(current)
+        current = _proc_parent_pid(current)
+    return ""
+
+
+def _runtime_component_ownership(
+    root: Path,
+    role_rows: dict[str, list[dict]],
+    screen_rows: list[dict],
+) -> dict[str, dict[str, list[dict]]]:
+    """Freeze process-group to Screen ownership for one runtime instance."""
+
+    canonical_root = str(_canonical_runtime_root(root).resolve())
+    root_screens = [
+        row for row in screen_rows
+        if str(row.get("project_root") or "").rstrip("/") == canonical_root
+    ]
+    result: dict[str, dict[str, list[dict]]] = {}
+    for role, rows in sorted(role_rows.items()):
+        groups: dict[int, list[dict]] = {}
+        for row in rows:
+            try:
+                pid = int(row.get("pid") or 0)
+                pgid = int(row.get("pgid") or pid)
+            except (TypeError, ValueError):
+                continue
+            if pid > 1 and pgid > 1:
+                groups.setdefault(pgid, []).append(row)
+        managed_groups = []
+        orphan_groups = []
+        for pgid, members in sorted(groups.items()):
+            pids = sorted({int(item.get("pid") or 0) for item in members})
+            sessions = sorted({
+                session
+                for item in members
+                if (session := _screen_ancestor_session(
+                    int(item.get("pid") or 0), root_screens,
+                ))
+            })
+            frozen = {
+                "pgid": pgid,
+                "pids": pids,
+                "screen_session": sessions[0] if len(sessions) == 1 else "",
+            }
+            (managed_groups if len(sessions) == 1 else orphan_groups).append(
+                frozen,
+            )
+        result[str(role)] = {
+            "managed_groups": managed_groups,
+            "orphan_groups": orphan_groups,
+        }
+    return result
+
+
 def _qualify_colliding_platform_names(
     instances: dict[str, dict],
     screen_aliases: dict[str, str],
@@ -1989,7 +2081,11 @@ def _platform_role_from_name(name: str) -> Optional[tuple]:
 
 def _role_from_command(command: str) -> str:
     lowered = (command or "").lower()
-    if "web_terminal_main.py" in lowered or "web_terminal_main" in lowered:
+    if (
+        "web_terminal_main.py" in lowered
+        or "web_terminal_main" in lowered
+        or "create_web_terminal_app" in lowered
+    ):
         return "web_terminal"
     if "worker_main" in lowered or "worker_gun.py" in lowered:
         return "worker"
