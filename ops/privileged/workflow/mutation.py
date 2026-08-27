@@ -1305,15 +1305,20 @@ class MutationWorkflow:
 
         if outcome.status != "achieved":
             raise ValueError("goal completion requires an achieved post-execution plan")
+        plan_verification = self.verifier.verify_plan_execution(plan)
         gaps = plan.completion_gaps
-        if plan.status != "verifying" or gaps:
+        if (
+            not plan.is_authorized
+            or plan_verification.status != "passed"
+            or gaps
+        ):
             plan.status = "paused"
             self.store.save(plan)
             reason = (
                 "拒绝提交目标完成状态：获批计划仍有未完成节点：%s"
                 % ", ".join(gaps[:12])
                 if gaps else
-                "拒绝提交目标完成状态：计划尚未通过计划级验收。"
+                "拒绝提交目标完成状态：计划尚未授权或未通过计划级验收。"
             )
             return WorkflowResult(
                 True,
@@ -1321,12 +1326,7 @@ class MutationWorkflow:
                 reason,
                 plan=plan,
                 outcome=GoalOutcome("blocked", reason=reason),
-                verification=VerificationDecision(
-                    "failed",
-                    failures=list(gaps),
-                    reason=reason,
-                    next_action="resume_incomplete_plan",
-                ),
+                verification=plan_verification,
             )
         plan.status = "completed"
         self.store.save(plan)

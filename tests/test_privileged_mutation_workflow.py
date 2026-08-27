@@ -557,6 +557,32 @@ def test_complete_goal_rejects_achieved_verdict_when_plan_tree_is_incomplete(tmp
     assert store.load(plan.plan_id).status == "paused"
 
 
+def test_complete_goal_revalidates_fully_verified_paused_recovery(tmp_path):
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+
+    workflow, _, _, store, _, _ = _workflow(
+        tmp_path, _change_plan(hierarchical=True),
+    )
+    submitted = _submit(
+        workflow, "deploy", evidence_bundle=object(),
+        evidence_conclusion=object(),
+    )
+    executed = workflow.confirm(
+        submitted.plan.plan_id, submitted.plan.content_hash,
+    )
+    assert executed.kind == "goal_verification"
+    executed.plan.status = "paused"
+    store.save(executed.plan)
+
+    result = workflow.complete_goal(
+        executed.plan,
+        GoalOutcome("achieved", reason="whole goal verified after recovery"),
+    )
+
+    assert result.kind == "completed"
+    assert store.load(executed.plan.plan_id).status == "completed"
+
+
 def test_plan_store_repairs_historical_outer_completed_inner_pending_state(tmp_path):
     from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
 
