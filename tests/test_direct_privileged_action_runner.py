@@ -955,6 +955,71 @@ def test_restart_reports_changed_when_start_fails_after_orphan_cleanup(
     ].index("stop")
 
 
+def test_screen_adoption_cleans_orphan_but_preserves_managed_session(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import action_runner as module
+    from klonet_agent.ops.privileged.action_runner import (
+        DirectActionResult, DirectPrivilegedActionRunner,
+    )
+
+    _write_runtime_entries(tmp_path)
+    calls = []
+    runner = DirectPrivilegedActionRunner(
+        command_runner=lambda argv, **kwargs: calls.append(list(argv))
+        or subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        runner, "_clean_dead_screen_session", lambda *_args: ([], ""),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_screen_session_targets",
+        lambda *_args, **_kwargs: ["123.test_c"],
+    )
+    monkeypatch.setattr(
+        module, "_component_pids", lambda *_args: [101, 201],
+    )
+
+    def owners(pids):
+        return (["123.test_c"], True) if 101 in pids else ([], True)
+
+    monkeypatch.setattr(module, "_screen_owner_targets_for_pids", owners)
+    monkeypatch.setattr(module, "_proc_cwd", lambda _pid: str(tmp_path))
+    stopped = []
+    monkeypatch.setattr(
+        runner,
+        "_stop_frozen_component_groups",
+        lambda root, component, pids, step: stopped.append(list(pids))
+        or DirectActionResult("completed", "stopped environment_changed=true"),
+    )
+    started = []
+    monkeypatch.setattr(
+        runner,
+        "_start_one_component",
+        lambda *_args: started.append(True),
+    )
+
+    result = runner(_step(
+        "restart_screen_component",
+        {
+            "platform": "test",
+            "component": "celery",
+            "screen_session": "test_c",
+            "project_root": str(tmp_path),
+            "lifecycle_mode": "screen_adoption",
+            "orphan_pids": [201],
+        },
+        risk="medium",
+    ))
+
+    assert result.status == "completed", result.output
+    assert stopped == [[201]]
+    assert started == []
+    assert not any("stuff" in call or "quit" in call for call in calls)
+    assert "preserved_managed_screen=true" in result.output
+
+
 def test_restart_does_not_create_parallel_screen_when_stale_cleanup_fails(
     tmp_path, monkeypatch,
 ):

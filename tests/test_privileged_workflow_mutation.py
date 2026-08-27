@@ -2239,6 +2239,112 @@ def test_platform_restart_uses_authoritative_celery_identity_without_requery():
     assert resources["celery_python_executable"] == "/envs/test/bin/python3.8"
 
 
+def test_all_role_screen_adoption_only_selects_noncompliant_running_components():
+    import base64
+    import json
+
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    root = "/srv/test"
+    specs = [
+        {"name": "master", "screen_suffix": "m"},
+        {"name": "celery", "screen_suffix": "c", "start_after": ["master"]},
+        {"name": "worker", "screen_suffix": "w", "start_after": ["celery"]},
+        {
+            "name": "data_server", "screen_suffix": "data_server",
+            "managed": True, "default_restart": False,
+            "command_argv": [
+                "/envs/test/bin/python3.8", "-m", "gunicorn", "-c",
+                "data_server_gun.py", "data_server_main:flask_app",
+            ],
+            "preflight_argv": [
+                "/envs/test/bin/python3.8", "-m", "gunicorn",
+                "--check-config", "-c", "data_server_gun.py",
+                "data_server_main:flask_app",
+            ],
+        },
+    ]
+    ownership = {
+        "master": {
+            "managed_groups": [{
+                "pgid": 10, "pids": [10], "screen_session": "test_m",
+            }],
+            "orphan_groups": [],
+        },
+        "worker": {
+            "managed_groups": [{
+                "pgid": 20, "pids": [20], "screen_session": "test_w",
+            }],
+            "orphan_groups": [],
+        },
+        "celery": {
+            "managed_groups": [{
+                "pgid": 30, "pids": [30], "screen_session": "test_c",
+            }],
+            "orphan_groups": [{
+                "pgid": 31, "pids": [31], "screen_session": "",
+            }],
+        },
+        "data_server": {
+            "managed_groups": [],
+            "orphan_groups": [{
+                "pgid": 40, "pids": [40, 41], "screen_session": "",
+            }],
+        },
+    }
+    encode = lambda value: base64.urlsafe_b64encode(
+        json.dumps(value).encode("utf-8")
+    ).decode("ascii")
+    bundle = EvidenceBundle(
+        goal="把所有平台的所有应用角色收编到 Screen，已合规角色保持不动",
+    )
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "inventory"),
+        "platform=test project_root=%s roles=celery,data_server,master,worker "
+        "backend_status=healthy master_endpoint=healthy worker_endpoint=healthy "
+        "master_identities=10:1000:/envs/test/bin/python3.8 "
+        "worker_identities=20:1000:/envs/test/bin/python3.8 "
+        "celery_identities=30:1000:/envs/test/bin/python3.8,"
+        "31:1000:/envs/test/bin/python3.8 "
+        "data_server_identities=40:1000:/envs/test/bin/python3.8 "
+        "component_specs_b64=%s component_ownership_b64=%s"
+        % (root, encode(specs), encode(ownership)),
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        bundle.goal,
+        bundle,
+        intent_context={
+            "operation": "restart", "scope": "platform", "components": [],
+            "base_goal": bundle.goal,
+        },
+    )
+
+    assert data is not None and data["status"] == "ready"
+    objective = data["changes"][0]["objective"]
+    assert "celery" in objective and "data_server" in objective
+    assert "master" not in objective and "worker" not in objective
+    lifecycle_roles = {
+        item["role"] for item in data["resources"]
+        if item["role"].startswith("runtime_component_lifecycle:")
+    }
+    assert lifecycle_roles == {
+        "runtime_component_lifecycle:celery",
+        "runtime_component_lifecycle:data_server",
+    }
+    orphan_values = {
+        item["role"]: item["value"] for item in data["resources"]
+        if item["role"].startswith("runtime_component_orphan_pids:")
+    }
+    assert orphan_values == {
+        "runtime_component_orphan_pids:celery": [31],
+        "runtime_component_orphan_pids:data_server": [40, 41],
+    }
+
+
 def test_runtime_repair_replaces_legacy_http_checks_with_backend_health_contract():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, EvidenceRecord, ProbeRequest,
