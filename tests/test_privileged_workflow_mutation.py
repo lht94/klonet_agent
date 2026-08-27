@@ -1364,6 +1364,78 @@ def test_platform_restart_compiler_includes_manifest_managed_future_component():
     assert "metrics_service" in resource["value"]
 
 
+def test_component_scoped_custom_runtime_never_expands_to_standard_roles():
+    import base64
+    import json
+
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    specs = [
+        {"name": "master", "screen_suffix": "m"},
+        {"name": "celery", "screen_suffix": "c"},
+        {"name": "web_terminal", "screen_suffix": "web"},
+        {"name": "worker", "screen_suffix": "w"},
+        {
+            "name": "data_server",
+            "managed": True,
+            "default_restart": False,
+            "screen_suffix": "data_server",
+            "command_argv": [
+                "/opt/envs/test/bin/python3.8", "-m", "gunicorn", "-c",
+                "data_server_gun.py", "data_server_main:flask_app",
+            ],
+        },
+    ]
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(specs).encode("utf-8")
+    ).decode("ascii")
+    bundle = EvidenceBundle(goal="migrate data_server into Screen")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        (
+            "platform=test project_root=/srv/test roles=celery,data_server,"
+            "master,web_terminal,worker backend_status=healthy "
+            "configured_ports=master_port:45554,worker_port:45555,"
+            "web_terminal_port:5114 master_port=45554 master_endpoint=healthy "
+            "worker_port=45555 worker_endpoint=healthy "
+            "data_server_identities=1205:1000:/opt/envs/test/bin/python3.8 "
+            "component_specs_b64=%s"
+        ) % encoded,
+    ))
+
+    data = ChangePlannerAgent._deterministic_runtime_restart(
+        "只把 /srv/test 的 data_server 收编到 Screen，其他角色不得重启",
+        bundle,
+        intent_context={
+            "operation": "restart",
+            "scope": "component",
+            "components": ["data_server"],
+            "resolved_project_root": "/srv/test",
+            "base_goal": "所有角色收编 Screen；本轮只迁移 data_server",
+        },
+    )
+
+    assert data is not None
+    change = data["changes"][0]
+    assert "data_server" in change["objective"]
+    assert all(
+        role not in change["objective"]
+        for role in ("master", "celery", "web_terminal", "worker")
+    )
+    assert change["postconditions"] == [{
+        "checker": "screen_session_exists",
+        "args": {"session": "test_data_server"},
+    }]
+    resources = {item["role"]: item for item in data["resources"]}
+    assert resources["screen_session"]["value"] == "test_data_server"
+    assert "data_server_main:flask_app" in resources[
+        "runtime_component_spec:data_server"
+    ]["value"]
+
+
 def _bundle_and_conclusion():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,
@@ -4981,7 +5053,7 @@ def test_complete_klonet_deployment_contract_requires_config_fields_and_master_n
     assert "complete Klonet Nginx must proxy to frozen master_port=47001" in errors
 
 
-def test_complete_klonet_deployment_contract_rejects_unsupported_data_server_component():
+def test_complete_klonet_contract_does_not_globally_reject_managed_data_server():
     from klonet_agent.ops.privileged.contracts import PlanResource
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
@@ -5005,7 +5077,7 @@ def test_complete_klonet_deployment_contract_rejects_unsupported_data_server_com
         [resource],
     )
 
-    assert "complete Klonet runtime includes unsupported data_server component" in errors
+    assert "complete Klonet runtime includes unsupported data_server component" not in errors
 
 
 def test_complete_klonet_deployment_contract_rejects_invented_database_migration():

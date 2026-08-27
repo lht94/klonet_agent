@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -808,6 +809,7 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
         if str(row.get("pid", "")).isdigit():
             entry["pids"].append(int(row["pid"]))
         entry.setdefault("role_pids", {}).setdefault(role, []).append(int(row["pid"]))
+        entry.setdefault("role_rows", {}).setdefault(role, []).append(row)
         if (
             str(row.get("pid", "")).isdigit()
             and str(row.get("uid", "")).isdigit()
@@ -875,12 +877,25 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                 f"{role}_listener_pid={binding.get('listener_pid', 'none')}",
                 f"{role}_listener_pgid={binding.get('listener_pgid', 'none')}",
             ])
+        component_specs = _runtime_component_specs(
+            root, roles, entry.get("role_rows", {}),
+        )
+        custom_identity_fields = " ".join(
+            "%s_identities=%s" % (
+                role,
+                ",".join(sorted(set(identities))) or "none",
+            )
+            for role, identities in sorted(
+                entry.get("role_identities", {}).items()
+            )
+            if role not in {"master", "worker", "celery", "web_terminal"}
+        )
         rows.append(
             "platform=%s project_root=%s runtime_source=process roles=%s pids=%s "
             "master_pids=%s worker_pids=%s master_pgids=%s worker_pgids=%s "
             "master_identities=%s worker_identities=%s "
             "celery_identities=%s web_terminal_identities=%s "
-            "runtime_identities=%s "
+            "runtime_identities=%s %s "
                 "role_bindings_b64=%s "
                 "screen_sessions_b64=%s "
                 "backend_status=%s missing_roles=%s configured_ports=%s "
@@ -903,6 +918,7 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                     for identities in entry.get("role_identities", {}).values()
                     for identity in identities
                 })) or "none",
+                custom_identity_fields,
                 base64.urlsafe_b64encode(json.dumps(
                     role_bindings,
                     ensure_ascii=True,
@@ -927,13 +943,13 @@ def inspect_running_platforms(args: Optional[dict] = None) -> str:
                     for key in _ordered_ports(ports)
                 ) or "none",
                 ",".join(
-                    spec["name"] for spec in _runtime_component_specs(root, roles)
+                    spec["name"] for spec in component_specs
                     if spec.get("category") == "application"
                     and spec.get("managed")
                     and spec.get("default_restart")
                 ) or "none",
                 base64.urlsafe_b64encode(json.dumps(
-                    _runtime_component_specs(root, roles),
+                    component_specs,
                     ensure_ascii=True,
                     separators=(",", ":"),
                 ).encode("utf-8")).decode("ascii"),
@@ -2000,7 +2016,11 @@ def _role_from_command(command: str) -> str:
     return ""
 
 
-def _runtime_component_specs(root: Path, running_roles: set[str]) -> list[dict]:
+def _runtime_component_specs(
+    root: Path,
+    running_roles: set[str],
+    role_rows: Optional[dict[str, list[dict]]] = None,
+) -> list[dict]:
     builtins = [
         {"name": "master", "category": "application", "managed": True,
          "default_restart": True, "screen_suffix": "m", "start_after": []},
@@ -2024,16 +2044,76 @@ def _runtime_component_specs(root: Path, running_roles: set[str]) -> list[dict]:
             by_name[normalized["name"]] = normalized
     for role in sorted(running_roles):
         if role not in by_name:
-            by_name[role] = {
+            observed_argv = _observed_runtime_component_argv(
+                root, list((role_rows or {}).get(role, [])),
+            )
+            discovered = {
                 "name": role,
                 "category": "application",
                 "managed": True,
                 "default_restart": False,
                 "screen_suffix": role,
                 "start_after": [],
-                "discovery_status": "command_contract_missing",
+                "discovery_status": (
+                    "observed_runtime_contract"
+                    if observed_argv else "command_contract_missing"
+                ),
             }
+            if observed_argv:
+                discovered["command_argv"] = observed_argv
+            by_name[role] = discovered
     return list(by_name.values())
+
+
+def _observed_runtime_component_argv(
+    root: Path,
+    rows: list[dict],
+) -> list[str]:
+    """Freeze a safe current argv for an inventory-discovered component.
+
+    Only a process already attributed to the exact runtime root may define the
+    contract.  Prefer the process-group leader so Gunicorn children cannot
+    create multiple competing identities.  Complex shell syntax and redacted
+    argv are deliberately rejected; Discovery/Binding can then use the normal
+    read-only/Shell fallback instead of guessing.
+    """
+
+    root_text = str(_canonical_runtime_root(Path(root)).resolve())
+    candidates = sorted(
+        rows,
+        key=lambda item: (
+            0 if int(item.get("pid") or 0) == int(item.get("pgid") or -1) else 1,
+            0 if int(item.get("ppid") or 0) == 1 else 1,
+            int(item.get("pid") or 0),
+        ),
+    )
+    for row in candidates:
+        cwd = str(row.get("cwd") or "")
+        if not cwd.startswith("/"):
+            continue
+        try:
+            if str(_canonical_runtime_root(Path(cwd)).resolve()) != root_text:
+                continue
+        except OSError:
+            continue
+        command = str(row.get("cmd") or "").strip()
+        if not command or "<redacted>" in command.lower():
+            continue
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if (
+            not _safe_runtime_component_argv(argv)
+            or any(re.search(r"[;&|<>`\n\x00]", item) for item in argv)
+            or redact_sensitive_text(" ".join(argv)) != " ".join(argv)
+        ):
+            continue
+        executable = str(row.get("executable") or "")
+        if executable.startswith("/") and Path(argv[0]).name != Path(executable).name:
+            continue
+        return argv
+    return []
 
 
 def _safe_runtime_component_manifest_item(value) -> dict:

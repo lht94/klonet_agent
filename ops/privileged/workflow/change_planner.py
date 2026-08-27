@@ -424,9 +424,14 @@ that port instead of implicitly checking an existing port 80 route. Missing
 image or credential details are resolvable by Discovery and Binding and must
 never justify sharing an existing service.
 
-A complete Klonet platform runtime has exactly four Screen components:
+A Klonet runtime's authoritative application-component set comes from the
+current RuntimeInventory component manifest. The standard components are
 master (`<instance>_m`), celery (`<instance>_c`), web terminal
-(`<instance>_web`), and worker (`<instance>_w`). It has distinct frozen
+(`<instance>_web`), and worker (`<instance>_w`), but an observed or manifested
+managed application component is equally valid. An explicit component-scoped
+user decision overrides the platform default-restart set: never replace an
+explicit custom component with the four standard components, and never include
+components the user explicitly excluded. It has distinct frozen
 `master_port`, `worker_port`, and `web_terminal_port` host resources; celery
 does not listen on a fourth application port. Configuration changes must name
 those exact Python attributes as well as mysql_port, redis_port,
@@ -441,9 +446,10 @@ not be copied into the model response. The Nginx site
 fronts the master application port; web-terminal and worker liveness are
 proved independently. Do not rename the web-terminal port to a generic
 `web_port`, and do not spell Screen suffixes as `_master` or `_worker`.
-The currently registered complete-runtime capability does not start a separate
-data-server component, so do not add `data_server_port`, a data-server Screen,
-or a fifth application component to this workflow deployment contract.
+For a managed non-standard component, preserve its inventory-proven Screen
+suffix, argv, runtime identity, ports and health checks. If a registered Action
+cannot cover it, keep the semantic component unchanged so Binding can use the
+existing policy-validated Shell fallback; never substitute another component.
 The discovered source initializes empty database tables during application
 startup (`app_factory` calls `create_all`); do not invent a separate migration,
 seed, or database-initialization ChangeStep without explicit contrary evidence.
@@ -1353,30 +1359,31 @@ the complete proposed replacement goal and list what would be superseded.
         structured_roles = [
             str(role).strip().lower().replace("-", "_")
             for role in (intent_context or {}).get("components") or []
-            if str(role).strip().lower().replace("-", "_")
-            in {item[0] for item in role_patterns}
+            if str(role).strip()
         ]
         all_roles_requested = _requests_all_runtime_roles(base_lowered)
+        component_scoped = (
+            str((intent_context or {}).get("scope") or "") == "component"
+            and bool(structured_roles)
+        )
         requested_roles = (
-            [role for role, _pattern in role_patterns]
-            if all_roles_requested
-            else
             structured_roles
-            if str((intent_context or {}).get("scope") or "") == "component"
-            and structured_roles
+            if component_scoped
+            else [role for role, _pattern in role_patterns]
+            if all_roles_requested
             else [
                 role for role, pattern in role_patterns
                 if re.search(pattern, lowered, re.I)
             ]
         )
-        platform_wide = all_roles_requested or (
+        platform_wide = not component_scoped and (all_roles_requested or (
             not requested_roles and (
                 str((intent_context or {}).get("scope") or "") == "platform"
                 or bool(re.search(
                     r"平台|platform|整个|全部|all", base_lowered, re.I,
                 ))
             )
-        )
+        ))
         if platform_wide:
             requested_roles = [role for role, _pattern in role_patterns]
         if not requested_roles:
@@ -1519,6 +1526,13 @@ the complete proposed replacement goal and list what would be superseded.
         )
         if platform_wide and component_specs:
             requested_roles = _ordered_default_restart_components(component_specs)
+        if component_scoped and component_specs:
+            requested_roles = [
+                role for role in requested_roles
+                if role in component_specs
+                and component_specs[role].category == "application"
+                and component_specs[role].managed
+            ]
         # Recovery completion is an execution fact and therefore the final
         # scope floor. Apply it after manifest expansion so no Planner path can
         # reintroduce an already completed component.
@@ -1737,7 +1751,10 @@ the complete proposed replacement goal and list what would be superseded.
         for role in requested_roles:
             session = selected.screen_session(role)
             if not session:
-                continue
+                spec = component_specs.get(role)
+                if spec is None:
+                    continue
+                session = "%s_%s" % (alias, spec.screen_suffix)
             resources.append({
                 "name": _plan_resource_name(step_id, role, "screen_session"),
                 "kind": "identifier", "status": "frozen",
@@ -1806,7 +1823,7 @@ the complete proposed replacement goal and list what would be superseded.
                 })
             else:
                 spec = component_specs.get(role)
-                if spec is None or not spec.managed or not spec.default_restart:
+                if spec is None or not spec.managed:
                     return None
                 expected.append(
                     "%s managed component %s and component readiness succeeds"
@@ -5312,13 +5329,6 @@ the complete proposed replacement goal and list what would be superseded.
             if not re.search(pattern, payload, re.I)
         ]
         errors = []
-        if "data_server" in payload or any(
-            "data_server" in "%s %s" % (resource.name, resource.role)
-            for resource in resources
-        ):
-            errors.append(
-                "complete Klonet runtime includes unsupported data_server component"
-            )
         invented_database_step = False
         for change in data.get("changes", []):
             if not isinstance(change, dict):

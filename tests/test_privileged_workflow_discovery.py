@@ -769,6 +769,34 @@ def test_runtime_component_manifest_extends_managed_applications_but_not_shared_
     assert {"master", "celery", "web_terminal", "worker"}.issubset(by_name)
 
 
+def test_runtime_component_inventory_freezes_safe_observed_custom_argv(tmp_path):
+    from klonet_agent.tools.environment import _runtime_component_specs
+
+    rows = {"data_server": [{
+        "pid": 1205,
+        "ppid": 1,
+        "pgid": 1205,
+        "uid": 1000,
+        "executable": "/opt/envs/test/bin/python3.8",
+        "cwd": str(tmp_path),
+        "cmd": (
+            "/opt/envs/test/bin/python3.8 -m gunicorn -c "
+            "data_server_gun.py data_server_main:flask_app"
+        ),
+        "role": "data_server",
+    }]}
+
+    specs = _runtime_component_specs(tmp_path, {"data_server"}, rows)
+    data_server = next(item for item in specs if item["name"] == "data_server")
+
+    assert data_server["default_restart"] is False
+    assert data_server["discovery_status"] == "observed_runtime_contract"
+    assert data_server["command_argv"] == [
+        "/opt/envs/test/bin/python3.8", "-m", "gunicorn", "-c",
+        "data_server_gun.py", "data_server_main:flask_app",
+    ]
+
+
 def test_discovery_collects_reusable_klonet_knowledge_before_host_probes():
     from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
