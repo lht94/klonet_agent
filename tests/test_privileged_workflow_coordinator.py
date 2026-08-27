@@ -1427,9 +1427,13 @@ def test_conversation_bypasses_privileged_discovery_and_execution():
 
 
 def test_workflow_coordinator_handles_exact_control_before_classifier_or_discovery():
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
     from klonet_agent.ops.privileged.workflow.coordinator import (
         PrivilegedOpsCoordinator,
         WorkflowResult,
+    )
+    from klonet_agent.ops.privileged.workflow.operational_context import (
+        OperationalContextSnapshot,
     )
 
     class NoCall:
@@ -1444,7 +1448,23 @@ def test_workflow_coordinator_handles_exact_control_before_classifier_or_discove
             self.calls.append(text)
             return WorkflowResult(True, "completed", "confirmed")
 
+    class Store:
+        def __init__(self):
+            self.snapshot = OperationalContextSnapshot(
+                resolved_goal="重启 test 的 celery",
+                base_goal="重启 test 的 celery",
+                active_plan_id="priv-ops-flow",
+                evidence=EvidenceBundle(goal="重启 test 的 celery"),
+            )
+
+        def load(self):
+            return self.snapshot
+
+        def save(self, value):
+            self.snapshot = value
+
     controls = Controls()
+    store = Store()
     coordinator = PrivilegedOpsCoordinator(
         classifier=NoCall(),
         discovery=NoCall(),
@@ -1452,6 +1472,7 @@ def test_workflow_coordinator_handles_exact_control_before_classifier_or_discove
         response=NoCall(),
         mutation_workflow=controls,
         verifier=NoCall(),
+        context_store=store,
     )
 
     result = coordinator.handle_with_context(
@@ -1462,6 +1483,9 @@ def test_workflow_coordinator_handles_exact_control_before_classifier_or_discove
 
     assert result.kind == "completed"
     assert controls.calls == ["confirm-priv-plan priv-ops-flow " + "a" * 64]
+    assert store.snapshot.resolved_goal == ""
+    assert store.snapshot.base_goal == ""
+    assert store.snapshot.active_plan_id == ""
 
 
 def test_paused_confirm_result_automatically_diagnoses_and_replans():
@@ -3208,7 +3232,9 @@ def test_new_runtime_inventory_goal_cannot_be_hijacked_by_active_change_plan(que
 
     assert result.kind == "completed"
     assert discovery.calls[0][0] == query
-    assert store.saved[-1].resolved_goal == query
+    assert store.saved[-1].resolved_goal == ""
+    assert store.saved[-1].base_goal == ""
+    assert store.saved[-1].decision_history == []
     assert store.saved[-1].active_plan_id == ""
 
 
@@ -3267,7 +3293,9 @@ def test_correction_supersedes_old_plan_and_runs_replacement_readonly_goal():
     assert result.kind == "completed"
     assert mutation.aborted == ["priv-ops-old-restart"]
     assert discovery.calls[0][0] == request
-    assert store.saved[-1].resolved_goal == request
+    assert store.saved[-1].resolved_goal == ""
+    assert store.saved[-1].base_goal == ""
+    assert store.saved[-1].decision_history == []
     assert store.saved[-1].active_plan_id == ""
 
 

@@ -62,6 +62,28 @@ class PrivilegedOpsCoordinator:
         environment_context: str = "",
         conversation_context: str = "",
     ) -> WorkflowResult:
+        """Run one turn and retire its active goal after verified success."""
+
+        result = self._handle(
+            text,
+            environment_context=environment_context,
+            conversation_context=conversation_context,
+        )
+        if result.kind == "completed":
+            current = (
+                self.context_store.load()
+                if self.context_store is not None else None
+            )
+            self._clear_context(current)
+        return result
+
+    def _handle(
+        self,
+        text: str,
+        *,
+        environment_context: str = "",
+        conversation_context: str = "",
+    ) -> WorkflowResult:
         normalized = str(text or "").lstrip("\ufeff\u200b").strip()
         snapshot = self.context_store.load() if self.context_store is not None else None
         if snapshot is not None and snapshot.pending_goal_revision:
