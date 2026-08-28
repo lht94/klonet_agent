@@ -2510,7 +2510,29 @@ the complete proposed replacement goal and list what would be superseded.
                         "probe_requests": {
                             "type": "array",
                             "items": {
-                                "type": "object", "additionalProperties": True,
+                                "type": "object",
+                                "properties": {
+                                    "probe": {"type": "string"},
+                                    "args": {
+                                        "type": "object",
+                                        "additionalProperties": True,
+                                    },
+                                    "purpose": {"type": "string"},
+                                    "required_facts": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "freshness": {"type": "string"},
+                                    "gap_id": {"type": "string"},
+                                    "affected_steps": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                },
+                                "required": [
+                                    "probe", "args", "purpose", "required_facts",
+                                ],
+                                "additionalProperties": True,
                             },
                         },
                         "assumptions": {
@@ -2524,8 +2546,18 @@ the complete proposed replacement goal and list what would be superseded.
                                     "name": {"type": "string"},
                                     "kind": {"type": "string"},
                                     "status": {"type": "string"},
+                                    "role": {"type": "string"},
+                                    "value": {},
+                                    "source": {"type": "string"},
+                                    "consumers": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
                                 },
-                                "required": ["name", "kind", "status"],
+                                "required": [
+                                    "name", "kind", "status", "role", "value",
+                                    "source", "consumers",
+                                ],
                                 "additionalProperties": True,
                             },
                         },
@@ -2537,8 +2569,41 @@ the complete proposed replacement goal and list what would be superseded.
                                     "step_id": {"type": "string"},
                                     "title": {"type": "string"},
                                     "objective": {"type": "string"},
+                                    "reason": {"type": "string"},
+                                    "evidence_refs": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "risk": {"type": "string"},
+                                    "expected_changes": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                    },
+                                    "postconditions": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "checker": {"type": "string"},
+                                                "args": {
+                                                    "type": "object",
+                                                    "additionalProperties": True,
+                                                },
+                                            },
+                                            "required": ["checker", "args"],
+                                            "additionalProperties": True,
+                                        },
+                                    },
                                 },
-                                "required": ["step_id", "title", "objective"],
+                                "required": [
+                                    "step_id", "title", "objective", "reason",
+                                    "evidence_refs", "depends_on", "risk",
+                                    "expected_changes", "postconditions",
+                                ],
                                 "additionalProperties": True,
                             },
                         },

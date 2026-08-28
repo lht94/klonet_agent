@@ -3459,32 +3459,23 @@ def test_change_planner_forces_bounded_function_schema():
         "type": "string",
         "enum": ["need_evidence", "ready", "blocked"],
     }
-    assert properties["probe_requests"]["items"] == {
-        "type": "object", "additionalProperties": True,
-    }
-    assert properties["resources"]["items"] == {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "kind": {"type": "string"},
-            "status": {"type": "string"},
-        },
-        "required": ["name", "kind", "status"],
-        "additionalProperties": True,
-    }
-    assert properties["changes"]["items"] == {
-        "type": "object",
-        "properties": {
-            "step_id": {"type": "string"},
-            "title": {"type": "string"},
-            "objective": {"type": "string"},
-        },
-        "required": ["step_id", "title", "objective"],
-        "additionalProperties": True,
-    }
+    assert properties["probe_requests"]["items"]["required"] == [
+        "probe", "args", "purpose", "required_facts",
+    ]
+    assert properties["resources"]["items"]["required"] == [
+        "name", "kind", "status", "role", "value", "source", "consumers",
+    ]
+    assert properties["changes"]["items"]["required"] == [
+        "step_id", "title", "objective", "reason", "evidence_refs",
+        "depends_on", "risk", "expected_changes", "postconditions",
+    ]
+    postcondition = properties["changes"]["items"]["properties"][
+        "postconditions"
+    ]["items"]
+    assert postcondition["required"] == ["checker", "args"]
     assert parameters["required"] == ["status"]
     assert parameters["additionalProperties"] is True
-    assert len(json.dumps(call["tools"][0], separators=(",", ":"))) < 1500
+    assert len(json.dumps(call["tools"][0], separators=(",", ":"))) < 3500
 
 
 def test_change_planner_compacts_accumulated_evidence_for_transport():
