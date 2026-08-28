@@ -4864,3 +4864,16 @@ def test_hierarchical_binding_failure_identifies_owning_semantic_step():
         "step_id": "change-2",
     }
     assert raised.value.failed_criteria == ["observed Docker image required"]
+
+
+def test_binding_selection_schema_uses_absence_instead_of_empty_enum_values():
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    tool = PrivilegedExecutionAgent(None)._selection_function_tool()
+    parameters = tool["function"]["parameters"]
+    properties = parameters["properties"]
+
+    assert "" not in properties["action"]["enum"]
+    assert "" not in properties["shell_blocker_category"]["enum"]
+    assert "action" not in parameters["required"]
+    assert "shell_blocker_category" not in parameters["required"]

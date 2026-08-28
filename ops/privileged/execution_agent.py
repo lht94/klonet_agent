@@ -2490,7 +2490,7 @@ class PrivilegedExecutionAgent:
                     },
                     "action": {
                         "type": "string",
-                        "enum": ["", *self._direct_action_names()],
+                        "enum": self._direct_action_names(),
                     },
                     "selection_reason": {"type": "string"},
                     "resolved_from_evidence": {
@@ -2529,7 +2529,6 @@ class PrivilegedExecutionAgent:
                     "shell_blocker_category": {
                         "type": "string",
                         "enum": [
-                            "",
                             "hard_policy",
                             "unverifiable",
                             "no_safe_command",
@@ -2538,7 +2537,6 @@ class PrivilegedExecutionAgent:
                 },
                 "required": [
                     "status",
-                    "action",
                     "selection_reason",
                     "resolved_from_evidence",
                     "probe_requests",
