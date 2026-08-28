@@ -28,7 +28,10 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
-from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
+from klonet_agent.ops.privileged.workflow.runtime_inventory import (
+    RuntimeInventory,
+    requests_new_platform_deployment,
+)
 
 
 def _plan_resource_name(*parts: Any) -> str:
@@ -818,20 +821,6 @@ def _requests_screen_management_transition(text: str) -> bool:
     )
 
 
-def _requests_new_platform_deployment(text: str) -> bool:
-    """Recognize creation as a deployment lifecycle, never a restart."""
-
-    value = str(text or "")
-    return bool(
-        re.search(
-            r"\b(?:create|deploy|provision|clone)\b|创建|新建|部署|克隆",
-            value,
-            re.I,
-        )
-        and re.search(r"\b(?:klonet|platform|instance)\b|平台|实例", value, re.I)
-    )
-
-
 def _reply_preserves_existing_goal_scope(text: str) -> bool:
     """Return whether the user explicitly freezes the existing objective."""
 
@@ -994,7 +983,7 @@ the complete proposed replacement goal and list what would be superseded.
         authoritative_goal = str(
             effective_intent_context.get("base_goal") or goal
         )
-        if _requests_new_platform_deployment(authoritative_goal):
+        if requests_new_platform_deployment(authoritative_goal):
             # A later implementation refinement may mention restarting or
             # Screen-owning the roles it will create.  The immutable base goal
             # still owns the lifecycle: this is deployment, not runtime restart.
@@ -1411,7 +1400,7 @@ the complete proposed replacement goal and list what would be superseded.
         base_goal = str((intent_context or {}).get("base_goal") or text)
         base_lowered = base_goal.lower()
         structured_operation = str((intent_context or {}).get("operation") or "")
-        if _requests_new_platform_deployment(base_goal):
+        if requests_new_platform_deployment(base_goal):
             return None
         screen_lifecycle = _requests_screen_management_transition(base_goal)
         if (
@@ -5069,7 +5058,7 @@ the complete proposed replacement goal and list what would be superseded.
                 changes,
             )
         )
-        deployment = _requests_new_platform_deployment(goal_text)
+        deployment = requests_new_platform_deployment(goal_text)
         if not deployment:
             return errors
         frozen = [item for item in resources if item.status == "frozen"]
@@ -5903,7 +5892,7 @@ the complete proposed replacement goal and list what would be superseded.
 
         normalized = list(resources)
         if not (
-            _requests_new_platform_deployment(goal_text)
+            requests_new_platform_deployment(goal_text)
             and _automatic_conflict_port_policy(goal_text)
         ):
             return normalized

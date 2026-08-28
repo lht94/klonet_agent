@@ -34,6 +34,25 @@ _RUNTIME_OUTCOME_TERMS = (
 )
 
 
+def requests_new_platform_deployment(text: str) -> bool:
+    """Return whether the goal creates a distinct platform lifecycle.
+
+    Source templates and existing repositories may appear in a deployment
+    goal, but they are evidence inputs rather than the requested runtime
+    target. Planner and Verifier must therefore share this one distinction.
+    """
+
+    value = str(text or "")
+    return bool(
+        re.search(
+            r"\b(?:create|deploy|provision|clone)\b|创建|新建|部署|克隆",
+            value,
+            re.I,
+        )
+        and re.search(r"\b(?:klonet|platform|instance)\b|平台|实例", value, re.I)
+    )
+
+
 def _field(line: str, name: str, default: str = "") -> str:
     match = re.search(r"(?:^|\s)%s=([^\s]+)" % re.escape(name), line)
     return match.group(1) if match else default

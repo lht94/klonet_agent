@@ -2308,6 +2308,44 @@ def test_mutation_with_explicit_roots_already_healthy_completes_without_plan():
     assert mutation.calls == []
 
 
+def test_new_platform_source_health_never_completes_deployment_target():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle,
+        EvidenceConclusion,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import PrivilegedOpsCoordinator
+
+    goal = (
+        "创建新的 Klonet 平台到 /srv/new/vemu_uestc，"
+        "从 /srv/source/vemu_uestc 完整复制当前工作树"
+    )
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime inventory"),
+        "platform=source project_root=/srv/source/vemu_uestc "
+        "backend_status=healthy master_port=45551 master_endpoint=healthy "
+        "worker_port=45552 worker_endpoint=healthy",
+    ))
+    mutation = RecordingMutationWorkflow()
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier(
+            "mutating_action", operation="start", scope="platform",
+        ),
+        discovery=StubDiscovery(bundle),
+        synthesis=StubSynthesis(EvidenceConclusion()),
+        response=StubResponse(),
+        mutation_workflow=mutation,
+        verifier=StubGoalVerifier(),
+    )
+
+    result = coordinator.handle(goal)
+
+    assert result.kind == "awaiting_confirmation"
+    assert len(mutation.calls) == 1
+
+
 def test_named_platform_alias_selects_one_abnormal_root_without_clarification():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle,

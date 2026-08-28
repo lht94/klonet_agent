@@ -25,7 +25,9 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.runtime_inventory import (
-    RuntimeInventory, runtime_inventory_answers_goal,
+    RuntimeInventory,
+    requests_new_platform_deployment,
+    runtime_inventory_answers_goal,
 )
 
 
@@ -203,6 +205,7 @@ class PrivilegedVerifierAgent:
         ]
         if (
             operation in {"repair", "start"}
+            and not requests_new_platform_deployment(goal)
             and explicit_targets
             and all(item.backend_status == "healthy" for item in explicit_targets)
         ):
