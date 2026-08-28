@@ -504,6 +504,12 @@ class PrivilegedExecutionAgent:
                             % last_error,
                             replan_recommended=True,
                             category="implementation_plan_unavailable",
+                            failed_criteria=list(exc.failed_criteria),
+                            missing_decisions=list(exc.missing_decisions),
+                            replan_context={
+                                **dict(exc.replan_context),
+                                "step_id": semantic_step.step_id,
+                            },
                         ) from exc
                     feedback = (
                         "The previous implementation decomposition could not be"
@@ -3350,10 +3356,7 @@ def _deterministic_klonet_config_items(
             and re.search(r"settings?|ports?|ips?|endpoints?|配置|设置|端口", text, re.I)
         )
     )
-    if not (
-        config_semantic
-        and re.search(r"complete|isolated|完整|隔离", "%s %s" % (plan.goal, text), re.I)
-    ):
+    if not config_semantic:
         return []
     def scoped(resource: PlanResource) -> bool:
         return any(
@@ -3372,17 +3375,35 @@ def _deterministic_klonet_config_items(
         ),
         "",
     )
-    ports = {
-        str(resource.role): int(resource.value)
-        for resource in plan.resources
-        if resource.status == "frozen"
-        and resource.kind == "port"
-        and scoped(resource)
-        and str(resource.role) in {
-            "master_port", "worker_port", "web_terminal_port", "public_port",
-            "redis_port", "mysql_port", "rabbitmq_port",
-        }
+    port_roles = {
+        "master_port", "worker_port", "web_terminal_port", "public_port",
+        "redis_port", "mysql_port", "rabbitmq_port",
     }
+    ports: dict[str, int] = {}
+    for resource in plan.resources:
+        if not (
+            resource.status == "frozen"
+            and resource.kind == "port"
+            and scoped(resource)
+        ):
+            continue
+        role = str(resource.role or "")
+        if role not in port_roles:
+            if str(resource.name or "") in port_roles:
+                role = str(resource.name)
+            else:
+                identity = "%s %s" % (resource.name, resource.role)
+                service = next((
+                    item for item in ("mysql", "redis", "rabbitmq")
+                    if re.search(
+                        r"\b%s(?:[_ -]host)?[_ -]port\b" % item,
+                        identity,
+                        re.I,
+                    )
+                ), "")
+                role = "%s_port" % service if service else ""
+        if role in port_roles:
+            ports[role] = int(resource.value)
     required = {
         "master_port", "worker_port", "web_terminal_port",
         "redis_port", "mysql_port", "rabbitmq_port",
@@ -3392,6 +3413,7 @@ def _deterministic_klonet_config_items(
     attributes: list[tuple[str, Any]] = [
         ("master_ip", "127.0.0.1"),
         ("mysql_ip", "127.0.0.1"),
+        ("redis_ip", "127.0.0.1"),
         ("rabbitmq_ip", "127.0.0.1"),
         ("master_port", ports["master_port"]),
         ("worker_port", ports["worker_port"]),
@@ -3405,7 +3427,7 @@ def _deterministic_klonet_config_items(
             ("mysql_port", ports["mysql_port"]),
             ("rabbitmq_port", ports["rabbitmq_port"]),
             ("celery_redis_port_db", "%s/6" % ports["redis_port"]),
-            ("celery_rabbitmq_port_db", "%s/7" % ports["redis_port"]),
+            ("celery_rabbitmq_port_db", "%s/7" % ports["rabbitmq_port"]),
         ]
     )
     items = []
@@ -5742,6 +5764,21 @@ def _resource_manifest_payload(
     return [resource.to_dict() for resource in resources]
 
 
+def _container_service_for_step(step: PrivilegedStep) -> str:
+    """Prefer the atomic title when inherited parent prose names all services."""
+
+    markers = ("mysql", "redis", "rabbitmq")
+    for fragment in (
+        str(step.title or ""),
+        str(step.objective or ""),
+        " ".join([step.title, step.objective, step.reason, *step.expected_changes]),
+    ):
+        present = [marker for marker in markers if marker in fragment.lower()]
+        if len(present) == 1:
+            return present[0]
+    return ""
+
+
 def _validate_action_resource_bindings(
     step: PrivilegedStep,
     action: str,
@@ -5769,15 +5806,7 @@ def _validate_action_resource_bindings(
                 for consumer in resource.consumers
             )
         ]
-        step_text = "%s %s" % (step.title, step.objective)
-        service = next(
-            (
-                marker
-                for marker in ("mysql", "redis", "rabbitmq")
-                if marker in step_text.lower()
-            ),
-            "",
-        )
+        service = _container_service_for_step(step)
         credential_source = args.get("credential_source")
         if service in {"mysql", "redis"}:
             if not isinstance(credential_source, dict):
@@ -6065,6 +6094,8 @@ def _forced_registered_action_for_step(step: PrivilegedStep) -> str:
     if _step_is_verification(step):
         return ""
     primary = "%s %s" % (step.title, step.objective)
+    if re.search(r"\bsync_directory\b", primary, re.I):
+        return "sync_directory"
     if re.match(r"^\s*Set\s+WtxConfig\s+", step.title, re.I) or (
         re.search(
             r"(?<![A-Za-z0-9_])(?:master_port|worker_port)(?![A-Za-z0-9_])",
@@ -6331,10 +6362,7 @@ def _validate_action_contract_consistency(
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     )
-    service = next(
-        (item for item in ("mysql", "redis", "rabbitmq") if item in text.lower()),
-        "",
-    )
+    service = _container_service_for_step(step)
     names = re.findall(
         r"\b[A-Za-z0-9][A-Za-z0-9_.-]{0,70}[-_]"
         r"(?:mysql|redis|rabbitmq)\b",
@@ -6611,14 +6639,17 @@ def _infer_structural_action_args(
         }
         if attribute and attribute in compiled:
             compiled["value"] = compiled[attribute]
-        elif attribute in {"master_ip", "mysql_ip", "rabbitmq_ip"}:
+        elif attribute in {"master_ip", "mysql_ip", "redis_ip", "rabbitmq_ip"}:
             compiled["value"] = "127.0.0.1"
         elif attribute in frozen_ports:
             compiled["value"] = frozen_ports[attribute]
         elif attribute == "celery_redis_port_db" and "redis_port" in frozen_ports:
             compiled["value"] = "%s/6" % frozen_ports["redis_port"]
-        elif attribute == "celery_rabbitmq_port_db" and "redis_port" in frozen_ports:
-            compiled["value"] = "%s/7" % frozen_ports["redis_port"]
+        elif (
+            attribute == "celery_rabbitmq_port_db"
+            and "rabbitmq_port" in frozen_ports
+        ):
+            compiled["value"] = "%s/7" % frozen_ports["rabbitmq_port"]
     if action == "git_operation":
         operation = str(compiled.get("operation") or "").strip().lower()
         if operation == "clone" and str(compiled.get("revision") or "").strip():
@@ -6638,6 +6669,13 @@ def _infer_structural_action_args(
         identity = "%s %s" % (
             compiled.get("name") or "",
             compiled.get("image") or "",
+        )
+        container_service = next(
+            (
+                item for item in ("mysql", "redis", "rabbitmq")
+                if item in identity.lower()
+            ),
+            "",
         )
         service = next(
             (item for item in ("mysql", "redis") if item in identity.lower()),
@@ -6661,6 +6699,34 @@ def _infer_structural_action_args(
                 "path": config_path,
                 "service": service,
             }
+        if container_service:
+            service_ports = [
+                resource
+                for resource in resources
+                if resource.status == "frozen"
+                and resource.kind == "port"
+                and container_service in " ".join(
+                    [resource.name, resource.role, *resource.consumers]
+                ).lower()
+            ]
+            internal_port = next((
+                int(resource.value)
+                for resource in service_ports
+                if "internal" in "%s %s" % (resource.name, resource.role)
+                or "container_port" in "%s %s" % (resource.name, resource.role)
+            ), None)
+            host_port = next((
+                int(resource.value)
+                for resource in service_ports
+                if not (
+                    "internal" in "%s %s" % (resource.name, resource.role)
+                    or "container_port" in "%s %s" % (resource.name, resource.role)
+                )
+            ), None)
+            if host_port is not None and internal_port is not None:
+                compiled["port_bindings"] = [
+                    "127.0.0.1:%s:%s" % (host_port, internal_port)
+                ]
     if action == "install_nginx_config":
         content = str(compiled.get("content") or "")
         if content and "location = /healthz" not in content:
@@ -7235,10 +7301,7 @@ def _infer_semantic_action_args(
     text = " ".join(
         [step.title, step.objective, step.reason, *step.expected_changes]
     )
-    service = next(
-        (item for item in ("mysql", "redis", "rabbitmq") if item in text.lower()),
-        "",
-    )
+    service = _container_service_for_step(step)
     names = re.findall(
         r"\b[A-Za-z0-9][A-Za-z0-9_.-]{0,70}[-_]"
         r"(?:mysql|redis|rabbitmq)\b",

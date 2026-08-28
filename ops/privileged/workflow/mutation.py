@@ -296,6 +296,7 @@ class MutationWorkflow:
         knowledge_sections = []
         priority = {
             "ops_file": 0,
+            "docker_images": 0,
             "process_logs": 1,
             "running_platforms": 2,
         }

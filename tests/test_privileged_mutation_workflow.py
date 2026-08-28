@@ -65,6 +65,46 @@ def test_binding_context_preserves_exact_ops_source_before_large_runtime_evidenc
     )
 
 
+def test_binding_context_preserves_docker_images_before_compacting_large_evidence():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle,
+        EvidenceRecord,
+        ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+
+    bundle = EvidenceBundle(goal="deploy containers")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ops_file", {"path": "/tmp/config.py"}, "config"),
+        "config evidence\n" + "a" * 9000,
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("running_platforms", {}, "runtime"),
+        "runtime evidence\n" + "b" * 9000,
+    ))
+    docker_output = (
+        "inspect_docker_images\n"
+        "mysql latest sha256:a\nredis 7 sha256:b\nrabbitmq latest sha256:c"
+    )
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("docker_images", {}, "installed images"),
+        docker_output,
+    ))
+    for index in range(4):
+        bundle.add(EvidenceRecord.from_probe(
+            ProbeRequest("project_layout", {"index": index}, "layout"),
+            "layout-%s\n%s" % (index, "z" * 8000),
+        ))
+
+    context = MutationWorkflow._binding_context(bundle)
+
+    assert context is not None
+    assert docker_output in context.environment_evidence
+    assert context.environment_evidence.index("probe=docker_images") < (
+        context.environment_evidence.index("probe=running_platforms")
+    )
+
+
 def test_workflow_confirmation_redacts_registered_action_credentials():
     from klonet_agent.ops.privileged.contracts import ExecutionBinding
     from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
@@ -1998,6 +2038,9 @@ def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
                 status="blocked",
                 candidate_plan=plan,
                 reason="candidate ports became occupied: 6379",
+                replan_context={
+                    "active_gap_affected_steps": ["deploy"],
+                },
             )
 
     planner = CandidatePlanner()
@@ -2023,6 +2066,9 @@ def test_occupied_candidate_ports_trigger_one_bounded_replan(tmp_path):
     assert len(planner.calls) == 2
     assert planner.finalize_calls == 1
     assert "candidate ports became occupied: 6379" in planner.calls[1]["binding_feedback"]
+    assert planner.calls[1]["intent_context"][
+        "active_gap_affected_steps"
+    ] == ["deploy"]
 
 
 def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
@@ -2316,6 +2362,59 @@ def test_binding_replan_receives_structured_implementation_gap(tmp_path):
         "missing_effects": ["worker_runtime_recovery"],
     }
     assert feedback["failed_criteria"] == ["worker 缺少启动动作"]
+
+
+def test_binding_replan_uses_pre_binding_semantic_snapshot(tmp_path):
+    from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
+    from klonet_agent.ops.privileged.workflow.contracts import GoalOutcome
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+
+    original = _change_plan()
+    original.steps[0].title = "Sync current working tree"
+
+    class Planner:
+        def __init__(self):
+            self.calls = []
+
+        def plan(self, *args, candidate_plan=None, **kwargs):
+            self.calls.append(candidate_plan)
+            if len(self.calls) == 1:
+                return GoalOutcome(status="need_execution", plan=original)
+            assert candidate_plan.steps[0].title == "Sync current working tree"
+            replacement = _change_plan()
+            replacement.steps[0].title = "Sync current working tree"
+            return GoalOutcome(status="need_execution", plan=replacement)
+
+    class Binder:
+        calls = 0
+
+        def bind(self, plan, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                # Real binding expands and normalizes the candidate in place
+                # before a later atomic action rejects. Replan must still see
+                # the authoritative pre-binding semantic plan.
+                plan.steps[0].title = "Clone remote repository"
+                raise ChangeBindingError(
+                    "unfrozen_host_port=45560",
+                    replan_context={"step_id": plan.steps[0].step_id},
+                )
+            plan.status = "awaiting_confirmation"
+            return plan
+
+    planner = Planner()
+    workflow = MutationWorkflow(
+        planner=planner, binder=Binder(), store=MemoryStore(),
+        executor=FakeExecutor(), verifier=FakeVerifier(),
+    )
+
+    result = _submit(
+        workflow, "create platform", evidence_bundle=object(),
+        evidence_conclusion=object(),
+    )
+
+    assert result.kind == "awaiting_confirmation"
+    assert len(planner.calls) == 2
 
 
 def test_binding_replan_need_evidence_returns_to_discovery_then_binds(tmp_path):

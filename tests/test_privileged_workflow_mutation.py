@@ -3427,6 +3427,8 @@ def test_change_planner_stops_after_compact_retry_is_still_oversized():
 
 
 def test_change_planner_forces_bounded_function_schema():
+    import json
+
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, _evidence_id = _bundle_and_conclusion()
@@ -3451,11 +3453,166 @@ def test_change_planner_forces_bounded_function_schema():
     }
     function = call["tools"][0]["function"]
     assert function["name"] == "submit_change_plan"
-    properties = function["parameters"]["properties"]
-    assert properties["assumptions"]["maxItems"] == 12
-    assert properties["assumptions"]["items"]["maxLength"] == 500
-    assert properties["resources"]["maxItems"] == 64
-    assert properties["changes"]["maxItems"] == 12
+    parameters = function["parameters"]
+    properties = parameters["properties"]
+    assert properties["status"] == {
+        "type": "string",
+        "enum": ["need_evidence", "ready", "blocked"],
+    }
+    assert properties["probe_requests"]["items"] == {
+        "type": "object", "additionalProperties": True,
+    }
+    assert properties["resources"]["items"] == {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "kind": {"type": "string"},
+            "status": {"type": "string"},
+        },
+        "required": ["name", "kind", "status"],
+        "additionalProperties": True,
+    }
+    assert properties["changes"]["items"] == {
+        "type": "object",
+        "properties": {
+            "step_id": {"type": "string"},
+            "title": {"type": "string"},
+            "objective": {"type": "string"},
+        },
+        "required": ["step_id", "title", "objective"],
+        "additionalProperties": True,
+    }
+    assert parameters["required"] == ["status"]
+    assert parameters["additionalProperties"] is True
+    assert len(json.dumps(call["tools"][0], separators=(",", ":"))) < 1500
+
+
+def test_change_planner_compacts_accumulated_evidence_for_transport():
+    import json
+
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="create platform")
+    duplicate = ProbeRequest("running_platforms", {}, "runtime inventory")
+    bundle.records.extend([
+        EvidenceRecord.from_probe(duplicate, "OLD-" + "x" * 5000),
+        EvidenceRecord.from_probe(duplicate, "NEW-" + "y" * 5000 + "-NEW-TAIL"),
+    ])
+    for port in range(47000, 47020):
+        request = ProbeRequest("ports", {"ports": [port]}, "port evidence")
+        bundle.records.append(EvidenceRecord.from_probe(
+            request,
+            "PORT-%s-" % port + "z" * 5000 + "-TAIL-%s" % port,
+        ))
+
+    rendered = ChangePlannerAgent._evidence_json(bundle)
+    payload = json.loads(rendered)
+
+    assert "OLD-" not in rendered
+    assert "NEW-" in rendered and "-NEW-TAIL" in rendered
+    assert "-TAIL-47019" in rendered
+    assert len(payload) == 21
+    assert len(rendered) < 35000
+
+
+def test_explicit_deployment_boundaries_reject_forbidden_and_missing_effects():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    goal = (
+        "必须使用 sync_directory 复制当前工作树，严禁 Git clone；"
+        "必须创建 create_e2e-mysql、create_e2e-redis、create_e2e-rabbitmq；"
+        "必须启动 create_e2e_m、create_e2e_c、create_e2e_web、create_e2e_w；"
+        "不得配置 Nginx，不得启动 data_server"
+    )
+    changes = [{
+        "step_id": "deploy",
+        "title": "Clone source and install Nginx",
+        "objective": "Create create_e2e-mysql and start create_e2e_m",
+        "expected_changes": ["data_server starts"],
+    }]
+
+    errors = ChangePlannerAgent._explicit_goal_boundary_errors(goal, changes)
+
+    assert "explicit goal forbids Git clone" in errors
+    assert "explicit goal forbids Nginx" in errors
+    assert "explicit goal forbids data_server" in errors
+    assert "explicit goal missing containers=create_e2e-rabbitmq,create_e2e-redis" in errors
+    assert "explicit goal missing Screen sessions=create_e2e_c,create_e2e_w,create_e2e_web" in errors
+
+
+def test_explicit_deployment_boundaries_accept_exact_requested_scope():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    goal = (
+        "必须使用 sync_directory 复制当前工作树，严禁 Git clone；"
+        "必须创建 create_e2e-mysql、create_e2e-redis、create_e2e-rabbitmq；"
+        "必须启动 create_e2e_m、create_e2e_c、create_e2e_web、create_e2e_w；"
+        "不得配置 Nginx，不得启动 data_server"
+    )
+    changes = [
+        {"title": "Sync source", "objective": "Use sync_directory", "expected_changes": []},
+        {"title": "Create containers", "objective": (
+            "Create create_e2e-mysql create_e2e-redis create_e2e-rabbitmq"
+        ), "expected_changes": []},
+        {"title": "Start components", "objective": (
+            "Start create_e2e_m create_e2e_c create_e2e_web create_e2e_w"
+        ), "expected_changes": []},
+    ]
+
+    assert ChangePlannerAgent._explicit_goal_boundary_errors(goal, changes) == []
+
+
+def test_new_platform_with_negative_restart_clause_never_routes_to_restart_compiler():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
+
+    goal = (
+        "创建 create_e2e Klonet 平台，并启动 master、celery、web_terminal、worker；"
+        "不得修改或重启任何现有平台"
+    )
+
+    assert ChangePlannerAgent._deterministic_runtime_restart(
+        goal,
+        EvidenceBundle(goal=goal),
+        intent_context={"base_goal": goal, "operation": "none"},
+    ) is None
+
+
+def test_occupied_candidate_ports_report_affected_resource_consumers():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan, ChangeStep, EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    plan = ChangePlan(
+        plan_id="priv-ops-ports", goal="create platform", risk="high",
+        steps=[ChangeStep(
+            step_id="change-2", title="configure dependencies",
+            objective="configure MySQL", risk="high",
+            expected_changes=["MySQL port configured"],
+            postconditions=[{"checker": "container_running", "args": {
+                "container": "create_e2e-mysql",
+            }}],
+        )],
+        resources=[PlanResource(
+            "mysql_port", "port", "frozen", "mysql_port", 47001,
+            "planner_choice", consumers=["change-2.mysql_port"],
+        )],
+    )
+    bundle = EvidenceBundle(goal=plan.goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": [47001]}, "verify port"),
+        "LISTEN 0 128 127.0.0.1:47001 0.0.0.0:*",
+    ))
+
+    outcome = ChangePlannerAgent.finalize_candidate(plan, bundle)
+
+    assert outcome.status == "blocked"
+    assert outcome.replan_context["active_gap_affected_steps"] == ["change-2"]
 
 
 def test_planner_compiles_checker_aliases_and_clone_resource_consumers():
@@ -3728,6 +3885,361 @@ def test_planner_derives_config_path_after_checker_path_normalization():
     config = next(item for item in normalized if item.role == "config_path")
     assert config.value == "/home/lzl/klonet_workflow_e2e/vemu_config/config.py"
     assert config.consumers == ["config.path"]
+
+
+def test_missing_explicit_deployment_allocations_are_frozen_from_checked_evidence():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, PlanResource, ProbeRequest,
+    )
+
+    goal = (
+        "Create a new Klonet platform using sync_directory and automatically select "
+        "free ports for master_port, worker_port, web_terminal_port, public_port, "
+        "mysql_port, redis_port, and rabbitmq_port. Use observed mysql:latest, "
+        "redis:7 or redis:latest, and rabbitmq:latest images."
+    )
+    data = {
+        "goal": goal,
+        "changes": [
+            {
+                "step_id": "change-1",
+                "title": "Sync source working tree",
+                "objective": "Use sync_directory to copy the source tree",
+                "expected_changes": [],
+            },
+            {
+                "step_id": "change-2",
+                "title": "Create MySQL, Redis, and RabbitMQ containers",
+                "objective": (
+                    "Create the mysql, redis, and rabbitmq containers with frozen "
+                    "host ports and internal ports 3306, 6379, and 5672"
+                ),
+                "expected_changes": [],
+            },
+            {
+                "step_id": "change-3",
+                "title": "Configure WtxConfig attributes",
+                "objective": (
+                    "Set master_port, worker_port, web_terminal_port, public_port, "
+                    "mysql_port, redis_port, and rabbitmq_port"
+                ),
+                "expected_changes": [],
+            },
+            {
+                "step_id": "change-4",
+                "title": "Start four Screen components",
+                "objective": (
+                    "Start create_e2e_m/master, create_e2e_c/celery, "
+                    "create_e2e_web/web_terminal, and create_e2e_w/worker"
+                ),
+                "expected_changes": [],
+            },
+        ],
+    }
+    resources = [
+        PlanResource(
+            name="mysql_container_internal_port", kind="port", status="frozen",
+            role="container_internal_port", value=3306, source="domain",
+            consumers=["change-2.mysql_container_port"],
+        ),
+        PlanResource(
+            name="redis_container_internal_port", kind="port", status="frozen",
+            role="container_internal_port", value=6379, source="domain",
+            consumers=["change-2.redis_container_port"],
+        ),
+        PlanResource(
+            name="rabbitmq_container_internal_port", kind="port", status="frozen",
+            role="container_internal_port", value=5672, source="domain",
+            consumers=["change-2.rabbitmq_container_port"],
+        ),
+        PlanResource(
+            name="mysql_image", kind="identifier", status="frozen",
+            role="docker_image", value="mysql:latest", source="user_input",
+            consumers=["change-2.mysql_image"],
+        ),
+        PlanResource(
+            name="rabbitmq_image", kind="identifier", status="frozen",
+            role="docker_image", value="rabbitmq:latest", source="user_input",
+            consumers=["change-2.rabbitmq_image"],
+        ),
+    ]
+    bundle = EvidenceBundle(goal=goal)
+    candidates = list(range(45560, 45570))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": candidates}, "candidate availability"),
+        "inspect_ports\nchecked_ports=%s\noccupied_ports=\navailable_ports=%s"
+        % (",".join(map(str, candidates)), ",".join(map(str, candidates))),
+    ))
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("docker_images", {}, "select installed images"),
+        "inspect_docker_images\nmysql latest sha256:a\nredis 7 sha256:b\n"
+        "redis latest sha256:c\nrabbitmq latest sha256:d",
+    ))
+
+    normalized = ChangePlannerAgent._normalize_missing_explicit_deployment_resources(
+        data, resources, bundle, goal,
+    )
+
+    port_resources = {
+        item.role: item for item in normalized
+        if item.kind == "port" and item.role in {
+            "master_port", "worker_port", "web_terminal_port", "public_port",
+            "mysql_port", "redis_port", "rabbitmq_port",
+        }
+    }
+    assert set(port_resources) == {
+        "master_port", "worker_port", "web_terminal_port", "public_port",
+        "mysql_port", "redis_port", "rabbitmq_port",
+    }
+    assert [port_resources[role].value for role in (
+        "master_port", "worker_port", "web_terminal_port", "public_port",
+        "mysql_port", "redis_port", "rabbitmq_port",
+    )] == candidates[:7]
+    assert port_resources["mysql_port"].consumers == [
+        "change-3.mysql_port", "change-2.mysql_host_port",
+    ]
+    assert port_resources["master_port"].consumers == [
+        "change-3.master_port", "change-4.master_port",
+    ]
+    redis_image = next(item for item in normalized if item.name == "redis_image")
+    assert redis_image.value == "redis:7"
+    assert redis_image.consumers == ["change-2.redis_image"]
+    payload = json.dumps(data["changes"], ensure_ascii=False)
+    for role, item in port_resources.items():
+        assert "%s=%s" % (role, item.value) in payload
+    assert "45564->3306" in payload
+    assert "45565->6379" in payload
+    assert "45566->5672" in payload
+
+
+def test_missing_explicit_deployment_allocations_are_not_invented_without_evidence():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
+
+    goal = "Create a new Klonet platform and automatically select free ports"
+    data = {
+        "goal": goal,
+        "changes": [{
+            "step_id": "change-1", "title": "Configure WtxConfig",
+            "objective": "Set master_port and worker_port", "expected_changes": [],
+        }],
+    }
+    normalized = ChangePlannerAgent._normalize_missing_explicit_deployment_resources(
+        data, [], EvidenceBundle(goal=goal), goal,
+    )
+    assert normalized == []
+    assert "=" not in data["changes"][0]["objective"]
+
+
+def test_automatic_port_policy_accepts_unoccupied_port_wording():
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        _automatic_conflict_port_policy,
+    )
+
+    assert _automatic_conflict_port_policy(
+        "创建平台到 /home/lzl/create_e2e/vemu_uestc；自动选择未占用端口"
+    )
+
+
+def test_explicit_boundaries_allow_semantic_steps_to_echo_prohibitions():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    goal = (
+        "创建 Klonet 平台，必须使用 sync_directory，严禁 Git clone；"
+        "不得配置 Nginx，不得启动 data_server"
+    )
+    changes = [{
+        "title": "Sync and start the application",
+        "objective": (
+            "Use sync_directory. No Git clone is permitted. Start four Screen "
+            "components. No data_server and no Nginx."
+        ),
+        "expected_changes": ["working tree synchronized"],
+    }]
+
+    assert ChangePlannerAgent._explicit_goal_boundary_errors(goal, changes) == []
+
+
+def test_complete_platform_contract_is_not_triggered_by_complete_tree_copy():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    assert ChangePlannerAgent._complete_klonet_contract_errors({
+        "goal": "创建 Klonet 平台并完整复制当前工作树，不得配置 Nginx",
+        "changes": [],
+    }, []) == []
+
+
+def test_sync_directory_deployment_does_not_require_git_resources_or_repository_consumer():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, PlanResource, ProbeRequest,
+    )
+
+    goal = (
+        "创建新的 Klonet 平台，目标 /home/lzl/create_e2e/vemu_uestc，必须使用 "
+        "sync_directory 从 /home/lzl/test/vemu_uestc 复制，禁止 Git clone，"
+        "自动选择未占用端口"
+    )
+    data = {
+        "goal": goal,
+        "changes": [{
+            "step_id": "change-1",
+            "title": "Sync source working tree",
+            "objective": "Use sync_directory and configure master_port=47001",
+            "expected_changes": ["target tree exists"],
+            "postconditions": [{
+                "checker": "file_exists",
+                "args": {"path": "/home/lzl/create_e2e/vemu_uestc"},
+            }],
+        }],
+    }
+    resources = [
+        PlanResource(
+            name="instance_root", kind="path", status="frozen",
+            role="instance_root", value="/home/lzl/create_e2e/vemu_uestc",
+            source="user_input", consumers=["change-1.target_path"],
+        ),
+        PlanResource(
+            name="source_directory", kind="path", status="frozen",
+            role="source_directory", value="/home/lzl/test/vemu_uestc",
+            source="user_input", consumers=["change-1.source_path"],
+        ),
+        PlanResource(
+            name="instance_identifier", kind="identifier", status="frozen",
+            role="instance_identifier", value="create_e2e", source="user_input",
+            consumers=["change-1.instance_name"],
+        ),
+        PlanResource(
+            name="master_port", kind="port", status="frozen",
+            role="master_port", value=47001, source="checked_free_candidate",
+            consumers=["change-1.master_port"],
+        ),
+    ]
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": [47001]}, "availability"),
+        "inspect_ports\nchecked_ports=47001\noccupied_ports=\navailable_ports=47001",
+    ))
+
+    errors = ChangePlannerAgent._ready_contract_errors(data, goal, resources, bundle)
+    assert not any("source_remote" in item or "source_branch" in item for item in errors)
+    assert "instance_root requires a .repository consumer" not in errors
+
+
+def test_screen_component_suffixes_are_not_treated_as_goal_paths():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    goal = (
+        "目标 /home/lzl/create_e2e/vemu_uestc；启动 create_e2e_m/master、"
+        "create_e2e_c/celery、create_e2e_web/web_terminal、create_e2e_w/worker"
+    )
+    assert ChangePlannerAgent._explicit_goal_paths(goal) == {
+        "/home/lzl/create_e2e/vemu_uestc"
+    }
+
+
+def test_container_host_port_contract_derives_service_resources_and_config_consumers():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import PlanResource
+
+    data = {"changes": [
+        {
+            "step_id": "change-1",
+            "title": "Sync source project tree",
+            "objective": "Copy vemu_config/config.py and all project files",
+            "expected_changes": [],
+        },
+        {
+            "step_id": "change-2",
+            "title": "Create isolated containers",
+            "objective": (
+                "Create create_e2e-mysql (container_port 3306, host_port 47009), "
+                "create_e2e-redis (container_port 6379, host_port 47010), and "
+                "create_e2e-rabbitmq (container_port 5672, host_port 47011)"
+            ),
+            "expected_changes": [],
+        },
+        {
+            "step_id": "change-3",
+            "title": "Configure WtxConfig attributes",
+            "objective": "Set mysql_port, redis_port, and rabbitmq_port",
+            "expected_changes": [],
+        },
+    ]}
+    resources = [
+        PlanResource(
+            name="mysql_host_port", kind="port", status="frozen",
+            role="service_port", value=47009, source="planner",
+            consumers=["change-2.mysql_host_port", "change-3.mysql_port"],
+        ),
+    ]
+
+    normalized = ChangePlannerAgent._normalize_derived_resources(data, resources)
+    by_name = {item.name: item for item in normalized}
+    assert by_name["redis_port"].value == 47010
+    assert {"change-2.redis_host_port", "change-3.redis_port"}.issubset(
+        by_name["redis_port"].consumers
+    )
+    assert by_name["rabbitmq_port"].value == 47011
+    assert {"change-2.rabbitmq_host_port", "change-3.rabbitmq_port"}.issubset(
+        by_name["rabbitmq_port"].consumers
+    )
+    assert "redis_port=47010" in data["changes"][2]["objective"]
+    assert "rabbitmq_port=47011" in data["changes"][2]["objective"]
+
+
+def test_partial_evidence_candidate_normalizes_explicit_container_host_ports():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    goal = (
+        "Create a new Klonet platform with sync_directory and automatically select "
+        "free ports for mysql_port, redis_port, and rabbitmq_port"
+    )
+    data = {
+        "status": "need_evidence",
+        "changes": [
+            {
+                "step_id": "change-2", "title": "Create isolated containers",
+                "objective": (
+                    "Create MySQL (host_port 47009), Redis (host_port 47010), "
+                    "and RabbitMQ (host_port 47011) containers"
+                ),
+                "reason": "isolated services", "depends_on": [], "risk": "medium",
+                "expected_changes": ["three containers exist"],
+                "postconditions": [{"checker": "exit_code_zero", "args": {}}],
+            },
+            {
+                "step_id": "change-3", "title": "Configure WtxConfig attributes",
+                "objective": "Set mysql_port, redis_port, and rabbitmq_port",
+                "reason": "bind service ports", "depends_on": ["change-2"],
+                "risk": "medium", "expected_changes": ["ports configured"],
+                "postconditions": [{"checker": "exit_code_zero", "args": {}}],
+            },
+        ],
+        "resources": [{
+            "name": "mysql_host_port", "kind": "port", "status": "frozen",
+            "role": "service_port", "value": 47009, "source": "evidence",
+            "consumers": ["change-2.mysql_host_port", "change-3.mysql_port"],
+        }],
+        "assumptions": [],
+    }
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ports", {"ports": [47009, 47010, 47011]}, "availability"),
+        "inspect_ports\nchecked_ports=47009,47010,47011\noccupied_ports=\n"
+        "available_ports=47009,47010,47011",
+    ))
+
+    candidate = ChangePlannerAgent._partial_candidate_plan(data, goal, bundle)
+
+    assert candidate is not None
+    ports = {item.name: item.value for item in candidate.resources}
+    assert ports["redis_port"] == 47010
+    assert ports["rabbitmq_port"] == 47011
 
 
 def test_ports_probe_explicitly_reports_checked_occupied_and_available(monkeypatch):

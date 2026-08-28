@@ -1807,6 +1807,191 @@ def test_structural_attribute_inference_prefers_scoped_injected_value():
     assert args["value"] == 45553
 
 
+def test_structural_container_inference_uses_matching_service_ports():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    resources = [
+        PlanResource(
+            name="mysql_host_port", kind="port", status="frozen",
+            role="service_port", value=47009,
+            consumers=["change-2.mysql_host_port"],
+        ),
+        PlanResource(
+            name="mysql_container_internal_port", kind="port", status="frozen",
+            role="container_internal_port", value=3306,
+            consumers=["change-2.mysql_container_port"],
+        ),
+        PlanResource(
+            name="redis_host_port", kind="port", status="frozen",
+            role="service_port", value=47010,
+            consumers=["change-2.redis_host_port"],
+        ),
+        PlanResource(
+            name="redis_container_internal_port", kind="port", status="frozen",
+            role="container_internal_port", value=6379,
+            consumers=["change-2.redis_container_port"],
+        ),
+    ]
+
+    args = _infer_structural_action_args(
+        "create_docker_container",
+        {
+            "name": "create_e2e-mysql",
+            "image": "mysql:latest",
+            "port_bindings": ["127.0.0.1:47010:3306"],
+        },
+        resources,
+    )
+
+    assert args["port_bindings"] == ["127.0.0.1:47009:3306"]
+
+
+def test_structural_config_inference_uses_redis_ip_and_rabbitmq_port():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_structural_action_args,
+    )
+
+    resources = [
+        PlanResource(
+            name="redis_port", kind="port", status="frozen",
+            role="redis_port", value=47010, consumers=["change-3.redis_port"],
+        ),
+        PlanResource(
+            name="rabbitmq_port", kind="port", status="frozen",
+            role="rabbitmq_port", value=47011,
+            consumers=["change-3.rabbitmq_port"],
+        ),
+    ]
+
+    redis_ip = _infer_structural_action_args(
+        "set_python_class_attribute", {"attribute": "redis_ip"}, resources,
+    )
+    rabbitmq_db = _infer_structural_action_args(
+        "set_python_class_attribute",
+        {"attribute": "celery_rabbitmq_port_db"},
+        resources,
+    )
+
+    assert redis_ip["value"] == "127.0.0.1"
+    assert rabbitmq_db["value"] == "47011/7"
+
+
+def test_sync_directory_step_with_clone_prohibition_forces_sync_action():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _forced_registered_action_for_step,
+    )
+
+    step = PrivilegedStep(
+        step_id="change-1",
+        title="Sync source project tree to target directory",
+        objective=(
+            "Use sync_directory to copy the complete working tree from the source. "
+            "No git_operation or Git clone."
+        ),
+        risk="medium",
+        expected_changes=["target tree exists"],
+    )
+
+    assert _forced_registered_action_for_step(step) == "sync_directory"
+
+
+def test_atomic_redis_step_prefers_title_service_over_parent_objective():
+    from klonet_agent.ops.privileged.contracts import PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _infer_semantic_action_args,
+        _validate_action_contract_consistency,
+    )
+
+    step = PrivilegedStep(
+        step_id="change-2__redis",
+        title="Create Redis container create_e2e-redis",
+        objective=(
+            "Parent deployment creates MySQL, Redis, and RabbitMQ containers; "
+            "this atomic effect creates create_e2e-redis"
+        ),
+        risk="medium",
+        expected_changes=["Redis container exists"],
+    )
+    args = _infer_semantic_action_args(
+        "create_docker_container",
+        {"name": "create_e2e-redis", "image": "redis:7"},
+        step,
+    )
+
+    assert _validate_action_contract_consistency(
+        "create_docker_container", args, step,
+    ) == ""
+    assert args["name"] == "create_e2e-redis"
+
+
+def test_deterministic_klonet_config_compiles_all_thirteen_attributes():
+    from types import SimpleNamespace
+
+    from klonet_agent.ops.privileged.contracts import PlanResource, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        _deterministic_klonet_config_items,
+    )
+
+    step = PrivilegedStep(
+        step_id="change-3",
+        title="Configure WtxConfig attributes in copied config.py",
+        objective=(
+            "Set master_port, worker_port, web_terminal_port, public_port, "
+            "mysql_port, redis_port, rabbitmq_port, master_ip, mysql_ip, redis_ip, "
+            "rabbitmq_ip, celery_redis_port_db, and celery_rabbitmq_port_db"
+        ),
+        risk="medium",
+        expected_changes=["config is written"],
+    )
+    resources = [
+        PlanResource(
+            name="config_file_path", kind="path", status="frozen",
+            role="config_file", value="/srv/create/vemu_config/config.py",
+            consumers=["change-3.path"],
+        ),
+    ]
+    for name, role, value in (
+        ("master_port", "service_port", 47001),
+        ("worker_port", "service_port", 47002),
+        ("web_terminal_port", "service_port", 47003),
+        ("public_port", "service_port", 47008),
+        ("mysql_host_port", "service_port", 47009),
+        ("redis_host_port", "service_port", 47010),
+        ("rabbitmq_host_port", "service_port", 47011),
+    ):
+        resources.append(PlanResource(
+            name=name, kind="port", status="frozen", role=role, value=value,
+            consumers=["change-3.%s" % name.replace("_host", "")],
+        ))
+    plan = SimpleNamespace(
+        goal="配置 Klonet 平台",
+        resources=resources,
+    )
+
+    items = _deterministic_klonet_config_items(plan, step)
+
+    attributes = [
+        item["attribute"] for item in items if "attribute" in item
+    ]
+    assert attributes == [
+        "master_ip", "mysql_ip", "redis_ip", "rabbitmq_ip",
+        "master_port", "worker_port", "web_terminal_port", "public_port",
+        "redis_port", "mysql_port", "rabbitmq_port",
+        "celery_redis_port_db", "celery_rabbitmq_port_db",
+    ]
+    values = {
+        item["attribute"]: item["value"]
+        for item in items if "attribute" in item
+    }
+    assert values["celery_redis_port_db"] == "47010/6"
+    assert values["celery_rabbitmq_port_db"] == "47011/7"
+
+
 def test_plural_screen_start_is_split_into_one_step_per_component():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep
     from klonet_agent.ops.privileged.execution_agent import (
@@ -4628,3 +4813,54 @@ def test_observational_shell_rejects_state_changing_command(tmp_path):
             [],
             observational=True,
         )
+
+
+def test_hierarchical_binding_failure_identifies_owning_semantic_step():
+    import pytest
+
+    from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
+    from klonet_agent.ops.privileged.execution_agent import (
+        ExecutionBindingError,
+        PrivilegedExecutionAgent,
+    )
+
+    class FailingAgent(PrivilegedExecutionAgent):
+        def _decompose_semantic_step(self, *args, **kwargs):
+            return [PrivilegedStep(
+                step_id="change-2__create-mysql",
+                title="Create MySQL container",
+                objective="Create an isolated MySQL container",
+                expected_changes=["new MySQL container"],
+                risk="high",
+            )]
+
+        def prepare_step(self, *args, **kwargs):
+            raise ExecutionBindingError(
+                "docker_image_not_observed=mysql:5.7",
+                category="capability_contract_invalid",
+                failed_criteria=["observed Docker image required"],
+                replan_context={"action": "create_docker_container"},
+            )
+
+    plan = PrivilegedPlan(
+        plan_id="priv-ops-deploy",
+        goal="create a platform",
+        risk="high",
+        steps=[PrivilegedStep(
+            step_id="change-2",
+            title="Create isolated dependencies",
+            objective="Create MySQL, Redis and RabbitMQ containers",
+            expected_changes=["three new containers"],
+            success_criteria=["containers are running"],
+            risk="high",
+        )],
+    )
+
+    with pytest.raises(ExecutionBindingError) as raised:
+        FailingAgent(None).prepare_plan(plan, grounded_context=None)
+
+    assert raised.value.replan_context == {
+        "action": "create_docker_container",
+        "step_id": "change-2",
+    }
+    assert raised.value.failed_criteria == ["observed Docker image required"]

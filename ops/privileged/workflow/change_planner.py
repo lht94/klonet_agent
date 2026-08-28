@@ -769,7 +769,7 @@ def _automatic_conflict_port_policy(decision_text: str) -> bool:
         pathless = text
     return bool(re.search(
         r"(?:自动(?:选择|分配|查找|改用)?|automatically(?:\s+(?:select|allocate|find|use))?)"
-        r"[^\n。！？]{0,24}(?:空闲端口|free\s+port)",
+        r"[^\n。！？]{0,24}(?:空闲端口|未占用端口|free\s+port|unoccupied\s+port)",
         pathless,
         re.I,
     ))
@@ -1411,6 +1411,8 @@ the complete proposed replacement goal and list what would be superseded.
         base_goal = str((intent_context or {}).get("base_goal") or text)
         base_lowered = base_goal.lower()
         structured_operation = str((intent_context or {}).get("operation") or "")
+        if _requests_new_platform_deployment(base_goal):
+            return None
         screen_lifecycle = _requests_screen_management_transition(base_goal)
         if (
             structured_operation != "restart"
@@ -2479,19 +2481,19 @@ the complete proposed replacement goal and list what would be superseded.
 
     @staticmethod
     def _planner_tool() -> dict[str, Any]:
-        text = {"type": "string", "maxLength": 500}
-        checker_args = {
-            "type": "object",
-            "description": "Arguments for the named registered checker.",
-            "additionalProperties": True,
-        }
+        # The transport tool only selects the one accepted response channel.
+        # The full ChangePlan contract is provider-independent and enforced by
+        # _outcome(), whose bounded repair loop returns precise validation
+        # errors.  Encoding that contract twice made Gemini compile an FST
+        # larger than its provider-specific constraint limit.
         return {
             "type": "function",
             "function": {
                 "name": "submit_change_plan",
                 "description": (
-                    "Submit one bounded semantic change planning outcome. This is the "
-                    "only accepted Change Planner response channel."
+                    "Submit one bounded semantic planning outcome. "
+                    "need_evidence requires probe_requests; ready requires goal, "
+                    "assumptions, resources, and changes; blocked requires reason."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2500,164 +2502,49 @@ the complete proposed replacement goal and list what would be superseded.
                             "type": "string",
                             "enum": ["need_evidence", "ready", "blocked"],
                         },
-                        "goal": {"type": "string", "maxLength": 1000},
-                        "reason": {"type": "string", "maxLength": 1000},
+                        "goal": {"type": "string"},
+                        "reason": {"type": "string"},
                         "missing_decisions": {
-                            "type": "array",
-                            "maxItems": 8,
-                            "items": text,
+                            "type": "array", "items": {"type": "string"},
                         },
                         "probe_requests": {
                             "type": "array",
-                            "maxItems": 4,
                             "items": {
-                                "type": "object",
-                                "properties": {
-                                    "probe": {"type": "string", "maxLength": 100},
-                                    "args": {
-                                        "type": "object",
-                                        "properties": {
-                                            "ports": {
-                                                "type": "array",
-                                                "maxItems": 64,
-                                                "items": {"type": "integer"},
-                                            },
-                                            "candidates": {
-                                                "type": "array",
-                                                "maxItems": 64,
-                                                "items": {"type": "integer"},
-                                            },
-                                            "candidate_ports": {
-                                                "type": "array",
-                                                "maxItems": 64,
-                                                "items": {"type": "integer"},
-                                            },
-                                        },
-                                        "additionalProperties": True,
-                                    },
-                                    "purpose": text,
-                                    "required_facts": {
-                                        "type": "array",
-                                        "maxItems": 12,
-                                        "items": text,
-                                    },
-                                    "freshness": {
-                                        "type": "string",
-                                        "enum": ["cached", "refresh"],
-                                    },
-                                    "gap_id": {
-                                        "type": "string",
-                                        "pattern": "^gap-[-A-Za-z0-9_.:]{3,160}$",
-                                    },
-                                    "affected_steps": {
-                                        "type": "array",
-                                        "maxItems": 12,
-                                        "items": {"type": "string", "maxLength": 100},
-                                    },
-                                },
-                                "required": [
-                                    "probe", "args", "purpose", "required_facts"
-                                ],
-                                "additionalProperties": False,
+                                "type": "object", "additionalProperties": True,
                             },
                         },
                         "assumptions": {
-                            "type": "array",
-                            "maxItems": 12,
-                            "items": text,
+                            "type": "array", "items": {"type": "string"},
                         },
                         "resources": {
                             "type": "array",
-                            "maxItems": 64,
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "name": {"type": "string", "maxLength": 100},
-                                    "kind": {"type": "string", "maxLength": 50},
-                                    "status": {
-                                        "type": "string",
-                                        "enum": ["frozen", "deferred"],
-                                    },
-                                    "role": {"type": "string", "maxLength": 100},
-                                    "value": {},
-                                    "source": {"type": "string", "maxLength": 200},
-                                    "consumers": {
-                                        "type": "array",
-                                        "maxItems": 24,
-                                        "items": {
-                                            "type": "string",
-                                            "maxLength": 150,
-                                        },
-                                    },
+                                    "name": {"type": "string"},
+                                    "kind": {"type": "string"},
+                                    "status": {"type": "string"},
                                 },
-                                "required": [
-                                    "name", "kind", "status", "role", "source",
-                                    "consumers",
-                                ],
-                                "additionalProperties": False,
+                                "required": ["name", "kind", "status"],
+                                "additionalProperties": True,
                             },
                         },
                         "changes": {
                             "type": "array",
-                            "maxItems": 12,
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "step_id": {"type": "string", "maxLength": 100},
-                                    "title": text,
-                                    "objective": {"type": "string", "maxLength": 1000},
-                                    "reason": {"type": "string", "maxLength": 1000},
-                                    "evidence_refs": {
-                                        "type": "array",
-                                        "maxItems": 24,
-                                        "items": {"type": "string", "maxLength": 100},
-                                    },
-                                    "depends_on": {
-                                        "type": "array",
-                                        "maxItems": 12,
-                                        "items": {"type": "string", "maxLength": 100},
-                                    },
-                                    "risk": {
-                                        "type": "string",
-                                        "enum": ["low", "medium", "high", "critical"],
-                                    },
-                                    "expected_changes": {
-                                        "type": "array",
-                                        "minItems": 1,
-                                        "maxItems": 24,
-                                        "items": text,
-                                    },
-                                    "postconditions": {
-                                        "type": "array",
-                                        "minItems": 1,
-                                        "maxItems": 24,
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "checker": {
-                                                    "type": "string",
-                                                    "enum": list(
-                                                        DefaultCheckerRegistry().names
-                                                    ),
-                                                },
-                                                "args": checker_args,
-                                            },
-                                            "required": ["checker", "args"],
-                                            "additionalProperties": False,
-                                        },
-                                    },
+                                    "step_id": {"type": "string"},
+                                    "title": {"type": "string"},
+                                    "objective": {"type": "string"},
                                 },
-                                "required": [
-                                    "step_id", "title", "objective", "reason",
-                                    "evidence_refs", "depends_on", "risk",
-                                    "expected_changes", "postconditions",
-                                ],
-                                "additionalProperties": False,
+                                "required": ["step_id", "title", "objective"],
+                                "additionalProperties": True,
                             },
                         },
                     },
                     "required": ["status"],
-                    "additionalProperties": False,
+                    "additionalProperties": True,
                 },
             },
         }
@@ -2852,6 +2739,9 @@ the complete proposed replacement goal and list what would be superseded.
             if isinstance(item, dict)
         ]
         self._normalize_core_resource_consumers(data, resources)
+        resources = self._normalize_missing_explicit_deployment_resources(
+            data, resources, bundle, goal,
+        )
         resources = self._normalize_derived_resources(data, resources)
         self._normalize_existing_config_paths(data, resources)
         self._normalize_resource_consumer_owners(data, resources)
@@ -2971,6 +2861,11 @@ the complete proposed replacement goal and list what would be superseded.
             for item in data.get("resources") or []
             if isinstance(item, dict)
         ]
+        # Evidence collection must persist the same normalized resource
+        # ownership that a ready outcome would use. Otherwise a candidate can
+        # forget already-grounded container/config port relationships between
+        # Planner rounds and ask Discovery for the same facts again.
+        resources = cls._normalize_derived_resources(data, resources)
         risk = max(steps, key=lambda item: RISK_LEVELS.index(item.risk)).risk
         return ChangePlan.new(
             goal=goal,
@@ -4832,11 +4727,22 @@ the complete proposed replacement goal and list what would be superseded.
             if any(re.search(r":%s\b" % port, record.output) for record in relevant):
                 occupied.append(port)
         if occupied:
+            affected_steps = sorted({
+                str(consumer).split(".", 1)[0]
+                for resource in candidate.resources
+                if ChangePlannerAgent._requires_host_port_availability(resource)
+                and int(resource.value) in occupied
+                for consumer in resource.consumers
+                if str(consumer).split(".", 1)[0]
+            })
             return GoalOutcome(
                 status="blocked",
                 candidate_plan=candidate,
                 reason="candidate ports became occupied: %s"
                 % ",".join(str(item) for item in occupied),
+                replan_context={
+                    "active_gap_affected_steps": affected_steps,
+                },
             )
         if (
             ChangePlannerAgent._plan_needs_docker_images(candidate)
@@ -4902,6 +4808,118 @@ the complete proposed replacement goal and list what would be superseded.
             and "inspect_docker_images" in record.output
             for record in bundle.records
         )
+
+    @staticmethod
+    def _explicit_goal_boundary_errors(
+        goal_text: str,
+        changes: list[dict[str, Any]] | Any,
+    ) -> list[str]:
+        """Enforce explicit include/exclude boundaries deterministically.
+
+        Provider prompts guide plan quality, but a negative scope decision such
+        as "no Nginx" and named required effects must remain hard contracts.
+        Only semantic change text is inspected so discovered Git metadata does
+        not look like a requested clone operation.
+        """
+
+        semantic_changes = [
+            item for item in (changes or []) if isinstance(item, dict)
+        ] if isinstance(changes, list) else []
+        payload = json.dumps(
+            [
+                {
+                    "title": item.get("title", ""),
+                    "objective": item.get("objective", ""),
+                    "expected_changes": item.get("expected_changes", []),
+                }
+                for item in semantic_changes
+            ],
+            ensure_ascii=False,
+        ).lower()
+        goal = str(goal_text or "")
+        errors: list[str] = []
+
+        def forbidden(pattern: str) -> bool:
+            return bool(
+                re.search(
+                    r"(?:不得|严禁|禁止|不要|不应|不准|暂不|无需|"
+                    r"\bno\b|\bwithout\b|\bdo not\b|\bmust not\b)"
+                    r".{0,28}(?:%s)" % pattern,
+                    goal,
+                    re.I,
+                )
+            )
+
+        sync_required = "sync_directory" in goal or bool(re.search(
+            r"(?:当前|current).{0,16}(?:工作树|working tree).{0,24}(?:复制|copy|sync)",
+            goal,
+            re.I,
+        ))
+        clone_forbidden = forbidden(r"git\s*clone|clone|git_operation")
+
+        def positively_mentions(pattern: str) -> bool:
+            for clause in re.split(r"[\n.!?。！？;；]", payload):
+                for match in re.finditer(pattern, clause, re.I):
+                    prefix = clause[:match.start()]
+                    if not re.search(
+                        r"(?:\bno\b|\bwithout\b|\bdo\s+not\b|\bmust\s+not\b|"
+                        r"不得|严禁|禁止|不要|不应|不准|暂不|无需)"
+                        r"[^\n.!?。！？;；]{0,32}$",
+                        prefix,
+                        re.I,
+                    ):
+                        return True
+            return False
+
+        if sync_required and "sync_directory" not in payload:
+            errors.append("explicit goal requires sync_directory")
+        if clone_forbidden and positively_mentions(r"\bgit_operation\b|\bclone\b|克隆"):
+            errors.append("explicit goal forbids Git clone")
+        if forbidden(r"nginx") and positively_mentions(r"nginx"):
+            errors.append("explicit goal forbids Nginx")
+        if forbidden(r"data[_ -]?server") and positively_mentions(r"data[_ -]?server"):
+            errors.append("explicit goal forbids data_server")
+
+        required_containers = set(re.findall(
+            r"(?<![A-Za-z0-9_.-])([A-Za-z0-9][A-Za-z0-9_.-]*-"
+            r"(?:mysql|redis|rabbitmq))(?![A-Za-z0-9_.-])",
+            goal,
+            re.I,
+        ))
+        missing_containers = sorted(
+            item for item in required_containers if item.lower() not in payload
+        )
+        if missing_containers:
+            errors.append(
+                "explicit goal missing containers=%s"
+                % ",".join(missing_containers)
+            )
+
+        required_sessions = set(re.findall(
+            r"(?<![A-Za-z0-9_.-])([A-Za-z0-9][A-Za-z0-9_.-]*_"
+            r"(?:m|c|web|w))(?![A-Za-z0-9_.-])",
+            goal,
+            re.I,
+        ))
+        missing_sessions = sorted(
+            item for item in required_sessions if item.lower() not in payload
+        )
+        if missing_sessions:
+            errors.append(
+                "explicit goal missing Screen sessions=%s"
+                % ",".join(missing_sessions)
+            )
+        return errors
+
+    @staticmethod
+    def _explicit_goal_paths(goal_text: str) -> set[str]:
+        return {
+            match.rstrip(".,;:，。；：")
+            for match in re.findall(
+                r"(?<![A-Za-z0-9_.-])/[A-Za-z0-9_./-]+",
+                str(goal_text or ""),
+            )
+        }
 
     @staticmethod
     def _ready_contract_errors(
@@ -4980,22 +4998,39 @@ the complete proposed replacement goal and list what would be superseded.
         original_goal = str(goal or "")
         planned_goal = str(data.get("goal") or "")
         goal_text = "%s\n%s" % (original_goal, planned_goal)
+        errors.extend(
+            ChangePlannerAgent._explicit_goal_boundary_errors(
+                goal_text,
+                changes,
+            )
+        )
         deployment = _requests_new_platform_deployment(goal_text)
         if not deployment:
             return errors
         frozen = [item for item in resources if item.status == "frozen"]
         roles = {str(item.role or "").lower(): item for item in frozen}
+        sync_deployment = "sync_directory" in goal_text or bool(re.search(
+            r"(?:当前|current).{0,16}(?:工作树|working tree).{0,24}(?:复制|copy|sync)",
+            goal_text,
+            re.I,
+        ))
         required_roles = {
             "instance_root": any(
                 role in {"instance_root", "target_root", "deployment_root"}
                 for role in roles
             ),
-            "source_remote": any(
-                "source" in role and ("remote" in role or "url" in role)
+            (
+                "source_directory" if sync_deployment else "source_remote"
+            ): any(
+                (
+                    "source" in role
+                    and ("directory" in role or "path" in role or "root" in role)
+                )
+                if sync_deployment
+                else (
+                    "source" in role and ("remote" in role or "url" in role)
+                )
                 for role in roles
-            ),
-            "source_branch": any(
-                "source" in role and "branch" in role for role in roles
             ),
             "instance_identifier": any(
                 role in {
@@ -5010,13 +5045,14 @@ the complete proposed replacement goal and list what would be superseded.
                 for item in frozen
             ),
         }
+        if not sync_deployment:
+            required_roles["source_branch"] = any(
+                "source" in role and "branch" in role for role in roles
+            )
         missing_roles = [name for name, present in required_roles.items() if not present]
         if missing_roles:
             errors.append("missing frozen resources=%s" % ",".join(missing_roles))
-        explicit_paths = set(
-            match.rstrip(".,;:，。；：")
-            for match in re.findall(r"/[A-Za-z0-9_./-]+", original_goal)
-        )
+        explicit_paths = ChangePlannerAgent._explicit_goal_paths(original_goal)
         frozen_paths = {str(item.value) for item in frozen if item.kind == "path"}
         absent_paths = sorted(explicit_paths - frozen_paths)
         if absent_paths:
@@ -5113,10 +5149,20 @@ the complete proposed replacement goal and list what would be superseded.
             ),
             None,
         )
+        root_consumer_suffixes = (
+            (".target_path", ".destination", ".project_root")
+            if sync_deployment
+            else (".repository",)
+        )
         if root_resource is not None and not any(
-            consumer.endswith(".repository") for consumer in root_resource.consumers
+            consumer.endswith(root_consumer_suffixes)
+            for consumer in root_resource.consumers
         ):
-            errors.append("instance_root requires a .repository consumer")
+            errors.append(
+                "instance_root requires a sync target consumer"
+                if sync_deployment
+                else "instance_root requires a .repository consumer"
+            )
         if root_resource is not None and isinstance(changes, list):
             root_text = str(root_resource.value).rstrip("/")
             for change in changes:
@@ -5460,10 +5506,13 @@ the complete proposed replacement goal and list what would be superseded.
         """Keep a requested complete platform from degrading into a partial start."""
 
         goal = str(data.get("goal") or "")
-        if not (
-            re.search(r"(?:complete|full|fully operational|完整|全量)", goal, re.I)
-            and re.search(r"(?:klonet|platform|instance|平台|实例)", goal, re.I)
-        ):
+        complete_platform = bool(re.search(
+            r"(?:\bcomplete\b|\bfull\b|fully\s+operational|完整|全量)"
+            r"[^\n。！？.]{0,20}(?:klonet|platform|instance|平台|实例)",
+            goal,
+            re.I,
+        ))
+        if not complete_platform:
             return []
         payload = json.dumps(data.get("changes", []), ensure_ascii=False).lower()
         component_patterns = {
@@ -5609,7 +5658,14 @@ the complete proposed replacement goal and list what would be superseded.
             for change in changes
             if "nginx" in json.dumps(change, ensure_ascii=False).lower()
         )
-        if master_port is not None and (
+        nginx_forbidden = bool(re.search(
+            r"(?:不得|严禁|禁止|不要|不应|不准|暂不|无需|"
+            r"\bno\b|\bwithout\b|\bdo not\b|\bmust not\b)"
+            r"[^\n。！？.]{0,28}nginx",
+            goal,
+            re.I,
+        ))
+        if master_port is not None and not nginx_forbidden and (
             not re.search(r"\bmaster\b", nginx_payload, re.I)
             or str(master_port) not in nginx_payload
         ):
@@ -5767,6 +5823,214 @@ the complete proposed replacement goal and list what would be superseded.
         )
 
     @staticmethod
+    def _normalize_missing_explicit_deployment_resources(
+        data: dict[str, Any],
+        resources: list[PlanResource],
+        bundle: EvidenceBundle,
+        goal_text: str,
+    ) -> list[PlanResource]:
+        """Freeze omitted deployment allocations from explicit checked evidence.
+
+        The model still owns semantic decomposition.  This normalization only
+        fills values that the user explicitly delegated to automatic selection
+        and that Discovery has already proved available or installed.
+        """
+
+        normalized = list(resources)
+        if not (
+            _requests_new_platform_deployment(goal_text)
+            and _automatic_conflict_port_policy(goal_text)
+        ):
+            return normalized
+
+        changes = [
+            item for item in data.get("changes", []) if isinstance(item, dict)
+        ]
+
+        def change_text(change: dict[str, Any]) -> str:
+            return json.dumps(
+                {
+                    "title": change.get("title", ""),
+                    "objective": change.get("objective", ""),
+                    "expected_changes": change.get("expected_changes", []),
+                },
+                ensure_ascii=False,
+            ).lower()
+
+        config_change = next((
+            item for item in changes
+            if re.search(r"wtxconfig|config|配置", change_text(item), re.I)
+            and re.search(r"master_port|worker_port|mysql_port", change_text(item), re.I)
+        ), None)
+        container_change = next((
+            item for item in changes
+            if re.search(r"container|容器", change_text(item), re.I)
+            and all(service in change_text(item) for service in ("mysql", "redis", "rabbitmq"))
+        ), None)
+        screen_change = next((
+            item for item in changes
+            if re.search(r"screen|会话", change_text(item), re.I)
+            and re.search(r"start|launch|启动", change_text(item), re.I)
+        ), None)
+        if config_change is None:
+            return normalized
+
+        requested_roles = [
+            role for role in (
+                "master_port", "worker_port", "web_terminal_port", "public_port",
+                "mysql_port", "redis_port", "rabbitmq_port",
+            )
+            if role in str(goal_text).lower()
+        ]
+        existing_roles = {
+            str(item.role or item.name).lower()
+            for item in normalized
+            if item.status == "frozen" and item.kind == "port"
+        }
+        missing_roles = [role for role in requested_roles if role not in existing_roles]
+
+        candidates: list[int] = []
+        occupied: set[int] = set()
+        for record in bundle.records:
+            if record.status != "available" or record.request.probe != "ports":
+                continue
+            requested = record.request.args.get("ports", [])
+            if not isinstance(requested, list):
+                continue
+            for raw_port in requested:
+                try:
+                    port = int(raw_port)
+                except (TypeError, ValueError):
+                    continue
+                if not 1 <= port <= 65535:
+                    continue
+                if port not in candidates:
+                    candidates.append(port)
+                if re.search(r":%s\b" % port, record.output):
+                    occupied.add(port)
+        occupied.update(
+            instance_port
+            for instance in RuntimeInventory.from_bundle(bundle).instances
+            for instance_port in instance.configured_ports.values()
+        )
+        reserved = {
+            int(item.value)
+            for item in normalized
+            if ChangePlannerAgent._requires_host_port_availability(item)
+        }
+        free = [
+            port for port in candidates
+            if port not in occupied and port not in reserved
+        ]
+
+        config_id = str(config_change.get("step_id") or "")
+        container_id = str((container_change or {}).get("step_id") or "")
+        screen_id = str((screen_change or {}).get("step_id") or "")
+        selected: dict[str, int] = {}
+        if len(free) >= len(missing_roles):
+            selected = dict(zip(missing_roles, free))
+            for role, port in selected.items():
+                consumers = ["%s.%s" % (config_id, role)]
+                service = role.removesuffix("_port")
+                if service in {"mysql", "redis", "rabbitmq"} and container_id:
+                    consumers.append("%s.%s_host_port" % (container_id, service))
+                if service in {"master", "worker", "web_terminal"} and screen_id:
+                    consumers.append("%s.%s" % (screen_id, role))
+                normalized.append(PlanResource(
+                    name=role,
+                    kind="port",
+                    status="frozen",
+                    role=role,
+                    value=port,
+                    source="compiler_selected_from_checked_free_candidates",
+                    consumers=consumers,
+                ))
+
+        if selected:
+            assignments = ", ".join(
+                "%s=%s" % (role, selected[role])
+                for role in requested_roles if role in selected
+            )
+            config_change["objective"] = "%s; frozen allocations: %s" % (
+                str(config_change.get("objective") or "").rstrip("; "),
+                assignments,
+            )
+            config_change.setdefault("expected_changes", []).append(
+                "Frozen WtxConfig allocations: %s" % assignments
+            )
+            if container_change is not None and all(
+                role in selected for role in ("mysql_port", "redis_port", "rabbitmq_port")
+            ):
+                mappings = "%s->3306, %s->6379, %s->5672" % (
+                    selected["mysql_port"], selected["redis_port"],
+                    selected["rabbitmq_port"],
+                )
+                container_change["objective"] = "%s; frozen port mappings: %s" % (
+                    str(container_change.get("objective") or "").rstrip("; "),
+                    mappings,
+                )
+                container_change.setdefault("expected_changes", []).append(
+                    "Frozen container port mappings: %s" % mappings
+                )
+            if screen_change is not None:
+                runtime_assignments = ", ".join(
+                    "%s=%s" % (role, selected[role])
+                    for role in ("master_port", "worker_port", "web_terminal_port")
+                    if role in selected
+                )
+                if runtime_assignments:
+                    screen_change["objective"] = "%s; frozen runtime ports: %s" % (
+                        str(screen_change.get("objective") or "").rstrip("; "),
+                        runtime_assignments,
+                    )
+
+        if container_change is not None:
+            container_payload = change_text(container_change)
+            existing_image_consumers = {
+                consumer
+                for item in normalized
+                if item.status == "frozen" and item.role == "docker_image"
+                for consumer in item.consumers
+            }
+            image_output = "\n".join(
+                record.output
+                for record in bundle.records
+                if record.status == "available"
+                and record.request.probe == "docker_images"
+            )
+            for service, allowed_tags in (
+                ("mysql", ("latest",)),
+                ("redis", ("7", "latest")),
+                ("rabbitmq", ("latest",)),
+            ):
+                consumer = "%s.%s_image" % (container_id, service)
+                if service not in container_payload or consumer in existing_image_consumers:
+                    continue
+                selected_image = next((
+                    "%s:%s" % (service, tag)
+                    for tag in allowed_tags
+                    if re.search(
+                        r"(?:\b%s\s+%s\b|\b%s:%s\b)"
+                        % (re.escape(service), re.escape(tag), re.escape(service), re.escape(tag)),
+                        image_output,
+                        re.I,
+                    )
+                ), None)
+                if selected_image is None:
+                    continue
+                normalized.append(PlanResource(
+                    name="%s_image" % service,
+                    kind="identifier",
+                    status="frozen",
+                    role="docker_image",
+                    value=selected_image,
+                    source="observed_docker_images",
+                    consumers=[consumer],
+                ))
+
+        return normalized
+
+    @staticmethod
     def _normalize_derived_resources(
         data: dict[str, Any],
         resources: list[PlanResource],
@@ -5786,6 +6050,101 @@ the complete proposed replacement goal and list what would be superseded.
         }
         changes = data.get("changes")
         if isinstance(changes, list):
+            config_change = next((
+                change for change in changes
+                if isinstance(change, dict)
+                and re.search(
+                    r"wtxconfig|config|配置",
+                    "%s %s" % (
+                        change.get("title", ""), change.get("objective", ""),
+                    ),
+                    re.I,
+                )
+                and re.search(
+                    r"master_port|worker_port|web_terminal_port|"
+                    r"mysql_port|redis_port|rabbitmq_port",
+                    "%s %s" % (
+                        change.get("title", ""), change.get("objective", ""),
+                    ),
+                    re.I,
+                )
+            ), None)
+            config_id = str((config_change or {}).get("step_id") or "")
+            derived_service_ports: dict[str, int] = {}
+            for change in changes:
+                if not config_id:
+                    break
+                if not isinstance(change, dict):
+                    continue
+                step_id = str(change.get("step_id") or "")
+                text = json.dumps(
+                    {
+                        "title": change.get("title", ""),
+                        "objective": change.get("objective", ""),
+                        "expected_changes": change.get("expected_changes", []),
+                    },
+                    ensure_ascii=False,
+                ).lower()
+                if not re.search(r"container|容器", text, re.I):
+                    continue
+                for service in ("mysql", "redis", "rabbitmq"):
+                    match = re.search(
+                        r"\b%s\b[^)]{0,120}?host[_ ]?port\s*(?:=|:)?\s*([1-9]\d{1,4})"
+                        % service,
+                        text,
+                        re.I,
+                    )
+                    if match is None:
+                        continue
+                    port = int(match.group(1))
+                    if not 1 <= port <= 65535:
+                        continue
+                    container_consumer = "%s.%s_host_port" % (step_id, service)
+                    config_consumer = "%s.%s_port" % (config_id, service)
+                    existing = next((
+                        item for item in normalized
+                        if item.status == "frozen"
+                        and item.kind == "port"
+                        and int(item.value) == port
+                        and service in "%s %s" % (item.name, item.role)
+                    ), None)
+                    if existing is None:
+                        consumers = [container_consumer]
+                        if config_id:
+                            consumers.append(config_consumer)
+                        existing = PlanResource(
+                            name="%s_port" % service,
+                            kind="port",
+                            status="frozen",
+                            role="%s_port" % service,
+                            value=port,
+                            source="derived_from_container_host_port_contract",
+                            consumers=consumers,
+                        )
+                        normalized.append(existing)
+                        by_port[port] = existing
+                    else:
+                        consumers = [container_consumer]
+                        if config_id:
+                            consumers.append(config_consumer)
+                        for consumer in consumers:
+                            if consumer and consumer not in existing.consumers:
+                                existing.consumers.append(consumer)
+                    derived_service_ports[service] = port
+            if config_change is not None and derived_service_ports:
+                assignments = ", ".join(
+                    "%s_port=%s" % (service, derived_service_ports[service])
+                    for service in ("mysql", "redis", "rabbitmq")
+                    if service in derived_service_ports
+                )
+                objective = str(config_change.get("objective") or "")
+                missing_assignments = [
+                    item for item in assignments.split(", ") if item not in objective
+                ]
+                if missing_assignments:
+                    config_change["objective"] = "%s; frozen service ports: %s" % (
+                        objective.rstrip("; "), ", ".join(missing_assignments),
+                    )
             standard_internal_ports = {
                 "mysql": 3306,
                 "redis": 6379,
@@ -6468,6 +6827,23 @@ the complete proposed replacement goal and list what would be superseded.
 
     @staticmethod
     def _evidence_json(bundle: EvidenceBundle) -> str:
+        latest: dict[str, Any] = {}
+        for item in bundle.records:
+            latest[item.request.cache_key] = item
+        records = list(latest.values())
+        per_record_limit = max(
+            800,
+            min(3000, 28000 // max(1, len(records))),
+        )
+
+        def compact(output: str) -> str:
+            value = str(output or "")
+            if len(value) <= per_record_limit:
+                return value
+            marker = "\n...[evidence compacted for Planner transport]...\n"
+            half = max(1, (per_record_limit - len(marker)) // 2)
+            return value[:half] + marker + value[-half:]
+
         return json.dumps(
             [
                 {
@@ -6478,9 +6854,9 @@ the complete proposed replacement goal and list what would be superseded.
                     "gap_id": item.request.need_key,
                     "affected_steps": list(item.request.affected_steps),
                     "status": item.status,
-                    "output": item.output[:7000],
+                    "output": compact(item.output),
                 }
-                for item in bundle.records
+                for item in records
             ],
             ensure_ascii=False,
         )

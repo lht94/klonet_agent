@@ -938,7 +938,8 @@ class PrivilegedOpsCoordinator:
                     "%s. Select different ports that are not reported as occupied, "
                     "freeze them, and preserve every other grounded decision."
                     % outcome.reason
-                ), candidate_plan=persistent_candidate)
+                ), candidate_plan=persistent_candidate,
+                    active_gap_affected_steps=active_gap_steps)
                 continue
             if outcome.status != "need_execution" or outcome.plan is None:
                 if binding_attempt:
@@ -995,6 +996,11 @@ class PrivilegedOpsCoordinator:
                 if callable(evidence_scope)
                 else nullcontext()
             )
+            # Binder expands and normalizes the candidate in place. If a later
+            # atomic contract rejects, that partially bound object is useful
+            # diagnostics but is no longer the authoritative semantic plan.
+            # Preserve the pre-binding semantics for a scoped Planner repair.
+            semantic_candidate_snapshot = deepcopy(outcome.plan)
             before_binding_evidence = _available_evidence_state(evidence_bundle)
             with scope:
                 bind_kwargs: dict[str, Any] = {
@@ -1055,11 +1061,11 @@ class PrivilegedOpsCoordinator:
                     },
                     ensure_ascii=False,
                     sort_keys=True,
-                ), candidate_plan=(binding.candidate_plan or outcome.plan),
+                ), candidate_plan=semantic_candidate_snapshot,
                     active_gap_affected_steps=binding_allowed_steps)
                 persistent_candidate = (
                     outcome.candidate_plan
-                    or binding.candidate_plan
+                    or semantic_candidate_snapshot
                     or persistent_candidate
                 )
                 active_gap_steps = merge_gap_steps(
