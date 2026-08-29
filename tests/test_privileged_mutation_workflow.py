@@ -1759,9 +1759,13 @@ def test_repeated_process_detail_gap_uses_readonly_fallback_then_replans(tmp_pat
 
     request = ProbeRequest(
         "process_detail",
-        {"process_keywords": ["master_main"]},
+        {"pids": [1234]},
         "继承 master 运行身份",
-        ("master cwd", "master python executable", "master full cmdline"),
+        (
+            {"fact_id": "fact-master-cwd", "predicate": "process.cwd", "expected": "/srv/test", "comparison": "equals"},
+            {"fact_id": "fact-master-python", "predicate": "process.python_executable", "expected": True, "comparison": "present"},
+            {"fact_id": "fact-master-cmdline", "predicate": "process.cmdline", "expected": True, "comparison": "present"},
+        ),
     )
     bundle = EvidenceBundle(goal="重启 test 平台")
     bundle.add(EvidenceRecord.from_probe(
@@ -1779,6 +1783,14 @@ def test_repeated_process_detail_gap_uses_readonly_fallback_then_replans(tmp_pat
                 content=json.dumps({
                     "status": "command",
                     "command": "ps -p 1234 -o user=,args=",
+                    "covers": [
+                        "fact-master-python", "fact-master-cmdline",
+                    ],
+                    "subject": {"kind": "pid_set", "value": [1234]},
+                    "extractors": [
+                        {"fact_id": "fact-master-python", "kind": "output_contains", "expected": "python3.8"},
+                        {"fact_id": "fact-master-cmdline", "kind": "output_contains", "expected": "gunicorn"},
+                    ],
                     "reason": "obtain full process identity",
                 })
             ))])
@@ -1823,7 +1835,11 @@ def test_repeated_process_detail_gap_uses_readonly_fallback_then_replans(tmp_pat
         for item in bundle.records
     )
     assert planner.calls == 2
-    assert any("已取得新的目标相关事实" in item for item in progress)
+    assert any(
+        "已解决=fact-master-cmdline,fact-master-python" in item
+        and "仍未解决=fact-master-cwd" in item
+        for item in progress
+    )
 
 
 def test_verified_candidate_plan_is_finalized_without_model_reselection(tmp_path):
@@ -2110,7 +2126,7 @@ def test_planner_discovery_loop_stops_at_explicit_budget(tmp_path):
 
 def test_planner_discovery_stops_after_one_no_progress_replan(tmp_path):
     from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceBundle, EvidenceRecord, GoalOutcome, ProbeRequest,
+        EvidenceBundle, EvidenceRecord, FactObservation, GoalOutcome, ProbeRequest,
     )
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
@@ -2420,13 +2436,17 @@ def test_binding_replan_uses_pre_binding_semantic_snapshot(tmp_path):
 def test_binding_replan_need_evidence_returns_to_discovery_then_binds(tmp_path):
     from klonet_agent.ops.privileged.workflow.change_binding import ChangeBindingError
     from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceBundle, EvidenceRecord, GoalOutcome, ProbeRequest,
+        EvidenceBundle, EvidenceRecord, FactObservation, GoalOutcome,
+        ProbeRequest,
     )
     from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
 
     request = ProbeRequest(
         "process_detail", {"project_root": "/srv/test"},
-        "确认 worker 的运行身份", required_facts=("worker cwd",),
+        "确认 worker 的运行身份", required_facts=({
+            "fact_id": "fact-worker-cwd", "predicate": "process.cwd",
+            "expected": "/srv/test", "comparison": "equals",
+        },),
     )
 
     class Binder:
@@ -2446,6 +2466,10 @@ def test_binding_replan_need_evidence_returns_to_discovery_then_binds(tmp_path):
             self.calls += 1
             bundle.add(EvidenceRecord.from_probe(
                 requests[0], "worker cwd=/srv/test pid=1234",
+                observations=(FactObservation(
+                    "fact-worker-cwd", "confirmed", "/srv/test",
+                    "test.process.cwd",
+                ),),
             ))
             return bundle
 
@@ -2905,6 +2929,42 @@ def test_llm_failure_explanation_cannot_replace_deterministic_three_choice_menu(
     assert [item.action for item in result.failure.options] == [
         "continue_current_goal", "provide_direction", "cancel",
     ]
+
+
+def test_invalid_response_text_cannot_replace_deterministic_failure_facts(tmp_path):
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+    from klonet_agent.ops.privileged.workflow.response import ResponseAgent
+
+    class LLM:
+        def complete(self, **kwargs):
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content="false",
+            ))])
+
+    workflow = MutationWorkflow(
+        planner=object(), binder=object(),
+        store=ChangePlanStore(tmp_path, user_id="u", project_id="p"),
+        executor=object(), verifier=object(), response=ResponseAgent(LLM()),
+    )
+
+    result = workflow.failure_result(
+        stage="binding",
+        category="binding_provider_transient",
+        summary="实施绑定的模型调用超时。",
+        technical_reason="APITimeoutError: request timed out",
+        goal="创建平台",
+        goal_kind="execution",
+        semantic_step_id="provision-containers",
+        atomic_step_index=2,
+    )
+
+    assert "失败阶段：binding" in result.message
+    assert "实施绑定的模型调用超时" in result.message
+    assert "APITimeoutError" in result.message
+    assert "失败说明：false" not in result.message
+    assert "Binding 语义步骤：provision-containers" in result.message
+    assert "Binding 原子步骤索引：2" in result.message
 
 
 def test_repeated_failure_keeps_the_same_three_user_control_exits(tmp_path):

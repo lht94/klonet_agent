@@ -20,8 +20,10 @@ from klonet_agent.tools.environment import redact_sensitive_text
 from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceConclusion,
+    EvidenceSubject,
     GoalOutcome,
     ProbeRequest,
+    infer_evidence_subject,
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.runtime_inventory import (
@@ -40,7 +42,13 @@ bounds: you may explain them but never change them to passed.
 Return one JSON object. If more evidence is materially required, use:
 {"status":"need_evidence","probe_requests":[
  {"probe":"preferred read-only capability","args":{},"purpose":"...",
-  "required_facts":[],"freshness":"cached|refresh"}
+  "gap_id":"gap-stable-id","affected_steps":[],
+  "subject":{"kind":"path|pid_set|...","value":"exact object"},
+  "required_facts":[{"fact_id":"fact-stable-id",
+    "predicate":"typed.predicate","expected":true,
+    "comparison":"equals|contains|contains_all|present",
+    "freshness":"cached|refresh"}],
+  "scope":[],"exclusions":[],"freshness":"cached|refresh"}
 ]}
 Otherwise use:
 {
@@ -72,7 +80,13 @@ Return exactly one JSON object:
   "failed_criteria": ["only current, evidence-proven unmet goal criteria"],
   "evidence_requests": [
     {"probe":"preferred capability","args":{},"purpose":"...",
-     "required_facts":[],"freshness":"cached|refresh"}
+     "gap_id":"gap-stable-id","affected_steps":[],
+     "subject":{"kind":"path|port_set|...","value":"exact object"},
+     "required_facts":[{"fact_id":"fact-stable-id",
+       "predicate":"typed.predicate","expected":true,
+       "comparison":"equals|contains|contains_all|present",
+       "freshness":"cached|refresh"}],
+     "scope":[],"exclusions":[],"freshness":"cached|refresh"}
   ]
 }
 
@@ -105,7 +119,9 @@ Rules:
   status such as paused/verifying, historical failure, or a diagnostic prompt
   is not itself an unmet goal criterion.
 - Request at most four probes and never repeat an attempted probe key.
-- State required facts precisely; do not emit a command. Write user-visible text in Chinese.
+- State required facts through the same structured EvidenceGap contract used by
+  Planner. The probe args and subject must inspect the same object. Do not emit
+  a command. Write user-visible text in Chinese.
 
 Registered probes:
 %s
@@ -444,15 +460,31 @@ class PrivilegedVerifierAgent:
                 dict(raw.get("args") or {}),
             )
             request = ProbeRequest(
-                probe,
-                args,
-                str(raw.get("purpose") or "补齐目标证据"),
-                tuple(
+                probe=probe,
+                args=args,
+                purpose=str(raw.get("purpose") or "补齐目标证据"),
+                required_facts=tuple(raw.get("required_facts") or []),
+                freshness=str(raw.get("freshness") or "cached"),
+                gap_id=str(raw.get("gap_id") or ""),
+                affected_steps=tuple(
                     str(item).strip()
-                    for item in raw.get("required_facts") or []
+                    for item in raw.get("affected_steps") or []
                     if str(item).strip()
                 ),
-                str(raw.get("freshness") or "cached"),
+                subject=(
+                    EvidenceSubject.from_value(raw.get("subject"))
+                    or infer_evidence_subject(probe, args)
+                ),
+                scope=tuple(
+                    str(item).strip()
+                    for item in raw.get("scope") or []
+                    if str(item).strip()
+                ),
+                exclusions=tuple(
+                    str(item).strip()
+                    for item in raw.get("exclusions") or []
+                    if str(item).strip()
+                ),
             )
             if (
                 request.need_key not in attempted_keys
@@ -839,21 +871,26 @@ class PrivilegedVerifierAgent:
         for item in value[:3]:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("probe") or "").strip()
-            args = item.get("args")
-            result.append(
-                {
-                    "probe": name,
-                    "args": args if isinstance(args, dict) else {},
-                    "purpose": str(item.get("purpose") or "").strip()[:500],
-                    "required_facts": [
-                        str(value).strip()[:500]
-                        for value in item.get("required_facts") or []
-                        if str(value).strip()
-                    ][:12],
-                    "freshness": str(item.get("freshness") or "cached"),
-                }
+            probe, args = normalize_probe_request(
+                str(item.get("probe") or ""),
+                item.get("args") if isinstance(item.get("args"), dict) else {},
             )
+            request = ProbeRequest(
+                probe=probe,
+                args=args,
+                purpose=str(item.get("purpose") or "").strip()[:500],
+                required_facts=tuple(item.get("required_facts") or [])[:12],
+                freshness=str(item.get("freshness") or "cached"),
+                gap_id=str(item.get("gap_id") or ""),
+                affected_steps=tuple(item.get("affected_steps") or []),
+                subject=(
+                    EvidenceSubject.from_value(item.get("subject"))
+                    or infer_evidence_subject(probe, args)
+                ),
+                scope=tuple(item.get("scope") or []),
+                exclusions=tuple(item.get("exclusions") or []),
+            )
+            result.append(request.to_dict())
         if not result:
             raise ValueError("Verifier probes are empty")
         return result

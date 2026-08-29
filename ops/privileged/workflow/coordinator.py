@@ -12,11 +12,19 @@ import re
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.goal_guard import GoalSafetyGuard
-from klonet_agent.ops.privileged.workflow.contracts import EvidenceBundle
+from klonet_agent.ops.privileged.workflow.contracts import (
+    EvidenceBundle,
+    GoalOutcome,
+    extract_labeled_deployment_paths,
+)
 from klonet_agent.ops.privileged.workflow.operational_context import (
     OperationalContextSnapshot,
 )
-from klonet_agent.ops.privileged.workflow.runtime_inventory import RuntimeInventory
+from klonet_agent.ops.privileged.workflow.runtime_inventory import (
+    RuntimeInventory,
+    requests_new_platform_deployment,
+)
+from klonet_agent.tools.environment import redact_sensitive_text
 
 
 @dataclass
@@ -86,6 +94,37 @@ class PrivilegedOpsCoordinator:
     ) -> WorkflowResult:
         normalized = str(text or "").lstrip("\ufeff\u200b").strip()
         snapshot = self.context_store.load() if self.context_store is not None else None
+        evidence_detail = re.fullmatch(
+            r"show-priv-evidence\s+(ev-[A-Za-z0-9_-]{4,64})",
+            normalized,
+        )
+        if evidence_detail is not None:
+            evidence_id = evidence_detail.group(1)
+            records = list(
+                getattr(getattr(snapshot, "evidence", None), "records", []) or []
+            )
+            record = next(
+                (item for item in records if item.evidence_id == evidence_id),
+                None,
+            )
+            if record is None:
+                return WorkflowResult(
+                    True,
+                    "clarification",
+                    "未找到证据记录 %s。" % evidence_id,
+                )
+            return WorkflowResult(
+                True,
+                "technical_details",
+                "证据 %s（probe=%s，status=%s，已脱敏）：\n%s"
+                % (
+                    evidence_id,
+                    record.request.probe,
+                    record.status,
+                    redact_sensitive_text(str(record.output or "")),
+                ),
+                evidence=snapshot.evidence,
+            )
         if snapshot is not None and snapshot.pending_goal_revision:
             if normalized in {"确认", "确认覆盖目标", "确认切换目标"}:
                 replacement = snapshot.pending_goal_revision
@@ -232,6 +271,31 @@ class PrivilegedOpsCoordinator:
                 "clarification",
                 str(getattr(decision, "clarification_question", "") or "请补充说明目标实例和操作。"),
             )
+        if (
+            decision.intent == "mutating_action"
+            and goal_relation == "new"
+            and requests_new_platform_deployment(normalized)
+        ):
+            missing_boundaries = _deployment_boundary_gaps(normalized)
+            if missing_boundaries:
+                self._save_context(
+                    snapshot,
+                    resolved_goal=normalized,
+                    bundle=EvidenceBundle(goal=normalized),
+                    workflow_intent="mutating_action",
+                    goal_kind="execution",
+                    operation=str(getattr(decision, "operation", "") or "none"),
+                    scope=str(getattr(decision, "scope", "") or "none"),
+                    components=list(getattr(decision, "components", ()) or ()),
+                )
+                return WorkflowResult(
+                    True,
+                    "clarification",
+                    "创建新平台前还需要你决定：%s。"
+                    "这些边界确定前不会扫描运行时、Git、Nginx 或端口；"
+                    "端口若授权自动选择，不需要逐个指定。"
+                    % "、".join(missing_boundaries),
+                )
         superseded = False
         refinement_predecessor = None
         turn_base_goal = ""
@@ -740,6 +804,7 @@ class PrivilegedOpsCoordinator:
         no_progress_replans = 0
         candidate_replans = 0
         binding_attempt = 0
+        binding_resume_attempts = 0
         first_binding_error = ""
         first_binding_failed_criteria: list[str] = []
         first_binding_missing_decisions: list[str] = []
@@ -794,7 +859,9 @@ class PrivilegedOpsCoordinator:
                         evidence=evidence_bundle,
                         evidence_requests=list(outcome.evidence_requests),
                     )
-                before_available = _available_evidence_state(evidence_bundle)
+                before_available = _evidence_progress_state(
+                    evidence_bundle, outcome.evidence_requests,
+                )
                 requested_summary = _evidence_request_summary(
                     outcome.evidence_requests,
                 )
@@ -810,7 +877,9 @@ class PrivilegedOpsCoordinator:
                     outcome.evidence_requests,
                     evidence_bundle,
                 )
-                after_available = _available_evidence_state(evidence_bundle)
+                after_available = _evidence_progress_state(
+                    evidence_bundle, outcome.evidence_requests,
+                )
                 if (
                     before_available is not None
                     and after_available is not None
@@ -837,7 +906,14 @@ class PrivilegedOpsCoordinator:
                                     {
                                         "probe": item.probe,
                                         "args": item.args,
-                                        "required_facts": list(item.required_facts),
+                                        "required_facts": [
+                                            fact.to_dict()
+                                            for fact in item.required_facts
+                                        ],
+                                        "subject": (
+                                            item.subject.to_dict()
+                                            if item.subject is not None else None
+                                        ),
                                         "need_key": item.need_key,
                                     }
                                     for item in outcome.evidence_requests
@@ -897,9 +973,18 @@ class PrivilegedOpsCoordinator:
                     goal, evidence_bundle,
                 )
                 replanning_rounds += 1
+                progress_summary = _evidence_progress_summary(
+                    before_available,
+                    after_available,
+                    outcome.evidence_requests,
+                )
                 self._emit_progress(
-                    "Replan %s/%s：已取得新的目标相关事实，正在重新规划。"
-                    % (replanning_rounds, workflow.max_replanning_rounds)
+                    "Replan %s/%s：%s；正在重新规划。"
+                    % (
+                        replanning_rounds,
+                        workflow.max_replanning_rounds,
+                        progress_summary,
+                    )
                 )
                 finalize_candidate = getattr(
                     workflow.planner, "finalize_candidate", None,
@@ -1002,17 +1087,38 @@ class PrivilegedOpsCoordinator:
             # Preserve the pre-binding semantics for a scoped Planner repair.
             semantic_candidate_snapshot = deepcopy(outcome.plan)
             before_binding_evidence = _available_evidence_state(evidence_bundle)
-            with scope:
-                bind_kwargs: dict[str, Any] = {
-                    "evidence_bundle": evidence_bundle,
-                }
-                bind_parameters = inspect.signature(workflow.bind_once).parameters
-                if (
-                    predecessor_snapshot is not None
-                    and "predecessor_plan" in bind_parameters
-                ):
-                    bind_kwargs["predecessor_plan"] = predecessor_snapshot
-                binding = workflow.bind_once(outcome.plan, **bind_kwargs)
+            try:
+                with scope:
+                    bind_kwargs: dict[str, Any] = {
+                        "evidence_bundle": evidence_bundle,
+                    }
+                    bind_parameters = inspect.signature(workflow.bind_once).parameters
+                    if (
+                        predecessor_snapshot is not None
+                        and "predecessor_plan" in bind_parameters
+                    ):
+                        bind_kwargs["predecessor_plan"] = predecessor_snapshot
+                    binding = workflow.bind_once(outcome.plan, **bind_kwargs)
+            except Exception as exc:
+                failed_plan = outcome.plan
+                failed_plan.status = "blocked"
+                workflow.store.save(failed_plan)
+                return workflow.failure_result(
+                    **{
+                        **recovery_failure_context(),
+                        "plan": failed_plan,
+                    },
+                    stage="binding",
+                    category="binding_unhandled_failure",
+                    summary="实施绑定发生未处理异常，已在执行前安全停止。",
+                    technical_reason="%s: %s" % (
+                        type(exc).__name__, str(exc)[:1000],
+                    ),
+                    goal=goal,
+                    goal_kind="execution",
+                    attempted_recoveries=["保存当前语义计划和 Binding 断点"],
+                    evidence=evidence_bundle,
+                )
             after_binding_evidence = _available_evidence_state(evidence_bundle)
             if binding.status == "needs_user_decision" and binding.plan is not None:
                 return WorkflowResult(
@@ -1025,6 +1131,55 @@ class PrivilegedOpsCoordinator:
                 )
             if binding.status != "need_replan":
                 raise ValueError("invalid binding transition")
+            if binding.replan_context.get("resume_binding"):
+                partial_plan = binding.candidate_plan or outcome.plan
+                if partial_plan is None:
+                    raise ValueError("binding resume requested without candidate plan")
+                if binding_resume_attempts < 1:
+                    binding_resume_attempts += 1
+                    cursor = dict(binding.replan_context.get("binding_cursor") or {})
+                    self._emit_progress(
+                        "Binding 恢复 1/1：临时调用失败，正在从语义步骤 %s 的"
+                        "原子步骤 %s 继续绑定；不重新运行 Planner。"
+                        % (
+                            cursor.get("semantic_step_id") or "unknown",
+                            cursor.get("atomic_step_index", "unknown"),
+                        )
+                    )
+                    outcome = GoalOutcome(
+                        status="need_execution",
+                        reason=binding.reason,
+                        plan=partial_plan,
+                        candidate_plan=partial_plan,
+                    )
+                    continue
+                partial_plan.status = "blocked"
+                workflow.store.save(partial_plan)
+                cursor = dict(binding.replan_context.get("binding_cursor") or {})
+                return workflow.failure_result(
+                    **{
+                        **recovery_failure_context(),
+                        "plan": partial_plan,
+                    },
+                    stage="binding",
+                    category=str(
+                        binding.replan_context.get("failure_category")
+                        or "binding_provider_transient"
+                    ),
+                    summary="实施绑定的模型调用连续失败，已保存当前原子步骤断点。",
+                    technical_reason=binding.reason,
+                    goal=goal,
+                    goal_kind="execution",
+                    attempted_recoveries=[
+                        "保存已绑定原子步骤",
+                        "从 Binding 断点原地重试一次",
+                    ],
+                    failed_checks=list(binding.failed_criteria),
+                    missing_decisions=list(binding.missing_decisions),
+                    evidence=evidence_bundle,
+                    semantic_step_id=str(cursor.get("semantic_step_id") or ""),
+                    atomic_step_index=int(cursor.get("atomic_step_index", -1)),
+                )
             if binding_attempt == 0:
                 first_binding_error = binding.reason
                 first_binding_failed_criteria = list(binding.failed_criteria)
@@ -1043,6 +1198,12 @@ class PrivilegedOpsCoordinator:
                         "Binding Replan 1/1：实施补证已写入统一证据上下文。"
                     )
                 binding_allowed_steps = [
+                    str(item)
+                    for item in binding.replan_context.get(
+                        "affected_steps", []
+                    )
+                    if str(item)
+                ] or [
                     str(binding.replan_context.get("step_id") or "")
                 ]
                 binding_allowed_steps = [
@@ -1053,7 +1214,15 @@ class PrivilegedOpsCoordinator:
                         "reason": binding.reason,
                         "failed_criteria": list(binding.failed_criteria),
                         "missing_decisions": list(binding.missing_decisions),
-                        "implementation_gap": dict(binding.replan_context),
+                        "implementation_gap": {
+                            key: value
+                            for key, value in binding.replan_context.items()
+                            if key not in {
+                                "failure_category", "replan_recommended",
+                                "resume_binding", "binding_cursor",
+                                "exception_type",
+                            }
+                        },
                         "instruction": (
                             "Preserve the goal and grounded instance identity; repair"
                             " only the rejected semantic effect."
@@ -1617,7 +1786,9 @@ class PrivilegedOpsCoordinator:
                 candidate_status = str(
                     getattr(candidate, "status", "") or ""
                 )
-                if candidate_scope or candidate_status in {
+                if candidate_scope or bool(
+                    getattr(candidate, "binding_cursor", {})
+                ) or candidate_status in {
                     "approved", "executing", "verifying", "paused", "blocked",
                 }:
                     recovery_plan = candidate
@@ -1654,6 +1825,81 @@ class PrivilegedOpsCoordinator:
                 snapshot=snapshot,
                 conversation_context=conversation_context,
             )
+        if (
+            option.action == "continue_current_goal"
+            and recovery_plan is not None
+            and failure.stage == "binding"
+            and failure.environment_changed == "false"
+            and bool(getattr(recovery_plan, "binding_cursor", {}))
+        ):
+            # A Binding checkpoint is already the authoritative resume point.
+            # Re-entering Discovery+Planner here would discard successful
+            # atomic bindings and recreate the failure at a coarser level.
+            bundle = (
+                snapshot.evidence
+                if snapshot is not None else EvidenceBundle(goal=goal)
+            )
+            if failure.evidence_requests:
+                self._emit_progress(
+                    "正在刷新当前 Binding 步骤明确依赖的运行态事实"
+                )
+                self.discovery.collect_requests(
+                    [replace(item, freshness="refresh") for item in failure.evidence_requests],
+                    bundle,
+                )
+            cursor = dict(recovery_plan.binding_cursor)
+            self._emit_progress(
+                "正在从 Binding 断点继续：语义步骤 %s，原子步骤 %s；"
+                "不会重新运行 Planner"
+                % (
+                    cursor.get("semantic_step_id") or failure.semantic_step_id or "unknown",
+                    cursor.get("atomic_step_index", failure.atomic_step_index),
+                )
+            )
+            binding = self.mutation_workflow.bind_once(
+                recovery_plan,
+                evidence_bundle=bundle,
+            )
+            if binding.status == "needs_user_decision" and binding.plan is not None:
+                return WorkflowResult(
+                    True,
+                    "awaiting_confirmation",
+                    binding.user_question,
+                    plan=binding.plan,
+                    evidence=bundle,
+                    outcome=binding,
+                )
+            if binding.status == "need_replan" and binding.replan_context.get(
+                "resume_binding"
+            ):
+                resumed_plan = binding.candidate_plan or recovery_plan
+                resumed_cursor = dict(
+                    binding.replan_context.get("binding_cursor") or cursor
+                )
+                return self.mutation_workflow.failure_result(
+                    stage="binding",
+                    category=str(
+                        binding.replan_context.get("failure_category")
+                        or "binding_provider_transient"
+                    ),
+                    summary="实施绑定恢复仍未成功，断点已保留。",
+                    technical_reason=binding.reason,
+                    goal=goal,
+                    goal_kind="execution",
+                    plan=resumed_plan,
+                    attempted_recoveries=["从持久化 Binding 断点原地恢复"],
+                    failed_checks=list(binding.failed_criteria),
+                    missing_decisions=list(binding.missing_decisions),
+                    evidence=bundle,
+                    semantic_step_id=str(
+                        resumed_cursor.get("semantic_step_id") or ""
+                    ),
+                    atomic_step_index=int(
+                        resumed_cursor.get("atomic_step_index", -1)
+                    ),
+                )
+            # A deterministic semantic/evidence rejection invalidates only the
+            # affected step; fall through to the ordinary scoped Replan loop.
         if (
             option.action == "continue_current_goal"
             and recovery_plan is not None
@@ -2203,6 +2449,82 @@ def _available_evidence_state(bundle: Any) -> dict[str, str] | None:
     return state
 
 
+def _evidence_progress_state(
+    bundle: Any,
+    requests: list[Any],
+) -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None:
+    """Measure progress only by active fact ids, never by output volume."""
+
+    records = getattr(bundle, "records", None)
+    if records is None:
+        return None
+    state: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    for request in requests:
+        requirements = list(getattr(request, "required_facts", ()) or ())
+        if not requirements:
+            # Older/control requests without a fact contract retain raw-output
+            # progress semantics, but cannot resolve a structured gap.
+            raw = _available_evidence_state(bundle)
+            if raw is None:
+                return None
+            state[str(getattr(request, "need_key", ""))] = (
+                tuple(sorted(raw.values())), (),
+            )
+            continue
+        fact_ids = {str(item.fact_id) for item in requirements}
+        latest: dict[str, str] = {}
+        need_key = str(getattr(request, "need_key", ""))
+        for record in records:
+            record_request = getattr(record, "request", None)
+            if str(getattr(record_request, "need_key", "")) != need_key:
+                continue
+            for observation in getattr(record, "observations", ()) or ():
+                if str(getattr(observation, "fact_id", "")) in fact_ids:
+                    latest[str(observation.fact_id)] = str(observation.status)
+        unresolved = tuple(sorted(
+            fact_id for fact_id in fact_ids
+            if latest.get(fact_id) not in {"confirmed", "contradicted"}
+        ))
+        contradicted = tuple(sorted(
+            fact_id for fact_id in fact_ids
+            if latest.get(fact_id) == "contradicted"
+        ))
+        state[need_key] = (unresolved, contradicted)
+    return state
+
+
+def _evidence_progress_summary(
+    before: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None,
+    after: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] | None,
+    requests: list[Any],
+) -> str:
+    """Render the exact gap/fact delta accepted as Replan progress."""
+
+    before = before or {}
+    after = after or {}
+    summaries = []
+    for request in requests:
+        requirements = list(getattr(request, "required_facts", ()) or ())
+        if not requirements:
+            continue
+        gap_id = str(getattr(request, "need_key", "") or "unknown-gap")
+        before_state = before.get(gap_id, ((), ()))
+        after_state = after.get(gap_id, ((), ()))
+        resolved = sorted(set(before_state[0]) - set(after_state[0]))
+        remaining = sorted(set(after_state[0]))
+        if not resolved and before_state == after_state:
+            continue
+        summaries.append(
+            "gap=%s 已解决=%s 仍未解决=%s"
+            % (
+                gap_id,
+                ",".join(resolved) or "none",
+                ",".join(remaining) or "none",
+            )
+        )
+    return "；".join(summaries) or "结构化证据状态已更新"
+
+
 def _evidence_request_summary(requests: list[Any]) -> str:
     rendered = []
     for request in requests:
@@ -2211,11 +2533,55 @@ def _evidence_request_summary(requests: list[Any]) -> str:
             "%s（%s）"
             % (
                 str(getattr(request, "probe", "unknown") or "unknown"),
-                "、".join(str(item) for item in facts)
+                "、".join(
+                    "%s[%s]" % (item.predicate, item.fact_id)
+                    for item in facts
+                )
                 or str(getattr(request, "purpose", "补齐目标事实") or "补齐目标事实"),
             )
         )
     return "；".join(rendered) or "未说明的目标事实"
+
+
+def _deployment_boundary_gaps(text: str) -> list[str]:
+    """Return user decisions that cannot be discovered from the host."""
+
+    value = str(text or "")
+    path = r"/[A-Za-z0-9_.+@%=-]+(?:/[A-Za-z0-9_.+@%=-]+)+"
+    explicit_name = bool(re.search(
+        r"(?:平台(?:实例)?名|实例名|instance\s+name)\s*(?:固定)?\s*[:：=是为]?\s*"
+        r"[A-Za-z0-9_.-]{2,64}",
+        value,
+        re.I,
+    ))
+    target_match = re.search(
+        r"(?:目标(?:实例)?(?:根)?目录|部署目录|实例目录|target(?:\s+(?:directory|path))?)"
+        r"\s*(?:固定)?\s*[:：=是为]?\s*`?" + path,
+        value,
+        re.I,
+    ) or re.search(
+        r"(?:创建|新建|部署|create|deploy)[^\n。；;]{0,40}"
+        r"(?:到|至|at|to)\s*`?" + path,
+        value,
+        re.I,
+    )
+    has_target = bool(target_match)
+    # An exact deployment root is itself a stable instance identity; Planner
+    # derives its display alias from that root when no separate name is given.
+    has_name = explicit_name or has_target
+    has_source = bool(
+        extract_labeled_deployment_paths(value).get("source_directory")
+        or re.search(r"sync_directory[^\n。；;]{0,32}从\s*`?" + path, value, re.I)
+        or re.search(r"(?:git@|https?://|ssh://)\S+", value, re.I)
+    )
+    return [
+        label for present, label in (
+            (has_name, "平台名"),
+            (has_target, "目标目录"),
+            (has_source, "源码来源或模板目录"),
+        )
+        if not present
+    ]
 
 
 def _localized_result(result: WorkflowResult) -> WorkflowResult:

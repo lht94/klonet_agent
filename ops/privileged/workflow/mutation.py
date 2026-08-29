@@ -107,10 +107,13 @@ class MutationWorkflow:
         self.store.save(plan)
         grounded_context = self._binding_context(evidence_bundle)
         try:
-            plan = self.binder.bind(
-                plan,
-                grounded_context=grounded_context,
-            )
+            bind_parameters = inspect.signature(self.binder.bind).parameters
+            bind_kwargs: dict[str, Any] = {
+                "grounded_context": grounded_context,
+            }
+            if "checkpoint" in bind_parameters:
+                bind_kwargs["checkpoint"] = self.store.save
+            plan = self.binder.bind(plan, **bind_kwargs)
         except ChangeBindingError as exc:
             # Binding may have expanded some semantic steps before rejecting a
             # later atomic contract.  This is still a successor of the
@@ -126,7 +129,11 @@ class MutationWorkflow:
                 candidate_plan=plan,
                 failed_criteria=list(exc.failed_criteria),
                 missing_decisions=list(exc.missing_decisions),
-                replan_context=dict(exc.replan_context),
+                replan_context={
+                    **dict(exc.replan_context),
+                    "failure_category": exc.category,
+                    "replan_recommended": exc.replan_recommended,
+                },
             )
         self._inherit_completed_component_effects(plan, predecessor_plan)
         try:
@@ -340,6 +347,25 @@ class MutationWorkflow:
             }
             for instance in inventory.instances
         ]
+        evidence_resolutions = []
+        gap_resolutions = getattr(evidence_bundle, "gap_resolutions", None)
+        if callable(gap_resolutions):
+            for gap_id, resolution in gap_resolutions().items():
+                requests = [
+                    record.request for record in records
+                    if record.request.need_key == gap_id
+                ]
+                requirements = {}
+                affected_steps = []
+                for request in requests:
+                    affected_steps.extend(request.affected_steps)
+                    for requirement in request.required_facts:
+                        requirements[requirement.fact_id] = requirement.to_dict()
+                evidence_resolutions.append({
+                    **resolution.to_dict(),
+                    "requirements": list(requirements.values()),
+                    "affected_steps": list(dict.fromkeys(affected_steps)),
+                })
         return GroundedPlanContext(
             knowledge_evidence=_head_tail(
                 redact_sensitive_text("\n\n".join(knowledge_sections)),
@@ -350,7 +376,10 @@ class MutationWorkflow:
                 24000,
             ),
             action_catalog="audited Action/Shell registry",
-            facts={"runtime_instances": runtime_instances},
+            facts={
+                "runtime_instances": runtime_instances,
+                "evidence_resolutions": evidence_resolutions,
+            },
         )
     def confirm(self, plan_id: str, content_hash: str) -> WorkflowResult:
         plan = self.store.load(plan_id)
@@ -867,6 +896,8 @@ class MutationWorkflow:
         evidence: Any | None = None,
         evidence_requests: list[Any] | None = None,
         missing_decisions: list[str] | None = None,
+        semantic_step_id: str = "",
+        atomic_step_index: int = -1,
     ) -> WorkflowResult:
         """Persist the sole workflow failure transition and involve the user."""
 
@@ -895,6 +926,8 @@ class MutationWorkflow:
             plan_id=plan.plan_id if plan is not None else str(plan_id or ""),
             evidence_requests=list(evidence_requests or []),
             missing_decisions=list(missing_decisions or []),
+            semantic_step_id=semantic_step_id,
+            atomic_step_index=atomic_step_index,
         )
         if plan is not None:
             plan.failure = failure
@@ -2018,17 +2051,22 @@ def _failure_message(
     *,
     explanation: str = "",
 ) -> str:
+    deterministic = _failure_explanation_fallback(failure)
+    rendered = str(explanation or "").strip()
     lines = [
         "本轮目标尚未完成，系统没有隐藏失败。",
         "失败阶段：%s" % failure.stage,
-        "失败说明：%s" % (
-            str(explanation or "").strip()
-            or _failure_explanation_fallback(failure)
-        ),
+        "失败说明：%s" % deterministic,
         "环境是否已改变：%s" % {
             "true": "是", "false": "否", "unknown": "无法确定",
         }[failure.environment_changed],
     ]
+    if rendered and rendered != deterministic:
+        lines.insert(3, "通俗说明：%s" % rendered)
+    if failure.semantic_step_id:
+        lines.append("Binding 语义步骤：%s" % failure.semantic_step_id)
+    if failure.atomic_step_index >= 0:
+        lines.append("Binding 原子步骤索引：%s" % failure.atomic_step_index)
     if failure.failed_step:
         lines.append("失败步骤：%s" % failure.failed_step)
     if failure.failed_checks:
@@ -2088,7 +2126,7 @@ def _direction_question(failure: FailureRecord) -> str:
         context.append("未满足的验收：%s" % "；".join(failure.failed_checks[:4]))
     if failure.evidence_requests:
         facts = [
-            fact
+            "%s[%s]" % (fact.predicate, fact.fact_id)
             for request in failure.evidence_requests[:4]
             for fact in request.required_facts
         ]
@@ -2137,6 +2175,10 @@ def _failure_detail_message(
     ]
     if failure.completed_steps:
         lines.append("已完成步骤：%s" % "；".join(failure.completed_steps))
+    if failure.semantic_step_id:
+        lines.append("Binding 语义步骤：%s" % failure.semantic_step_id)
+    if failure.atomic_step_index >= 0:
+        lines.append("Binding 原子步骤索引：%s" % failure.atomic_step_index)
     if failure.failed_checks:
         lines.append("失败校验：%s" % "；".join(failure.failed_checks))
     if failure.missing_decisions:

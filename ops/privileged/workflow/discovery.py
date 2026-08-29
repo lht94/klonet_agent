@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
+import shlex
 from typing import Any, Callable
 
 from klonet_agent.ops.privileged.probes import DEFAULT_READONLY_PROBES
@@ -13,9 +15,14 @@ from klonet_agent.ops.privileged.context import klonet_domain_context
 from klonet_agent.ops.privileged.workflow.contracts import (
     DiscoveryBudget,
     DiscoveryBudgetExceeded,
+    EvidenceSubject,
     EvidenceBundle,
     EvidenceRecord,
+    FactObservation,
+    FactRequirement,
     ProbeRequest,
+    extract_labeled_deployment_paths,
+    infer_evidence_subject,
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.runtime_inventory import (
@@ -32,7 +39,11 @@ read-only command. Never propose mutations, plans, or user confirmation.
 
 Return one JSON object with status `need_evidence`, `ready`, or `blocked`.
 For need_evidence return at most four probe_requests with probe, args, purpose,
-required_facts, and optional freshness (`cached` or `refresh`).
+required_facts, subject, and optional freshness (`cached` or `refresh`).
+Every required_facts item must contain stable fact_id, predicate, expected,
+comparison, and freshness. Reuse the same fact_id for the same fact. The
+subject must identify the exact path, port set, process, session, service, or
+runtime being inspected. Probe args must inspect that same subject.
 Request only facts materially needed for the current goal. Do not repeat an
 identical probe and arguments after evidence was returned.
 
@@ -44,6 +55,11 @@ Screen git_root or cwd ancestors before returning blocked.
 Once a matching `screen_git_repositories` section reports
 inside_work_tree=true with remote and branch, source discovery is complete.
 Do not request screen_session or broad process probes to rediscover that source.
+
+When the goal explicitly says to copy or synchronize the current working tree,
+project_layout evidence for that exact source is sufficient. Do not request Git
+remote, branch, revision, or cleanliness facts unless the user asked for Git
+semantics or the planned source operation is git_operation.
 
 Registered probes:
 %s
@@ -63,8 +79,15 @@ Return exactly one JSON object:
 - {"status":"satisfied","reason":"..."} when the supplied registered-probe
   output already contains every required fact;
 - {"status":"command","command":"one non-interactive read-only command",
-   "reason":"..."} when a supplemental command can obtain the missing facts;
+   "covers":["fact-id"], "subject":{"kind":"...","value":"..."},
+   "extractors":[{"fact_id":"...","kind":"output_contains|output_regex|output_nonempty",
+   "expected":"..."}], "scope_expansion_reason":"", "reason":"..."}
+  when a supplemental command can obtain the missing facts;
 - {"status":"blocked","reason":"..."} only when no safe command can do so.
+The command must preserve the supplied subject, covers and exclusions. Do not
+expand to unrelated paths or components. If the exact subject is genuinely
+insufficient, state a non-empty scope_expansion_reason; policy may still reject
+the expansion.
 """.strip()
 
 
@@ -79,6 +102,409 @@ def parse_json_object(content: str) -> dict[str, Any]:
     return value
 
 
+def _comparison_status(requirement: FactRequirement, actual: Any) -> str:
+    if actual is None:
+        return "unresolved"
+    if requirement.comparison == "present":
+        return "confirmed" if actual not in (None, "", [], {}) else "contradicted"
+    if requirement.comparison == "equals":
+        return "confirmed" if actual == requirement.expected else "contradicted"
+    if requirement.comparison == "contains":
+        try:
+            matched = requirement.expected in actual
+        except TypeError:
+            matched = False
+        return "confirmed" if matched else "contradicted"
+    if requirement.comparison == "contains_all":
+        expected = requirement.expected
+        if not isinstance(expected, (list, tuple, set)):
+            return "unresolved"
+        try:
+            matched = set(expected).issubset(set(actual))
+        except TypeError:
+            matched = False
+        return "confirmed" if matched else "contradicted"
+    return "unresolved"
+
+
+def _registered_observations(
+    request: ProbeRequest,
+    output: str,
+    *,
+    status: str,
+) -> tuple[FactObservation, ...]:
+    """Map typed Probe output to fact ids without another model judgement."""
+
+    observations: list[FactObservation] = []
+    if not request.required_facts:
+        return ()
+    if status != "available":
+        return tuple(
+            FactObservation(item.fact_id, "unresolved", None, "probe.unavailable")
+            for item in request.required_facts
+        )
+    spec = DEFAULT_READONLY_PROBES.get(request.probe)
+    supported = set(spec.supported_predicates if spec is not None else ())
+    actual_by_predicate: dict[str, Any] = {}
+    if request.probe == "ports":
+        for label, predicate in (
+            ("available_ports", "port.available"),
+            ("occupied_ports", "port.occupied"),
+        ):
+            match = re.search(r"(?m)^%s=([^\n]+)$" % label, output)
+            if match is not None:
+                raw = match.group(1).strip()
+                actual_by_predicate[predicate] = [] if raw == "none" else [
+                    int(item) for item in raw.split(",") if item.strip().isdigit()
+                ]
+        actual_by_predicate["port.in_use"] = actual_by_predicate.get(
+            "port.occupied", []
+        )
+        actual_by_predicate["port.listening"] = actual_by_predicate.get(
+            "port.occupied", []
+        )
+        actual_by_predicate["port.listener"] = output if "LISTEN" in output else ""
+    elif request.probe == "project_layout":
+        try:
+            # Production wraps probe output in a recovery section header.
+            # Evidence extraction must not depend on that UI wrapper.
+            data = parse_json_object(output)
+        except (TypeError, ValueError):
+            data = {}
+        projects = data.get("projects") if isinstance(data, dict) else []
+        projects = projects if isinstance(projects, list) else []
+        subject_values = []
+        if request.subject is not None:
+            value = request.subject.value
+            subject_values = value if isinstance(value, list) else [value]
+        selected = [
+            item for item in projects if isinstance(item, dict)
+            and (
+                not subject_values
+                or str(item.get("candidate_root") or "") in {
+                    str(value) for value in subject_values
+                }
+            )
+        ]
+        actual_by_predicate["path.exists"] = bool(selected)
+        if selected:
+            project = selected[0]
+            actual_by_predicate["project.layout"] = project.get("layout_kind")
+            actual_by_predicate["project.readiness"] = project.get("readiness")
+            actual_by_predicate["project.runnable"] = (
+                project.get("readiness") == "runnable"
+            )
+            actual_by_predicate["project.runtime_cwd"] = project.get("runtime_cwd")
+            actual_by_predicate["project.source_root"] = project.get("source_repo_root")
+            violations = set(project.get("violations") or [])
+            actual_by_predicate["project.entry_files"] = (
+                [
+                    "gun.py", "master_main.py", "celery_worker.py",
+                    "web_terminal_main.py", "worker_gun.py", "worker_main.py",
+                ]
+                if "entry_sources_missing" not in violations else []
+            )
+    elif request.probe == "screen":
+        sessions = [
+            match.group(1)
+            for match in re.finditer(
+                r"(?m)^\s*\d+\.([A-Za-z0-9_.-]{1,128})\s+", output,
+            )
+        ]
+        actual_by_predicate["screen.sessions"] = sessions
+        requested = str(request.args.get("session") or "").strip()
+        if requested:
+            actual_by_predicate["screen.session_exists"] = requested in sessions
+            actual_by_predicate["screen.session_available"] = requested not in sessions
+    elif request.probe == "git_repository":
+        inside = re.search(r"\binside_work_tree=([^\s]+)", output)
+        revision = re.search(r"\brevision=([^\s]+)", output)
+        status_match = re.search(r"(?m)^status=(.*)$", output)
+        remotes_match = re.search(r"(?ms)^remotes=(.*)$", output)
+        if inside is not None:
+            actual_by_predicate["git.inside_work_tree"] = (
+                inside.group(1).strip().lower() == "true"
+            )
+        if revision is not None and revision.group(1) not in {"unknown", "none"}:
+            actual_by_predicate["git.revision"] = revision.group(1).strip()
+        if status_match is not None:
+            status_text = status_match.group(1).strip()
+            actual_by_predicate["git.status"] = status_text
+            branch = re.search(r"^##\s+([^\.\s]+)", status_text)
+            if branch is not None:
+                actual_by_predicate["git.branch"] = branch.group(1)
+        if remotes_match is not None:
+            remotes = remotes_match.group(1).strip()
+            if remotes and remotes != "none":
+                actual_by_predicate["git.remote"] = remotes
+    elif request.probe == "disk":
+        body = output.split("inspect_disk", 1)[-1].strip()
+        if body and "command_" not in body:
+            actual_by_predicate["disk.capacity"] = body
+            actual_by_predicate["disk.filesystems"] = body
+    elif request.probe == "path_permissions":
+        rows = re.findall(r"(?m)^path=([^\s]+)\s+([^\n]+)$", output)
+        if rows:
+            existence = ["exists=true" in details for _, details in rows]
+            actual_by_predicate["path.exists"] = all(existence)
+            actual_by_predicate["path.permissions"] = "\n".join(
+                "path=%s %s" % row for row in rows
+            )
+            uids = re.findall(r"\buid=(\d+)", output)
+            gids = re.findall(r"\bgid=(\d+)", output)
+            if uids:
+                actual_by_predicate["path.uid"] = [int(item) for item in uids]
+            if gids:
+                actual_by_predicate["path.gid"] = [int(item) for item in gids]
+    elif request.probe == "process_detail":
+        patterns = {
+            "process.cwd": r"\bcwd=([^\s]+)",
+            "process.uid": r"\b(?:run_as_uid|uid)=(\d+)",
+            "process.python_executable": r"\bpython_executable=([^\s]+)",
+            "process.cmdline": r"\bcmdline=(.+)$",
+        }
+        for predicate, pattern in patterns.items():
+            match = re.search(pattern, output, re.M)
+            if match is not None and match.group(1).strip() not in {
+                "unknown", "unchecked", "truncated",
+            }:
+                actual_by_predicate[predicate] = match.group(1).strip()
+        actual_by_predicate["process.identity"] = bool(
+            actual_by_predicate.get("process.cwd")
+            and actual_by_predicate.get("process.cmdline")
+        )
+    elif request.probe in {"running_platforms", "platform_health"}:
+        # The domain probes already emit root-bound structured records. Their
+        # contents remain raw evidence; presence is enough only for predicates
+        # whose requirement asks for a present result.
+        for predicate in supported:
+            actual_by_predicate[predicate] = bool(output.strip())
+
+    for requirement in request.required_facts:
+        actual = actual_by_predicate.get(requirement.predicate)
+        observation_status = (
+            _comparison_status(requirement, actual)
+            if requirement.predicate in supported
+            else "unresolved"
+        )
+        observations.append(FactObservation(
+            requirement.fact_id,
+            observation_status,
+            actual,
+            "%s.%s" % (request.probe, requirement.predicate),
+        ))
+    return tuple(observations)
+
+
+def _registered_probe_contract_errors(
+    requests: list[ProbeRequest],
+) -> list[str]:
+    """Explain typed predicate mismatches before any registered probe runs."""
+
+    errors = []
+    for request in requests:
+        if not request.required_facts:
+            continue
+        spec = DEFAULT_READONLY_PROBES.get(request.probe)
+        if spec is None:
+            continue
+        supported = set(spec.supported_predicates)
+        unsupported = sorted({
+            item.predicate for item in request.required_facts
+            if item.predicate not in supported
+        })
+        if not unsupported:
+            continue
+        errors.append(
+            "registered probe %s does not cover predicates=%s; supported=%s"
+            % (
+                request.probe,
+                ",".join(unsupported),
+                ",".join(sorted(supported)) or "none",
+            )
+        )
+    return errors
+
+
+def _subject_paths(subject: EvidenceSubject | None) -> tuple[Path, ...]:
+    if subject is None or subject.kind not in {"path", "path_set"}:
+        return ()
+    values = subject.value if isinstance(subject.value, list) else [subject.value]
+    result = []
+    for value in values:
+        path = Path(str(value or ""))
+        if path.is_absolute():
+            result.append(path.resolve(strict=False))
+    return tuple(result)
+
+
+def _path_within(path: Path, roots: tuple[Path, ...]) -> bool:
+    for root in roots:
+        try:
+            path.resolve(strict=False).relative_to(root)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return False
+
+
+def _validate_shell_fallback_contract(
+    request: ProbeRequest,
+    data: dict[str, Any],
+    *,
+    unresolved_fact_ids: set[str],
+) -> tuple[str, tuple[str, ...], list[dict[str, Any]], str]:
+    command = str(data.get("command") or "").strip()
+    if not command:
+        raise ValueError("empty read-only command candidate")
+    covers = tuple(str(item) for item in data.get("covers") or [])
+    if (
+        not covers
+        or len(covers) != len(set(covers))
+        or not set(covers).issubset(unresolved_fact_ids)
+    ):
+        raise ValueError("read-only fallback covers facts outside the active gap")
+    supplied_subject = EvidenceSubject.from_value(data.get("subject"))
+    if request.subject is not None and supplied_subject != request.subject:
+        raise ValueError("read-only fallback changed the evidence subject")
+    extractors = [
+        dict(item) for item in data.get("extractors") or []
+        if isinstance(item, dict)
+    ]
+    extractor_ids = {str(item.get("fact_id") or "") for item in extractors}
+    if set(covers) != extractor_ids:
+        raise ValueError("read-only fallback extractor coverage is incomplete")
+    if any(
+        str(item.get("kind") or "")
+        not in {"output_contains", "output_regex", "output_nonempty"}
+        for item in extractors
+    ):
+        raise ValueError("unsupported deterministic read-only extractor")
+    requirements = {item.fact_id: item for item in request.required_facts}
+    for extractor in extractors:
+        requirement = requirements[str(extractor.get("fact_id") or "")]
+        kind = str(extractor.get("kind") or "")
+        expected = extractor.get("expected")
+        if kind == "output_nonempty" and requirement.comparison != "present":
+            raise ValueError(
+                "output_nonempty can only resolve a present fact requirement"
+            )
+        if kind == "output_contains":
+            if requirement.comparison not in {"contains", "present"}:
+                raise ValueError(
+                    "output_contains does not match the fact comparison"
+                )
+            if requirement.comparison == "contains" and expected != requirement.expected:
+                raise ValueError(
+                    "output_contains changed the expected fact value"
+                )
+        if kind == "output_regex":
+            pattern = str(extractor.get("expected") or "")
+            if not pattern or len(pattern) > 500:
+                raise ValueError("output_regex requires a bounded pattern")
+
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise ValueError("invalid read-only command quoting") from exc
+    subject_roots = _subject_paths(request.subject)
+    scope_roots = tuple(
+        Path(item).resolve(strict=False)
+        for item in request.scope if Path(item).is_absolute()
+    )
+    exclusion_roots = tuple(
+        Path(item).resolve(strict=False)
+        for item in request.exclusions if Path(item).is_absolute()
+    )
+    argument_paths = [
+        Path(token).resolve(strict=False)
+        for token in argv[1:] if token.startswith("/")
+    ]
+    if any(_path_within(path, exclusion_roots) for path in argument_paths):
+        raise ValueError("read-only fallback queried an excluded path")
+    excluded_components = {
+        item.lower() for item in request.exclusions
+        if not str(item).startswith("/")
+    }
+    if "nginx" in excluded_components and re.search(
+        r"(?:^|[\s/])nginx(?:[\s/]|$)", command, re.I,
+    ):
+        raise ValueError("read-only fallback queried excluded component nginx")
+    outside = [
+        path for path in argument_paths
+        if subject_roots and not _path_within(path, subject_roots + scope_roots)
+    ]
+    expansion_reason = str(data.get("scope_expansion_reason") or "").strip()
+    if not subject_roots and argument_paths and not expansion_reason:
+        raise ValueError("read-only fallback requires a scope expansion reason")
+    if outside and not expansion_reason:
+        raise ValueError("read-only fallback expanded path scope without reason")
+    # A frozen path subject is authoritative. Expansion must be proposed back
+    # to Planner/user by changing the gap scope, never smuggled into Shell.
+    if outside and request.subject is not None and request.subject.kind == "path":
+        raise ValueError("read-only fallback exceeded the frozen path subject")
+    return command, covers, extractors, expansion_reason
+
+
+def _shell_observations(
+    request: ProbeRequest,
+    output: str,
+    extractors: list[dict[str, Any]],
+) -> tuple[FactObservation, ...]:
+    observations = []
+    requirements = {item.fact_id: item for item in request.required_facts}
+    for extractor in extractors:
+        fact_id = str(extractor.get("fact_id") or "")
+        requirement = requirements[fact_id]
+        kind = str(extractor.get("kind") or "")
+        expected = str(extractor.get("expected") or "")
+        if kind == "output_nonempty":
+            actual: Any = str(output or "").strip()
+        elif kind == "output_contains":
+            actual = (
+                str(output or "")
+                if expected and expected in str(output or "") else ""
+            )
+        else:
+            try:
+                match = re.search(expected, str(output or ""))
+            except re.error:
+                match = None
+            actual = (
+                match.group(1)
+                if match is not None and match.lastindex
+                else match.group(0)
+                if match is not None
+                else ""
+            )
+        observations.append(FactObservation(
+            fact_id,
+            _comparison_status(requirement, actual),
+            actual,
+            "readonly_command.%s" % kind,
+        ))
+    return tuple(observations)
+
+
+def _evidence_user_summary(record: EvidenceRecord) -> str:
+    """Summarize evidence without copying raw command output to the UI."""
+
+    by_status = {"confirmed": [], "contradicted": [], "unresolved": []}
+    for observation in record.observations:
+        by_status.setdefault(observation.status, []).append(observation.fact_id)
+    facts = "；".join(
+        "%s=%s" % (status, ",".join(by_status[status]) or "none")
+        for status in ("confirmed", "contradicted", "unresolved")
+        if by_status[status]
+    ) or "无结构化 fact 结论"
+    return "证据摘要：probe=%s status=%s；%s；原始输出已保存为 %s" % (
+        record.request.probe,
+        record.status,
+        facts,
+        record.evidence_id,
+    )
+
+
 def _knowledge_task_type(goal: str) -> str:
     lowered = str(goal or "").lower()
     if any(marker in lowered for marker in (
@@ -87,6 +513,28 @@ def _knowledge_task_type(goal: str) -> str:
     )):
         return "troubleshooting"
     return "operation_guide"
+
+
+_ABSOLUTE_PATH_RE = r"/[A-Za-z0-9_.+@%=-]+(?:/[A-Za-z0-9_.+@%=-]+)+"
+
+
+def _explicit_deployment_boundaries(goal: str) -> dict[str, str]:
+    """Extract only paths explicitly labelled by the user."""
+
+    return extract_labeled_deployment_paths(goal)
+
+
+def _goal_evidence_exclusions(goal: str) -> tuple[str, ...]:
+    text = str(goal or "")
+    exclusions = []
+    if re.search(
+        r"(?:不(?:配置|使用|修改|读取|处理|启动)?|无需|排除)"
+        r"[^\n。！？;；]{0,20}\bnginx\b",
+        text,
+        re.I,
+    ):
+        exclusions.append("nginx")
+    return tuple(exclusions)
 
 
 class DiscoveryAgent:
@@ -142,6 +590,89 @@ class DiscoveryAgent:
                     "（%s）" % source if source else "",
                 )
             )
+
+    def _seed_explicit_deployment_boundaries(
+        self,
+        goal: str,
+        bundle: EvidenceBundle,
+    ) -> None:
+        boundaries = _explicit_deployment_boundaries(goal)
+        exclusions = _goal_evidence_exclusions(goal)
+        for role in ("source_directory", "target_directory"):
+            path = boundaries.get(role)
+            if not path:
+                continue
+            fact_id = "fact-user-%s" % role.replace("_", "-")
+            request = ProbeRequest(
+                "user_decision",
+                {role: path},
+                "冻结用户明确提供的部署边界",
+                ({
+                    "fact_id": fact_id,
+                    "predicate": "deployment.%s" % role,
+                    "expected": path,
+                    "comparison": "equals",
+                },),
+                gap_id="gap-user-deployment-boundaries",
+                subject={"kind": "path", "value": path},
+                scope=(path,),
+                exclusions=exclusions,
+            )
+            if any(
+                record.request.cache_key == request.cache_key
+                for record in bundle.records
+            ):
+                continue
+            bundle.add(EvidenceRecord.from_probe(
+                request,
+                json.dumps({role: path}, ensure_ascii=False),
+                observations=(FactObservation(
+                    fact_id,
+                    "confirmed",
+                    path,
+                    "user_decision.%s" % role,
+                ),),
+            ))
+
+        owner = getattr(self.probe_runner, "__self__", None)
+        register_user_root = getattr(
+            owner, "register_user_decided_project_root", None,
+        )
+        if callable(register_user_root):
+            for path in boundaries.values():
+                register_user_root(path)
+
+        source = boundaries.get("source_directory")
+        if not source or self.probe_runner is None:
+            return
+        layout_request = ProbeRequest(
+            "project_layout",
+            {"project_roots": [source]},
+            "检查用户明确提供的源码目录及入口文件",
+            (
+                {
+                    "fact_id": "fact-explicit-source-exists",
+                    "predicate": "path.exists",
+                    "expected": True,
+                    "comparison": "equals",
+                },
+                {
+                    "fact_id": "fact-explicit-source-entry-files",
+                    "predicate": "project.entry_files",
+                    "expected": [
+                        "master_main.py", "worker_main.py",
+                        "celery_worker.py", "web_terminal_main.py",
+                    ],
+                    "comparison": "contains_all",
+                },
+            ),
+            gap_id="gap-explicit-source-layout",
+            affected_steps=("prepare-source",),
+            subject={"kind": "path", "value": source},
+            scope=(source,),
+            exclusions=exclusions,
+        )
+        self.collect_requests([layout_request], bundle)
     def begin_probe_session(self) -> None:
         owner = getattr(self.probe_runner, "__self__", None)
         begin = getattr(owner, "begin_probe_session", None)
@@ -200,7 +731,7 @@ class DiscoveryAgent:
                 record.evidence_id,
                 record.request.probe,
                 record.status,
-                ",".join(record.request.required_facts) or "none",
+                ",".join(record.request.covers) or "none",
                 record.output[:7000],
             )
             for record in bundle.records
@@ -229,7 +760,6 @@ class DiscoveryAgent:
             ),
             None,
         )
-        had_registered_evidence = existing is not None
         registered = DEFAULT_READONLY_PROBES.get(request.probe) is not None
         records: list[EvidenceRecord] = []
         if registered and (existing is None or request.freshness == "refresh"):
@@ -249,7 +779,14 @@ class DiscoveryAgent:
             except Exception as exc:
                 output = "probe failed: %s" % type(exc).__name__
                 status = "unavailable"
-            record = EvidenceRecord.from_probe(request, output, status=status)
+            record = EvidenceRecord.from_probe(
+                request,
+                output,
+                status=status,
+                observations=_registered_observations(
+                    request, output, status=status,
+                ),
+            )
             record = (
                 bundle.refresh(record)
                 if request.freshness == "refresh"
@@ -259,18 +796,29 @@ class DiscoveryAgent:
             records.append(record)
             existing = record
         elif existing is not None:
+            # The same raw probe result may answer a newly narrowed fact set.
+            # Rebind it to the current request and run the same deterministic
+            # extractor instead of asking an LLM whether it is sufficient.
+            existing = EvidenceRecord(
+                evidence_id=existing.evidence_id,
+                request=request,
+                output=existing.output,
+                status=existing.status,
+                collected_at=existing.collected_at,
+                observations=_registered_observations(
+                    request, existing.output, status=existing.status,
+                ),
+            )
+            bundle.refresh(existing)
             records.append(existing)
 
-        # ``required_facts`` describes the evidence contract; it is not proof
-        # that a registered probe failed to satisfy that contract.  A usable
-        # registered result returns to Planner/Verifier, which alone decides
-        # whether another fact is still missing.  Shell is only the capability
-        # fallback for an absent/unavailable implementation, or for the same
-        # fact explicitly requested again after registered evidence was seen.
+        unresolved = set(request.covers)
+        if existing is not None:
+            unresolved = set(existing.unresolved_fact_ids)
         if (
             not registered
             or (existing is not None and existing.status != "available")
-            or (had_registered_evidence and bool(request.required_facts))
+            or bool(unresolved)
         ):
             fallback = self._collect_readonly_fallback(
                 request,
@@ -280,6 +828,9 @@ class DiscoveryAgent:
             )
             if fallback is not None:
                 records.append(fallback)
+        if self.on_progress is not None:
+            for item in records:
+                self.on_progress(_evidence_user_summary(item))
         return records
 
     def _collect_readonly_fallback(
@@ -318,7 +869,19 @@ class DiscoveryAgent:
             "requested_capability": request.probe,
             "args": request.args,
             "purpose": request.purpose,
-            "required_facts": list(request.required_facts),
+            "gap_id": request.need_key,
+            "subject": (
+                request.subject.to_dict() if request.subject is not None else None
+            ),
+            "required_facts": [
+                item.to_dict() for item in request.required_facts
+                if item.fact_id in set(
+                    prior_record.unresolved_fact_ids
+                    if prior_record is not None else request.covers
+                )
+            ],
+            "scope": list(request.scope),
+            "exclusions": list(request.exclusions),
             "registered_probe_output": prior,
             "prior_fallback_attempts": prior_fallbacks,
         }
@@ -336,12 +899,24 @@ class DiscoveryAgent:
             ]))
             status = str(data.get("status") or "").strip().lower()
             if status == "satisfied" and prior_record is not None:
-                return None
+                if not prior_record.unresolved_fact_ids:
+                    return None
+                raise ValueError(
+                    "model claimed satisfied while required facts remain unresolved"
+                )
             if status != "command":
                 raise ValueError(str(data.get("reason") or "no safe read-only command"))
-            command = str(data.get("command") or "").strip()
-            if not command:
-                raise ValueError("empty read-only command candidate")
+            unresolved = set(
+                prior_record.unresolved_fact_ids
+                if prior_record is not None else request.covers
+            )
+            command, covers, extractors, expansion_reason = (
+                _validate_shell_fallback_contract(
+                    request,
+                    data,
+                    unresolved_fact_ids=unresolved,
+                )
+            )
             if command in {
                 str(item.get("command") or "") for item in prior_fallbacks
             }:
@@ -354,12 +929,20 @@ class DiscoveryAgent:
                     "command": command,
                     "source_probe": request.probe,
                     "source_need_key": request.need_key,
+                    "covers": list(covers),
+                    "extractors": extractors,
                 },
                 "补齐未被注册 Probe 覆盖的事实：%s" % request.purpose,
-                request.required_facts,
+                tuple(
+                    item for item in request.required_facts
+                    if item.fact_id in set(covers)
+                ),
                 request.freshness,
                 request.need_key,
                 request.affected_steps,
+                request.subject,
+                request.scope,
+                request.exclusions,
             )
             existing = next(
                 (
@@ -373,10 +956,19 @@ class DiscoveryAgent:
             if self.readonly_command_runner is None:
                 raise RuntimeError("read-only command boundary unavailable")
             if self.on_progress is not None:
+                if expansion_reason:
+                    self.on_progress(
+                        "只读补证需要扩大查询范围：%s" % expansion_reason
+                    )
                 self.on_progress("只读命令候选已生成，正在进行确定性安全校验并执行。")
             output = self.readonly_command_runner(command)
             record = EvidenceRecord.from_probe(
-                fallback_request, output, status="available",
+                fallback_request,
+                output,
+                status="available",
+                observations=_shell_observations(
+                    fallback_request, output, extractors,
+                ),
             )
             return (
                 bundle.refresh(record)
@@ -395,6 +987,9 @@ class DiscoveryAgent:
                 request.freshness,
                 request.need_key,
                 request.affected_steps,
+                request.subject,
+                request.scope,
+                request.exclusions,
             )
             record = EvidenceRecord.from_probe(
                 failed_request,
@@ -431,6 +1026,7 @@ class DiscoveryAgent:
             records=list(getattr(seed_bundle, "records", []) or []),
         )
         self.collect_knowledge(goal, bundle)
+        self._seed_explicit_deployment_boundaries(goal, bundle)
         if preload_capabilities and not any(
             item.request.probe == "privilege_capabilities"
             for item in bundle.records
@@ -521,6 +1117,7 @@ class DiscoveryAgent:
                 }
             )
         invalid_repairs = 0
+        predicate_repairs = 0
         while True:
             try:
                 data = parse_json_object(self._complete(messages))
@@ -555,7 +1152,48 @@ class DiscoveryAgent:
                     bundle.blocked_reason = "invalid discovery status"
                     return bundle
                 continue
-            requests = self._requests(data.get("probe_requests"))
+            try:
+                requests = self._requests(data.get("probe_requests"))
+            except (TypeError, ValueError) as exc:
+                if invalid_repairs >= 1:
+                    bundle.blocked_reason = "discovery output invalid: %s" % exc
+                    return bundle
+                invalid_repairs += 1
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Return one valid Discovery JSON object whose fact "
+                        "comparisons are equals, contains, contains_all, or "
+                        "present. Error: %s" % exc
+                    ),
+                })
+                continue
+            contract_errors = _registered_probe_contract_errors(requests)
+            if contract_errors and predicate_repairs < 1:
+                predicate_repairs += 1
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Correct the Probe predicate contract before execution. "
+                        "If the required semantic is equivalent to a supported "
+                        "predicate, reuse that exact predicate. If it is genuinely "
+                        "long-tail, request a clearly named long-tail capability so "
+                        "Discovery can bind a read-only Shell implementation.\n"
+                        + "\n".join(contract_errors)
+                    ),
+                })
+                continue
+            exclusions = _goal_evidence_exclusions(goal)
+            if exclusions:
+                requests = [
+                    replace(
+                        request,
+                        exclusions=tuple(dict.fromkeys(
+                            (*request.exclusions, *exclusions)
+                        )),
+                    )
+                    for request in requests
+                ]
             try:
                 fresh = budget.register_round(requests)
             except DiscoveryBudgetExceeded:
@@ -652,20 +1290,31 @@ class DiscoveryAgent:
                 aliases.get(requested_probe, requested_probe),
                 item.get("args") if isinstance(item.get("args"), dict) else {},
             )
+            subject = (
+                EvidenceSubject.from_value(item.get("subject"))
+                or infer_evidence_subject(normalized_probe, normalized_args)
+            )
             request = ProbeRequest(
                 probe=normalized_probe,
                 args=normalized_args,
                 purpose=str(item.get("purpose") or "collect required fact"),
-                required_facts=tuple(
-                    str(value).strip()
-                    for value in item.get("required_facts") or []
-                    if str(value).strip()
-                ),
+                required_facts=tuple(item.get("required_facts") or []),
                 freshness=str(item.get("freshness") or "cached"),
                 gap_id=str(item.get("gap_id") or ""),
                 affected_steps=tuple(
                     str(value).strip()
                     for value in item.get("affected_steps") or []
+                    if str(value).strip()
+                ),
+                subject=subject,
+                scope=tuple(
+                    str(value).strip()
+                    for value in item.get("scope") or []
+                    if str(value).strip()
+                ),
+                exclusions=tuple(
+                    str(value).strip()
+                    for value in item.get("exclusions") or []
                     if str(value).strip()
                 ),
             )

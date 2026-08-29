@@ -309,3 +309,145 @@ def test_recovery_contract_rejects_planner_strategy_as_user_control():
             description="不应成为失败恢复状态",
             action="component_restart",
         )
+
+
+def test_evidence_contract_round_trips_only_structured_fact_requirements():
+    from klonet_agent.ops.privileged.workflow.contracts import ProbeRequest
+
+    request = ProbeRequest(
+        "project_layout",
+        {"project_roots": ["/srv/source"]},
+        "inspect the frozen source",
+        ({
+            "fact_id": "fact-source-exists",
+            "predicate": "path.exists",
+            "expected": True,
+            "comparison": "equals",
+            "freshness": "cached",
+        },),
+        gap_id="gap-source-layout",
+        affected_steps=("prepare-source",),
+        subject={"kind": "path", "value": "/srv/source"},
+        scope=("/srv/source",),
+        exclusions=("/etc/nginx",),
+    )
+
+    payload = request.to_dict()
+    restored = ProbeRequest(
+        payload["probe"], payload["args"], payload["purpose"],
+        tuple(payload["required_facts"]), payload["freshness"],
+        payload["gap_id"], tuple(payload["affected_steps"]),
+        payload["subject"], tuple(payload["scope"]),
+        tuple(payload["exclusions"]),
+    )
+
+    assert restored == request
+    assert payload["covers"] == ["fact-source-exists"]
+    assert isinstance(payload["required_facts"][0], dict)
+    assert payload["subject"] == {"kind": "path", "value": "/srv/source"}
+
+
+def test_model_fact_id_is_canonicalized_once_at_contract_ingress():
+    from klonet_agent.ops.privileged.workflow.contracts import FactRequirement
+
+    requirement = FactRequirement.from_value({
+        "fact_id": "source_dir_exists",
+        "predicate": "path.exists",
+        "expected": True,
+        "comparison": "equals",
+    })
+
+    assert requirement.fact_id == "fact-source-dir-exists"
+    assert FactRequirement.from_value(requirement) is requirement
+
+
+def test_probe_contract_normalizes_provider_scalar_lists_and_contains_all():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        FactRequirement, normalize_probe_request,
+    )
+
+    probe, args = normalize_probe_request(
+        "ports", {"ports": "45553, 45554"},
+    )
+    requirement = FactRequirement.from_value({
+        "fact_id": "fact-ports-used",
+        "predicate": "port.in_use",
+        "expected": "45553,45554",
+        "comparison": "contains_all",
+    })
+
+    assert probe == "ports"
+    assert args == {"ports": ["45553", "45554"]}
+    assert requirement.expected == [45553, 45554]
+
+
+def test_gap_resolution_ignores_raw_output_without_fact_observation():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    request = ProbeRequest(
+        "long_tail",
+        {"path": "/srv/source"},
+        "find marker",
+        ({
+            "fact_id": "fact-source-marker",
+            "predicate": "source.marker",
+            "expected": "ready",
+            "comparison": "equals",
+        },),
+        gap_id="gap-source-marker",
+    )
+    bundle = EvidenceBundle(goal="inspect source")
+    bundle.add(EvidenceRecord.from_probe(
+        request,
+        "a large but unrelated nginx configuration was returned",
+    ))
+
+    resolution = bundle.resolve_gap("gap-source-marker")
+
+    assert resolution.confirmed_fact_ids == ()
+    assert resolution.contradicted_fact_ids == ()
+    assert resolution.unresolved_fact_ids == ("fact-source-marker",)
+
+
+def test_gap_resolution_uses_fact_identity_and_keeps_only_unanswered_facts():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, FactObservation, ProbeRequest,
+    )
+
+    request = ProbeRequest(
+        "project_layout",
+        {"project_roots": ["/srv/source"]},
+        "inspect exact source",
+        (
+            {
+                "fact_id": "fact-source-exists",
+                "predicate": "path.exists",
+                "expected": True,
+                "comparison": "equals",
+            },
+            {
+                "fact_id": "fact-entry-files",
+                "predicate": "project.entry_files",
+                "expected": ["master_main.py", "worker_main.py"],
+                "comparison": "contains_all",
+            },
+        ),
+        gap_id="gap-source-layout",
+    )
+    bundle = EvidenceBundle(goal="inspect source")
+    bundle.add(EvidenceRecord.from_probe(
+        request,
+        "字段名和语言可以变化；resolution 不读取这段自然语言",
+        observations=(FactObservation(
+            "fact-source-exists", "confirmed", True,
+            "project_layout.path.exists",
+        ),),
+    ))
+
+    resolution = bundle.resolve_gap("gap-source-layout")
+
+    assert resolution.confirmed_fact_ids == ("fact-source-exists",)
+    assert resolution.contradicted_fact_ids == ()
+    assert resolution.unresolved_fact_ids == ("fact-entry-files",)

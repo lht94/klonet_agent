@@ -605,19 +605,40 @@ def test_step_verifier_preserves_long_tail_evidence_need_for_discovery():
 
     requests = PrivilegedVerifierAgent._probe_requests([{
         "probe": "proc_environment_identity",
-        "args": {"pid": 1234},
+        "args": {"pids": [1234]},
         "purpose": "resolve interpreter environment",
-        "required_facts": ["python executable", "run_as uid"],
+        "gap_id": "gap-process-identity",
+        "affected_steps": ["start-master"],
+        "subject": {"kind": "pid_set", "value": [1234]},
+        "required_facts": [
+            {
+                "fact_id": "fact-python-executable",
+                "predicate": "process.python_executable",
+                "expected": True,
+                "comparison": "present",
+                "freshness": "refresh",
+            },
+            {
+                "fact_id": "fact-run-as-uid",
+                "predicate": "process.uid",
+                "expected": True,
+                "comparison": "present",
+                "freshness": "refresh",
+            },
+        ],
         "freshness": "refresh",
     }])
 
-    assert requests == [{
-        "probe": "proc_environment_identity",
-        "args": {"pid": 1234},
-        "purpose": "resolve interpreter environment",
-        "required_facts": ["python executable", "run_as uid"],
-        "freshness": "refresh",
-    }]
+    assert requests[0]["probe"] == "proc_environment_identity"
+    assert requests[0]["args"] == {"pids": [1234]}
+    assert requests[0]["gap_id"] == "gap-process-identity"
+    assert requests[0]["covers"] == [
+        "fact-python-executable", "fact-run-as-uid",
+    ]
+    assert requests[0]["subject"] == {"kind": "pid_set", "value": [1234]}
+    assert all(
+        isinstance(item, dict) for item in requests[0]["required_facts"]
+    )
 
 
 def test_verifier_goal_decides_replan_after_supported_execution_failure():
@@ -975,3 +996,51 @@ def test_plan_execution_rejects_incomplete_or_failed_step_evidence():
 
     assert outcome.status == "failed"
     assert set(outcome.failed_criteria) == {"recover-runtime", "restart-worker"}
+
+
+def test_goal_verifier_preserves_the_structured_evidence_gap_contract():
+    from klonet_agent.ops.privileged.verifier import PrivilegedVerifierAgent
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceConclusion
+
+    outcome = PrivilegedVerifierAgent._goal_outcome(
+        {
+            "status": "need_evidence",
+            "reason": "需要确认指定源码入口",
+            "evidence_requests": [{
+                "probe": "project_layout",
+                "args": {"project_roots": ["/srv/source"]},
+                "purpose": "检查用户冻结的源码目录",
+                "gap_id": "gap-source-layout",
+                "affected_steps": ["prepare-source"],
+                "subject": {"kind": "path", "value": "/srv/source"},
+                "scope": ["/srv/source"],
+                "exclusions": ["nginx"],
+                "required_facts": [{
+                    "fact_id": "fact-source-entry-files",
+                    "predicate": "project.entry_files",
+                    "expected": ["master_main.py", "worker_main.py"],
+                    "comparison": "contains_all",
+                    "freshness": "cached",
+                }],
+            }],
+        },
+        set(),
+        goal="创建平台",
+        conclusion=EvidenceConclusion(),
+        phase="readonly",
+        goal_kind="execution",
+    )
+
+    request = outcome.evidence_requests[0]
+    assert request.gap_id == "gap-source-layout"
+    assert request.affected_steps == ("prepare-source",)
+    assert request.subject.to_dict() == {"kind": "path", "value": "/srv/source"}
+    assert request.scope == ("/srv/source",)
+    assert request.exclusions == ("nginx",)
+    assert request.required_facts[0].to_dict() == {
+        "fact_id": "fact-source-entry-files",
+        "predicate": "project.entry_files",
+        "expected": ["master_main.py", "worker_main.py"],
+        "comparison": "contains_all",
+        "freshness": "cached",
+    }

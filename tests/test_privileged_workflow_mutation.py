@@ -1382,12 +1382,20 @@ def test_change_planner_preserves_unregistered_semantic_evidence_for_discovery_b
         "probe": "command_available",
         "args": {"commands": ["screen"]},
         "purpose": "find screen",
-        "required_facts": ["screen executable path"],
+        "required_facts": [{
+            "fact_id": "fact-screen-executable",
+            "predicate": "command.path",
+            "expected": True,
+            "comparison": "present",
+        }],
+        "subject": {"kind": "command", "value": "screen"},
         "freshness": "refresh",
     }])
 
     assert requests[0].probe == "command_available"
-    assert requests[0].required_facts == ("screen executable path",)
+    assert requests[0].covers == ("fact-screen-executable",)
+    assert requests[0].required_facts[0].predicate == "command.path"
+    assert requests[0].subject.value == "screen"
     assert requests[0].freshness == "refresh"
 
 
@@ -1476,9 +1484,9 @@ def test_structured_all_platform_restart_requests_authoritative_inventory_first(
     assert [item.probe for item in outcome.evidence_requests] == [
         "running_platforms"
     ]
-    assert "runtime instance project roots" in (
-        outcome.evidence_requests[0].required_facts
-    )
+    assert "platform.inventory" in {
+        item.predicate for item in outcome.evidence_requests[0].required_facts
+    }
 
 
 def test_v4_e2e_alias_uses_deterministic_restart_and_existing_ports():
@@ -3460,7 +3468,13 @@ def test_change_planner_forces_bounded_function_schema():
         "enum": ["need_evidence", "ready", "blocked"],
     }
     assert properties["probe_requests"]["items"]["required"] == [
-        "probe", "args", "purpose", "required_facts",
+        "probe", "args", "purpose", "required_facts", "subject",
+    ]
+    fact_schema = properties["probe_requests"]["items"]["properties"][
+        "required_facts"
+    ]["items"]
+    assert fact_schema["required"] == [
+        "fact_id", "predicate", "expected", "comparison",
     ]
     assert properties["resources"]["items"]["required"] == [
         "name", "kind", "status", "role", "value", "source", "consumers",
@@ -3664,8 +3678,9 @@ def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
 
     data = {
         "changes": [
-            {"step_id": "clone", "title": "Clone Git source repository", "objective": "Clone source", "depends_on": []},
+            {"step_id": "clone", "title": "Synchronize current working tree", "objective": "Copy source project", "depends_on": []},
             {"step_id": "redis", "title": "Provision Redis container", "objective": "Create new Redis container", "depends_on": []},
+            {"step_id": "config", "title": "Configure application", "objective": "Write vemu_config/config.py", "depends_on": []},
             {"step_id": "runtime", "title": "Start complete Screen runtime", "objective": "Start master celery worker web terminal", "depends_on": []},
             {"step_id": "nginx", "title": "Activate Nginx site", "objective": "Reload Nginx", "depends_on": []},
         ]
@@ -3686,10 +3701,38 @@ def test_planner_compiles_runtime_dependencies_and_stale_nginx_consumers():
 
     by_id = {item["step_id"]: item for item in data["changes"]}
     assert by_id["redis"]["depends_on"] == ["clone"]
-    assert by_id["runtime"]["depends_on"] == ["redis"]
+    assert by_id["config"]["depends_on"] == ["redis"]
+    assert by_id["runtime"]["depends_on"] == ["config"]
     assert by_id["nginx"]["depends_on"] == ["runtime"]
     assert resources[0].consumers == ["nginx.listen"]
     assert resources[1].consumers == ["nginx.instance_root"]
+
+
+def test_planner_normalizes_complete_deployment_to_stable_semantic_stage_order():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    data = {
+        "changes": [
+            {"step_id": "runtime", "title": "Launch Screen services", "objective": "Start master celery worker web terminal", "depends_on": []},
+            {"step_id": "config", "title": "Write configuration", "objective": "Configure vemu_config/config.py", "depends_on": []},
+            {"step_id": "source", "title": "Copy source project", "objective": "Synchronize current working tree", "depends_on": []},
+            {"step_id": "deps", "title": "Prepare containers", "objective": "Create MySQL Redis RabbitMQ containers", "depends_on": []},
+        ]
+    }
+
+    ChangePlannerAgent._normalize_semantic_dependencies(data)
+    ChangePlannerAgent._normalize_change_order(data)
+
+    assert [item["step_id"] for item in data["changes"]] == [
+        "source", "deps", "config", "runtime",
+    ]
+    assert ChangePlannerAgent._semantic_deployment_stages(data["changes"]) == {
+        "source": ["source"],
+        "dependencies": ["deps"],
+        "configuration": ["config"],
+        "runtime": ["runtime"],
+        "nginx": [],
+    }
 
 
 def test_planner_prunes_stale_consumers_and_grounds_future_paths_to_matching_steps():
@@ -4116,6 +4159,58 @@ def test_sync_directory_deployment_does_not_require_git_resources_or_repository_
     errors = ChangePlannerAgent._ready_contract_errors(data, goal, resources, bundle)
     assert not any("source_remote" in item or "source_branch" in item for item in errors)
     assert "instance_root requires a .repository consumer" not in errors
+
+
+def test_deployment_contract_binds_labeled_user_paths_to_their_exact_roles():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, PlanResource,
+    )
+
+    goal = (
+        "创建新平台，源码模板目录：/srv/source，目标目录：/srv/target，"
+        "使用 sync_directory，自动选择未占用端口"
+    )
+    data = {
+        "goal": goal,
+        "changes": [{
+            "step_id": "change-1",
+            "title": "Sync source",
+            "objective": "Use sync_directory with master_port=47001",
+            "expected_changes": ["target exists"],
+            "postconditions": [{
+                "checker": "file_exists", "args": {"path": "/srv/target"},
+            }],
+        }],
+    }
+    resources = [
+        PlanResource(
+            "target", "path", "frozen", "instance_root", "/srv/target",
+            "user_input", consumers=["change-1.target_path"],
+        ),
+        PlanResource(
+            "wrong_source", "path", "frozen", "source_directory", "/srv/wrong",
+            "planner", consumers=["change-1.source_path"],
+        ),
+        PlanResource(
+            "source_evidence", "path", "frozen", "evidence_path", "/srv/source",
+            "planner", consumers=["change-1.evidence_path"],
+        ),
+        PlanResource(
+            "name", "identifier", "frozen", "instance_identifier", "target",
+            "user_input", consumers=["change-1.instance_name"],
+        ),
+        PlanResource(
+            "port", "port", "frozen", "master_port", 47001,
+            "checked", consumers=["change-1.master_port"],
+        ),
+    ]
+
+    errors = ChangePlannerAgent._ready_contract_errors(
+        data, goal, resources, EvidenceBundle(goal=goal),
+    )
+
+    assert "source_directory does not preserve user decision=/srv/source" in errors
 
 
 def test_screen_component_suffixes_are_not_treated_as_goal_paths():

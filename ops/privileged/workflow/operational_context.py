@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from klonet_agent.ops.privileged.workflow.contracts import (
+    EvidenceSubject,
     EvidenceBundle,
     EvidenceRecord,
+    FactObservation,
     ProbeRequest,
     _utc_now,
 )
@@ -83,13 +85,25 @@ class OperationalContextSnapshot:
                         "probe": item.request.probe,
                         "args": item.request.args,
                         "purpose": item.request.purpose,
-                        "required_facts": list(item.request.required_facts),
+                        "required_facts": [
+                            fact.to_dict() for fact in item.request.required_facts
+                        ],
                         "freshness": item.request.freshness,
                         "gap_id": item.request.gap_id,
                         "affected_steps": list(item.request.affected_steps),
+                        "subject": (
+                            item.request.subject.to_dict()
+                            if item.request.subject is not None else None
+                        ),
+                        "scope": list(item.request.scope),
+                        "exclusions": list(item.request.exclusions),
                         "output": redact_sensitive_text(item.output),
                         "status": item.status,
                         "collected_at": item.collected_at,
+                        "observations": [
+                            observation.to_dict()
+                            for observation in item.observations
+                        ],
                     }
                     for item in self.evidence.records
                 ],
@@ -108,10 +122,13 @@ class OperationalContextSnapshot:
                 str(raw.get("probe") or ""),
                 dict(raw.get("args") or {}),
                 str(raw.get("purpose") or ""),
-                tuple(str(item) for item in raw.get("required_facts") or []),
+                tuple(raw.get("required_facts") or []),
                 str(raw.get("freshness") or "cached"),
                 str(raw.get("gap_id") or ""),
                 tuple(str(item) for item in raw.get("affected_steps") or []),
+                EvidenceSubject.from_value(raw.get("subject")),
+                tuple(str(item) for item in raw.get("scope") or []),
+                tuple(str(item) for item in raw.get("exclusions") or []),
             )
             bundle.add(EvidenceRecord(
                 evidence_id=str(raw.get("evidence_id") or "ev-" + request.cache_key[:16]),
@@ -119,6 +136,11 @@ class OperationalContextSnapshot:
                 output=str(raw.get("output") or ""),
                 status=str(raw.get("status") or "available"),
                 collected_at=str(raw.get("collected_at") or _utc_now()),
+                observations=tuple(
+                    FactObservation.from_dict(item)
+                    for item in raw.get("observations") or []
+                    if isinstance(item, dict)
+                ),
             ))
         return cls(
             resolved_goal=str(data.get("resolved_goal") or ""),

@@ -34,15 +34,247 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+FACT_COMPARISONS = {"equals", "contains", "contains_all", "present"}
+FACT_OBSERVATION_STATUSES = {"confirmed", "contradicted", "unresolved"}
+
+
+_DEPLOYMENT_PATH_PATTERN = (
+    r"/[A-Za-z0-9_.+@%=-]+(?:/[A-Za-z0-9_.+@%=-]+)+"
+)
+
+
+def extract_labeled_deployment_paths(text: str) -> dict[str, str]:
+    """Return deployment paths that the user explicitly assigned a role.
+
+    This is the single ingestion boundary for source/target path wording.  The
+    returned values are user decisions, not discoverable runtime facts.
+    """
+
+    value = str(text or "")
+    labels = {
+        "source_directory": (
+            r"(?:源码模板(?:目录)?|源码(?:来源|路径|目录)|"
+            r"source(?:\s+(?:template|directory|path))?)"
+        ),
+        "target_directory": (
+            r"(?:目标(?:实例)?(?:根)?目录|部署目录|实例目录|"
+            r"target(?:\s+(?:directory|path))?)"
+        ),
+    }
+    result: dict[str, str] = {}
+    assignment = (
+        r"\s*(?:(?:固定\s*)?(?:使用|采用|选用|取自|来自|设为|为|是)?"
+        r"\s*[:：=]?\s*)`?(" + _DEPLOYMENT_PATH_PATTERN + r")"
+    )
+    for role, label in labels.items():
+        match = re.search(label + assignment, value, re.I)
+        if match is not None:
+            result[role] = match.group(1).rstrip("/.,;:，；。`").rstrip("/") or "/"
+
+    if "source_directory" not in result:
+        source_match = re.search(
+            r"(?:从|from)\s*`?(" + _DEPLOYMENT_PATH_PATTERN + r")`?"
+            r"[^\n。；;]{0,40}(?:复制|同步|copy|sync)",
+            value,
+            re.I,
+        )
+        if source_match is not None:
+            result["source_directory"] = (
+                source_match.group(1).rstrip("/.,;:，；。`").rstrip("/") or "/"
+            )
+    return result
+
+
+def _stable_fact_id(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+    if not normalized:
+        normalized = hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+    return "fact-" + normalized[:120]
+
+
+@dataclass(frozen=True)
+class EvidenceSubject:
+    """The exact object an evidence gap is allowed to inspect."""
+
+    kind: str
+    value: Any
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{1,63}", str(self.kind or "")):
+            raise ValueError("invalid evidence subject kind")
+        if self.value in (None, "", [], {}):
+            raise ValueError("evidence subject value is required")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "value": self.value}
+
+    @classmethod
+    def from_value(cls, value: Any) -> "EvidenceSubject | None":
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return None
+        kind = str(value.get("kind") or "").strip()
+        subject_value = value.get("value")
+        return cls(kind, subject_value) if kind and subject_value not in (None, "") else None
+
+
+@dataclass(frozen=True)
+class FactRequirement:
+    """One stable, deterministically comparable fact required by a gap."""
+
+    fact_id: str
+    predicate: str
+    expected: Any = True
+    comparison: str = "equals"
+    freshness: str = "cached"
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"fact-[-A-Za-z0-9_.:]{3,160}", self.fact_id):
+            raise ValueError("invalid fact id")
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{1,95}", self.predicate):
+            raise ValueError("invalid fact predicate")
+        if self.comparison not in FACT_COMPARISONS:
+            raise ValueError("invalid fact comparison")
+        if self.freshness not in {"cached", "refresh"}:
+            raise ValueError("invalid fact freshness")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "predicate": self.predicate,
+            "expected": self.expected,
+            "comparison": self.comparison,
+            "freshness": self.freshness,
+        }
+
+    @classmethod
+    def from_value(
+        cls,
+        value: Any,
+        *,
+        freshness: str = "cached",
+    ) -> "FactRequirement":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            predicate = str(value.get("predicate") or "").strip()
+            raw_fact_id = str(value.get("fact_id") or "").strip()
+            fact_id = raw_fact_id
+            if not fact_id and predicate:
+                fact_id = _stable_fact_id(predicate)
+            elif not re.fullmatch(r"fact-[-A-Za-z0-9_.:]{3,160}", fact_id):
+                # Normalize provider-generated identifiers once at ingress;
+                # the runtime protocol and persisted form remain canonical.
+                fact_id = _stable_fact_id(raw_fact_id or predicate)
+            comparison = str(value.get("comparison") or "equals")
+            expected = value.get("expected", True)
+            if comparison == "contains_all" and isinstance(expected, str):
+                expected = [
+                    item.strip() for item in expected.split(",")
+                    if item.strip()
+                ]
+            if predicate.startswith("port.") and isinstance(expected, list):
+                expected = [
+                    int(item) if str(item).isdigit() else item
+                    for item in expected
+                ]
+            return cls(
+                fact_id=fact_id,
+                predicate=predicate,
+                expected=expected,
+                comparison=comparison,
+                freshness=str(value.get("freshness") or freshness),
+            )
+        # Persisted pre-structured requests are normalized once at ingress.
+        # Runtime code only sees FactRequirement; serializers never emit the
+        # legacy string protocol again.
+        text = str(value or "").strip()
+        lowered = text.lower()
+        if "port" in lowered and any(word in lowered for word in ("avail", "free", "空闲", "可用")):
+            predicate = "port.available"
+        elif any(word in lowered for word in ("source_directory", "source path", "源码路径", "path exists")):
+            predicate = "path.exists"
+        elif any(word in lowered for word in ("entry_files", "entry files", "入口文件")):
+            predicate = "project.entry_files"
+        elif lowered in {"cwd", "master cwd", "worker cwd", "process cwd"}:
+            predicate = "process.cwd"
+        elif any(word in lowered for word in ("run_as_uid", "process uid", "运行用户")) or lowered == "uid":
+            predicate = "process.uid"
+        elif "python executable" in lowered or "python解释器" in lowered:
+            predicate = "process.python_executable"
+        elif "cmdline" in lowered or "启动参数" in lowered:
+            predicate = "process.cmdline"
+        elif "platform_health" in lowered or "platform health" in lowered or "平台健康" in lowered:
+            predicate = "platform.health"
+        elif any(word in lowered for word in ("runtime instance", "project roots", "平台实例")):
+            predicate = "platform.inventory"
+        elif any(word in lowered for word in ("managed component roles", "runtime roles", "运行角色")):
+            predicate = "runtime.roles"
+        elif any(word in lowered for word in ("runtime identit", "进程身份")):
+            predicate = "runtime.identity"
+        elif any(word in lowered for word in ("configured component ports", "runtime ports", "配置端口")):
+            predicate = "runtime.ports"
+        elif any(word in lowered for word in ("startup contract", "启动合同")):
+            predicate = "runtime.startup_contract"
+        else:
+            predicate = re.sub(r"[^a-z0-9]+", ".", lowered).strip(".")
+        if not predicate or "." not in predicate:
+            predicate = "legacy." + (predicate or "fact")
+        return cls(
+            fact_id=_stable_fact_id(text),
+            predicate=predicate[:96],
+            expected=True,
+            comparison="present",
+            freshness=freshness,
+        )
+
+
+@dataclass(frozen=True)
+class FactObservation:
+    fact_id: str
+    status: str
+    value: Any = None
+    extractor: str = ""
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"fact-[-A-Za-z0-9_.:]{3,160}", self.fact_id):
+            raise ValueError("invalid observed fact id")
+        if self.status not in FACT_OBSERVATION_STATUSES:
+            raise ValueError("invalid fact observation status")
+        if not str(self.extractor or "").strip():
+            raise ValueError("fact observation requires extractor")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fact_id": self.fact_id,
+            "status": self.status,
+            "value": self.value,
+            "extractor": self.extractor,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "FactObservation":
+        return cls(
+            fact_id=str(value.get("fact_id") or ""),
+            status=str(value.get("status") or "unresolved"),
+            value=value.get("value"),
+            extractor=str(value.get("extractor") or "persisted"),
+        )
+
+
 @dataclass(frozen=True)
 class ProbeRequest:
     probe: str
     args: dict[str, Any]
     purpose: str
-    required_facts: tuple[str, ...] = ()
+    required_facts: tuple[FactRequirement, ...] = ()
     freshness: str = "cached"
     gap_id: str = ""
     affected_steps: tuple[str, ...] = ()
+    subject: EvidenceSubject | None = None
+    scope: tuple[str, ...] = ()
+    exclusions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.probe or "").strip():
@@ -51,16 +283,36 @@ class ProbeRequest:
             raise ValueError("probe args must be an object")
         if self.freshness not in {"cached", "refresh"}:
             raise ValueError("probe freshness must be cached or refresh")
-        if any(not str(item or "").strip() for item in self.required_facts):
-            raise ValueError("required_facts cannot contain empty values")
+        normalized_facts = tuple(
+            FactRequirement.from_value(item, freshness=self.freshness)
+            for item in self.required_facts
+        )
+        fact_ids = [item.fact_id for item in normalized_facts]
+        if len(fact_ids) != len(set(fact_ids)):
+            raise ValueError("required_facts must use unique fact ids")
+        object.__setattr__(self, "required_facts", normalized_facts)
+        normalized_subject = EvidenceSubject.from_value(self.subject)
+        inferred_subject = infer_evidence_subject(self.probe, self.args)
+        if normalized_subject is None:
+            normalized_subject = inferred_subject
+        elif inferred_subject is not None and normalized_subject != inferred_subject:
+            raise ValueError("probe args do not inspect the declared evidence subject")
+        if normalized_subject is not self.subject:
+            object.__setattr__(self, "subject", normalized_subject)
         if self.gap_id and not re.fullmatch(r"gap-[-A-Za-z0-9_.:]{3,160}", self.gap_id):
             raise ValueError("invalid evidence gap id")
         if any(not str(item or "").strip() for item in self.affected_steps):
             raise ValueError("affected_steps cannot contain empty values")
+        if any(not str(item or "").strip() for item in (*self.scope, *self.exclusions)):
+            raise ValueError("evidence scope cannot contain empty values")
 
     @property
     def cache_key(self) -> str:
-        payload = {"probe": self.probe.strip(), "args": self.args}
+        payload = {
+            "probe": self.probe.strip(),
+            "args": self.args,
+            "subject": self.subject.to_dict() if self.subject is not None else None,
+        }
         return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
 
     @property
@@ -68,6 +320,30 @@ class ProbeRequest:
         """Identify one stable semantic gap independently of prompt wording."""
 
         return self.gap_id or "gap-" + self.cache_key[:24]
+
+    @property
+    def request_id(self) -> str:
+        return "probe-" + self.cache_key[:20]
+
+    @property
+    def covers(self) -> tuple[str, ...]:
+        return tuple(item.fact_id for item in self.required_facts)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "probe": self.probe,
+            "args": self.args,
+            "purpose": self.purpose,
+            "required_facts": [item.to_dict() for item in self.required_facts],
+            "covers": list(self.covers),
+            "freshness": self.freshness,
+            "gap_id": self.gap_id,
+            "affected_steps": list(self.affected_steps),
+            "subject": self.subject.to_dict() if self.subject is not None else None,
+            "scope": list(self.scope),
+            "exclusions": list(self.exclusions),
+        }
 
 
 def normalize_probe_request(
@@ -78,6 +354,17 @@ def normalize_probe_request(
 
     normalized_probe = str(probe or "").strip()
     normalized_args = dict(args)
+    for key in (
+        "project_roots", "roots", "paths", "ports", "pids",
+        "services", "modules", "keywords",
+    ):
+        raw = normalized_args.get(key)
+        if raw in (None, "", [], {}):
+            continue
+        if not isinstance(raw, list):
+            normalized_args[key] = [
+                item.strip() for item in str(raw).split(",") if item.strip()
+            ]
     path = str(normalized_args.get("path") or "").strip()
     if normalized_probe == "logs" and Path(path).suffix.lower() in {
         ".py", ".cfg", ".conf", ".ini", ".json", ".toml", ".yaml", ".yml",
@@ -86,6 +373,34 @@ def normalize_probe_request(
         normalized_args.setdefault("view", "head")
         normalized_args.setdefault("max_chars", 20000)
     return normalized_probe, normalized_args
+
+
+def infer_evidence_subject(
+    probe: str,
+    args: dict[str, Any],
+) -> EvidenceSubject | None:
+    """Derive a bounded subject from typed probe arguments when omitted."""
+
+    mappings = (
+        (("path", "project_root", "repository", "script_dir"), "path"),
+        (("project_roots", "roots", "paths"), "path_set"),
+        (("ports",), "port_set"),
+        (("pids",), "pid_set"),
+        (("session",), "screen_session"),
+        (("services",), "service_set"),
+    )
+    for keys, kind in mappings:
+        for key in keys:
+            value = args.get(key)
+            if value not in (None, "", [], {}):
+                if kind.endswith("_set") and not isinstance(value, list):
+                    value = [value]
+                if kind == "path_set" and isinstance(value, list) and len(value) == 1:
+                    return EvidenceSubject("path", value[0])
+                return EvidenceSubject(kind, value)
+    if str(probe or "").strip() == "running_platforms":
+        return EvidenceSubject("host_runtime", "klonet_platforms")
+    return None
 
 
 def normalize_instance_alias(value: str) -> str:
@@ -124,6 +439,7 @@ class EvidenceRecord:
     output: str
     status: str = "available"
     collected_at: str = field(default_factory=_utc_now)
+    observations: tuple[FactObservation, ...] = ()
 
     @classmethod
     def from_probe(
@@ -132,13 +448,54 @@ class EvidenceRecord:
         output: str,
         *,
         status: str = "available",
+        observations: tuple[FactObservation, ...] | list[FactObservation] = (),
     ) -> "EvidenceRecord":
         return cls(
             evidence_id="ev-" + request.cache_key[:16],
             request=request,
             output=str(output or ""),
             status=status,
+            observations=tuple(observations),
         )
+
+    @property
+    def unresolved_fact_ids(self) -> tuple[str, ...]:
+        by_id = {item.fact_id: item.status for item in self.observations}
+        return tuple(
+            requirement.fact_id
+            for requirement in self.request.required_facts
+            if by_id.get(requirement.fact_id) not in {"confirmed", "contradicted"}
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "evidence_id": self.evidence_id,
+            "request": self.request.to_dict(),
+            "output": self.output,
+            "status": self.status,
+            "collected_at": self.collected_at,
+            "observations": [item.to_dict() for item in self.observations],
+        }
+
+
+@dataclass(frozen=True)
+class EvidenceGapResolution:
+    gap_id: str
+    confirmed_fact_ids: tuple[str, ...] = ()
+    contradicted_fact_ids: tuple[str, ...] = ()
+    unresolved_fact_ids: tuple[str, ...] = ()
+
+    @property
+    def progress_key(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        return self.unresolved_fact_ids, self.contradicted_fact_ids
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "gap_id": self.gap_id,
+            "confirmed_fact_ids": list(self.confirmed_fact_ids),
+            "contradicted_fact_ids": list(self.contradicted_fact_ids),
+            "unresolved_fact_ids": list(self.unresolved_fact_ids),
+        }
 
 
 @dataclass
@@ -182,6 +539,47 @@ class EvidenceBundle:
             item for item in self.records
             if item.request.probe == "klonet_knowledge"
         ]
+
+    def resolve_gap(self, gap_id: str) -> EvidenceGapResolution:
+        """Resolve one evidence gap by stable fact identity, never prose."""
+
+        relevant = [
+            item for item in self.records
+            if item.request.need_key == str(gap_id or "")
+        ]
+        requirements: dict[str, FactRequirement] = {}
+        latest: dict[str, FactObservation] = {}
+        for record in relevant:
+            requirements.update({
+                item.fact_id: item for item in record.request.required_facts
+            })
+            for observation in record.observations:
+                if observation.fact_id in record.request.covers:
+                    latest[observation.fact_id] = observation
+        confirmed = []
+        contradicted = []
+        unresolved = []
+        for fact_id in requirements:
+            status = latest.get(fact_id)
+            if status is not None and status.status == "confirmed":
+                confirmed.append(fact_id)
+            elif status is not None and status.status == "contradicted":
+                contradicted.append(fact_id)
+            else:
+                unresolved.append(fact_id)
+        return EvidenceGapResolution(
+            gap_id=str(gap_id or ""),
+            confirmed_fact_ids=tuple(sorted(confirmed)),
+            contradicted_fact_ids=tuple(sorted(contradicted)),
+            unresolved_fact_ids=tuple(sorted(unresolved)),
+        )
+
+    def gap_resolutions(self) -> dict[str, EvidenceGapResolution]:
+        gap_ids = {
+            item.request.need_key for item in self.records
+            if item.request.required_facts
+        }
+        return {gap_id: self.resolve_gap(gap_id) for gap_id in sorted(gap_ids)}
 
 
 @dataclass(frozen=True)
@@ -542,6 +940,8 @@ class FailureRecord:
     plan_id: str = ""
     evidence_requests: list[ProbeRequest] = field(default_factory=list)
     missing_decisions: list[str] = field(default_factory=list)
+    semantic_step_id: str = ""
+    atomic_step_index: int = -1
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"failure-[A-Za-z0-9_-]{1,64}", self.failure_id):
@@ -559,6 +959,10 @@ class FailureRecord:
             raise ValueError("failure outcome requires reasons")
         if not self.options:
             raise ValueError("failure outcome requires recovery options")
+        if self.atomic_step_index < -1:
+            raise ValueError("invalid failure atomic step index")
+        if self.semantic_step_id and self.stage != "binding":
+            raise ValueError("binding cursor can only be reported at binding stage")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -582,18 +986,12 @@ class FailureRecord:
             "goal_kind": self.goal_kind,
             "plan_id": self.plan_id,
             "evidence_requests": [
-                {
-                    "probe": item.probe,
-                    "args": item.args,
-                    "purpose": item.purpose,
-                    "required_facts": list(item.required_facts),
-                    "freshness": item.freshness,
-                    "gap_id": item.gap_id,
-                    "affected_steps": list(item.affected_steps),
-                }
+                item.to_dict()
                 for item in self.evidence_requests
             ],
             "missing_decisions": list(self.missing_decisions),
+            "semantic_step_id": self.semantic_step_id,
+            "atomic_step_index": self.atomic_step_index,
         }
 
     @classmethod
@@ -632,13 +1030,13 @@ class FailureRecord:
                     str(item.get("probe") or ""),
                     dict(item.get("args") or {}),
                     str(item.get("purpose") or "补齐失败恢复所需事实"),
-                    tuple(
-                        str(value) for value in item.get("required_facts") or []
-                        if str(value).strip()
-                    ),
+                    tuple(item.get("required_facts") or []),
                     str(item.get("freshness") or "cached"),
                     str(item.get("gap_id") or ""),
                     tuple(str(value) for value in item.get("affected_steps") or []),
+                    EvidenceSubject.from_value(item.get("subject")),
+                    tuple(str(value) for value in item.get("scope") or []),
+                    tuple(str(value) for value in item.get("exclusions") or []),
                 )
                 for item in data.get("evidence_requests") or []
                 if isinstance(item, dict)
@@ -647,6 +1045,11 @@ class FailureRecord:
                 str(item) for item in data.get("missing_decisions") or []
                 if str(item).strip()
             ],
+            semantic_step_id=str(data.get("semantic_step_id") or ""),
+            atomic_step_index=int(
+                data.get("atomic_step_index")
+                if data.get("atomic_step_index") is not None else -1
+            ),
         )
 
 
@@ -664,6 +1067,7 @@ class ChangePlan:
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
     failure: FailureRecord | None = None
+    binding_cursor: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.plan_id.startswith("priv-ops-"):
@@ -676,6 +1080,15 @@ class ChangePlan:
             raise ValueError("change plan requires steps")
         if self.status not in CHANGE_PLAN_STATUSES:
             raise ValueError("invalid change plan status: %s" % self.status)
+        if self.binding_cursor and str(
+            self.binding_cursor.get("phase") or ""
+        ) != "binding":
+            raise ValueError("invalid change plan binding cursor")
+        if self.binding_cursor:
+            if not str(self.binding_cursor.get("semantic_step_id") or ""):
+                raise ValueError("binding cursor requires semantic_step_id")
+            if int(self.binding_cursor.get("atomic_step_index", -1)) < 0:
+                raise ValueError("binding cursor requires atomic_step_index")
         # The semantic ChangePlan is the sole owner of its resource manifest.
         # Normalize byte-for-byte equivalent declarations here so persisted
         # drafts and every caller observe the same invariant before Binding.
@@ -798,6 +1211,7 @@ class ChangePlan:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "failure": self.failure.to_dict() if self.failure is not None else None,
+            "binding_cursor": dict(self.binding_cursor),
         }
 
     @classmethod
@@ -823,4 +1237,5 @@ class ChangePlan:
             created_at=str(data.get("created_at") or _utc_now()),
             updated_at=str(data.get("updated_at") or _utc_now()),
             failure=FailureRecord.from_dict(data.get("failure")),
+            binding_cursor=dict(data.get("binding_cursor") or {}),
         )

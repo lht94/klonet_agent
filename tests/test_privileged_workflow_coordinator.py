@@ -3020,9 +3020,282 @@ def test_failure_option_reenters_discovery_without_injecting_planning_strategy()
     ]
     assert intent["resolved_project_root"] == "/home/lzl/klonet_v4_e2e"
     assert discovery.targeted[0].freshness == "refresh"
-    assert discovery.targeted[0].required_facts == (
-        "master cwd", "master python executable",
+    assert [
+        item.predicate for item in discovery.targeted[0].required_facts
+    ] == ["process.cwd", "process.python_executable"]
+
+
+def test_continue_binding_timeout_resumes_checkpoint_without_planner_or_discovery():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan, ChangeStep, EvidenceBundle, FailureRecord, GoalOutcome,
+        RecoveryOption,
     )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator, WorkflowResult,
+    )
+    from klonet_agent.ops.privileged.workflow.operational_context import (
+        OperationalContextSnapshot,
+    )
+
+    goal = "创建 test2 平台"
+    plan = ChangePlan.new(
+        goal=goal, risk="medium",
+        steps=[ChangeStep(
+            step_id="provision", title="provision", objective="provision",
+            risk="medium", expected_changes=["container exists"],
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        )],
+    )
+    plan.status = "blocked"
+    plan.binding_cursor = {
+        "phase": "binding", "semantic_step_id": "provision",
+        "atomic_step_index": 2,
+    }
+    failure = FailureRecord(
+        failure_id="failure-binding-timeout",
+        stage="binding",
+        category="binding_provider_transient",
+        summary="binding timeout",
+        technical_reason="APITimeoutError",
+        goal=goal,
+        goal_kind="execution",
+        plan_id=plan.plan_id,
+        semantic_step_id="provision",
+        atomic_step_index=2,
+        selected_option_id="continue_current_goal",
+        options=[RecoveryOption(
+            option_id="continue_current_goal", label="继续处理",
+            description="resume", action="continue_current_goal",
+            recommended=True,
+        )],
+    )
+
+    class Mutation:
+        bind_calls = 0
+
+        def handle_control(self, text):
+            return WorkflowResult(
+                True, "failure_option_selected", "selected", failure=failure,
+            )
+
+        def load_plan(self, plan_id):
+            return plan
+
+        def bind_once(self, resumed, *, evidence_bundle):
+            self.bind_calls += 1
+            assert resumed is plan
+            assert resumed.binding_cursor["atomic_step_index"] == 2
+            resumed.binding_cursor = {}
+            resumed.status = "awaiting_confirmation"
+            return GoalOutcome(
+                "needs_user_decision", user_question="resumed plan", plan=resumed,
+            )
+
+    class ForbiddenDiscovery:
+        def collect(self, *args, **kwargs):
+            raise AssertionError("Binding checkpoint must not restart Discovery")
+
+        def collect_requests(self, *args, **kwargs):
+            raise AssertionError("no evidence refresh was requested")
+
+    class Store:
+        def __init__(self):
+            self.snapshot = OperationalContextSnapshot(
+                resolved_goal=goal,
+                base_goal=goal,
+                active_plan_id=plan.plan_id,
+                evidence=EvidenceBundle(goal=goal),
+            )
+
+        def load(self):
+            return self.snapshot
+
+        def save(self, snapshot):
+            self.snapshot = snapshot
+
+    mutation = Mutation()
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier("conversation"),
+        discovery=ForbiddenDiscovery(),
+        synthesis=object(), response=StubResponse(),
+        mutation_workflow=mutation, verifier=StubGoalVerifier(),
+        context_store=Store(),
+    )
+
+    result = coordinator.handle("选择 1")
+
+    assert result.kind == "awaiting_confirmation"
+    assert result.message == "resumed plan"
+    assert mutation.bind_calls == 1
+
+
+def test_replan_progress_ignores_unmapped_output_and_reports_fact_delta():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, FactObservation, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        _evidence_progress_state, _evidence_progress_summary,
+    )
+
+    request = ProbeRequest(
+        "project_layout",
+        {"project_roots": ["/srv/source"]},
+        "inspect source",
+        (
+            {
+                "fact_id": "fact-source-exists",
+                "predicate": "path.exists",
+                "expected": True,
+                "comparison": "equals",
+            },
+            {
+                "fact_id": "fact-entry-files",
+                "predicate": "project.entry_files",
+                "expected": ["master_main.py"],
+                "comparison": "contains_all",
+            },
+        ),
+        gap_id="gap-source-layout",
+    )
+    bundle = EvidenceBundle(goal="create platform")
+    before = _evidence_progress_state(bundle, [request])
+
+    bundle.add(EvidenceRecord.from_probe(
+        request,
+        "large but unrelated nginx output",
+    ))
+    unrelated = _evidence_progress_state(bundle, [request])
+
+    assert unrelated == before
+
+    bundle.refresh(EvidenceRecord.from_probe(
+        request,
+        "same raw output wording is irrelevant",
+        observations=(FactObservation(
+            "fact-source-exists", "confirmed", True,
+            "project_layout.path.exists",
+        ),),
+    ))
+    after = _evidence_progress_state(bundle, [request])
+
+    assert after != before
+    summary = _evidence_progress_summary(before, after, [request])
+    assert "gap-source-layout" in summary
+    assert "fact-source-exists" in summary
+    assert "fact-entry-files" in summary
+
+    bundle.refresh(EvidenceRecord.from_probe(
+        request,
+        "duplicate result",
+        observations=(FactObservation(
+            "fact-source-exists", "confirmed", True,
+            "project_layout.path.exists",
+        ),),
+    ))
+    assert _evidence_progress_state(bundle, [request]) == after
+
+
+def test_fuzzy_new_platform_request_asks_boundaries_before_any_discovery():
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator,
+    )
+
+    class ForbiddenDiscovery:
+        def collect(self, *args, **kwargs):
+            raise AssertionError("fuzzy deployment must not start Discovery")
+
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier(
+            "mutating_action", goal_kind="execution", operation="deploy",
+        ),
+        discovery=ForbiddenDiscovery(),
+        synthesis=object(),
+        response=StubResponse(),
+        mutation_workflow=NoMutationWorkflow(),
+        verifier=StubGoalVerifier(),
+    )
+
+    result = coordinator.handle("创建一个新的 Klonet 平台")
+
+    assert result.kind == "clarification"
+    assert "平台名" in result.message
+    assert "目标目录" in result.message
+    assert "源码来源或模板目录" in result.message
+    assert "不会扫描运行时、Git、Nginx 或端口" in result.message
+
+
+def test_complete_new_platform_boundaries_do_not_ask_for_manual_ports():
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        _deployment_boundary_gaps,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import (
+        _explicit_deployment_boundaries,
+    )
+    from klonet_agent.ops.privileged.workflow.change_planner import (
+        ChangePlannerAgent,
+    )
+
+    assert _deployment_boundary_gaps(
+        "创建新平台，平台名 demo，目标目录 /srv/demo，"
+        "源码模板目录 /srv/source，端口自动选择未占用端口"
+    ) == []
+    assert _deployment_boundary_gaps(
+        "创建新平台，实例名 demo，目标目录 /srv/demo，"
+        "源码模板固定使用 /srv/source，复制当前工作树"
+    ) == []
+
+    explicit_goal = (
+        "创建平台，平台实例名固定为 create_agent_e2e_final_0829；"
+        "源码目录固定为 /home/lzl/klonet_agent；"
+        "目标实例根目录固定为 /home/lzl/create_agent_e2e_final_0829/vemu_uestc"
+    )
+    assert _deployment_boundary_gaps(explicit_goal) == []
+    assert _explicit_deployment_boundaries(explicit_goal) == {
+        "source_directory": "/home/lzl/klonet_agent",
+        "target_directory": "/home/lzl/create_agent_e2e_final_0829/vemu_uestc",
+    }
+    assert ChangePlannerAgent._labeled_deployment_paths(explicit_goal) == {
+        "source_directory": "/home/lzl/klonet_agent",
+        "instance_root": "/home/lzl/create_agent_e2e_final_0829/vemu_uestc",
+    }
+
+
+def test_show_priv_evidence_returns_only_explicitly_requested_redacted_raw_output():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.coordinator import (
+        PrivilegedOpsCoordinator,
+    )
+    from klonet_agent.ops.privileged.workflow.operational_context import (
+        OperationalContextSnapshot,
+    )
+
+    bundle = EvidenceBundle(goal="inspect")
+    record = bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("ops_file", {"path": "/srv/app/config.py"}, "inspect"),
+        "status=ok password=super-secret-token",
+    ))
+
+    class Store:
+        def load(self):
+            return OperationalContextSnapshot(
+                resolved_goal="inspect", base_goal="inspect", evidence=bundle,
+            )
+
+    coordinator = PrivilegedOpsCoordinator(
+        classifier=StubClassifier("conversation"),
+        discovery=object(), synthesis=object(), response=StubResponse(),
+        mutation_workflow=NoMutationWorkflow(), verifier=StubGoalVerifier(),
+        context_store=Store(),
+    )
+
+    result = coordinator.handle("show-priv-evidence %s" % record.evidence_id)
+
+    assert result.kind == "technical_details"
+    assert "status=ok" in result.message
+    assert "super-secret-token" not in result.message
+    assert "已脱敏" in result.message
 
 
 def test_failure_direction_is_recorded_as_decision_without_rewriting_base_goal():
@@ -3230,7 +3503,13 @@ def test_operational_context_persists_goal_locale_and_only_reuses_static_evidenc
         item for item in restored.evidence.records
         if item.request.probe == "process"
     )
-    assert process.request.required_facts == ("pid", "cwd", "full cmdline")
+    assert [item.fact_id for item in process.request.required_facts] == [
+        "fact-pid", "fact-cwd", "fact-full-cmdline",
+    ]
+    assert all(
+        isinstance(item.to_dict(), dict)
+        for item in process.request.required_facts
+    )
     assert process.request.freshness == "refresh"
     assert restored.output_locale == "zh-CN"
     assert restored.target_roots == ["/srv/app"]

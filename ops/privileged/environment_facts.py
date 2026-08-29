@@ -185,6 +185,18 @@ class UnifiedEnvironmentFacts:
 class EnvironmentFactCollector:
     """Collect bounded read-only facts without returning secret values."""
 
+    def collect_project_layouts(
+        self,
+        candidate_roots: list[str],
+    ) -> UnifiedEnvironmentFacts:
+        """Inspect only the explicitly named project roots."""
+
+        return UnifiedEnvironmentFacts(projects=tuple(
+            fact
+            for raw in candidate_roots
+            if (fact := self._project_layout(Path(raw).expanduser())) is not None
+        ))
+
     def collect(self, candidate_roots: list[str]) -> UnifiedEnvironmentFacts:
         projects = tuple(
             fact

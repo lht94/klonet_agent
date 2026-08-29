@@ -20,6 +20,100 @@ class FakeLLM:
         )
 
 
+def test_invalid_fact_comparison_is_repaired_at_discovery_contract_boundary():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    invalid = json.dumps({
+        "status": "need_evidence",
+        "probe_requests": [{
+            "probe": "ports",
+            "args": {"ports": [47001]},
+            "purpose": "check port",
+            "required_facts": [{
+                "fact_id": "fact-port-free",
+                "predicate": "port.available",
+                "expected": 47001,
+                "comparison": "is_free",
+            }],
+            "subject": {"kind": "port_set", "value": [47001]},
+        }],
+    })
+    llm = FakeLLM([invalid, json.dumps({"status": "ready"})])
+
+    bundle = DiscoveryAgent(
+        llm, probe_runner=lambda requests: "must not run",
+    ).collect("inspect port")
+
+    assert bundle.blocked_reason == ""
+    assert len(llm.calls) == 2
+    repair = llm.calls[1]["messages"][-1]["content"]
+    assert "equals, contains, contains_all, or present" in repair
+
+
+def test_registered_probe_predicate_mismatch_is_repaired_before_execution():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    mismatched = json.dumps({
+        "status": "need_evidence",
+        "probe_requests": [{
+            "probe": "ports",
+            "args": {"ports": [47001]},
+            "purpose": "check port",
+            "required_facts": [{
+                "fact_id": "fact-port-free",
+                "predicate": "port.is_free",
+                "expected": 47001,
+                "comparison": "contains",
+            }],
+            "subject": {"kind": "port_set", "value": [47001]},
+        }],
+    })
+    llm = FakeLLM([mismatched, json.dumps({"status": "ready"})])
+    calls = []
+
+    bundle = DiscoveryAgent(
+        llm, probe_runner=lambda requests: calls.append(requests) or "unused",
+    ).collect("inspect port")
+
+    assert bundle.blocked_reason == ""
+    assert calls == []
+    repair = llm.calls[1]["messages"][-1]["content"]
+    assert "supported=port.available" in repair
+
+
+def test_provider_scalar_probe_args_are_normalized_before_registered_execution():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    request = json.dumps({
+        "status": "need_evidence",
+        "probe_requests": [{
+            "probe": "ports",
+            "args": {"ports": "45553,45554"},
+            "purpose": "freeze occupied ports",
+            "required_facts": [{
+                "fact_id": "fact-existing-ports",
+                "predicate": "port.in_use",
+                "expected": "45553,45554",
+                "comparison": "contains_all",
+            }],
+        }],
+    })
+    llm = FakeLLM([request, json.dumps({"status": "ready"})])
+    calls = []
+
+    bundle = DiscoveryAgent(
+        llm,
+        probe_runner=lambda values: calls.append(values) or (
+            "inspect_ports\nchecked_ports=45553,45554\n"
+            "occupied_ports=45553,45554\navailable_ports=none"
+        ),
+    ).collect("allocate new ports")
+
+    assert calls[0][0]["args"] == {"ports": ["45553", "45554"]}
+    assert bundle.records[-1].observations[0].status == "confirmed"
+    assert not any(item.request.probe == "readonly_command" for item in bundle.records)
+
+
 def test_user_visible_probe_purpose_is_chinese_even_when_model_purpose_is_english():
     from klonet_agent.ops.privileged.context import _localized_probe_purpose
 
@@ -340,6 +434,32 @@ def test_runtime_inventory_dynamically_grounds_followup_log_path(tmp_path, monke
     refused = builder.run_recovery_diagnostics([
         {"probe": "logs", "args": {"path": str(log)}, "purpose": "new turn"}
     ])
+    assert "path_outside_grounded_project_roots" in refused
+
+
+def test_user_decided_source_root_is_grounded_without_relaxing_other_paths(tmp_path):
+    from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
+
+    source = tmp_path / "source"
+    outside = tmp_path / "outside"
+    source.mkdir()
+    outside.mkdir()
+    builder = PrivilegedPlanContextBuilder()
+    builder.begin_probe_session()
+    builder.register_user_decided_project_root(str(source))
+
+    accepted = builder.run_recovery_diagnostics([{
+        "probe": "project_layout",
+        "args": {"project_roots": [str(source)]},
+        "purpose": "inspect the user-decided source",
+    }])
+    refused = builder.run_recovery_diagnostics([{
+        "probe": "project_layout",
+        "args": {"project_roots": [str(outside)]},
+        "purpose": "inspect an unrelated model-proposed path",
+    }])
+
+    assert "path_outside_grounded_project_roots" not in accepted
     assert "path_outside_grounded_project_roots" in refused
 
 
@@ -885,8 +1005,23 @@ def test_unregistered_evidence_request_binds_safe_readonly_command():
     from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
 
     commands = []
+    request = ProbeRequest(
+        "command_available", {"commands": ["screen"]},
+        "确认 screen 可执行文件", ({
+            "fact_id": "fact-screen-executable",
+            "predicate": "command.path",
+            "expected": "/usr/bin/screen",
+            "comparison": "contains",
+        },), subject={"kind": "command", "value": "screen"},
+    )
     llm = FakeLLM([json.dumps({
         "status": "command", "command": "which screen",
+        "covers": ["fact-screen-executable"],
+        "subject": {"kind": "command", "value": "screen"},
+        "extractors": [{
+            "fact_id": "fact-screen-executable",
+            "kind": "output_contains", "expected": "/usr/bin/screen",
+        }],
         "reason": "locate the executable",
     })])
     agent = DiscoveryAgent(
@@ -898,12 +1033,7 @@ def test_unregistered_evidence_request_binds_safe_readonly_command():
     )
     bundle = EvidenceBundle(goal="确认 screen 命令")
 
-    agent.collect_requests([
-        ProbeRequest(
-            "command_available", {"commands": ["screen"]},
-            "确认 screen 可执行文件", ("screen executable path",),
-        )
-    ], bundle)
+    agent.collect_requests([request], bundle)
 
     assert commands == ["which screen"]
     assert [item.request.probe for item in bundle.records] == ["readonly_command"]
@@ -911,7 +1041,7 @@ def test_unregistered_evidence_request_binds_safe_readonly_command():
     assert "/usr/bin/screen" in bundle.records[0].output
 
 
-def test_registered_probe_uses_shell_only_after_planner_repeats_unmet_fact():
+def test_registered_probe_uses_shell_for_only_the_unresolved_fact_ids():
     from klonet_agent.ops.privileged.workflow.contracts import (
         EvidenceBundle, ProbeRequest,
     )
@@ -920,6 +1050,12 @@ def test_registered_probe_uses_shell_only_after_planner_repeats_unmet_fact():
     commands = []
     llm = FakeLLM([json.dumps({
         "status": "command", "command": "ps -p 1234 -o args=",
+        "covers": ["fact-master-cmdline", "fact-master-python"],
+        "subject": {"kind": "pid_set", "value": [1234]},
+        "extractors": [
+            {"fact_id": "fact-master-cmdline", "kind": "output_contains", "expected": "gunicorn"},
+            {"fact_id": "fact-master-python", "kind": "output_contains", "expected": "/python"},
+        ],
         "reason": "registered evidence lacks full cmdline",
     })])
     agent = DiscoveryAgent(
@@ -933,20 +1069,12 @@ def test_registered_probe_uses_shell_only_after_planner_repeats_unmet_fact():
 
     request = ProbeRequest(
         "process_detail", {"pids": [1234]}, "继承 master 运行身份",
-        ("full cmdline", "python executable"), "refresh",
+        (
+            {"fact_id": "fact-master-cmdline", "predicate": "process.cmdline", "expected": True, "comparison": "present"},
+            {"fact_id": "fact-master-python", "predicate": "process.python_executable", "expected": True, "comparison": "present"},
+        ), "refresh",
     )
     agent.collect_requests([request], bundle)
-
-    # The first registered result returns to Planner/Verifier.  Repeating the
-    # still-unmet fact is the explicit signal that a long-tail supplement is
-    # now warranted.
-    assert commands == []
-    agent.collect_requests([
-        ProbeRequest(
-            request.probe, request.args, request.purpose,
-            request.required_facts, "cached",
-        )
-    ], bundle)
 
     assert commands == ["ps -p 1234 -o args="]
     assert [item.request.probe for item in bundle.records] == [
@@ -965,10 +1093,22 @@ def test_readonly_fallback_does_not_repeat_no_progress_command():
     llm = FakeLLM([
         json.dumps({
             "status": "command", "command": "ls -la /srv/klonet",
+            "covers": ["fact-run-as-uid", "fact-python-executable"],
+            "subject": {"kind": "path", "value": "/srv/klonet"},
+            "extractors": [
+                {"fact_id": "fact-run-as-uid", "kind": "output_nonempty"},
+                {"fact_id": "fact-python-executable", "kind": "output_nonempty"},
+            ],
             "reason": "inspect root",
         }),
         json.dumps({
             "status": "command", "command": "ls -la /srv/klonet",
+            "covers": ["fact-run-as-uid", "fact-python-executable"],
+            "subject": {"kind": "path", "value": "/srv/klonet"},
+            "extractors": [
+                {"fact_id": "fact-run-as-uid", "kind": "output_nonempty"},
+                {"fact_id": "fact-python-executable", "kind": "output_nonempty"},
+            ],
             "reason": "repeat inspection",
         }),
     ])
@@ -980,7 +1120,10 @@ def test_readonly_fallback_does_not_repeat_no_progress_command():
     bundle = EvidenceBundle(goal="find runtime identity")
     request = ProbeRequest(
         "runtime_startup_identity", {"project_root": "/srv/klonet"},
-        "find runtime identity", ("run_as_uid", "python executable"),
+        "find runtime identity", (
+            {"fact_id": "fact-run-as-uid", "predicate": "process.uid", "expected": True, "comparison": "present"},
+            {"fact_id": "fact-python-executable", "predicate": "process.python_executable", "expected": True, "comparison": "present"},
+        ),
         "refresh", "gap-runtime-identity",
     )
 
@@ -1066,6 +1209,10 @@ def test_readonly_fallback_policy_rejection_is_unavailable_evidence():
 
     llm = FakeLLM([json.dumps({
         "status": "command", "command": "ps aux | tee /tmp/processes",
+        "covers": ["fact-process-uid"],
+        "subject": {"kind": "pid_set", "value": [1234]},
+        "extractors": [{"fact_id": "fact-process-uid", "kind": "output_nonempty"}],
+        "scope_expansion_reason": "incorrectly proposes a temporary output path",
         "reason": "unsafe candidate",
     })])
     agent = DiscoveryAgent(
@@ -1078,12 +1225,405 @@ def test_readonly_fallback_policy_rejection_is_unavailable_evidence():
     bundle = EvidenceBundle(goal="inspect")
 
     agent.collect_requests([
-        ProbeRequest("process_owner", {"pid": 1234}, "owner", ("uid",))
+        ProbeRequest(
+            "process_owner", {"pids": [1234]}, "owner", ({
+                "fact_id": "fact-process-uid", "predicate": "process.uid",
+                "expected": True, "comparison": "present",
+            },)
+        )
     ], bundle)
 
     assert bundle.records[0].request.probe == "readonly_command"
     assert bundle.records[0].status == "unavailable"
     assert "PermissionError" in bundle.records[0].output
+
+
+def test_registered_ports_probe_resolves_fact_ids_without_shell_fallback():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    class ForbiddenLLM:
+        def complete(self, **kwargs):
+            raise AssertionError("resolved registered facts must not enter Shell")
+
+    request = ProbeRequest(
+        "ports", {"ports": [47001, 47002]}, "freeze available ports", (
+            {
+                "fact_id": "fact-master-port-free",
+                "predicate": "port.available",
+                "expected": 47001,
+                "comparison": "contains",
+            },
+            {
+                "fact_id": "fact-worker-port-free",
+                "predicate": "port.available",
+                "expected": 47002,
+                "comparison": "contains",
+            },
+        ), gap_id="gap-runtime-ports",
+    )
+    bundle = EvidenceBundle(goal="allocate ports")
+    agent = DiscoveryAgent(
+        ForbiddenLLM(),
+        probe_runner=lambda requests: (
+            "inspect_ports\nchecked_ports=47001,47002\n"
+            "occupied_ports=none\navailable_ports=47001,47002"
+        ),
+    )
+
+    agent.collect_requests([request], bundle)
+
+    assert [item.status for item in bundle.records[0].observations] == [
+        "confirmed", "confirmed",
+    ]
+    assert bundle.resolve_gap("gap-runtime-ports").unresolved_fact_ids == ()
+    assert [item.request.probe for item in bundle.records] == ["ports"]
+
+
+def test_shell_fallback_cannot_expand_a_frozen_path_subject():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    request = ProbeRequest(
+        "long_tail_layout",
+        {"path": "/srv/source"},
+        "check exact source",
+        ({
+            "fact_id": "fact-source-marker",
+            "predicate": "source.marker",
+            "expected": "master_main.py",
+            "comparison": "contains",
+        },),
+        gap_id="gap-source-marker",
+        subject={"kind": "path", "value": "/srv/source"},
+        exclusions=("/etc/nginx",),
+    )
+    llm = FakeLLM([json.dumps({
+        "status": "command",
+        "command": "find /home /root /opt /var -name master_main.py",
+        "covers": ["fact-source-marker"],
+        "subject": {"kind": "path", "value": "/srv/source"},
+        "extractors": [{
+            "fact_id": "fact-source-marker",
+            "kind": "output_contains", "expected": "master_main.py",
+        }],
+        "scope_expansion_reason": "search common deployment roots",
+        "reason": "broad search",
+    })])
+    commands = []
+    bundle = EvidenceBundle(goal="use /srv/source")
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=None,
+        readonly_command_runner=lambda command: commands.append(command) or "",
+    )
+
+    agent.collect_requests([request], bundle)
+
+    assert commands == []
+    assert bundle.records[-1].status == "unavailable"
+    assert "exceeded the frozen path subject" in bundle.records[-1].output
+
+
+def test_shell_fallback_cannot_confirm_equals_fact_from_nonempty_output():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    request = ProbeRequest(
+        "long_tail_owner", {"pids": [1234]}, "resolve exact uid", ({
+            "fact_id": "fact-process-uid",
+            "predicate": "process.uid",
+            "expected": 1000,
+            "comparison": "equals",
+        },), gap_id="gap-process-owner",
+    )
+    llm = FakeLLM([json.dumps({
+        "status": "command",
+        "command": "ps -p 1234 -o uid=",
+        "covers": ["fact-process-uid"],
+        "subject": {"kind": "pid_set", "value": [1234]},
+        "extractors": [{
+            "fact_id": "fact-process-uid", "kind": "output_nonempty",
+        }],
+        "reason": "read uid",
+    })])
+    commands = []
+    bundle = EvidenceBundle(goal="resolve process owner")
+    agent = DiscoveryAgent(
+        llm, probe_runner=None,
+        readonly_command_runner=lambda command: commands.append(command) or "1000",
+    )
+
+    agent.collect_requests([request], bundle)
+
+    assert commands == []
+    assert bundle.records[-1].status == "unavailable"
+    assert "output_nonempty can only resolve" in bundle.records[-1].output
+
+
+def test_project_layout_probe_does_not_read_unrelated_host_configuration(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged.environment_facts import EnvironmentFactCollector
+    from klonet_agent.ops.privileged.probes import _project_layout
+
+    monkeypatch.setattr(
+        EnvironmentFactCollector,
+        "_nginx_facts",
+        lambda self: (_ for _ in ()).throw(
+            AssertionError("project layout must not inspect Nginx")
+        ),
+    )
+
+    output = _project_layout({"project_roots": [str(tmp_path)]})
+
+    data = json.loads(output)
+    assert set(data) == {"schema_version", "projects"}
+
+
+def test_discovery_freezes_and_checks_an_explicit_source_before_model_discovery():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    source = "/srv/source"
+    observed = []
+
+    def run(requests):
+        observed.extend(requests)
+        assert requests == [{
+            "probe": "project_layout",
+            "args": {"project_roots": [source]},
+            "purpose": "检查用户明确提供的源码目录及入口文件",
+        }]
+        return json.dumps({
+            "schema_version": 1,
+            "projects": [{
+                "candidate_root": source,
+                "source_repo_root": source,
+                "runtime_cwd": source,
+                "layout_kind": "source_repository",
+                "violations": [],
+            }],
+        })
+
+    agent = DiscoveryAgent(
+        FakeLLM([json.dumps({"status": "ready"})]),
+        probe_runner=run,
+    )
+
+    bundle = agent.collect(
+        "创建部署，源码模板目录：/srv/source，目标目录：/srv/target；不配置 Nginx",
+    )
+
+    assert observed
+    assert [record.request.probe for record in bundle.records] == [
+        "user_decision", "user_decision", "project_layout",
+    ]
+    source_decision = bundle.records[0]
+    assert source_decision.request.subject.to_dict() == {
+        "kind": "path", "value": source,
+    }
+    assert source_decision.observations[0].status == "confirmed"
+    layout = bundle.records[-1]
+    assert layout.request.subject.to_dict() == {"kind": "path", "value": source}
+    assert layout.request.exclusions == ("nginx",)
+    assert bundle.resolve_gap("gap-explicit-source-layout").unresolved_fact_ids == ()
+
+
+def test_registered_project_layout_parses_production_probe_wrapper():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    output = '''## recovery_probe_1 name=project_layout purpose=inspect source
+{
+  "schema_version": 1,
+  "projects": [{
+    "candidate_root": "/srv/source",
+    "layout_kind": "platform_with_nested_backend",
+    "runtime_cwd": "/srv/source",
+    "source_repo_root": "/srv/source/vemu_uestc",
+    "violations": []
+  }]
+}'''
+    request = ProbeRequest(
+        "project_layout",
+        {"project_roots": ["/srv/source"]},
+        "inspect source",
+        ({
+            "fact_id": "fact-source-exists",
+            "predicate": "path.exists",
+            "expected": True,
+            "comparison": "equals",
+        }, {
+            "fact_id": "fact-source-entries",
+            "predicate": "project.entry_files",
+            "expected": ["master_main.py", "worker_main.py"],
+            "comparison": "contains_all",
+        }),
+        gap_id="gap-source-layout",
+        subject={"kind": "path", "value": "/srv/source"},
+    )
+    llm = FakeLLM([])
+    bundle = EvidenceBundle(goal="inspect source")
+
+    DiscoveryAgent(
+        llm, probe_runner=lambda requests: output,
+    ).collect_requests([request], bundle)
+
+    record = bundle.records[0]
+    assert tuple(
+        item.fact_id for item in record.observations
+        if item.status == "confirmed"
+    ) == ("fact-source-exists", "fact-source-entries")
+    assert not any(item.request.probe == "readonly_command" for item in bundle.records)
+    assert llm.calls == []
+
+
+def test_registered_common_probes_resolve_typed_facts_without_shell():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    outputs = {
+        "git_repository": (
+            "## recovery_probe_1 name=git_repository purpose=inspect\n"
+            "inspect_git_repository\npath=/srv/source inside_work_tree=true "
+            "revision=abc123\nstatus=## main...origin/main\n"
+            "remotes=origin https://example.invalid/repo.git (fetch)"
+        ),
+        "disk": (
+            "## recovery_probe_1 name=disk purpose=inspect\n"
+            "inspect_disk\nFilesystem Size Used Avail Use% Mounted on\n"
+            "/dev/sda 100G 20G 80G 20% /"
+        ),
+        "path_permissions": (
+            "## recovery_probe_1 name=path_permissions purpose=inspect\n"
+            "inspect_path_permissions\n"
+            "path=/srv/source exists=true mode=0o755 uid=1000 gid=1000"
+        ),
+    }
+    requests = [
+        ProbeRequest(
+            "git_repository", {"repository": "/srv/source"}, "git",
+            ({"fact_id": "fact-git-remote", "predicate": "git.remote",
+              "expected": True, "comparison": "present"},),
+            gap_id="gap-git", subject={"kind": "path", "value": "/srv/source"},
+        ),
+        ProbeRequest(
+            "disk", {}, "disk",
+            ({"fact_id": "fact-disk-capacity", "predicate": "disk.capacity",
+              "expected": True, "comparison": "present"},),
+            gap_id="gap-disk",
+        ),
+        ProbeRequest(
+            "path_permissions", {"paths": ["/srv/source"]}, "permissions",
+            ({"fact_id": "fact-path-exists", "predicate": "path.exists",
+              "expected": True, "comparison": "equals"},),
+            gap_id="gap-permissions",
+            subject={"kind": "path", "value": "/srv/source"},
+        ),
+    ]
+    llm = FakeLLM([])
+    bundle = EvidenceBundle(goal="inspect")
+
+    DiscoveryAgent(
+        llm,
+        probe_runner=lambda values: outputs[values[0]["probe"]],
+    ).collect_requests(requests, bundle)
+
+    assert all(
+        observation.status == "confirmed"
+        for record in bundle.records for observation in record.observations
+    )
+    assert not any(item.request.probe == "readonly_command" for item in bundle.records)
+    assert llm.calls == []
+
+
+def test_shell_scope_without_a_known_subject_requires_an_expansion_reason():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    request = ProbeRequest(
+        "long_tail_source_search",
+        {"name": "master_main.py"},
+        "locate source because the user did not provide a path",
+        ({
+            "fact_id": "fact-source-location",
+            "predicate": "source.location",
+            "expected": True,
+            "comparison": "present",
+        },),
+        gap_id="gap-source-location",
+    )
+    llm = FakeLLM([json.dumps({
+        "status": "command",
+        "command": "find /home /opt -name master_main.py",
+        "covers": ["fact-source-location"],
+        "subject": None,
+        "extractors": [{
+            "fact_id": "fact-source-location",
+            "kind": "output_nonempty",
+        }],
+        "reason": "search common roots",
+    })])
+    commands = []
+    bundle = EvidenceBundle(goal="locate source")
+    agent = DiscoveryAgent(
+        llm,
+        probe_runner=None,
+        readonly_command_runner=lambda command: commands.append(command) or "",
+    )
+
+    agent.collect_requests([request], bundle)
+
+    assert commands == []
+    assert "scope expansion reason" in bundle.records[-1].output
+
+
+def test_default_progress_shows_fact_summary_without_raw_probe_output():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    raw = (
+        "inspect_ports\nchecked_ports=47001\noccupied_ports=none\n"
+        "available_ports=47001\n" + "Permission denied /secret/path\n" * 100
+    )
+    progress = []
+    request = ProbeRequest(
+        "ports", {"ports": [47001]}, "check port", ({
+            "fact_id": "fact-port-free",
+            "predicate": "port.available",
+            "expected": 47001,
+            "comparison": "contains",
+        },),
+        gap_id="gap-port",
+    )
+    agent = DiscoveryAgent(
+        FakeLLM([]),
+        probe_runner=lambda requests: raw,
+        on_progress=progress.append,
+    )
+
+    agent.collect_requests([request], EvidenceBundle(goal="check port"))
+
+    rendered = "\n".join(progress)
+    assert "fact-port-free" in rendered
+    assert "confirmed" in rendered
+    assert "Permission denied" not in rendered
+    assert "/secret/path" not in rendered
+    assert "原始输出已保存为 ev-" in rendered
 
 
 def test_ad_hoc_binding_evidence_joins_active_workflow_bundle():

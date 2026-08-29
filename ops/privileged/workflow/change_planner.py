@@ -22,9 +22,12 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     ChangeStep,
     EvidenceBundle,
     EvidenceConclusion,
+    EvidenceSubject,
     GoalOutcome,
     ProbeRequest,
     RuntimeComponentSpec,
+    extract_labeled_deployment_paths,
+    infer_evidence_subject,
     normalize_probe_request,
 )
 from klonet_agent.ops.privileged.workflow.discovery import parse_json_object
@@ -384,8 +387,11 @@ Return one JSON object with status `need_evidence`, `ready`, or `blocked`.
 For need_evidence return at most four semantic read-only probe_requests. Prefer
 a registered probe, but when the catalog cannot express the required fact,
 name the intended capability and let Discovery bind a safe read-only command.
-Every request must state required_facts and may set freshness to `cached` or
-`refresh`. Never emit a command yourself.
+Every request must state one exact subject and structured required_facts. Each
+fact requires fact_id, predicate, expected, comparison, and freshness. Reuse a
+fact_id only for the same subject/predicate/expected. Probe args must inspect
+the same subject. You may also state scope and exclusions. Never emit a command
+yourself.
 Give each unresolved semantic fact a stable gap_id beginning with `gap-` and
 reuse that exact gap_id on every later request for the same missing fact even
 if the probe, wording, or required_facts change. List the semantic step IDs
@@ -2509,7 +2515,40 @@ the complete proposed replacement goal and list what would be superseded.
                                     "purpose": {"type": "string"},
                                     "required_facts": {
                                         "type": "array",
-                                        "items": {"type": "string"},
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "fact_id": {"type": "string"},
+                                                "predicate": {"type": "string"},
+                                                "expected": {},
+                                                "comparison": {
+                                                    "type": "string",
+                                                    "enum": [
+                                                        "equals", "contains",
+                                                        "contains_all", "present",
+                                                    ],
+                                                },
+                                                "freshness": {"type": "string"},
+                                            },
+                                            "required": [
+                                                "fact_id", "predicate", "expected",
+                                                "comparison",
+                                            ],
+                                        },
+                                    },
+                                    "subject": {
+                                        "type": "object",
+                                        "properties": {
+                                            "kind": {"type": "string"},
+                                            "value": {},
+                                        },
+                                        "required": ["kind", "value"],
+                                    },
+                                    "scope": {
+                                        "type": "array", "items": {"type": "string"},
+                                    },
+                                    "exclusions": {
+                                        "type": "array", "items": {"type": "string"},
                                     },
                                     "freshness": {"type": "string"},
                                     "gap_id": {"type": "string"},
@@ -2520,6 +2559,7 @@ the complete proposed replacement goal and list what would be superseded.
                                 },
                                 "required": [
                                     "probe", "args", "purpose", "required_facts",
+                                    "subject",
                                 ],
                                 "additionalProperties": True,
                             },
@@ -3198,43 +3238,97 @@ the complete proposed replacement goal and list what would be superseded.
         data.update(rewritten)
 
     @staticmethod
+    def _semantic_deployment_stages(
+        changes: list[dict[str, Any]],
+    ) -> dict[str, list[str]]:
+        """Classify deployment steps into the stable execution-stage vocabulary."""
+
+        stages = {
+            "source": [],
+            "dependencies": [],
+            "configuration": [],
+            "runtime": [],
+            "nginx": [],
+        }
+        for item in changes:
+            step_id = str(item.get("step_id") or "")
+            if not step_id:
+                continue
+            value = "%s %s" % (
+                item.get("title") or "", item.get("objective") or "",
+            )
+            if (
+                re.search(
+                    r"\b(?:clone|checkout|sync|synchroni[sz]e|copy|mirror)\b|"
+                    r"克隆|检出|同步|复制",
+                    value,
+                    re.I,
+                )
+                and re.search(
+                    r"\b(?:git|repository|source|working tree|project)\b|"
+                    r"仓库|源码|工作树|项目",
+                    value,
+                    re.I,
+                )
+            ):
+                stages["source"].append(step_id)
+            if (
+                re.search(r"mysql|redis|rabbitmq", value, re.I)
+                and re.search(r"containers?\b|容器", value, re.I)
+                and re.search(
+                    r"\b(?:create|provision|prepare|start)\b|创建|部署|准备|启动",
+                    value,
+                    re.I,
+                )
+            ):
+                stages["dependencies"].append(step_id)
+            if (
+                not re.search(r"nginx", value, re.I)
+                and re.search(
+                    r"\b(?:configure|configuration|settings?)\b|"
+                    r"vemu_config|config\.py|配置",
+                    value,
+                    re.I,
+                )
+            ):
+                stages["configuration"].append(step_id)
+            if (
+                re.search(r"\b(?:start|launch)\b|启动", value, re.I)
+                and re.search(
+                    r"screen|master|celery|web.?terminal|worker", value, re.I,
+                )
+                and not re.search(r"mysql|redis|rabbitmq", value, re.I)
+            ):
+                stages["runtime"].append(step_id)
+            if (
+                re.search(r"nginx", value, re.I)
+                and re.search(
+                    r"\b(?:activate|enable|reload|create)\b|"
+                    r"激活|启用|重载|创建",
+                    value,
+                    re.I,
+                )
+            ):
+                stages["nginx"].append(step_id)
+        return stages
+
+    @staticmethod
     def _normalize_semantic_dependencies(data: dict[str, Any]) -> None:
-        """Compile the fixed clone -> stateful -> runtime -> Nginx DAG."""
+        """Compile the fixed source -> deps -> config -> runtime -> Nginx DAG."""
 
         changes = data.get("changes")
         if not isinstance(changes, list):
             return
         valid = [item for item in changes if isinstance(item, dict)]
-        text = lambda item: "%s %s" % (
-            item.get("title") or "", item.get("objective") or ""
-        )
-        clones = [
-            str(item.get("step_id") or "") for item in valid
-            if re.search(r"\b(?:clone|checkout)\b|克隆|检出", text(item), re.I)
-            and re.search(r"\b(?:git|repository|source)\b|仓库|源码", text(item), re.I)
-        ]
-        stateful = [
-            str(item.get("step_id") or "") for item in valid
-            if re.search(r"mysql|redis|rabbitmq", text(item), re.I)
-            and re.search(r"containers?\b|容器", text(item), re.I)
-            and re.search(r"\b(?:create|provision)\b|创建|部署", text(item), re.I)
-        ]
-        runtime = [
-            str(item.get("step_id") or "") for item in valid
-            if re.search(r"\b(?:start|launch)\b|启动", text(item), re.I)
-            and re.search(r"screen|master|celery|web.?terminal|worker", text(item), re.I)
-            and not re.search(r"mysql|redis|rabbitmq", text(item), re.I)
-        ]
-        nginx = [
-            str(item.get("step_id") or "") for item in valid
-            if re.search(r"nginx", text(item), re.I)
-            and re.search(r"\b(?:activate|enable|reload|create)\b|激活|启用|重载|创建", text(item), re.I)
-        ]
-        required_by_id = {
-            **{step_id: clones for step_id in stateful},
-            **{step_id: stateful for step_id in runtime},
-            **{step_id: runtime for step_id in nginx},
-        }
+        stages = ChangePlannerAgent._semantic_deployment_stages(valid)
+        required_by_id: dict[str, list[str]] = {}
+        predecessor: list[str] = []
+        for name in ("source", "dependencies", "configuration", "runtime", "nginx"):
+            current = stages[name]
+            for step_id in current:
+                required_by_id[step_id] = list(predecessor)
+            if current:
+                predecessor = current
         for item in valid:
             step_id = str(item.get("step_id") or "")
             dependencies = item.get("depends_on")
@@ -4976,6 +5070,16 @@ the complete proposed replacement goal and list what would be superseded.
         }
 
     @staticmethod
+    def _labeled_deployment_paths(goal_text: str) -> dict[str, str]:
+        paths = extract_labeled_deployment_paths(goal_text)
+        result = {}
+        if paths.get("source_directory"):
+            result["source_directory"] = paths["source_directory"]
+        if paths.get("target_directory"):
+            result["instance_root"] = paths["target_directory"]
+        return result
+
+    @staticmethod
     def _ready_contract_errors(
         data: dict[str, Any],
         goal: str,
@@ -5111,6 +5215,26 @@ the complete proposed replacement goal and list what would be superseded.
         absent_paths = sorted(explicit_paths - frozen_paths)
         if absent_paths:
             errors.append("goal paths are not frozen=%s" % ",".join(absent_paths))
+        labeled_paths = ChangePlannerAgent._labeled_deployment_paths(original_goal)
+        accepted_roles = {
+            "source_directory": {
+                "source_directory", "source_path", "source_root",
+            },
+            "instance_root": {
+                "instance_root", "target_root", "deployment_root",
+            },
+        }
+        for expected_role, expected_path in labeled_paths.items():
+            if not any(
+                str(item.value).rstrip("/") == expected_path.rstrip("/")
+                and str(item.role or "").lower()
+                in accepted_roles[expected_role]
+                for item in frozen
+            ):
+                errors.append(
+                    "%s does not preserve user decision=%s"
+                    % (expected_role, expected_path)
+                )
         fixed_identifiers = [
             value
             for value in re.findall(
@@ -6858,21 +6982,32 @@ the complete proposed replacement goal and list what would be superseded.
                     args["ports"] = ports[:64]
             elif probe == "ports" and isinstance(args.get("ports"), list):
                 args["ports"] = args["ports"][:64]
+            subject = (
+                EvidenceSubject.from_value(item.get("subject"))
+                or infer_evidence_subject(probe, args)
+            )
             requests.append(
                 ProbeRequest(
                     probe,
                     args,
                     str(item.get("purpose") or "resolve planning evidence gap"),
-                    tuple(
-                        str(value).strip()
-                        for value in item.get("required_facts") or []
-                        if str(value).strip()
-                    ),
+                    tuple(item.get("required_facts") or []),
                     str(item.get("freshness") or "cached"),
                     str(item.get("gap_id") or ""),
                     tuple(
                         str(value).strip()
                         for value in item.get("affected_steps") or []
+                        if str(value).strip()
+                    ),
+                    subject,
+                    tuple(
+                        str(value).strip()
+                        for value in item.get("scope") or []
+                        if str(value).strip()
+                    ),
+                    tuple(
+                        str(value).strip()
+                        for value in item.get("exclusions") or []
                         if str(value).strip()
                     ),
                 )
@@ -6903,10 +7038,19 @@ the complete proposed replacement goal and list what would be superseded.
                 {
                     "evidence_id": item.evidence_id,
                     "probe": item.request.probe,
-                    "required_facts": list(item.request.required_facts),
+                    "required_facts": [
+                        fact.to_dict() for fact in item.request.required_facts
+                    ],
+                    "observations": [
+                        observation.to_dict() for observation in item.observations
+                    ],
                     "freshness": item.request.freshness,
                     "gap_id": item.request.need_key,
                     "affected_steps": list(item.request.affected_steps),
+                    "subject": (
+                        item.request.subject.to_dict()
+                        if item.request.subject is not None else None
+                    ),
                     "status": item.status,
                     "output": compact(item.output),
                 }

@@ -166,7 +166,7 @@ class ResponseAgent:
     @staticmethod
     def _failure_prompt(failure: FailureRecord) -> str:
         evidence_facts = [
-            fact
+            "%s[%s]" % (fact.predicate, fact.fact_id)
             for request in failure.evidence_requests
             for fact in request.required_facts
         ]
@@ -192,7 +192,12 @@ class ResponseAgent:
         """Reject model output that tries to become a recovery controller."""
 
         value = str(text or "").strip()
-        if not value or len(value) > 1200:
+        if (
+            not value
+            or len(value) < 12
+            or len(value) > 1200
+            or value.lower() in {"false", "true", "null", "none"}
+        ):
             return False
         forbidden = (
             r"(?m)^\s*\d+[.)、]\s*",

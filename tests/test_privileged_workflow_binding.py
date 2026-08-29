@@ -1,5 +1,254 @@
 from __future__ import annotations
 
+import pytest
+
+
+def test_binding_timeout_checkpoints_and_resumes_only_unbound_atomic_step():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding, ImplementationPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.workflow.change_binding import (
+        ChangeBinder, ChangeBindingError,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+
+    def atomic(step_id):
+        return PrivilegedStep(
+            step_id=step_id,
+            title=step_id,
+            objective="start one service",
+            risk="medium",
+            expected_changes=["service starts"],
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        )
+
+    binding = ExecutionBinding(
+        kind="registered_action",
+        risk="medium",
+        action="manage_service",
+        args={"service": "example", "operation": "start"},
+        postconditions=[{"checker": "exit_code_zero", "args": {}}],
+    )
+
+    class CapabilityBinder:
+        calls = 0
+        first_binding_calls = 0
+        second_binding_calls = 0
+
+        def prepare_plan(self, legacy, *, grounded_context, checkpoint):
+            self.calls += 1
+            semantic = legacy.steps[0]
+            if semantic.implementation_plan is None:
+                semantic.implementation_plan = ImplementationPlan(
+                    implementation_id="impl-deploy",
+                    semantic_step_id="deploy",
+                    objective="deploy",
+                    steps=[atomic("first"), atomic("second")],
+                    status="draft",
+                )
+            first, second = semantic.implementation_plan.steps
+            if first.execution_binding is None:
+                self.first_binding_calls += 1
+                first.execution_binding = binding
+                checkpoint(legacy, "deploy", 1)
+            if self.calls == 1:
+                checkpoint(legacy, "deploy", 1)
+                raise TimeoutError("provider timed out")
+            assert first.execution_binding is not None
+            self.second_binding_calls += 1
+            second.execution_binding = binding
+            semantic.implementation_plan.status = "awaiting_confirmation"
+            checkpoint(legacy, "deploy", 2)
+            legacy.status = "awaiting_confirmation"
+            return legacy
+
+    capability = CapabilityBinder()
+    binder = ChangeBinder(capability)
+    plan = ChangePlan.new(
+        goal="deploy",
+        risk="medium",
+        steps=[ChangeStep(
+            step_id="deploy", title="deploy", objective="deploy",
+            risk="medium", expected_changes=["deployed"],
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        )],
+    )
+    checkpoints = []
+
+    with pytest.raises(ChangeBindingError) as captured:
+        binder.bind(plan, grounded_context=None, checkpoint=lambda item: checkpoints.append(item.to_dict()))
+
+    assert captured.value.category == "binding_provider_transient"
+    assert captured.value.replan_recommended is False
+    assert captured.value.replan_context["resume_binding"] is True
+    assert plan.binding_cursor == {
+        "phase": "binding", "semantic_step_id": "deploy",
+        "atomic_step_index": 1,
+    }
+    assert plan.steps[0].implementation_plan.steps[0].execution_binding is not None
+    assert plan.steps[0].implementation_plan.steps[1].execution_binding is None
+    assert checkpoints
+
+    resumed = binder.bind(plan, grounded_context=None)
+
+    assert resumed.status == "awaiting_confirmation"
+    assert resumed.binding_cursor == {}
+    assert capability.first_binding_calls == 1
+    assert capability.second_binding_calls == 1
+    assert all(
+        step.execution_binding is not None
+        for step in resumed.steps[0].implementation_plan.steps
+    )
+
+
+def test_execution_agent_resumes_draft_implementation_without_redecomposing():
+    from klonet_agent.ops.privileged.contracts import (
+        ExecutionBinding, PrivilegedPlan, PrivilegedStep,
+    )
+    from klonet_agent.ops.privileged.execution_agent import PrivilegedExecutionAgent
+
+    class Agent(PrivilegedExecutionAgent):
+        def __init__(self):
+            super().__init__(None)
+            self.decompositions = 0
+            self.binding_calls = {"start-a": 0, "start-b": 0}
+            self.fail_second = True
+
+        def _decompose_semantic_step(self, *args, **kwargs):
+            self.decompositions += 1
+            return [
+                PrivilegedStep(
+                    step_id="start-a", title="Start service a",
+                    objective="Start service a", risk="medium",
+                    expected_changes=["service a starts"],
+                    postconditions=[{"checker": "exit_code_zero", "args": {}}],
+                ),
+                PrivilegedStep(
+                    step_id="start-b", title="Start service b",
+                    objective="Start service b", risk="medium",
+                    depends_on=["start-a"],
+                    expected_changes=["service b starts"],
+                    postconditions=[{"checker": "exit_code_zero", "args": {}}],
+                ),
+            ]
+
+        def prepare_step(self, plan, step, *, grounded_context):
+            self.binding_calls[step.step_id] += 1
+            if step.step_id == "start-b" and self.fail_second:
+                self.fail_second = False
+                raise TimeoutError("provider timeout")
+            return ExecutionBinding(
+                kind="registered_action", risk="medium",
+                action="manage_service",
+                args={
+                    "service": step.step_id.removeprefix("start-"),
+                    "operation": "start",
+                },
+                postconditions=[{"checker": "exit_code_zero", "args": {}}],
+            )
+
+    plan = PrivilegedPlan(
+        plan_id="priv-ops-checkpoint",
+        goal="start services a and b",
+        risk="medium",
+        steps=[PrivilegedStep(
+            step_id="start-services", title="Start services a and b",
+            objective="Start services a and b", risk="medium",
+            expected_changes=["services a and b start"],
+            postconditions=[{"checker": "exit_code_zero", "args": {}}],
+        )],
+    )
+    agent = Agent()
+    checkpoints = []
+
+    with pytest.raises(TimeoutError):
+        agent.prepare_plan(
+            plan, grounded_context=None,
+            checkpoint=lambda _plan, semantic, atomic: checkpoints.append(
+                (semantic, atomic)
+            ),
+        )
+
+    implementation = plan.steps[0].implementation_plan
+    assert implementation is not None
+    assert implementation.status == "draft"
+    assert implementation.steps[0].execution_binding is not None
+    assert implementation.steps[1].execution_binding is None
+
+    resumed = agent.prepare_plan(
+        plan, grounded_context=None,
+        checkpoint=lambda _plan, semantic, atomic: checkpoints.append(
+            (semantic, atomic)
+        ),
+    )
+
+    assert resumed.status == "awaiting_confirmation"
+    assert agent.decompositions == 1
+    assert agent.binding_calls == {"start-a": 1, "start-b": 2}
+    assert resumed.steps[0].implementation_plan.status == "awaiting_confirmation"
+    assert ("start-services", 1) in checkpoints
+    assert ("start-services", 2) in checkpoints
+
+
+def test_binding_contradicted_fact_replans_only_the_resource_consumer_step():
+    from klonet_agent.ops.privileged.context import GroundedPlanContext
+    from klonet_agent.ops.privileged.workflow.change_binding import (
+        ChangeBinder, ChangeBindingError,
+    )
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        ChangePlan, ChangeStep, PlanResource,
+    )
+
+    class ForbiddenCapabilityBinder:
+        def prepare_plan(self, *args, **kwargs):
+            raise AssertionError("invalidated frozen facts must stop before Binding")
+
+    plan = ChangePlan.new(
+        goal="create platform",
+        risk="medium",
+        steps=[
+            ChangeStep(
+                step_id="prepare-source", title="prepare", objective="prepare",
+                risk="medium", expected_changes=["source prepared"],
+                postconditions=[{"checker": "exit_code_zero", "args": {}}],
+            ),
+            ChangeStep(
+                step_id="start-master", title="start", objective="start",
+                risk="medium", expected_changes=["master started"],
+                postconditions=[{"checker": "exit_code_zero", "args": {}}],
+            ),
+        ],
+        resources=[PlanResource(
+            "master_port", "port", "frozen", "master_port", 47001,
+            "checked_free", consumers=["start-master.master_port"],
+        )],
+    )
+    context = GroundedPlanContext(
+        knowledge_evidence="knowledge",
+        environment_evidence="ports",
+        action_catalog="actions",
+        facts={"evidence_resolutions": [{
+            "gap_id": "gap-master-port",
+            "contradicted_fact_ids": ["fact-master-port-free"],
+            "requirements": [{
+                "fact_id": "fact-master-port-free",
+                "expected": 47001,
+            }],
+            "affected_steps": [],
+        }]},
+    )
+
+    with pytest.raises(ChangeBindingError) as captured:
+        ChangeBinder(ForbiddenCapabilityBinder()).bind(
+            plan, grounded_context=context,
+        )
+
+    assert captured.value.category == "binding_evidence_invalidated"
+    assert captured.value.replan_recommended is True
+    assert captured.value.replan_context["affected_steps"] == ["start-master"]
+    assert captured.value.replan_context["step_id"] == "start-master"
+    assert "prepare-source" not in captured.value.replan_context["affected_steps"]
+
 
 def test_exact_text_deletion_compiles_to_replace_with_empty_content():
     from klonet_agent.ops.privileged.contracts import PrivilegedStep

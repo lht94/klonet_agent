@@ -310,12 +310,14 @@ class PrivilegedExecutionAgent:
         plan: PrivilegedPlan,
         *,
         grounded_context: GroundedPlanContext | None,
+        checkpoint: Callable[[PrivilegedPlan, str, int], None] | None = None,
     ) -> PrivilegedPlan:
         _validate_runtime_knowledge_contract(plan, grounded_context)
         if self.enable_implementation_plans:
             return self._prepare_hierarchical_plan(
                 plan,
                 grounded_context=grounded_context,
+                checkpoint=checkpoint,
             )
         for index, step in enumerate(plan.steps, start=1):
             self._progress(
@@ -326,6 +328,8 @@ class PrivilegedExecutionAgent:
                     _progress_text(step.title or step.objective),
                 )
             )
+            if checkpoint is not None:
+                checkpoint(plan, step.step_id, 0)
             step.execution_binding = self.prepare_step(
                 plan,
                 step,
@@ -347,6 +351,8 @@ class PrivilegedExecutionAgent:
                 if binding.approval_scope == "step"
                 else "pending"
             )
+            if checkpoint is not None:
+                checkpoint(plan, step.step_id, 0)
         if grounded_context is not None:
             registered_steps = []
             for step in plan.steps:
@@ -415,6 +421,7 @@ class PrivilegedExecutionAgent:
         plan: PrivilegedPlan,
         *,
         grounded_context: GroundedPlanContext | None,
+        checkpoint: Callable[[PrivilegedPlan, str, int], None] | None = None,
     ) -> PrivilegedPlan:
         bound_micro_steps: list[PrivilegedStep] = []
         for index, semantic_step in enumerate(plan.steps, start=1):
@@ -445,12 +452,33 @@ class PrivilegedExecutionAgent:
             last_error = "implementation plan was not generated"
             for attempt in range(MAX_IMPLEMENTATION_PLAN_REBUILDS):
                 try:
-                    micro_steps = self._decompose_semantic_step(
-                        plan,
-                        semantic_step,
-                        grounded_context=grounded_context,
-                        feedback=feedback,
-                    )
+                    existing_implementation = semantic_step.implementation_plan
+                    if (
+                        attempt == 0
+                        and existing_implementation is not None
+                        and existing_implementation.status == "draft"
+                    ):
+                        micro_steps = existing_implementation.steps
+                    else:
+                        micro_steps = self._decompose_semantic_step(
+                            plan,
+                            semantic_step,
+                            grounded_context=grounded_context,
+                            feedback=feedback,
+                        )
+                        semantic_step.execution_binding = None
+                        semantic_step.implementation_plan = ImplementationPlan(
+                            implementation_id="impl-%s-%s"
+                            % (semantic_step.step_id, uuid.uuid4().hex[:8]),
+                            semantic_step_id=semantic_step.step_id,
+                            objective=(
+                                semantic_step.objective or semantic_step.title
+                            ),
+                            steps=micro_steps,
+                            status="draft",
+                        )
+                        if checkpoint is not None:
+                            checkpoint(plan, semantic_step.step_id, 0)
                     _validate_micro_plan_dependency_shape(
                         plan,
                         semantic_step,
@@ -470,6 +498,12 @@ class PrivilegedExecutionAgent:
                                 ),
                             )
                         )
+                        if micro_step.execution_binding is not None:
+                            continue
+                        if checkpoint is not None:
+                            checkpoint(
+                                plan, semantic_step.step_id, micro_index - 1,
+                            )
                         observational = _step_is_verification(micro_step)
                         binding = self.prepare_step(
                             plan,
@@ -482,6 +516,10 @@ class PrivilegedExecutionAgent:
                             observational=observational,
                         )
                         _apply_binding_to_step(micro_step, binding)
+                        if checkpoint is not None:
+                            checkpoint(
+                                plan, semantic_step.step_id, micro_index,
+                            )
                     _validate_runtime_recovery_action_coverage(
                         semantic_step,
                         micro_steps,
@@ -516,20 +554,22 @@ class PrivilegedExecutionAgent:
                         " bound. Rebuild the micro-plan without changing the"
                         " semantic objective. Binding failure: %s" % last_error
                     )
+                    semantic_step.implementation_plan = None
+                    semantic_step.execution_binding = None
+                    if checkpoint is not None:
+                        checkpoint(plan, semantic_step.step_id, 0)
                     self._progress(
                         "Implementation Plan 的原子步骤无法落地，正在保持语义目标"
                         "不变并进行第 %s/%s 次局部重建。"
                         % (attempt + 2, MAX_IMPLEMENTATION_PLAN_REBUILDS)
                     )
                     continue
-                implementation = ImplementationPlan(
-                    implementation_id="impl-%s-%s"
-                    % (semantic_step.step_id, uuid.uuid4().hex[:8]),
-                    semantic_step_id=semantic_step.step_id,
-                    objective=semantic_step.objective or semantic_step.title,
-                    steps=micro_steps,
-                    status="awaiting_confirmation",
-                )
+                implementation = semantic_step.implementation_plan
+                if implementation is None:
+                    raise ExecutionBindingError(
+                        "binding checkpoint lost the implementation plan"
+                    )
+                implementation.status = "awaiting_confirmation"
                 semantic_step.execution_binding = None
                 semantic_step.implementation_plan = implementation
                 semantic_step.risk = max(
@@ -539,6 +579,8 @@ class PrivilegedExecutionAgent:
                 semantic_step.approval_scope = "plan"
                 semantic_step.status = "pending"
                 bound_micro_steps.extend(micro_steps)
+                if checkpoint is not None:
+                    checkpoint(plan, semantic_step.step_id, len(micro_steps))
                 break
             else:
                 raise ExecutionBindingError(last_error)

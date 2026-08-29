@@ -46,6 +46,7 @@ class ReadOnlyProbeSpec:
     handler: Callable[[dict[str, Any]], str]
     arg_fields: tuple[str, ...] = ()
     sensitivity: str = "internal"
+    supported_predicates: tuple[str, ...] = ()
 
 
 class ReadOnlyProbeRegistry:
@@ -60,11 +61,12 @@ class ReadOnlyProbeRegistry:
 
     def render(self) -> str:
         return "\n".join(
-            "%s: %s args=%s sensitivity=%s"
+            "%s: %s args=%s predicates=%s sensitivity=%s"
             % (
                 spec.name,
                 spec.description,
                 ",".join(spec.arg_fields) or "none",
+                ",".join(spec.supported_predicates) or "unspecified",
                 spec.sensitivity,
             )
             for spec in self.describe()
@@ -79,8 +81,17 @@ class ReadOnlyProbeRegistry:
 
 def _project_layout(args: dict[str, Any]) -> str:
     roots = _string_list(args.get("project_roots") or args.get("roots"))
-    facts = EnvironmentFactCollector().collect(roots)
-    return facts.render_for_planner()
+    facts = EnvironmentFactCollector().collect_project_layouts(roots)
+    payload = facts.to_dict()
+    return json.dumps(
+        {
+            "schema_version": payload["schema_version"],
+            "projects": payload["projects"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        indent=2,
+    )
 
 
 def _python_runtime(args: dict[str, Any]) -> str:
@@ -795,15 +806,37 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
     (
         ReadOnlyProbeSpec("system_environment", "操作系统、Python、磁盘和命令路径", inspect_system_environment),
         ReadOnlyProbeSpec("privilege_capabilities", "当前账户、sudo、helper 与跨用户只读能力", inspect_privilege_capabilities),
-        ReadOnlyProbeSpec("project_layout", "源码、Python 包、入口和运行根目录关系", _project_layout, ("project_roots",)),
+        ReadOnlyProbeSpec(
+            "project_layout",
+            "源码、Python 包、入口和运行根目录关系",
+            _project_layout,
+            ("project_roots",),
+            supported_predicates=(
+                "path.exists", "project.entry_files", "project.layout",
+                "project.readiness", "project.runnable", "project.runtime_cwd",
+                "project.source_root",
+            ),
+        ),
         ReadOnlyProbeSpec("python_runtime", "Python 解释器及 Gunicorn/Celery 路径", _python_runtime),
-        ReadOnlyProbeSpec("ports", "监听端口及进程摘要", _ports, ("ports",)),
+        ReadOnlyProbeSpec(
+            "ports", "监听端口及进程摘要", _ports, ("ports",),
+            supported_predicates=(
+                "port.available", "port.occupied", "port.in_use",
+                "port.listening", "port.listener",
+            ),
+        ),
         ReadOnlyProbeSpec("port_owner", "指定端口的 PID/进程所有者", inspect_process_detail, ("ports",)),
         ReadOnlyProbeSpec("process", "PID、用户、状态、命令和 cwd", _process, ("pids", "keywords")),
         ReadOnlyProbeSpec("process_tree", "指定 PID 及其子进程树", _process_tree, ("pids",)),
         ReadOnlyProbeSpec("process_logs", "核对 PID cwd 后读取其项目根目录内 stdout/stderr 日志", _process_logs, ("pids", "project_root")),
         ReadOnlyProbeSpec("service", "指定 systemd 服务状态", _service, ("services",)),
-        ReadOnlyProbeSpec("screen", "screen 列表或指定会话输出", _screen, ("session",)),
+        ReadOnlyProbeSpec(
+            "screen", "screen 列表或指定会话输出", _screen, ("session",),
+            supported_predicates=(
+                "screen.sessions", "screen.session_exists",
+                "screen.session_available",
+            ),
+        ),
         ReadOnlyProbeSpec("docker", "Docker 容器状态", _docker, ("name",)),
         ReadOnlyProbeSpec("nginx", "Nginx 路由配置", inspect_nginx_routes, ("paths",)),
         ReadOnlyProbeSpec("redis", "Redis 服务状态，不读取密码值", _service_subset("redis"), sensitivity="secret_metadata"),
@@ -811,7 +844,10 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
         ReadOnlyProbeSpec("rabbitmq", "RabbitMQ 服务状态", _service_subset("rabbitmq")),
         ReadOnlyProbeSpec("network", "接口地址和路由", _network),
         ReadOnlyProbeSpec("firewall", "UFW/nftables/iptables 规则", _firewall),
-        ReadOnlyProbeSpec("disk", "文件系统容量", _disk),
+        ReadOnlyProbeSpec(
+            "disk", "文件系统容量", _disk,
+            supported_predicates=("disk.capacity", "disk.filesystems"),
+        ),
         ReadOnlyProbeSpec("memory", "内存和 swap", _memory),
         ReadOnlyProbeSpec("virtualization", "KVM 设备、虚拟化类型和 CPU 能力", _virtualization),
         ReadOnlyProbeSpec("libvirt", "libvirt domain、network 和节点能力", _libvirt),
@@ -828,19 +864,50 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
             _klonet_config_consistency,
             ("project_root",),
         ),
-        ReadOnlyProbeSpec("git_repository", "Git 状态、revision 和 remote", _git_repository, ("repository",)),
+        ReadOnlyProbeSpec(
+            "git_repository", "Git 状态、revision 和 remote",
+            _git_repository, ("repository",),
+            supported_predicates=(
+                "git.inside_work_tree", "git.revision", "git.remote",
+                "git.branch", "git.status",
+            ),
+        ),
         ReadOnlyProbeSpec("logs", "脱敏后的日志尾部", read_klonet_logs, ("path",)),
         ReadOnlyProbeSpec("tcp_connection", "指定主机端口 TCP 连通性", _tcp_connection, ("host", "ports")),
         ReadOnlyProbeSpec("http_endpoint", "HTTP(S) 健康端点", _http_endpoint, ("url",)),
         ReadOnlyProbeSpec("python_import", "使用目标解释器和 cwd 验证模块导入", _python_import, ("python_executable", "cwd", "modules")),
-        ReadOnlyProbeSpec("path_permissions", "路径 mode、uid 和 gid", _path_permissions, ("paths",)),
+        ReadOnlyProbeSpec(
+            "path_permissions", "路径 mode、uid 和 gid",
+            _path_permissions, ("paths",),
+            supported_predicates=(
+                "path.exists", "path.permissions", "path.uid", "path.gid",
+            ),
+        ),
         # Compatibility names used by existing recovery plans.
         ReadOnlyProbeSpec("klonet_runtime", "Klonet 综合运行状态", inspect_klonet_runtime),
         ReadOnlyProbeSpec("platform_instances", "发现平台实例", inspect_platform_instances, ("project_roots",)),
-        ReadOnlyProbeSpec("running_platforms", "按项目根目录核验 Master/Worker 后端接口并统计正常运行实例", inspect_running_platforms, ("project_roots",)),
-        ReadOnlyProbeSpec("platform_health", "指定平台健康状态", inspect_platform_health, ("project_root",)),
+        ReadOnlyProbeSpec(
+            "running_platforms",
+            "按项目根目录核验 Master/Worker 后端接口并统计正常运行实例",
+            inspect_running_platforms,
+            ("project_roots",),
+            supported_predicates=(
+                "platform.inventory", "platform.health", "runtime.roles",
+                "runtime.identity", "runtime.ports", "runtime.startup_contract",
+            ),
+        ),
+        ReadOnlyProbeSpec(
+            "platform_health", "指定平台健康状态", inspect_platform_health,
+            ("project_root",), supported_predicates=("platform.health",),
+        ),
         ReadOnlyProbeSpec("service_health", "共享服务健康状态", inspect_service_health),
-        ReadOnlyProbeSpec("process_detail", "端口/PID/关键词进程详情", inspect_process_detail),
+        ReadOnlyProbeSpec(
+            "process_detail", "端口/PID/关键词进程详情", inspect_process_detail,
+            supported_predicates=(
+                "process.cwd", "process.uid", "process.python_executable",
+                "process.cmdline", "process.identity",
+            ),
+        ),
         ReadOnlyProbeSpec("ops_file", "脱敏读取一个运维文件", read_ops_file, ("path",)),
         ReadOnlyProbeSpec("screen_session", "指定 screen 会话输出", inspect_screen_session, ("session",)),
         ReadOnlyProbeSpec("nginx_routes", "Nginx 路由配置", inspect_nginx_routes, ("paths",)),

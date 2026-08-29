@@ -57,10 +57,19 @@ class EvidenceSynthesizer:
                 "probe": item.request.probe,
                 "args": item.request.args,
                 "purpose": item.request.purpose,
-                "required_facts": list(item.request.required_facts),
+                "required_facts": [
+                    fact.to_dict() for fact in item.request.required_facts
+                ],
+                "observations": [
+                    observation.to_dict() for observation in item.observations
+                ],
                 "freshness": item.request.freshness,
                 "gap_id": item.request.need_key,
                 "affected_steps": list(item.request.affected_steps),
+                "subject": (
+                    item.request.subject.to_dict()
+                    if item.request.subject is not None else None
+                ),
                 "status": item.status,
                 "output": item.output[:7000],
             }
@@ -202,6 +211,22 @@ class EvidenceSynthesizer:
         conclusion.confirmed_facts = [
             item for item in promoted if item.text not in existing
         ] + conclusion.confirmed_facts
+        # Gap resolution is a contract calculation, not a synthesis opinion.
+        # The model may phrase facts and uncertainty, but it cannot promote an
+        # unresolved observation to resolved or reopen a fully answered gap.
+        resolutions = bundle.gap_resolutions()
+        conclusion.resolved_gaps = {
+            gap_id: [
+                record.evidence_id for record in bundle.records
+                if record.request.need_key == gap_id and record.observations
+            ]
+            for gap_id, resolution in resolutions.items()
+            if not resolution.unresolved_fact_ids
+        }
+        conclusion.unresolved_gaps = [
+            gap_id for gap_id, resolution in resolutions.items()
+            if resolution.unresolved_fact_ids
+        ]
         if complete_runtime_inventory_ids and any(
             marker in goal_text
             for marker in ("多少", "几个", "数量", "哪些", "how many", "which")
@@ -291,8 +316,16 @@ class EvidenceSynthesizer:
             confirmed_facts=facts,
             uncertainties=uncertainties,
             missing_decisions=[bundle.blocked_reason] if bundle.blocked_reason else [],
-            unresolved_gaps=list(dict.fromkeys(
-                item.request.need_key for item in bundle.records
-                if item.request.gap_id and item.status != "available"
-            )),
+            resolved_gaps={
+                gap_id: [
+                    record.evidence_id for record in bundle.records
+                    if record.request.need_key == gap_id and record.observations
+                ]
+                for gap_id, resolution in bundle.gap_resolutions().items()
+                if not resolution.unresolved_fact_ids
+            },
+            unresolved_gaps=[
+                gap_id for gap_id, resolution in bundle.gap_resolutions().items()
+                if resolution.unresolved_fact_ids
+            ],
         )

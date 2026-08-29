@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+import copy
+import inspect
+from typing import Any, Callable
 
 from klonet_agent.ops.privileged.contracts import PrivilegedPlan, PrivilegedStep
 from klonet_agent.ops.privileged.execution_agent import ExecutionBindingError
@@ -41,7 +43,66 @@ class ChangeBinder:
         plan: ChangePlan,
         *,
         grounded_context: Any | None = None,
+        checkpoint: Callable[[ChangePlan], None] | None = None,
     ) -> ChangePlan:
+        resolutions = list(
+            getattr(grounded_context, "facts", {}).get(
+                "evidence_resolutions", []
+            )
+            if grounded_context is not None else []
+        )
+        invalidated_facts: list[str] = []
+        affected_steps: set[str] = set()
+        for resolution in resolutions:
+            if not isinstance(resolution, dict):
+                continue
+            contradicted = {
+                str(item) for item in resolution.get(
+                    "contradicted_fact_ids", []
+                )
+            }
+            if not contradicted:
+                continue
+            invalidated_facts.extend(sorted(contradicted))
+            affected_steps.update(
+                str(item) for item in resolution.get("affected_steps", [])
+                if str(item)
+            )
+            expected_values = {
+                item.get("expected")
+                for item in resolution.get("requirements", [])
+                if isinstance(item, dict)
+                and str(item.get("fact_id") or "") in contradicted
+                and not isinstance(item.get("expected"), (dict, list, set))
+            }
+            for resource in plan.resources:
+                if resource.value not in expected_values:
+                    continue
+                affected_steps.update(
+                    str(consumer).split(".", 1)[0]
+                    for consumer in resource.consumers
+                    if str(consumer).split(".", 1)[0]
+                )
+        if invalidated_facts:
+            ordered_steps = [
+                step.step_id for step in plan.steps
+                if step.step_id in affected_steps
+            ]
+            raise ChangeBindingError(
+                "frozen evidence was contradicted before binding: %s"
+                % ",".join(sorted(set(invalidated_facts))),
+                category="binding_evidence_invalidated",
+                replan_recommended=True,
+                failed_criteria=[
+                    "contradicted frozen fact=%s" % fact_id
+                    for fact_id in sorted(set(invalidated_facts))
+                ],
+                replan_context={
+                    "step_id": ordered_steps[0] if ordered_steps else "",
+                    "affected_steps": ordered_steps,
+                    "invalidated_fact_ids": sorted(set(invalidated_facts)),
+                },
+            )
         legacy = PrivilegedPlan(
             plan_id=plan.plan_id,
             goal=plan.goal,
@@ -59,15 +120,49 @@ class ChangeBinder:
                     risk=step.risk,
                     expected_changes=list(step.expected_changes),
                     postconditions=list(step.postconditions),
+                    execution_binding=copy.deepcopy(step.execution_binding),
+                    implementation_plan=copy.deepcopy(step.implementation_plan),
                 )
                 for step in plan.steps
             ],
         )
-        try:
-            bound = self.capability_binder.prepare_plan(
-                legacy,
-                grounded_context=grounded_context,
+        by_change_id = {step.step_id: step for step in plan.steps}
+
+        def save_checkpoint(
+            partial: PrivilegedPlan,
+            semantic_step_id: str,
+            atomic_step_index: int,
+        ) -> None:
+            partial_step = next(
+                (item for item in partial.steps if item.step_id == semantic_step_id),
+                None,
             )
+            target = by_change_id.get(semantic_step_id)
+            if partial_step is not None and target is not None:
+                target.execution_binding = copy.deepcopy(
+                    partial_step.execution_binding
+                )
+                target.implementation_plan = copy.deepcopy(
+                    partial_step.implementation_plan
+                )
+                target.risk = partial_step.risk
+            plan.binding_cursor = {
+                "phase": "binding",
+                "semantic_step_id": semantic_step_id,
+                "atomic_step_index": int(atomic_step_index),
+            }
+            plan.status = "draft"
+            plan.authorized_hash = ""
+            if checkpoint is not None:
+                checkpoint(plan)
+
+        try:
+            prepare = self.capability_binder.prepare_plan
+            parameters = inspect.signature(prepare).parameters
+            kwargs: dict[str, Any] = {"grounded_context": grounded_context}
+            if "checkpoint" in parameters:
+                kwargs["checkpoint"] = save_checkpoint
+            bound = prepare(legacy, **kwargs)
         except ExecutionBindingError as exc:
             raise ChangeBindingError(
                 str(exc),
@@ -76,6 +171,27 @@ class ChangeBinder:
                 failed_criteria=exc.failed_criteria,
                 missing_decisions=exc.missing_decisions,
                 replan_context=exc.replan_context,
+            ) from exc
+        except Exception as exc:
+            name = type(exc).__name__
+            transient = any(marker in name.lower() for marker in (
+                "timeout", "connection", "ratelimit", "serviceunavailable",
+                "apierror",
+            ))
+            cursor = dict(plan.binding_cursor)
+            raise ChangeBindingError(
+                "%s: %s" % (name, str(exc)[:1000]),
+                category=(
+                    "binding_provider_transient"
+                    if transient else "binding_internal_failure"
+                ),
+                replan_recommended=False,
+                failed_criteria=["binding step did not produce an executable contract"],
+                replan_context={
+                    "resume_binding": bool(cursor),
+                    "binding_cursor": cursor,
+                    "exception_type": name,
+                },
             ) from exc
         by_id = {step.step_id: step for step in bound.steps}
         for change in plan.steps:
@@ -88,6 +204,7 @@ class ChangeBinder:
         plan.risk = bound.risk
         plan.status = "awaiting_confirmation"
         plan.authorized_hash = ""
+        plan.binding_cursor = {}
         return plan
 
     @staticmethod
