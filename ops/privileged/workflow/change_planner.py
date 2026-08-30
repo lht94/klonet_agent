@@ -456,10 +456,13 @@ independent state checkers; exit_code_zero alone is only a last resort.
 Use blocked only for a material user choice that changes the desired outcome.
 Never ask the user to choose implementation details that Discovery or Binding
 can resolve, including free ports, local IPs, generated service/screen names,
-whether to isolate rather than reuse an existing container, Nginx syntax,
-configuration file edits, startup commands, or source layout. For those, use
-need_evidence when state is missing, otherwise choose isolated values, freeze
-them as resources, and emit semantic changes.
+generated instance names, conflict-free target directories, whether to isolate
+rather than reuse an existing container, Nginx syntax, configuration file
+edits, startup commands, or source layout. An explicit user delegation such as
+"choose it for me" is already a decision granting the workflow authority to
+select a safe value; never turn that delegation back into a missing_decision.
+For those details, use need_evidence when state is missing, otherwise choose
+isolated values, freeze them as resources, and emit semantic changes.
 
 Keep every ChangeStep semantically cohesive. A configuration or service-group
 ChangeStep may contain multiple related attributes or components; the Binding
@@ -524,11 +527,20 @@ DISCOVERABLE_IMPLEMENTATION_MARKERS = (
     "startup command",
     "configuration file",
     "source layout",
+    "target directory",
+    "instance name",
+    "instance identifier",
+    "project root",
     "端口",
     "ip 地址",
     "容器",
     "启动命令",
     "配置文件",
+    "目标目录",
+    "项目根目录",
+    "平台名",
+    "实例名",
+    "实例标识",
 )
 
 USER_SCOPE_DECISION_MARKERS = (

@@ -888,6 +888,10 @@ class PrivilegedOpsCoordinator:
                     requested = ",".join(
                         str(item.probe) for item in outcome.evidence_requests
                     ) or "none"
+                    attempt_diagnostics = _evidence_attempt_diagnostics(
+                        evidence_bundle,
+                        outcome.evidence_requests,
+                    )
                     if (
                         no_progress_replans < 1
                         and replanning_rounds < workflow.max_replanning_rounds
@@ -918,6 +922,7 @@ class PrivilegedOpsCoordinator:
                                     }
                                     for item in outcome.evidence_requests
                                 ],
+                                "attempt_diagnostics": attempt_diagnostics,
                                 "instruction": (
                                     "Do not repeat the same evidence need. Change the"
                                     " target/arguments, request a different semantic"
@@ -955,14 +960,22 @@ class PrivilegedOpsCoordinator:
                         **recovery_failure_context(),
                         stage="planning",
                         category="planning_evidence_no_progress",
-                        summary="规划请求的补证没有产生新的可用事实，已停止重复查询。",
+                        summary=(
+                            "Planner 与 Discovery 的补证合同在自动规范化和"
+                            "重新规划后仍无进展。"
+                        ),
                         technical_reason=(
-                            "Planner-to-Discovery contract made no progress; probes=%s"
-                            % requested
+                            "Planner-to-Discovery contract made no progress; "
+                            "probes=%s; diagnostics=%s"
+                            % (
+                                requested,
+                                " | ".join(attempt_diagnostics) or "none",
+                            )
                         ),
                         goal=goal,
                         goal_kind="execution",
                         attempted_recoveries=[
+                            "确定性规范化 Planner 的 Probe 参数和证据主体",
                             "尝试注册 Probe 与安全只读命令补证",
                             "把缺失事实和已尝试路径交回 Planner 重新规划",
                         ],
@@ -2541,6 +2554,38 @@ def _evidence_request_summary(requests: list[Any]) -> str:
             )
         )
     return "；".join(rendered) or "未说明的目标事实"
+
+
+def _evidence_attempt_diagnostics(
+    bundle: Any,
+    requests: list[Any],
+) -> list[str]:
+    """Return exact bounded contract/probe failures for Replan and reporting."""
+
+    need_keys = {
+        str(getattr(request, "need_key", "") or "") for request in requests
+    }
+    diagnostics: list[str] = []
+    for record in reversed(list(getattr(bundle, "records", []) or [])):
+        record_request = getattr(record, "request", None)
+        if str(getattr(record_request, "need_key", "") or "") not in need_keys:
+            continue
+        status = str(getattr(record, "status", "") or "unknown")
+        unresolved = list(getattr(record, "unresolved_fact_ids", ()) or ())
+        if status == "available" and not unresolved:
+            continue
+        output = " ".join(str(getattr(record, "output", "") or "").split())
+        rendered = "%s status=%s unresolved=%s reason=%s" % (
+            str(getattr(record_request, "probe", "unknown") or "unknown"),
+            status,
+            ",".join(unresolved) or "none",
+            output[:500] or "no output",
+        )
+        if rendered not in diagnostics:
+            diagnostics.append(rendered)
+        if len(diagnostics) >= 4:
+            break
+    return list(reversed(diagnostics))
 
 
 def _deployment_boundary_gaps(text: str) -> list[str]:

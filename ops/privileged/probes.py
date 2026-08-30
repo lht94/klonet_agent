@@ -1003,7 +1003,14 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
                 ("project_root:scalar",),
             ),),
         ),
-        ReadOnlyProbeSpec("service_health", "共享服务健康状态", inspect_service_health),
+        ReadOnlyProbeSpec(
+            "service_health", "共享服务健康状态", inspect_service_health,
+            fact_contracts=(ProbeFactContract(
+                "service.health", (
+                    "contains:scalar", "present:any",
+                ),
+            ),),
+        ),
         ReadOnlyProbeSpec(
             "process_detail", "端口/PID/关键词进程详情", inspect_process_detail,
             fact_contracts=(

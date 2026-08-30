@@ -154,9 +154,136 @@ def test_direct_planner_probe_request_uses_same_fact_contract_gate():
     assert probe_calls == []
     assert shell_calls == []
     assert bundle.records[-1].status == "unavailable"
-    assert bundle.records[-1].observations[0].status == "unresolved"
-    assert "rejects comparison=equals" in bundle.records[-1].output
-    assert "requires arg ports:list" in bundle.records[-1].output
+    registered = next(
+        item for item in bundle.records if item.request.probe == "ports"
+    )
+    assert registered.observations[0].status == "unresolved"
+    assert "rejects comparison=equals" in registered.output
+    assert "requires arg ports:list" not in registered.output
+    assert bundle.records[-1].request.probe == "readonly_command"
+
+
+def test_semantic_port_subject_is_normalized_to_registered_probe_args():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    class ForbiddenLLM:
+        def complete(self, **kwargs):
+            raise AssertionError("normalized registered request must not use Shell")
+
+    calls = []
+
+    def probe_runner(values):
+        calls.extend(values)
+        ports = values[0]["args"]["ports"]
+        return (
+            "inspect_ports\nchecked_ports=%s\noccupied_ports=none\n"
+            "available_ports=%s\nno matching listeners"
+            % (
+                ",".join(str(item) for item in ports),
+                ",".join(str(item) for item in ports),
+            )
+        )
+
+    request = ProbeRequest(
+        "ports", {}, "find free ports for an isolated deployment", ({
+            "fact_id": "fact-candidate-ports-available",
+            "predicate": "port.available",
+            "expected": "present",
+            "comparison": "present",
+        },),
+        gap_id="gap-ports-availability",
+        subject={
+            "kind": "ports",
+            "value": "[47000, 47001, 47002, 47003]",
+        },
+    )
+    bundle = EvidenceBundle(goal="deploy a new platform")
+
+    DiscoveryAgent(
+        ForbiddenLLM(), probe_runner=probe_runner,
+    ).collect_requests([request], bundle)
+
+    assert calls[0]["args"]["ports"] == [47000, 47001, 47002, 47003]
+    record = bundle.records[-1]
+    assert record.request.subject.kind == "port_set"
+    assert record.status == "available"
+    assert record.unresolved_fact_ids == ()
+
+
+def test_semantic_free_port_need_without_candidates_gets_bounded_sample():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    calls = []
+
+    def probe_runner(values):
+        calls.extend(values)
+        ports = values[0]["args"]["ports"]
+        return (
+            "inspect_ports\nchecked_ports=%s\noccupied_ports=none\n"
+            "available_ports=%s"
+            % (
+                ",".join(str(item) for item in ports),
+                ",".join(str(item) for item in ports),
+            )
+        )
+
+    request = ProbeRequest(
+        "ports", {}, "find a bounded set of free host ports", ({
+            "fact_id": "fact-free-port-sample",
+            "predicate": "port.available",
+            "expected": "present",
+            "comparison": "present",
+        },), gap_id="gap-free-port-sample",
+        subject={"kind": "ports", "value": "all"},
+    )
+    bundle = EvidenceBundle(goal="deploy an isolated service")
+
+    DiscoveryAgent(None, probe_runner=probe_runner).collect_requests(
+        [request], bundle,
+    )
+
+    ports = calls[0]["args"]["ports"]
+    assert len(ports) == 32
+    assert all(20000 <= port < 60000 for port in ports)
+    assert bundle.records[-1].unresolved_fact_ids == ()
+
+
+def test_service_health_semantic_fact_uses_registered_probe_without_shell():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    request = ProbeRequest(
+        "service_health", {}, "inspect shared dependency health", ({
+            "fact_id": "fact-service-health",
+            "predicate": "service.health",
+            "expected": "present",
+            "comparison": "present",
+        },), gap_id="gap-service-health",
+    )
+    bundle = EvidenceBundle(goal="deploy a new platform")
+
+    DiscoveryAgent(
+        None,
+        probe_runner=lambda values: (
+            "inspect_service_health\n"
+            "service=redis status=detected recommendation=reuse"
+        ),
+        readonly_command_runner=lambda command: (_ for _ in ()).throw(
+            AssertionError("registered service evidence must not use Shell")
+        ),
+    ).collect_requests([request], bundle)
+
+    assert bundle.records[-1].request.probe == "service_health"
+    assert bundle.records[-1].status == "available"
+    assert bundle.records[-1].unresolved_fact_ids == ()
 
 
 def test_provider_scalar_probe_args_are_normalized_before_registered_execution():
@@ -539,6 +666,122 @@ def test_user_decided_source_root_is_grounded_without_relaxing_other_paths(tmp_p
 
     assert "path_outside_grounded_project_roots" not in accepted
     assert "path_outside_grounded_project_roots" in refused
+
+
+def test_seed_runtime_inventory_restores_git_probe_scope_after_new_session(
+    tmp_path, monkeypatch,
+):
+    from klonet_agent.ops.privileged import context as context_module
+    from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    runtime = tmp_path / "existing-platform"
+    runtime.mkdir()
+    monkeypatch.setitem(
+        context_module._RECOVERY_PROBES,
+        "git_repository",
+        lambda args: (
+            "inspect_git_repository\npath=%s inside_work_tree=true "
+            "revision=abc123\nstatus=## develop...origin/develop\n"
+            "remotes=origin git@example/platform.git (fetch)"
+        ) % args["repository"],
+    )
+    inventory_request = ProbeRequest(
+        "running_platforms", {}, "ground current runtime inventory",
+    )
+    seed = EvidenceBundle(goal="deploy a new platform", records=[
+        EvidenceRecord.from_probe(
+            inventory_request,
+            "inspect_running_platforms\nruntime_candidate_count=1\n"
+            "healthy_count=1\nabnormal_count=0\ncode_only_count=0\n"
+            "platform=existing project_root=%s backend_status=healthy"
+            % runtime,
+        )
+    ])
+    request = {
+        "probe": "git_repository",
+        "args": {"repository": str(runtime)},
+        "purpose": "reuse the existing platform Git source",
+        "required_facts": [
+            {
+                "fact_id": "fact-source-inside-work-tree",
+                "predicate": "git.inside_work_tree",
+                "expected": True,
+                "comparison": "equals",
+            },
+            {
+                "fact_id": "fact-source-remote",
+                "predicate": "git.remote",
+                "expected": True,
+                "comparison": "present",
+            },
+            {
+                "fact_id": "fact-source-branch",
+                "predicate": "git.branch",
+                "expected": True,
+                "comparison": "present",
+            },
+        ],
+        "subject": {"kind": "path", "value": str(runtime)},
+    }
+    llm = FakeLLM([
+        json.dumps({"status": "need_evidence", "probe_requests": [request]}),
+        json.dumps({"status": "ready"}),
+    ])
+    builder = PrivilegedPlanContextBuilder()
+    agent = DiscoveryAgent(llm, probe_runner=builder.run_recovery_diagnostics)
+    agent.begin_probe_session()
+
+    bundle = agent.collect("deploy a new platform from Git", seed_bundle=seed)
+
+    git_record = next(
+        item for item in bundle.records if item.request.probe == "git_repository"
+    )
+    assert git_record.status == "available"
+    assert not git_record.unresolved_fact_ids
+    assert "path_outside_grounded_project_roots" not in git_record.output
+
+
+def test_refused_registered_probe_is_not_reported_as_available(tmp_path):
+    from klonet_agent.ops.privileged.context import PrivilegedPlanContextBuilder
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    outside = tmp_path / "not-grounded"
+    outside.mkdir()
+    builder = PrivilegedPlanContextBuilder()
+    builder.begin_probe_session()
+    agent = DiscoveryAgent(
+        FakeLLM([json.dumps({
+            "status": "blocked",
+            "reason": "the path is outside the grounded read-only scope",
+        })]),
+        probe_runner=builder.run_recovery_diagnostics,
+    )
+    bundle = EvidenceBundle(goal="inspect an ungrounded repository")
+
+    agent.collect_requests([
+        ProbeRequest(
+            "git_repository", {"repository": str(outside)}, "inspect source", ({
+                "fact_id": "fact-source-remote",
+                "predicate": "git.remote",
+                "expected": True,
+                "comparison": "present",
+            },),
+        )
+    ], bundle)
+
+    registered = next(
+        item for item in bundle.records if item.request.probe == "git_repository"
+    )
+    assert registered.status == "unavailable"
+    assert "status=refused" in registered.output
+    assert registered.unresolved_fact_ids == ("fact-source-remote",)
 
 
 def test_screen_and_process_evidence_ground_their_verified_project_root(

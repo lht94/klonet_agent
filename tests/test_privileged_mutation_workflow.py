@@ -2136,7 +2136,16 @@ def test_planner_discovery_stops_after_one_no_progress_replan(tmp_path):
             "command_available", {"commands": ["screen"]}, "find screen",
         )],
     )
-    planner = FakePlanner([gap, gap])
+    class RecordingPlanner(FakePlanner):
+        def __init__(self, outcomes):
+            super().__init__(outcomes)
+            self.call_kwargs = []
+
+        def plan(self, *args, **kwargs):
+            self.call_kwargs.append(kwargs)
+            return super().plan(*args, **kwargs)
+
+    planner = RecordingPlanner([gap, gap])
     bundle = EvidenceBundle(goal="重启全部平台")
 
     class Discovery:
@@ -2178,6 +2187,15 @@ def test_planner_discovery_stops_after_one_no_progress_replan(tmp_path):
     assert result.kind == "awaiting_user_decision"
     assert result.failure.category == "planning_evidence_no_progress"
     assert "probes=command_available" in result.failure.technical_reason
+    assert "status=unavailable" in result.failure.technical_reason
+    assert "probe_not_registered=command_available" in result.failure.technical_reason
+    assert (
+        "确定性规范化 Planner 的 Probe 参数和证据主体"
+        in result.failure.attempted_recoveries
+    )
+    feedback = planner.call_kwargs[1]["binding_feedback"]
+    assert "attempt_diagnostics" in feedback
+    assert "probe_not_registered=command_available" in feedback
     assert planner.calls == discovery.calls == 2
     assert any("Replan 1/4" in item and "command_available" in item for item in progress)
     assert any("安全只读补证均未产生新事实" in item for item in progress)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -125,6 +126,28 @@ def _comparison_status(requirement: FactRequirement, actual: Any) -> str:
             matched = False
         return "confirmed" if matched else "contradicted"
     return "unresolved"
+
+
+def _registered_probe_run_status(output: str, *, runner_available: bool) -> str:
+    """Translate the probe boundary's explicit refusal into record status.
+
+    ``run_recovery_diagnostics`` returns a textual batch envelope even when
+    its path/scope gate refused the request.  Treating any returned string as
+    success makes a refusal look like available evidence and hides the reason
+    from both fallback binding and the Planner.
+    """
+
+    if not runner_available:
+        return "unavailable"
+    text = str(output or "")
+    if re.search(
+        r"(?m)^probe_\d+\s+name=\S+\s+status=refused\s+reason=\S+",
+        text,
+    ):
+        return "unavailable"
+    if text.strip().startswith(("probe runner unavailable", "probe failed:")):
+        return "unavailable"
+    return "available"
 
 
 def _registered_observations(
@@ -294,6 +317,10 @@ def _registered_observations(
             if image not in images:
                 images.append(image)
         actual_by_predicate["docker.images"] = images
+    elif request.probe == "service_health":
+        body = output.split("inspect_service_health", 1)[-1].strip()
+        if body:
+            actual_by_predicate["service.health"] = body
     elif request.probe in {"running_platforms", "platform_health"}:
         # Domain inventory is already root-bound. Keep its text as the
         # deterministic searchable value so contains/contains_all requirements
@@ -757,6 +784,103 @@ class DiscoveryAgent:
             exclusions=exclusions,
         )
         self.collect_requests([layout_request], bundle)
+
+    def _restore_grounded_project_roots(self, bundle: EvidenceBundle) -> None:
+        """Rebuild the per-session path gate from canonical persisted evidence."""
+
+        owner = getattr(self.probe_runner, "__self__", None)
+        register_root = getattr(owner, "register_grounded_project_root", None)
+        if not callable(register_root):
+            return
+        inventory = RuntimeInventory.from_bundle(bundle)
+        for root in (
+            *(item.project_root for item in inventory.instances),
+            *inventory.code_only_roots,
+        ):
+            register_root(root)
+
+    @staticmethod
+    def _port_candidates_from_request(
+        request: ProbeRequest,
+        bundle: EvidenceBundle,
+    ) -> list[int]:
+        """Derive a bounded candidate set from semantic evidence need.
+
+        The Planner owns the need for free ports, not the low-level ``ports``
+        Probe shape.  Provider JSON often carries the candidates in the typed
+        subject while omitting ``args.ports``; normalize that representation
+        before enforcing the executable Probe contract.
+        """
+
+        raw_values: list[Any] = []
+        if request.subject is not None and request.subject.kind in {
+            "ports", "port_set",
+        }:
+            raw_values.append(request.subject.value)
+        raw_values.extend(
+            requirement.expected for requirement in request.required_facts
+            if requirement.predicate.startswith("port.")
+        )
+        candidates: list[int] = []
+        for raw in raw_values:
+            values = raw if isinstance(raw, list) else []
+            if isinstance(raw, str):
+                try:
+                    decoded = json.loads(raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = None
+                values = decoded if isinstance(decoded, list) else re.findall(
+                    r"(?<!\d)\d{4,5}(?!\d)", raw,
+                )
+            elif isinstance(raw, int) and not isinstance(raw, bool):
+                values = [raw]
+            for value in values:
+                if str(value).isdigit() and 1024 <= int(value) <= 65535:
+                    port = int(value)
+                    if port not in candidates:
+                        candidates.append(port)
+        if candidates:
+            return candidates[:64]
+
+        reserved = {
+            int(port)
+            for instance in RuntimeInventory.from_bundle(bundle).instances
+            for port in instance.configured_ports.values()
+            if 1024 <= int(port) <= 65535
+        }
+        # A stable semantic gap gets a stable bounded sample without encoding
+        # a Klonet-specific port range or treating the sample as a decision.
+        span = 60000 - 20000
+        seed = int(hashlib.sha256(
+            request.need_key.encode("utf-8", errors="replace")
+        ).hexdigest()[:8], 16)
+        start = 20000 + seed % span
+        offset = 0
+        while len(candidates) < 32 and offset < span:
+            port = 20000 + ((start - 20000 + offset) % span)
+            if port not in reserved:
+                candidates.append(port)
+            offset += 1
+        return candidates
+
+    def _normalize_semantic_probe_request(
+        self,
+        request: ProbeRequest,
+        bundle: EvidenceBundle,
+    ) -> ProbeRequest:
+        """Bind semantic evidence needs to an executable registered shape."""
+
+        if request.probe != "ports" or request.args.get("ports"):
+            return request
+        candidates = self._port_candidates_from_request(request, bundle)
+        if not candidates:
+            return request
+        return replace(
+            request,
+            args={**request.args, "ports": candidates},
+            subject=EvidenceSubject("port_set", candidates),
+        )
+
     def begin_probe_session(self) -> None:
         owner = getattr(self.probe_runner, "__self__", None)
         begin = getattr(owner, "begin_probe_session", None)
@@ -778,7 +902,10 @@ class DiscoveryAgent:
     ) -> EvidenceBundle:
         """Collect a bounded Planner-requested evidence increment."""
 
-        bounded = list(requests[:4])
+        bounded = [
+            self._normalize_semantic_probe_request(request, bundle)
+            for request in requests[:4]
+        ]
         if len(requests) > 4:
             bundle.budget_exhausted = True
         collected: list[EvidenceRecord] = []
@@ -803,10 +930,18 @@ class DiscoveryAgent:
                 collected.append(bundle.add(record))
                 if self.on_progress is not None:
                     self.on_progress(
-                        "只读补证合同无效，未执行 Probe 或 Shell：%s"
+                        "注册 Probe 合同无法直接执行，正在尝试安全只读命令兜底：%s"
                         % "; ".join(contract_errors)
                     )
                     self.on_progress(_evidence_user_summary(record))
+                fallback = self._collect_readonly_fallback(
+                    request,
+                    bundle,
+                    prior_record=record,
+                    registered=True,
+                )
+                if fallback is not None:
+                    collected.append(fallback)
                 continue
             collected.extend(self._collect_request(request, bundle))
         if derive_traceback_sources and any(
@@ -884,7 +1019,10 @@ class DiscoveryAgent:
                     if self.probe_runner is not None
                     else "probe runner unavailable"
                 )
-                status = "available" if self.probe_runner is not None else "unavailable"
+                status = _registered_probe_run_status(
+                    output,
+                    runner_available=self.probe_runner is not None,
+                )
             except Exception as exc:
                 output = "probe failed: %s" % type(exc).__name__
                 status = "unavailable"
@@ -1134,6 +1272,7 @@ class DiscoveryAgent:
             goal=goal,
             records=list(getattr(seed_bundle, "records", []) or []),
         )
+        self._restore_grounded_project_roots(bundle)
         self.collect_knowledge(goal, bundle)
         self._seed_explicit_deployment_boundaries(goal, bundle)
         if preload_capabilities and not any(
@@ -1277,6 +1416,10 @@ class DiscoveryAgent:
                     ),
                 })
                 continue
+            requests = [
+                self._normalize_semantic_probe_request(request, bundle)
+                for request in requests
+            ]
             contract_errors = _registered_probe_contract_errors(requests)
             if contract_errors and predicate_repairs < 1:
                 predicate_repairs += 1

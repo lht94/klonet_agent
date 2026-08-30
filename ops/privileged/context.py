@@ -214,8 +214,8 @@ class PrivilegedPlanContextBuilder:
         self._probe_cache = None
         self._discovered_project_roots = []
 
-    def register_user_decided_project_root(self, value: str) -> None:
-        """Ground an exact project root supplied by the user this turn."""
+    def register_grounded_project_root(self, value: str) -> None:
+        """Add one root already grounded by the workflow's evidence authority."""
 
         try:
             path = Path(str(value or "")).expanduser().resolve()
@@ -224,6 +224,11 @@ class PrivilegedPlanContextBuilder:
         resolved = str(path)
         if resolved not in self._discovered_project_roots:
             self._discovered_project_roots.append(resolved)
+
+    def register_user_decided_project_root(self, value: str) -> None:
+        """Ground an exact project root supplied by the user this turn."""
+
+        self.register_grounded_project_root(value)
 
     def build(
         self,
