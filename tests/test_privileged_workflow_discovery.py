@@ -78,7 +78,85 @@ def test_registered_probe_predicate_mismatch_is_repaired_before_execution():
     assert bundle.blocked_reason == ""
     assert calls == []
     repair = llm.calls[1]["messages"][-1]["content"]
-    assert "supported=port.available" in repair
+    assert "facts=port.available" in repair
+
+
+def test_registered_probe_rejects_incompatible_comparison_shape_before_execution():
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    invalid_requests = (
+        {
+            "probe": "ports",
+            "args": {"ports": [45560, 45561]},
+            "purpose": "check free ports",
+            "required_facts": [{
+                "fact_id": "fact-candidate-ports-free",
+                "predicate": "port.available",
+                "expected": True,
+                "comparison": "equals",
+            }],
+        },
+        {
+            "probe": "path_permissions",
+            "args": {"paths": ["/srv/target", "/srv"]},
+            "purpose": "check parent ownership",
+            "required_facts": [{
+                "fact_id": "fact-parent-owner",
+                "predicate": "path.permissions",
+                "expected": "1000",
+                "comparison": "equals",
+            }],
+        },
+    )
+
+    for invalid in invalid_requests:
+        llm = FakeLLM([
+            json.dumps({"status": "need_evidence", "probe_requests": [invalid]}),
+            json.dumps({"status": "ready"}),
+        ])
+        calls = []
+        bundle = DiscoveryAgent(
+            llm, probe_runner=lambda requests: calls.append(requests) or "unused",
+        ).collect("inspect deployment prerequisites")
+
+        assert bundle.blocked_reason == ""
+        assert calls == []
+        repair = llm.calls[1]["messages"][-1]["content"]
+        assert "rejects comparison=equals" in repair
+
+
+def test_direct_planner_probe_request_uses_same_fact_contract_gate():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, ProbeRequest,
+    )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
+
+    request = ProbeRequest(
+        "ports", {}, "check candidate ports",
+        ({
+            "fact_id": "fact-candidate-ports-available",
+            "predicate": "port.available",
+            "expected": True,
+            "comparison": "equals",
+        },),
+        gap_id="gap-candidate-ports",
+    )
+    probe_calls = []
+    shell_calls = []
+    bundle = EvidenceBundle(goal="create platform")
+
+    DiscoveryAgent(
+        FakeLLM([]),
+        probe_runner=lambda values: probe_calls.append(values) or "must not run",
+        readonly_command_runner=lambda command: shell_calls.append(command) or "must not run",
+    ).collect_requests([request], bundle)
+
+    assert probe_calls == []
+    assert shell_calls == []
+    assert bundle.records[-1].status == "unavailable"
+    assert bundle.records[-1].observations[0].status == "unresolved"
+    assert "rejects comparison=equals" in bundle.records[-1].output
+    assert "requires arg ports:list" in bundle.records[-1].output
 
 
 def test_provider_scalar_probe_args_are_normalized_before_registered_execution():
@@ -1509,6 +1587,12 @@ def test_registered_common_probes_resolve_typed_facts_without_shell():
             "inspect_path_permissions\n"
             "path=/srv/source exists=true mode=0o755 uid=1000 gid=1000"
         ),
+        "docker_images": (
+            "inspect_docker_images\n"
+            "REPOSITORY TAG DIGEST IMAGE-ID CREATED SIZE\n"
+            "mysql latest sha256:a sha256:b now 1GB\n"
+            "redis 7 sha256:c sha256:d now 100MB"
+        ),
     }
     requests = [
         ProbeRequest(
@@ -1529,6 +1613,13 @@ def test_registered_common_probes_resolve_typed_facts_without_shell():
               "expected": True, "comparison": "equals"},),
             gap_id="gap-permissions",
             subject={"kind": "path", "value": "/srv/source"},
+        ),
+        ProbeRequest(
+            "docker_images", {}, "images",
+            ({"fact_id": "fact-docker-images", "predicate": "docker.images",
+              "expected": ["mysql:latest", "redis:7"],
+              "comparison": "contains_all"},),
+            gap_id="gap-images",
         ),
     ]
     llm = FakeLLM([])

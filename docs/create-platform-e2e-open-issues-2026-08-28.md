@@ -298,9 +298,9 @@ required_facts=[
 - ChangeBinder 将 provider timeout/connection/API 异常在 Binding 边界转换为带类别、断点和 exception type 的 `ChangeBindingError`；Coordinator 还有最终异常边界，所有此类失败统一记录为 `stage=binding`，不会被外层误包成 planning。
 - FailureRecord 确定性保存 `stage/category/summary/technical_reason/environment_changed/semantic_step_id/atomic_step_index`。
 - 用户失败消息始终先渲染确定性事实；Response 模型文本只能作为附加“通俗说明”，不能覆盖失败阶段、技术原因或断点。
-- Response 的 `false/true/null/none`、过短、超长或控制流程式无效结果会被拒绝；模型超时/无效时仍输出完整模板。
+- Response 的 `false/true/null/none`、过短、超长、残缺句、思维标签、模板占位符、英文 `Sentence/Paragraph` 骨架或控制流程式无效结果会被拒绝；模型超时/无效时仍输出完整模板。
 
-验证已包含在第 1 项的 `83 passed` 套件中；其中 `test_invalid_response_text_cannot_replace_deterministic_failure_facts` 直接验证 `失败阶段：binding`、API timeout 原因、语义步骤、原子索引且不出现 `失败说明：false`，既有 `test_second_binder_failure_is_persisted_as_blocked_without_traceback` 验证第二次 Binding 失败仍保持真实阶段并安全持久化。
+验证已包含在第 1 项的 Binding/Coordinator 套件及 Response 联合回归中；其中 `test_invalid_response_text_cannot_replace_deterministic_failure_facts` 直接验证 `失败阶段：binding`、API timeout 原因、语义步骤、原子索引且不出现 `失败说明：false`，`test_second_binder_failure_is_persisted_as_blocked_without_traceback` 验证第二次 Binding 失败仍保持真实阶段并安全持久化，`test_failure_response_rejects_reasoning_and_template_artifacts` 验证残缺或带模型产物的通俗说明回退到确定性文本。真实 CLI 复测还验证了上游 403 被归属为 `discovery`、环境未改变且保留三选一恢复门；复测发现的半句模型输出现已纳入通用拒绝合同。
 
 ### 现象
 
@@ -337,7 +337,7 @@ FailureRecord 必须确定性保存真实阶段、异常类别、当前步骤和
 已完成（2026-08-29）。现有主链已统一为 `Planner/Verifier → ProbeRequest → EvidenceRecord.observations → EvidenceGap resolution`：
 
 - `required_facts` 在运行时统一为 `FactRequirement`，使用稳定 `fact_id`、typed predicate、expected/comparison 和 freshness；序列化只输出结构化对象。
-- 注册 Probe 声明 `supported_predicates`，确定性 extractor 将输出映射到所覆盖的 `fact_id`；原始文本本身不能解决 gap。
+- 注册 Probe 通过唯一 `ProbeFactContract` 声明 predicate、允许的 comparison/expected 形状和必需参数；`supported_predicates` 仅由该合同派生，不再维护第二份能力清单。确定性 extractor 将输出映射到所覆盖的 `fact_id`，原始文本本身不能解决 gap。
 - `EvidenceRecord` 同时保留原始输出和可追溯 observation；resolution 仅按 fact identity 计算 confirmed/contradicted/unresolved。
 - Shell fallback 必须继承同一 gap、subject 和 covers，并提供确定性 extractor。
 - Planner、Discovery、EvidenceSynthesizer、OperationalContext、Goal Verifier 和 Step Verifier 已全部使用同一协议；审计时发现并删除了 Verifier 将 fact 字典转回字符串的残留路径。
@@ -347,8 +347,12 @@ FailureRecord 必须确定性保存真实阶段、异常类别、当前步骤和
 - 用户冻结的源码根会被 Discovery 显式交给现有 Probe 路径安全边界；该边界仍拒绝其他由模型临时提出的目录。模型给出不受支持的 comparison 时不会放宽或猜测语义，而是在同一个 Discovery 合同内有限校正，二次无效才确定性 blocked，不再让 `ValueError` 穿透主循环。
 - 注册 Probe 的 predicate 在执行前与能力目录核对；同义但非标准的 predicate 会在现有 Discovery 内校正一次，确属长尾才改走 Shell。`git_repository、disk、path_permissions、screen` 等真实规划中使用的注册能力已补齐确定性 extractor；复制当前工作树时 Discovery 被明确禁止索取无关 Git remote/branch/revision 事实。
 - 注册 Probe 的参数形状也在同一合同入口规范化：模型给出的逗号字符串或单个 `ports/paths/project_roots` 会成为标准列表，`contains_all.expected` 同步成为可比较集合；Probe 不会再因拿到空列表而“成功执行但没有检查目标”。语义含混的布尔入口文件 predicate 被删除，统一使用 `project.entry_files + contains_all`。
+- 合同校验已经下沉到 `Discovery.collect_requests()` 的统一入口，因此 Planner、Binder、Verifier 或 Discovery 自身提出的请求都走同一校验门；非法 subject、缺少必需参数或 comparison/expected 形状不匹配时，不执行注册 Probe，也不误入 Shell fallback。
+- Planner 的端口选择、冲突替换、候选计划终检和缺证判断已删除对 `EvidenceRecord.output` 中 `LISTEN/available_ports` 文本的重复解析，统一读取 `FactRequirement + FactObservation`。Planner 自动生成的端口补证请求现在为每个候选端口创建稳定 fact；只有 confirmed observation 能证明空闲，标量 contradicted observation 才能证明该端口不可用，集合整体 contradicted 不会被错误拆成逐端口结论。
+- 同一审计继续删除了 Planner 对 Git remote/branch、Docker image、Screen 派生源码和 port-owner 原文的直接解析。Git 与 Docker 补齐注册 fact contract 和确定性 extractor；Screen 原文只允许在 Discovery 边界派生带 observation 的 `git_repository` 记录；进程所有者统一由既有 `RuntimeInventory` 适配。`change_planner.py` 不再读取 `record.output` 作控制判决。
+- Failure Response 的展示合同增加了通用产物校验；思维标签、模板占位符、`Sentence/Paragraph` 骨架、恢复菜单或虚构用户边界均不能覆盖确定性 FailureRecord 展示。
 
-验证：结构化证据相关回归与相邻 Coordinator 合同最新结果为 `154 passed`；修改范围结果为 `565 passed`；全量结果为 `1433 passed, 2 failed`。两项失败是修改前即可独立复现的知识检索排序基线（`platform_usage.md` 与 topology node snippet 排名），与本次 Ops-Privilege 链路无关。覆盖注册 ports Probe 无 Shell 重查、生产包装后的 project layout 解析、用户冻结路径可查而相邻路径仍被拒绝、模型 fact id 单次规范化、comparison/predicate/参数形状有限校正、常用注册能力的确定性 extractor、部分 fact 只保留未回答项、原始自然语言不能冒充 observation、frozen path 的 Shell 不得换 subject、Verifier 完整保留结构化 gap 合同等场景。
+验证：结构化证据、Mutation、Binding、Coordinator、Verifier、Response、RuntimeInventory 与 Probe Registry 联合回归为 `643 passed`；包含用户原有未提交改动的共享工作树联合结果为 `1445 passed`。覆盖注册 ports Probe 无 Shell 重查、生产包装后的 project layout 解析、用户冻结路径可查而相邻路径仍被拒绝、模型 fact id 单次规范化、comparison/predicate/参数形状有限校正、所有调用方统一经过 `collect_requests()` 合同门、常用注册能力的确定性 extractor、部分 fact 只保留未回答项、端口/Git/Docker 原始文本不能冒充 observation、frozen path 的 Shell 不得换 subject、Verifier 完整保留结构化 gap 合同、Response 异常模型产物回退等场景。最终提交的独立干净快照结果在提交后复核并记录于交付说明。
 
 真实 CLI 复测中，显式源码 `/home/lzl/test/vemu_uestc` 由一次注册 `project_layout` 直接确认，目标路径与端口 Probe 在参数规范化后直接产生 confirmed/contradicted observations，均未再触发 Shell。流程最终停在外部 Change Planner API timeout；失败被正确归属为 `planning`、环境未改变。该外部规划可用性属于第 7 项端到端验证的剩余阻塞，不影响本节证据协议验收。
 
@@ -385,6 +389,114 @@ Planner
 ```
 
 现有 `ProbeRequest.required_facts` 的自由文本形式应被结构化要求替代；现有 `EvidenceRecord` 在保留原始输出的同时，必须明确回应这些要求。迁移时应同步更新所有调用方并删除旧字符串协议，不能长期双轨兼容。
+
+#### 0. 模块间交接信封：只关联消息，不复制业务状态
+
+第四个问题本质上是模块通信协议不完整。需要统一的不是另一套工作流状态机，而是每次模块交接时都必须携带的关联信息和类型化 payload。
+
+概念结构如下：
+
+```json
+{
+  "protocol_version": 1,
+  "message_id": "msg-...",
+  "causation_id": "msg-...",
+  "goal_id": "goal-...",
+  "plan_id": "priv-ops-...",
+  "plan_version": 3,
+  "phase": "binding",
+  "sender": "binder",
+  "receiver": "discovery",
+  "message_type": "evidence_request",
+  "payload": {
+    "gap": "<EvidenceGap>"
+  }
+}
+```
+
+字段含义：
+
+- `message_id`：本次交接的唯一身份，用于审计和幂等，不能作为目标或计划身份。
+- `causation_id`：指出是谁触发了本次交接，使“补证结果为何出现”可以沿调用链追溯。
+- `goal_id`：引用现有唯一目标；消息里不得再复制一份可独立修改的 goal 文本。
+- `plan_id/plan_version`：引用 PlanStore 中的权威 `ChangePlan` 版本；无计划的早期 Discovery 可以为空。
+- `phase`：记录请求发生在 planning、binding、execution 或 verification 哪个阶段，只用于路由和错误归属，不代表完成状态。
+- `sender/receiver`：用于检查写权限，防止 Discovery 改计划或 Response 改失败事实。
+- `message_type`：决定 payload 的确定结构，不能用一段自然语言同时表示“补证、重规划或失败”。
+- `payload`：只承载该消息类型允许的现有合同对象或引用。
+
+信封本身不允许出现通用的 `success/completed/ready/achieved` 字段。原子执行是否成功由 `ExecutionRecord` 表达，事实是否得到支持由 `FactObservation` 表达，整个目标是否完成只由现有 `GoalOutcome` 表达，避免再产生一套完成判据。
+
+允许的交接类型收敛为以下判别联合，而不是任意字典：
+
+| `message_type` | payload | 发送方 → 接收方 | 含义 |
+|---|---|---|---|
+| `evidence_request` | `EvidenceGap + ProbeRequest` | Planner/Binder/Verifier → Discovery | 缺什么事实、检查谁、影响哪些步骤 |
+| `evidence_result` | `EvidenceRecord[] + EvidenceGapResolution` | Discovery → 原请求方 | 查到了什么，以及缺口是否真正缩小 |
+| `replan_request` | `plan_id + affected_steps + gap resolutions + reason` | Coordinator/Binder/Verifier → Planner | 保持目标不变，只修订明确受影响的步骤 |
+| `binding_result` | `plan_id + binding_cursor + bound step refs` | Binder → Coordinator | 同一计划绑定到了哪里；完整结果仍写回 PlanStore |
+| `execution_result` | `plan_id + execution record refs` | Executor → Verifier/Coordinator | 哪些已审批原子动作实际发生及其原始结果 |
+| `verification_result` | `GoalOutcome + EvidenceGapResolution[]` | Verifier → Coordinator | 唯一的目标级判决及未满足事实 |
+| `failure_report` | `failure_id` | 任意失败阶段 → Coordinator/Response | 引用权威 FailureRecord，不复制或改写失败事实 |
+
+这里不新增独立 `WorkflowMessage` Agent，也不让消息信封成为新的持久化状态源。实现时优先把这些关联字段并入现有方法参数和合同对象；只有确实存在多种调用方重复拼装同一组字段时，才允许抽取一个无业务判决能力的 transport dataclass。
+
+##### 交接实例：Binder 缺端口事实
+
+```text
+Binder 发现 start_screen_component 缺少端口归属事实
+→ 发送 evidence_request
+   - phase=binding
+   - plan_id/plan_version 指向当前草稿
+   - gap.subject=[目标实例根目录, 目标端口]
+   - gap.affected_steps=[当前启动步骤]
+   - requirements=[port.listener_owner, process.project_root]
+→ Discovery 先选注册 Probe，不足时用同一 gap 生成只读 Shell
+→ 确定性 extractor 生成 observations
+→ 统一 resolution 计算 confirmed/contradicted/unresolved
+→ 发送 evidence_result 给 Binder
+→ Binder 从原 binding_cursor 继续
+```
+
+Discovery 不能把结果直接解释成“应该启动或停止组件”；Binder 也不能把原始 Shell 文本直接解释成事实。若证据否定当前计划前提，Binder 只能发出带 `affected_steps` 的 `replan_request`，由现有 Planner 修改同一份计划。
+
+##### 交接实例：执行后验证失败
+
+```text
+Executor 写入 execution_result
+→ Verifier 针对原计划后置条件请求或读取证据
+→ Verifier 返回 verification_result
+   - GoalOutcome 仍未 achieved
+   - unresolved/contradicted facts 明确列出
+→ 若环境已改变且仍可自动修复，Coordinator 发 replan_request
+→ 若需要用户决策或安全路径耗尽，生成 FailureRecord
+→ Response 只根据 failure_id 整理展示
+```
+
+因此“执行失败”不会被过早压缩成一段自然语言然后丢失阶段，也不会直接跳过执行后的诊断/Replan 主循环。
+
+##### 协议入口校验
+
+每次交接在接收方入口统一验证，不允许各调用方各写一套宽松判断：
+
+1. `goal_id、plan_id、plan_version` 与当前权威状态一致；旧版本消息不得修改新计划。
+2. `message_type` 与 payload 类型匹配；缺字段时返回结构化合同错误，不能让 `KeyError/ValueError` 击穿 CLI。
+3. payload 引用的 `fact_id、step_id、execution_id` 确实属于对应 gap 或 plan。
+4. sender 只写自己负责的字段；Response、Discovery 不得修改 Plan 或 GoalOutcome。
+5. 同一 `message_id` 重放必须幂等；超时重试不能重复绑定或重复执行动作。
+6. 合同错误保留原始阶段。例如 Binding 交接无效仍归类为 `binding_contract_invalid`，不能笼统上报为 planning 失败。
+
+##### 不采用自由文本作为控制协议
+
+自然语言仍可用于模型推理说明和最终用户表达，但不能承担路由与状态传递。例如以下文本不得成为模块间控制信号：
+
+```text
+“证据似乎够了”
+“建议重新规划”
+“这个步骤大概完成了”
+```
+
+它们必须分别落到 `EvidenceGapResolution`、`replan_request` 和 `GoalOutcome` 等现有结构后，主循环才能据此行动。模型输出缺少合法结构时，系统进行有限次合同修复；修复仍失败则保留准确阶段生成 FailureRecord，而不是猜测含义或切换旁路。
 
 #### 1. EvidenceGap：当前缺口的唯一权威定义
 

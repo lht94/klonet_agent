@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from klonet_agent.ops.privileged.workflow.contracts import EvidenceConclusion
 from klonet_agent.ops.privileged.workflow.response import ResponseAgent
 
@@ -144,6 +146,22 @@ def test_failure_response_rejects_invented_user_boundary():
     result = ResponseAgent(llm).render_failure(failure, fallback="safe fallback")
 
     assert result == "safe fallback"
+
+
+@pytest.mark.parametrize("content", [
+    "</think> *Sentence 1: explain the failure clearly",
+    "<analysis>内部推理</analysis>失败发生在绑定阶段。",
+    "{{FAILURE_SUMMARY}} 当前失败需要稍后解释。",
+    "当前任务在只读证据收集阶段因上游代理返回",
+])
+def test_failure_response_rejects_reasoning_and_template_artifacts(content):
+    failure = _failure_record()
+
+    result = ResponseAgent(FakeLLM(content)).render_failure(
+        failure, fallback="safe deterministic fallback",
+    )
+
+    assert result == "safe deterministic fallback"
 
 
 def test_failure_response_can_phrase_an_authoritative_missing_decision():

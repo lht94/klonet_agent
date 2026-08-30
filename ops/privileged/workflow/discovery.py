@@ -268,17 +268,38 @@ def _registered_observations(
             if match is not None and match.group(1).strip() not in {
                 "unknown", "unchecked", "truncated",
             }:
-                actual_by_predicate[predicate] = match.group(1).strip()
+                raw_value = match.group(1).strip()
+                actual_by_predicate[predicate] = (
+                    int(raw_value)
+                    if predicate == "process.uid" and raw_value.isdigit()
+                    else raw_value
+                )
         actual_by_predicate["process.identity"] = bool(
             actual_by_predicate.get("process.cwd")
             and actual_by_predicate.get("process.cmdline")
         )
+    elif request.probe == "docker_images":
+        images = []
+        for line in output.splitlines():
+            parts = line.split()
+            if (
+                len(parts) < 2
+                or parts[0] in {"inspect_docker_images", "REPOSITORY"}
+                or parts[0].startswith("command_")
+                or parts[0] == "<none>"
+                or parts[1] == "<none>"
+            ):
+                continue
+            image = "%s:%s" % (parts[0], parts[1])
+            if image not in images:
+                images.append(image)
+        actual_by_predicate["docker.images"] = images
     elif request.probe in {"running_platforms", "platform_health"}:
-        # The domain probes already emit root-bound structured records. Their
-        # contents remain raw evidence; presence is enough only for predicates
-        # whose requirement asks for a present result.
+        # Domain inventory is already root-bound. Keep its text as the
+        # deterministic searchable value so contains/contains_all requirements
+        # can be evaluated without another LLM interpretation.
         for predicate in supported:
-            actual_by_predicate[predicate] = bool(output.strip())
+            actual_by_predicate[predicate] = output.strip()
 
     for requirement in request.required_facts:
         actual = actual_by_predicate.get(requirement.predicate)
@@ -299,7 +320,7 @@ def _registered_observations(
 def _registered_probe_contract_errors(
     requests: list[ProbeRequest],
 ) -> list[str]:
-    """Explain typed predicate mismatches before any registered probe runs."""
+    """Explain typed fact-shape mismatches before a registered Probe runs."""
 
     errors = []
     for request in requests:
@@ -308,21 +329,84 @@ def _registered_probe_contract_errors(
         spec = DEFAULT_READONLY_PROBES.get(request.probe)
         if spec is None:
             continue
-        supported = set(spec.supported_predicates)
-        unsupported = sorted({
-            item.predicate for item in request.required_facts
-            if item.predicate not in supported
-        })
-        if not unsupported:
-            continue
-        errors.append(
-            "registered probe %s does not cover predicates=%s; supported=%s"
-            % (
-                request.probe,
-                ",".join(unsupported),
-                ",".join(sorted(supported)) or "none",
-            )
-        )
+        contracts = {item.predicate: item for item in spec.fact_contracts}
+        for requirement in request.required_facts:
+            contract = contracts.get(requirement.predicate)
+            if contract is None:
+                errors.append(
+                    "registered probe %s does not cover predicate=%s; facts=%s"
+                    % (
+                        request.probe,
+                        requirement.predicate,
+                        ",".join(sorted(contracts)) or "none",
+                    )
+                )
+                continue
+            shapes = {
+                item.split(":", 1)[0]: item.split(":", 1)[1]
+                for item in contract.comparison_shapes
+            }
+            expected_shape = shapes.get(requirement.comparison)
+            if expected_shape is None:
+                errors.append(
+                    "registered probe %s predicate=%s rejects comparison=%s; "
+                    "allowed=%s"
+                    % (
+                        request.probe,
+                        requirement.predicate,
+                        requirement.comparison,
+                        "|".join(contract.comparison_shapes),
+                    )
+                )
+            else:
+                value = requirement.expected
+                shape_ok = (
+                    expected_shape == "any"
+                    or (expected_shape == "bool" and isinstance(value, bool))
+                    or (
+                        expected_shape == "list"
+                        and isinstance(value, list)
+                    )
+                    or (
+                        expected_shape == "scalar"
+                        and value is not None
+                        and not isinstance(value, (bool, list, dict))
+                    )
+                )
+                if not shape_ok:
+                    errors.append(
+                        "registered probe %s predicate=%s comparison=%s requires "
+                        "expected_shape=%s; got=%s"
+                        % (
+                            request.probe,
+                            requirement.predicate,
+                            requirement.comparison,
+                            expected_shape,
+                            type(value).__name__,
+                        )
+                    )
+            for raw_arg_contract in contract.required_args:
+                field, arg_shape = raw_arg_contract.split(":", 1)
+                arg_value = request.args.get(field)
+                arg_ok = (
+                    (arg_shape == "list" and isinstance(arg_value, list) and bool(arg_value))
+                    or (
+                        arg_shape == "scalar"
+                        and arg_value not in (None, "")
+                        and not isinstance(arg_value, (bool, list, dict))
+                    )
+                )
+                if not arg_ok:
+                    errors.append(
+                        "registered probe %s predicate=%s requires arg %s:%s; got=%s"
+                        % (
+                            request.probe,
+                            requirement.predicate,
+                            field,
+                            arg_shape,
+                            type(arg_value).__name__,
+                        )
+                    )
     return errors
 
 
@@ -699,6 +783,31 @@ class DiscoveryAgent:
             bundle.budget_exhausted = True
         collected: list[EvidenceRecord] = []
         for request in bounded:
+            contract_errors = _registered_probe_contract_errors([request])
+            if contract_errors:
+                record = EvidenceRecord.from_probe(
+                    request,
+                    "probe fact contract invalid: %s"
+                    % "; ".join(contract_errors),
+                    status="unavailable",
+                    observations=tuple(
+                        FactObservation(
+                            item.fact_id,
+                            "unresolved",
+                            None,
+                            "probe.contract_invalid",
+                        )
+                        for item in request.required_facts
+                    ),
+                )
+                collected.append(bundle.add(record))
+                if self.on_progress is not None:
+                    self.on_progress(
+                        "只读补证合同无效，未执行 Probe 或 Shell：%s"
+                        % "; ".join(contract_errors)
+                    )
+                    self.on_progress(_evidence_user_summary(record))
+                continue
             collected.extend(self._collect_request(request, bundle))
         if derive_traceback_sources and any(
             request.probe in {"logs", "process_logs"} for request in bounded
@@ -1251,6 +1360,26 @@ class DiscoveryAgent:
             "git_repository",
             {"repository": root},
             "derived authoritative Screen source Git repository",
+            (
+                FactRequirement(
+                    "fact-derived-screen-source-inside",
+                    "git.inside_work_tree", True, "equals",
+                ),
+                FactRequirement(
+                    "fact-derived-screen-source-remote",
+                    "git.remote", True, "present",
+                ),
+                FactRequirement(
+                    "fact-derived-screen-source-branch",
+                    "git.branch", True, "present",
+                ),
+                FactRequirement(
+                    "fact-derived-screen-source-revision",
+                    "git.revision", True, "present",
+                ),
+            ),
+            "cached",
+            "gap-derived-screen-source",
         )
         if any(item.request.cache_key == request.cache_key for item in bundle.records):
             return
@@ -1259,6 +1388,9 @@ class DiscoveryAgent:
                 request,
                 record.output,
                 status="available",
+                observations=_registered_observations(
+                    request, record.output, status="available",
+                ),
             )
         )
 

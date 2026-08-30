@@ -40,13 +40,26 @@ from klonet_agent.tools.environment import (
 
 
 @dataclass(frozen=True)
+class ProbeFactContract:
+    """One fact shape a registered Probe can deterministically extract."""
+
+    predicate: str
+    comparison_shapes: tuple[str, ...]
+    required_args: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ReadOnlyProbeSpec:
     name: str
     description: str
     handler: Callable[[dict[str, Any]], str]
     arg_fields: tuple[str, ...] = ()
     sensitivity: str = "internal"
-    supported_predicates: tuple[str, ...] = ()
+    fact_contracts: tuple[ProbeFactContract, ...] = ()
+
+    @property
+    def supported_predicates(self) -> tuple[str, ...]:
+        return tuple(item.predicate for item in self.fact_contracts)
 
 
 class ReadOnlyProbeRegistry:
@@ -61,12 +74,19 @@ class ReadOnlyProbeRegistry:
 
     def render(self) -> str:
         return "\n".join(
-            "%s: %s args=%s predicates=%s sensitivity=%s"
+            "%s: %s args=%s facts=%s sensitivity=%s"
             % (
                 spec.name,
                 spec.description,
                 ",".join(spec.arg_fields) or "none",
-                ",".join(spec.supported_predicates) or "unspecified",
+                ",".join(
+                    "%s[%s;args=%s]" % (
+                        item.predicate,
+                        "|".join(item.comparison_shapes),
+                        ",".join(item.required_args) or "none",
+                    )
+                    for item in spec.fact_contracts
+                ) or "unspecified",
                 spec.sensitivity,
             )
             for spec in self.describe()
@@ -811,18 +831,45 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
             "源码、Python 包、入口和运行根目录关系",
             _project_layout,
             ("project_roots",),
-            supported_predicates=(
-                "path.exists", "project.entry_files", "project.layout",
-                "project.readiness", "project.runnable", "project.runtime_cwd",
-                "project.source_root",
+            fact_contracts=(
+                ProbeFactContract("path.exists", ("equals:bool",), ("project_roots:list",)),
+                ProbeFactContract("project.entry_files", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("project_roots:list",)),
+                ProbeFactContract("project.layout", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                ), ("project_roots:list",)),
+                ProbeFactContract("project.readiness", (
+                    "equals:scalar", "present:any",
+                ), ("project_roots:list",)),
+                ProbeFactContract("project.runnable", ("equals:bool",), ("project_roots:list",)),
+                ProbeFactContract("project.runtime_cwd", (
+                    "equals:scalar", "present:any",
+                ), ("project_roots:list",)),
+                ProbeFactContract("project.source_root", (
+                    "equals:scalar", "present:any",
+                ), ("project_roots:list",)),
             ),
         ),
         ReadOnlyProbeSpec("python_runtime", "Python 解释器及 Gunicorn/Celery 路径", _python_runtime),
         ReadOnlyProbeSpec(
             "ports", "监听端口及进程摘要", _ports, ("ports",),
-            supported_predicates=(
-                "port.available", "port.occupied", "port.in_use",
-                "port.listening", "port.listener",
+            fact_contracts=(
+                ProbeFactContract("port.available", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("ports:list",)),
+                ProbeFactContract("port.occupied", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("ports:list",)),
+                ProbeFactContract("port.in_use", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("ports:list",)),
+                ProbeFactContract("port.listening", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("ports:list",)),
+                ProbeFactContract("port.listener", (
+                    "contains:scalar", "present:any",
+                ), ("ports:list",)),
             ),
         ),
         ReadOnlyProbeSpec("port_owner", "指定端口的 PID/进程所有者", inspect_process_detail, ("ports",)),
@@ -832,9 +879,12 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
         ReadOnlyProbeSpec("service", "指定 systemd 服务状态", _service, ("services",)),
         ReadOnlyProbeSpec(
             "screen", "screen 列表或指定会话输出", _screen, ("session",),
-            supported_predicates=(
-                "screen.sessions", "screen.session_exists",
-                "screen.session_available",
+            fact_contracts=(
+                ProbeFactContract("screen.sessions", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                )),
+                ProbeFactContract("screen.session_exists", ("equals:bool",), ("session:scalar",)),
+                ProbeFactContract("screen.session_available", ("equals:bool",), ("session:scalar",)),
             ),
         ),
         ReadOnlyProbeSpec("docker", "Docker 容器状态", _docker, ("name",)),
@@ -846,14 +896,28 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
         ReadOnlyProbeSpec("firewall", "UFW/nftables/iptables 规则", _firewall),
         ReadOnlyProbeSpec(
             "disk", "文件系统容量", _disk,
-            supported_predicates=("disk.capacity", "disk.filesystems"),
+            fact_contracts=(
+                ProbeFactContract("disk.capacity", (
+                    "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("disk.filesystems", (
+                    "contains:scalar", "present:any",
+                )),
+            ),
         ),
         ReadOnlyProbeSpec("memory", "内存和 swap", _memory),
         ReadOnlyProbeSpec("virtualization", "KVM 设备、虚拟化类型和 CPU 能力", _virtualization),
         ReadOnlyProbeSpec("libvirt", "libvirt domain、network 和节点能力", _libvirt),
         ReadOnlyProbeSpec("ovs", "Open vSwitch bridge、port 和控制器状态", _ovs),
         ReadOnlyProbeSpec("docker_networks", "Docker 网络列表和驱动", _docker_networks),
-        ReadOnlyProbeSpec("docker_images", "Docker 镜像、tag 和 digest", _docker_images),
+        ReadOnlyProbeSpec(
+            "docker_images", "Docker 镜像、tag 和 digest", _docker_images,
+            fact_contracts=(
+                ProbeFactContract("docker.images", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                )),
+            ),
+        ),
         ReadOnlyProbeSpec("network_links", "宿主机 link、tap、veth、bridge 和状态", _network_links, ("names",)),
         ReadOnlyProbeSpec("file_integrity", "明确文件的大小与 SHA-256", _file_integrity, ("paths",)),
         ReadOnlyProbeSpec("json_file", "JSON 配置语法和顶层键，不输出值", _json_file, ("path",)),
@@ -867,9 +931,20 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
         ReadOnlyProbeSpec(
             "git_repository", "Git 状态、revision 和 remote",
             _git_repository, ("repository",),
-            supported_predicates=(
-                "git.inside_work_tree", "git.revision", "git.remote",
-                "git.branch", "git.status",
+            fact_contracts=(
+                ProbeFactContract("git.inside_work_tree", ("equals:bool",), ("repository:scalar",)),
+                ProbeFactContract("git.revision", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                ), ("repository:scalar",)),
+                ProbeFactContract("git.remote", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                ), ("repository:scalar",)),
+                ProbeFactContract("git.branch", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                ), ("repository:scalar",)),
+                ProbeFactContract("git.status", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                ), ("repository:scalar",)),
             ),
         ),
         ReadOnlyProbeSpec("logs", "脱敏后的日志尾部", read_klonet_logs, ("path",)),
@@ -879,8 +954,17 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
         ReadOnlyProbeSpec(
             "path_permissions", "路径 mode、uid 和 gid",
             _path_permissions, ("paths",),
-            supported_predicates=(
-                "path.exists", "path.permissions", "path.uid", "path.gid",
+            fact_contracts=(
+                ProbeFactContract("path.exists", ("equals:bool",), ("paths:list",)),
+                ProbeFactContract("path.permissions", (
+                    "contains:scalar", "present:any",
+                ), ("paths:list",)),
+                ProbeFactContract("path.uid", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("paths:list",)),
+                ProbeFactContract("path.gid", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                ), ("paths:list",)),
             ),
         ),
         # Compatibility names used by existing recovery plans.
@@ -891,21 +975,51 @@ DEFAULT_READONLY_PROBES = ReadOnlyProbeRegistry(
             "按项目根目录核验 Master/Worker 后端接口并统计正常运行实例",
             inspect_running_platforms,
             ("project_roots",),
-            supported_predicates=(
-                "platform.inventory", "platform.health", "runtime.roles",
-                "runtime.identity", "runtime.ports", "runtime.startup_contract",
+            fact_contracts=(
+                ProbeFactContract("platform.inventory", (
+                    "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("platform.health", (
+                    "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("runtime.roles", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                )),
+                ProbeFactContract("runtime.identity", (
+                    "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("runtime.ports", (
+                    "contains:scalar", "contains_all:list", "present:any",
+                )),
+                ProbeFactContract("runtime.startup_contract", (
+                    "contains:scalar", "present:any",
+                )),
             ),
         ),
         ReadOnlyProbeSpec(
             "platform_health", "指定平台健康状态", inspect_platform_health,
-            ("project_root",), supported_predicates=("platform.health",),
+            ("project_root",), fact_contracts=(ProbeFactContract(
+                "platform.health", ("contains:scalar", "present:any"),
+                ("project_root:scalar",),
+            ),),
         ),
         ReadOnlyProbeSpec("service_health", "共享服务健康状态", inspect_service_health),
         ReadOnlyProbeSpec(
             "process_detail", "端口/PID/关键词进程详情", inspect_process_detail,
-            supported_predicates=(
-                "process.cwd", "process.uid", "process.python_executable",
-                "process.cmdline", "process.identity",
+            fact_contracts=(
+                ProbeFactContract("process.cwd", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("process.uid", (
+                    "equals:scalar", "present:any",
+                )),
+                ProbeFactContract("process.python_executable", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("process.cmdline", (
+                    "equals:scalar", "contains:scalar", "present:any",
+                )),
+                ProbeFactContract("process.identity", ("equals:bool",)),
             ),
         ),
         ReadOnlyProbeSpec("ops_file", "脱敏读取一个运维文件", read_ops_file, ("path",)),

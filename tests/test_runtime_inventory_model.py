@@ -268,7 +268,7 @@ def test_restart_planner_reports_external_listener_instead_of_guessing_pid():
 def test_restart_planner_conflict_reassigns_only_after_checked_free_port():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
     from klonet_agent.ops.privileged.workflow.contracts import (
-        EvidenceRecord, ProbeRequest,
+        EvidenceRecord, FactObservation,
     )
 
     encoded = base64.urlsafe_b64encode(json.dumps({
@@ -306,9 +306,19 @@ def test_restart_planner_conflict_reassigns_only_after_checked_free_port():
     replacement = request["args"]["ports"][0]
     assert replacement != 45552
 
+    typed_request = ChangePlannerAgent._probe_requests([request])[0]
     bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", request["args"], "candidates"),
-        "inspect_ports\nno matching listeners",
+        typed_request,
+        "raw output does not control Planner port allocation",
+        observations=tuple(
+            FactObservation(
+                requirement.fact_id,
+                "confirmed",
+                request["args"]["ports"],
+                "ports.port.available",
+            )
+            for requirement in typed_request.required_facts
+        ),
     ))
     ready = ChangePlannerAgent._deterministic_runtime_restart(
         "重启 vemu worker", bundle, intent_context=context,

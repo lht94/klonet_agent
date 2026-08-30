@@ -197,6 +197,8 @@ class ResponseAgent:
             or len(value) < 12
             or len(value) > 1200
             or value.lower() in {"false", "true", "null", "none"}
+            or re.search(r"[\u4e00-\u9fff]", value) is None
+            or value[-1] not in "。！？.!?"
         ):
             return False
         forbidden = (
@@ -204,6 +206,9 @@ class ResponseAgent:
             r"choose-priv-option|confirm-priv-plan|show-priv-",
             r"```|(?m:^\s*(?:sudo|ps|ss|docker|screen|systemctl)\s+)",
             r"(?:请选择|回复|输入).{0,12}(?:选项|序号|1|2|3)",
+            r"</?(?:think|analysis|reasoning)>|<\|(?:begin|end)_of_[^|]+\|>",
+            r"(?im)^\s*[*#>-]*\s*(?:sentence|paragraph|answer|response)\s*\d*\s*[:：]?",
+            r"\{\{[^{}]+\}\}|\b(?:TODO|TBD|PLACEHOLDER)\b",
         )
         if any(re.search(pattern, value, re.I) for pattern in forbidden):
             return False

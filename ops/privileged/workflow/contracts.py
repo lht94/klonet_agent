@@ -104,6 +104,21 @@ class EvidenceSubject:
             raise ValueError("invalid evidence subject kind")
         if self.value in (None, "", [], {}):
             raise ValueError("evidence subject value is required")
+        scalar_kinds = {"path", "screen_session", "host_runtime", "service"}
+        set_kinds = {"path_set", "port_set", "pid_set", "service_set"}
+        if self.kind in scalar_kinds and not isinstance(self.value, str):
+            raise ValueError("evidence subject %s requires scalar string" % self.kind)
+        if self.kind in set_kinds and not isinstance(self.value, list):
+            raise ValueError("evidence subject %s requires list value" % self.kind)
+        if self.kind in {"port_set", "pid_set"} and any(
+            isinstance(item, bool) or not str(item).isdigit()
+            for item in self.value
+        ):
+            raise ValueError("evidence subject %s requires integer members" % self.kind)
+        if self.kind in {"path_set", "service_set"} and any(
+            not isinstance(item, str) or not item.strip() for item in self.value
+        ):
+            raise ValueError("evidence subject %s requires string members" % self.kind)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "value": self.value}
@@ -174,11 +189,22 @@ class FactRequirement:
                     item.strip() for item in expected.split(",")
                     if item.strip()
                 ]
-            if predicate.startswith("port.") and isinstance(expected, list):
-                expected = [
-                    int(item) if str(item).isdigit() else item
-                    for item in expected
-                ]
+            if predicate.startswith("port."):
+                if isinstance(expected, list):
+                    expected = [
+                        int(item) if str(item).isdigit() else item
+                        for item in expected
+                    ]
+                elif str(expected).isdigit():
+                    expected = int(expected)
+            if predicate in {"process.uid", "path.uid", "path.gid"}:
+                if isinstance(expected, list):
+                    expected = [
+                        int(item) if str(item).isdigit() else item
+                        for item in expected
+                    ]
+                elif str(expected).isdigit():
+                    expected = int(expected)
             return cls(
                 fact_id=fact_id,
                 predicate=predicate,
@@ -580,6 +606,79 @@ class EvidenceBundle:
             if item.request.required_facts
         }
         return {gap_id: self.resolve_gap(gap_id) for gap_id in sorted(gap_ids)}
+
+    def requirement_values(
+        self,
+        predicate: str,
+        *,
+        observation_status: str,
+    ) -> tuple[Any, ...]:
+        """Return values proved for one predicate by typed observations.
+
+        Consumers must not infer workflow facts by reparsing ``output``.  A
+        scalar ``contains`` requirement proves exactly its expected value; a
+        confirmed ``contains_all`` requirement proves all expected members.
+        A contradicted collection requirement does not identify which member
+        failed and therefore proves no individual value.
+        """
+
+        if observation_status not in FACT_OBSERVATION_STATUSES:
+            raise ValueError("invalid requested observation status")
+        values: list[Any] = []
+        for record in self.records:
+            observations = {
+                item.fact_id: item for item in record.observations
+            }
+            for requirement in record.request.required_facts:
+                if requirement.predicate != predicate:
+                    continue
+                observation = observations.get(requirement.fact_id)
+                if (
+                    observation is None
+                    or observation.status != observation_status
+                ):
+                    continue
+                if requirement.comparison == "contains":
+                    candidates = [requirement.expected]
+                elif (
+                    requirement.comparison == "contains_all"
+                    and observation_status == "confirmed"
+                    and isinstance(requirement.expected, (list, tuple, set))
+                ):
+                    candidates = list(requirement.expected)
+                else:
+                    continue
+                for value in candidates:
+                    if value not in values:
+                        values.append(value)
+        return tuple(values)
+
+    def observation_values(
+        self,
+        predicate: str,
+        *,
+        observation_status: str = "confirmed",
+    ) -> tuple[Any, ...]:
+        """Return extractor-owned values for one typed predicate."""
+
+        if observation_status not in FACT_OBSERVATION_STATUSES:
+            raise ValueError("invalid requested observation status")
+        values: list[Any] = []
+        for record in self.records:
+            requirements = {
+                item.fact_id: item for item in record.request.required_facts
+            }
+            for observation in record.observations:
+                requirement = requirements.get(observation.fact_id)
+                if (
+                    requirement is None
+                    or requirement.predicate != predicate
+                    or observation.status != observation_status
+                ):
+                    continue
+                if observation.value not in values:
+                    values.append(observation.value)
+        return tuple(values)
 
 
 @dataclass(frozen=True)

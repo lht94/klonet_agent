@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 
-def test_binding_timeout_checkpoints_and_resumes_only_unbound_atomic_step():
+def test_binding_timeout_checkpoints_and_resumes_only_unbound_atomic_step(tmp_path):
     from klonet_agent.ops.privileged.contracts import (
         ExecutionBinding, ImplementationPlan, PrivilegedStep,
     )
@@ -11,6 +11,7 @@ def test_binding_timeout_checkpoints_and_resumes_only_unbound_atomic_step():
         ChangeBinder, ChangeBindingError,
     )
     from klonet_agent.ops.privileged.workflow.contracts import ChangePlan, ChangeStep
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
 
     def atomic(step_id):
         return PrivilegedStep(
@@ -74,30 +75,40 @@ def test_binding_timeout_checkpoints_and_resumes_only_unbound_atomic_step():
         )],
     )
     checkpoints = []
+    store = ChangePlanStore(tmp_path, user_id="u", project_id="p")
+
+    def persist(item):
+        store.save(item)
+        checkpoints.append(item.to_dict())
 
     with pytest.raises(ChangeBindingError) as captured:
-        binder.bind(plan, grounded_context=None, checkpoint=lambda item: checkpoints.append(item.to_dict()))
+        binder.bind(plan, grounded_context=None, checkpoint=persist)
 
     assert captured.value.category == "binding_provider_transient"
     assert captured.value.replan_recommended is False
     assert captured.value.replan_context["resume_binding"] is True
-    assert plan.binding_cursor == {
+    plan_id = plan.plan_id
+    del plan
+    persisted = store.load(plan_id)
+    assert persisted.binding_cursor == {
         "phase": "binding", "semantic_step_id": "deploy",
         "atomic_step_index": 1,
     }
-    assert plan.steps[0].implementation_plan.steps[0].execution_binding is not None
-    assert plan.steps[0].implementation_plan.steps[1].execution_binding is None
+    assert persisted.steps[0].implementation_plan.steps[0].execution_binding is not None
+    assert persisted.steps[0].implementation_plan.steps[1].execution_binding is None
     assert checkpoints
 
-    resumed = binder.bind(plan, grounded_context=None)
+    resumed = binder.bind(persisted, grounded_context=None, checkpoint=store.save)
+    store.save(resumed)
+    reloaded = store.load(plan_id)
 
-    assert resumed.status == "awaiting_confirmation"
-    assert resumed.binding_cursor == {}
+    assert reloaded.status == "awaiting_confirmation"
+    assert reloaded.binding_cursor == {}
     assert capability.first_binding_calls == 1
     assert capability.second_binding_calls == 1
     assert all(
         step.execution_binding is not None
-        for step in resumed.steps[0].implementation_plan.steps
+        for step in reloaded.steps[0].implementation_plan.steps
     )
 
 

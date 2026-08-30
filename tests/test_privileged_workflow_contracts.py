@@ -380,6 +380,31 @@ def test_probe_contract_normalizes_provider_scalar_lists_and_contains_all():
     assert args == {"ports": ["45553", "45554"]}
     assert requirement.expected == [45553, 45554]
 
+    one_port = FactRequirement.from_value({
+        "fact_id": "fact-one-port",
+        "predicate": "port.available",
+        "expected": "45556",
+        "comparison": "contains",
+    })
+    assert one_port.expected == 45556
+
+    uid_requirement = FactRequirement.from_value({
+        "fact_id": "fact-owner-uid",
+        "predicate": "path.uid",
+        "expected": "1000",
+        "comparison": "contains",
+    })
+    assert uid_requirement.expected == 1000
+
+
+def test_evidence_subject_rejects_semantically_invalid_set_values():
+    from klonet_agent.ops.privileged.workflow.contracts import EvidenceSubject
+
+    with pytest.raises(ValueError, match="port_set requires list"):
+        EvidenceSubject("port_set", True)
+    with pytest.raises(ValueError, match="integer members"):
+        EvidenceSubject("port_set", ["not-a-port"])
+
 
 def test_gap_resolution_ignores_raw_output_without_fact_observation():
     from klonet_agent.ops.privileged.workflow.contracts import (
@@ -409,6 +434,71 @@ def test_gap_resolution_ignores_raw_output_without_fact_observation():
     assert resolution.confirmed_fact_ids == ()
     assert resolution.contradicted_fact_ids == ()
     assert resolution.unresolved_fact_ids == ("fact-source-marker",)
+
+
+def test_requirement_values_never_reparse_raw_output_and_preserve_fact_granularity():
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, FactObservation, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="allocate ports")
+    raw_only = ProbeRequest(
+        "ports", {"ports": [47001]}, "raw-only legacy result",
+        ({
+            "fact_id": "fact-port-available-47001",
+            "predicate": "port.available",
+            "expected": 47001,
+            "comparison": "contains",
+        },),
+        gap_id="gap-port-raw-only",
+    )
+    bundle.add(EvidenceRecord.from_probe(
+        raw_only,
+        "available_ports=47001",
+    ))
+    confirmed_many = ProbeRequest(
+        "ports", {"ports": [47002, 47003]}, "typed result",
+        ({
+            "fact_id": "fact-ports-available-many",
+            "predicate": "port.available",
+            "expected": [47002, 47003],
+            "comparison": "contains_all",
+        },),
+        gap_id="gap-port-confirmed-many",
+    )
+    bundle.add(EvidenceRecord.from_probe(
+        confirmed_many,
+        "raw text deliberately carries no control meaning",
+        observations=(FactObservation(
+            "fact-ports-available-many", "confirmed", [47002, 47003],
+            "ports.port.available",
+        ),),
+    ))
+    contradicted_one = ProbeRequest(
+        "ports", {"ports": [47004]}, "typed negative result",
+        ({
+            "fact_id": "fact-port-available-47004",
+            "predicate": "port.available",
+            "expected": 47004,
+            "comparison": "contains",
+        },),
+        gap_id="gap-port-negative-one",
+    )
+    bundle.add(EvidenceRecord.from_probe(
+        contradicted_one,
+        "available_ports=47004 is misleading raw text",
+        observations=(FactObservation(
+            "fact-port-available-47004", "contradicted", [],
+            "ports.port.available",
+        ),),
+    ))
+
+    assert bundle.requirement_values(
+        "port.available", observation_status="confirmed",
+    ) == (47002, 47003)
+    assert bundle.requirement_values(
+        "port.available", observation_status="contradicted",
+    ) == (47004,)
 
 
 def test_gap_resolution_uses_fact_identity_and_keeps_only_unanswered_facts():

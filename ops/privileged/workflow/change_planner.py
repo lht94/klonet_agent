@@ -23,6 +23,7 @@ from klonet_agent.ops.privileged.workflow.contracts import (
     EvidenceBundle,
     EvidenceConclusion,
     EvidenceSubject,
+    FactRequirement,
     GoalOutcome,
     ProbeRequest,
     RuntimeComponentSpec,
@@ -788,25 +789,119 @@ def _first_checked_free_port(
     bundle: EvidenceBundle,
     candidates: list[int],
 ) -> int | None:
-    checked: set[int] = set()
-    occupied: set[int] = set()
-    candidate_set = set(candidates)
-    for record in bundle.records:
-        if record.status != "available" or record.request.probe != "ports":
-            continue
-        requested = {
-            int(item)
-            for item in record.request.args.get("ports", [])
-            if str(item).isdigit() and int(item) in candidate_set
-        }
-        checked.update(requested)
-        for port in requested:
-            if re.search(r":%s\b" % port, record.output):
-                occupied.add(port)
+    available = _confirmed_port_values(bundle, "port.available")
     return next(
-        (port for port in candidates if port in checked and port not in occupied),
+        (port for port in candidates if port in available),
         None,
     )
+
+
+def _confirmed_port_values(
+    bundle: EvidenceBundle,
+    predicate: str,
+) -> set[int]:
+    return {
+        int(value)
+        for value in bundle.requirement_values(
+            predicate, observation_status="confirmed",
+        )
+        if str(value).isdigit() and 1 <= int(value) <= 65535
+    }
+
+
+def _contradicted_scalar_port_values(
+    bundle: EvidenceBundle,
+    predicate: str,
+) -> set[int]:
+    return {
+        int(value)
+        for value in bundle.requirement_values(
+            predicate, observation_status="contradicted",
+        )
+        if str(value).isdigit() and 1 <= int(value) <= 65535
+    }
+
+
+def _proven_unavailable_ports(bundle: EvidenceBundle) -> set[int]:
+    """Return ports deterministically proved unavailable by typed facts."""
+
+    unavailable = _contradicted_scalar_port_values(bundle, "port.available")
+    for predicate in ("port.occupied", "port.in_use", "port.listening"):
+        unavailable.update(_confirmed_port_values(bundle, predicate))
+    return unavailable
+
+
+def _port_availability_requirements(
+    ports: list[int],
+    *,
+    freshness: str = "refresh",
+    gap_id: str = "",
+) -> tuple[FactRequirement, ...]:
+    gap_suffix = (
+        "-" + hashlib.sha256(gap_id.encode("utf-8")).hexdigest()[:8]
+        if gap_id else ""
+    )
+    return tuple(
+        FactRequirement(
+            fact_id="fact-port-available-%s%s" % (port, gap_suffix),
+            predicate="port.available",
+            expected=port,
+            comparison="contains",
+            freshness=freshness,
+        )
+        for port in sorted(set(ports))
+    )
+
+
+def _port_availability_probe_payload(
+    ports: list[int],
+    *,
+    purpose: str,
+    gap_id: str,
+    affected_steps: list[str],
+) -> dict[str, Any]:
+    normalized = sorted(set(ports))
+    return {
+        "probe": "ports",
+        "args": {"ports": normalized},
+        "purpose": purpose,
+        "required_facts": [
+            item.to_dict()
+            for item in _port_availability_requirements(
+                normalized, gap_id=gap_id,
+            )
+        ],
+        "freshness": "refresh",
+        "gap_id": gap_id,
+        "affected_steps": list(affected_steps),
+    }
+
+
+def _docker_images_probe_request() -> ProbeRequest:
+    return ProbeRequest(
+        "docker_images",
+        {},
+        "select an already installed image for each new container",
+        (FactRequirement(
+            "fact-installed-docker-images",
+            "docker.images",
+            True,
+            "present",
+            "refresh",
+        ),),
+        "refresh",
+        "gap-installed-docker-images",
+    )
+
+
+def _observed_docker_images(bundle: EvidenceBundle) -> set[str]:
+    images: set[str] = set()
+    for value in bundle.observation_values("docker.images"):
+        candidates = value if isinstance(value, list) else [value]
+        images.update(
+            str(item) for item in candidates if str(item or "").strip()
+        )
+    return images
 
 
 def _requests_screen_management_transition(text: str) -> bool:
@@ -1684,23 +1779,17 @@ the complete proposed replacement goal and list what would be superseded.
                     "status": "need_evidence",
                     "reason": "explicit_target_port_requires_fresh_check=%s:%s"
                     % (role, explicit_port),
-                    "probe_requests": [{
-                        "probe": "ports",
-                        "args": {"ports": [explicit_port]},
-                        "purpose": (
+                    "probe_requests": [_port_availability_probe_payload(
+                        [explicit_port],
+                        purpose=(
                             "确认用户决定用于 %s 的 %s 目标端口 %s 当前未监听"
                             % (root, role, explicit_port)
                         ),
-                        "required_facts": [
-                            "target port listener state",
-                            "target port is free before plan freezing",
-                        ],
-                        "freshness": "refresh",
-                        "gap_id": "gap-%s-%s-explicit-target-port" % (
+                        gap_id="gap-%s-%s-explicit-target-port" % (
                             re.sub(r"[^A-Za-z0-9_.:-]+", "-", alias), role,
                         ),
-                        "affected_steps": [step_id],
-                    }],
+                        affected_steps=[step_id],
+                    )],
                 }
             port_overrides[role] = explicit_port
         skipped_conflict_roles: set[str] = set()
@@ -1786,23 +1875,17 @@ the complete proposed replacement goal and list what would be superseded.
                             return {
                                 "status": "need_evidence",
                                 "reason": "checked_free_replacement_port_required=%s" % role,
-                                "probe_requests": [{
-                                    "probe": "ports",
-                                    "args": {"ports": candidate_ports},
-                                    "purpose": (
+                                "probe_requests": [_port_availability_probe_payload(
+                                    candidate_ports,
+                                    purpose=(
                                         "为 %s 的 %s 选择一个经检查未监听的新端口；"
                                         "保留当前端口占用者" % (root, role)
                                     ),
-                                    "required_facts": [
-                                        "bounded candidate port listener states",
-                                        "at least one checked free replacement port",
-                                    ],
-                                    "freshness": "refresh",
-                                    "gap_id": "gap-%s-%s-replacement-port" % (
+                                    gap_id="gap-%s-%s-replacement-port" % (
                                         re.sub(r"[^A-Za-z0-9_.:-]+", "-", alias), role,
                                     ),
-                                    "affected_steps": [step_id],
-                                }],
+                                    affected_steps=[step_id],
+                                )],
                             }
                         port_overrides[role] = replacement
                         continue
@@ -2265,24 +2348,18 @@ the complete proposed replacement goal and list what would be superseded.
                         "status": "need_evidence",
                         "reason": "plan_wide_checked_free_port_required=%s:%s"
                         % (root, role),
-                        "probe_requests": [{
-                            "probe": "ports",
-                            "args": {"ports": candidates_for_role},
-                            "purpose": (
+                        "probe_requests": [_port_availability_probe_payload(
+                            candidates_for_role,
+                            purpose=(
                                 "端口 %s 在整份计划内冲突；为 %s 的 %s "
                                 "选择经检查未监听的唯一目标端口"
                                 % (collision_port, root, role)
                             ),
-                            "required_facts": [
-                                "bounded candidate port listener states",
-                                "one unique checked-free destination port",
-                            ],
-                            "freshness": "refresh",
-                            "gap_id": "gap-plan-wide-%s-%s-port" % (
+                            gap_id="gap-plan-wide-%s-%s-port" % (
                                 re.sub(r"[^A-Za-z0-9_.:-]+", "-", root), role,
                             ),
-                            "affected_steps": [],
-                        }],
+                            affected_steps=[],
+                        )],
                     }
                 runtime_port_overrides_by_root.setdefault(root, {})[role] = replacement
                 additionally_reserved.add(replacement)
@@ -2927,13 +3004,7 @@ the complete proposed replacement goal and list what would be superseded.
             return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=plan,
-                evidence_requests=[
-                    ProbeRequest(
-                        "docker_images",
-                        {},
-                        "select an already installed image for each new container",
-                    )
-                ],
+                evidence_requests=[_docker_images_probe_request()],
             )
         return GoalOutcome(status="need_execution", plan=plan)
 
@@ -3598,28 +3669,12 @@ the complete proposed replacement goal and list what would be superseded.
     ) -> None:
         """Allocate checked-free candidates when the model selects checked-busy ports."""
 
-        explicit_records = [
-            record
-            for record in bundle.records
-            if record.status == "available"
-            and record.request.probe == "ports"
-            and isinstance(record.request.args.get("ports"), list)
-            and record.request.args.get("ports")
-        ]
-        if not explicit_records:
+        available = _confirmed_port_values(bundle, "port.available")
+        unavailable = _proven_unavailable_ports(bundle)
+        if not available and not unavailable:
             return
-        candidates: list[int] = []
-        occupied: set[int] = set()
-        for record in explicit_records:
-            for raw_port in record.request.args.get("ports", []):
-                try:
-                    port = int(raw_port)
-                except (TypeError, ValueError):
-                    continue
-                if port not in candidates:
-                    candidates.append(port)
-                if re.search(r":%s\b" % port, record.output):
-                    occupied.add(port)
+        candidates = sorted(available)
+        occupied = set(unavailable)
         for instance in RuntimeInventory.from_bundle(bundle).instances:
             occupied.update(instance.configured_ports.values())
         host_resources = [
@@ -4657,32 +4712,6 @@ the complete proposed replacement goal and list what would be superseded.
                     and binding.configured_port == port
                 ):
                     owner_pid = binding.listener_pid
-                for record in bundle.records:
-                    if owner_pid is not None:
-                        break
-                    if record.status != "available" or record.request.probe != "port_owner":
-                        continue
-                    for line in record.output.splitlines():
-                        cwd_match = re.search(r"\bcwd=([^\s]+)", line)
-                        owner_cwd = (
-                            str(cwd_match.group(1)).rstrip("/")
-                            if cwd_match is not None
-                            else ""
-                        )
-                        if not (
-                            re.search(r"\bport=%s\b" % port, line)
-                            and "worker_main:flask_app" in line
-                            and owner_cwd in {root, root + "/mains"}
-                        ):
-                            continue
-                        pid_match = re.search(r"\btree_root_pid=(\d+)\b", line)
-                        if pid_match is None:
-                            pid_match = re.search(r"\bpid=(\d+)\b", line)
-                        if pid_match is not None:
-                            owner_pid = int(pid_match.group(1))
-                            break
-                    if owner_pid is not None:
-                        break
             for resource in data.get("resources") or []:
                 if not isinstance(resource, dict) or resource.get("kind") != "port":
                     continue
@@ -4754,60 +4783,31 @@ the complete proposed replacement goal and list what would be superseded.
         goal: str,
         bundle: EvidenceBundle,
     ) -> set[str]:
-        goal_text = str(goal or "").lower()
         roots: set[str] = set()
-        all_grounded_roots: set[str] = set()
         for record in bundle.records:
-            if (
+            if not (
                 record.status == "available"
                 and record.request.probe == "git_repository"
                 and "derived authoritative Screen source"
                 in str(record.request.purpose or "")
             ):
-                repository = str(record.request.args.get("repository") or "")
-                if repository:
-                    all_grounded_roots.add(repository)
-                    roots.add(repository)
                 continue
-            if record.status != "available" or record.request.probe != "screen":
+            requirements = {
+                item.fact_id: item for item in record.request.required_facts
+            }
+            confirmed = {
+                requirements[item.fact_id].predicate
+                for item in record.observations
+                if item.status == "confirmed" and item.fact_id in requirements
+            }
+            if not {
+                "git.inside_work_tree", "git.remote", "git.branch", "git.revision",
+            }.issubset(confirmed):
                 continue
-            output = record.output
-            if "remotes=origin" in output:
-                all_grounded_roots.update(
-                    match.group(1)
-                    for match in re.finditer(
-                        r"\bpath=(/[^\s]+)\s+inside_work_tree=true",
-                        output,
-                    )
-                )
-            for match in re.finditer(
-                r"(?m)^session=([A-Za-z0-9_.-]+).*?\bgit_roots=([^\s]+)",
-                output,
-            ):
-                session = match.group(1)
-                prefix = re.sub(
-                    r"_(?:web|m|c|w|worker|master|controller)$",
-                    "",
-                    session,
-                    flags=re.I,
-                )
-                for root in match.group(2).split(","):
-                    if root == "unknown" or not root:
-                        continue
-                    grounded = (
-                        "path=%s inside_work_tree=true" % root in output
-                        and "remotes=origin" in output
-                        and re.search(r"status=##\s+[^\s]+", output) is not None
-                    )
-                    if grounded:
-                        all_grounded_roots.add(root)
-                        if prefix.lower() in goal_text:
-                            roots.add(root)
-        if roots:
-            return roots
-        if "screen" in goal_text and len(all_grounded_roots) == 1:
-            return all_grounded_roots
-        return set()
+            repository = str(record.request.args.get("repository") or "")
+            if repository.startswith("/"):
+                roots.add(repository)
+        return roots
 
     @staticmethod
     def _is_redundant_source_request(
@@ -4861,18 +4861,13 @@ the complete proposed replacement goal and list what would be superseded.
                     candidate, bundle, unproven
                 ),
             )
+        unavailable = _proven_unavailable_ports(bundle)
         occupied = []
         for resource in candidate.resources:
             if not ChangePlannerAgent._requires_host_port_availability(resource):
                 continue
             port = int(resource.value)
-            relevant = [
-                record
-                for record in bundle.records
-                if record.request.probe == "ports"
-                and port in record.request.args.get("ports", [])
-            ]
-            if any(re.search(r":%s\b" % port, record.output) for record in relevant):
+            if port in unavailable:
                 occupied.append(port)
         if occupied:
             affected_steps = sorted({
@@ -4899,13 +4894,7 @@ the complete proposed replacement goal and list what would be superseded.
             return GoalOutcome(
                 status="need_evidence",
                 candidate_plan=candidate,
-                evidence_requests=[
-                    ProbeRequest(
-                        "docker_images",
-                        {},
-                        "select an already installed image for each new container",
-                    )
-                ],
+                evidence_requests=[_docker_images_probe_request()],
             )
         return GoalOutcome(status="need_execution", plan=candidate)
 
@@ -4928,34 +4917,40 @@ the complete proposed replacement goal and list what would be superseded.
     ) -> list[ProbeRequest]:
         requests = []
         if unproven_ports:
+            ports = sorted({int(item.value) for item in unproven_ports})
+            affected_steps = tuple(sorted({
+                str(consumer).split(".", 1)[0]
+                for item in unproven_ports
+                for consumer in item.consumers
+                if str(consumer).split(".", 1)[0]
+            }))
+            digest = hashlib.sha256(
+                (candidate.plan_id + ":" + ",".join(map(str, ports))).encode("utf-8")
+            ).hexdigest()[:16]
             requests.append(
                 ProbeRequest(
                     "ports",
-                    {"ports": sorted({int(item.value) for item in unproven_ports})},
+                    {"ports": ports},
                     "verify frozen port availability",
+                    _port_availability_requirements(
+                        ports,
+                        gap_id="gap-port-availability-" + digest,
+                    ),
+                    "refresh",
+                    "gap-port-availability-" + digest,
+                    affected_steps,
                 )
             )
         if (
             ChangePlannerAgent._plan_needs_docker_images(candidate)
             and not ChangePlannerAgent._has_docker_images(bundle)
         ):
-            requests.append(
-                ProbeRequest(
-                    "docker_images",
-                    {},
-                    "select an already installed image for each new container",
-                )
-            )
+            requests.append(_docker_images_probe_request())
         return requests
 
     @staticmethod
     def _has_docker_images(bundle: EvidenceBundle) -> bool:
-        return any(
-            record.request.probe == "docker_images"
-            and record.status == "available"
-            and "inspect_docker_images" in record.output
-            for record in bundle.records
-        )
+        return bool(_observed_docker_images(bundle))
 
     @staticmethod
     def _explicit_goal_boundary_errors(
@@ -5401,7 +5396,8 @@ the complete proposed replacement goal and list what would be superseded.
             ):
                 errors.append("source_remote must be a discovered Git remote")
             elif not any(
-                remote_value in record.output for record in bundle.records
+                remote_value in str(value)
+                for value in bundle.observation_values("git.remote")
             ):
                 errors.append("source_remote is not grounded in evidence")
         source_branch = next(
@@ -5418,7 +5414,8 @@ the complete proposed replacement goal and list what would be superseded.
         ):
             errors.append("source_branch requires a .ref consumer")
         if source_branch is not None and not any(
-            str(source_branch.value) in record.output for record in bundle.records
+            str(source_branch.value) == str(value)
+            for value in bundle.observation_values("git.branch")
         ):
             errors.append("source_branch is not grounded in evidence")
         for port_resource in ChangePlannerAgent._unproven_port_resources(
@@ -5434,15 +5431,7 @@ the complete proposed replacement goal and list what would be superseded.
             if ChangePlannerAgent._requires_host_port_availability(item)
         ):
             port = int(port_resource.value)
-            relevant = [
-                record
-                for record in bundle.records
-                if record.request.probe == "ports"
-                and port in record.request.args.get("ports", [])
-            ]
-            if not relevant:
-                continue
-            if any(re.search(r":%s\b" % port, record.output) for record in relevant):
+            if port in _proven_unavailable_ports(bundle):
                 errors.append("port resource is already listening=%s" % port)
         isolation_requested = bool(re.search(r"isolat|隔离|不干扰", goal_text, re.I))
         isolation_payload = json.dumps(
@@ -6068,24 +6057,9 @@ the complete proposed replacement goal and list what would be superseded.
         missing_roles = [role for role in requested_roles if role not in existing_roles]
 
         candidates: list[int] = []
-        occupied: set[int] = set()
-        for record in bundle.records:
-            if record.status != "available" or record.request.probe != "ports":
-                continue
-            requested = record.request.args.get("ports", [])
-            if not isinstance(requested, list):
-                continue
-            for raw_port in requested:
-                try:
-                    port = int(raw_port)
-                except (TypeError, ValueError):
-                    continue
-                if not 1 <= port <= 65535:
-                    continue
-                if port not in candidates:
-                    candidates.append(port)
-                if re.search(r":%s\b" % port, record.output):
-                    occupied.add(port)
+        available = _confirmed_port_values(bundle, "port.available")
+        candidates.extend(sorted(available))
+        occupied = _proven_unavailable_ports(bundle)
         occupied.update(
             instance_port
             for instance in RuntimeInventory.from_bundle(bundle).instances
@@ -6170,12 +6144,7 @@ the complete proposed replacement goal and list what would be superseded.
                 if item.status == "frozen" and item.role == "docker_image"
                 for consumer in item.consumers
             }
-            image_output = "\n".join(
-                record.output
-                for record in bundle.records
-                if record.status == "available"
-                and record.request.probe == "docker_images"
-            )
+            observed_images = _observed_docker_images(bundle)
             for service, allowed_tags in (
                 ("mysql", ("latest",)),
                 ("redis", ("7", "latest")),
@@ -6187,12 +6156,7 @@ the complete proposed replacement goal and list what would be superseded.
                 selected_image = next((
                     "%s:%s" % (service, tag)
                     for tag in allowed_tags
-                    if re.search(
-                        r"(?:\b%s\s+%s\b|\b%s:%s\b)"
-                        % (re.escape(service), re.escape(tag), re.escape(service), re.escape(tag)),
-                        image_output,
-                        re.I,
-                    )
+                    if "%s:%s" % (service, tag) in observed_images
                 ), None)
                 if selected_image is None:
                     continue
@@ -6879,16 +6843,15 @@ the complete proposed replacement goal and list what would be superseded.
         resources: list[PlanResource],
         bundle: EvidenceBundle,
     ) -> list[PlanResource]:
+        available = _confirmed_port_values(bundle, "port.available")
+        unavailable = _proven_unavailable_ports(bundle)
+        checked = available | unavailable
         unproven = []
         for resource in resources:
             if not ChangePlannerAgent._requires_host_port_availability(resource):
                 continue
             port = int(resource.value)
-            if not any(
-                record.request.probe == "ports"
-                and port in record.request.args.get("ports", [])
-                for record in bundle.records
-            ):
+            if port not in checked:
                 unproven.append(resource)
         return unproven
 

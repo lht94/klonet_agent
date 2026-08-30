@@ -44,6 +44,77 @@ def _encoded_runtime_value(value):
     ).decode("ascii")
 
 
+def _typed_port_record(
+    ports,
+    *,
+    available=(),
+    purpose="port availability",
+):
+    """Build Planner-facing port evidence through the fact protocol."""
+
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceRecord, FactObservation, FactRequirement, ProbeRequest,
+    )
+
+    checked = [int(item) for item in ports]
+    free = {int(item) for item in available}
+    requirements = tuple(
+        FactRequirement(
+            "fact-port-available-%s" % port,
+            "port.available",
+            port,
+            "contains",
+            "refresh",
+        )
+        for port in checked
+    )
+    request = ProbeRequest(
+        "ports",
+        {"ports": checked},
+        purpose,
+        requirements,
+        "refresh",
+        "gap-test-port-availability",
+    )
+    observations = tuple(
+        FactObservation(
+            requirement.fact_id,
+            "confirmed" if requirement.expected in free else "contradicted",
+            sorted(free),
+            "test.typed_port_evidence",
+        )
+        for requirement in requirements
+    )
+    return EvidenceRecord.from_probe(
+        request,
+        "typed port evidence; raw text is not a Planner control contract",
+        observations=observations,
+    )
+
+
+def _typed_docker_images_record(images, *, purpose="installed images"):
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceRecord, FactObservation, FactRequirement, ProbeRequest,
+    )
+
+    request = ProbeRequest(
+        "docker_images", {}, purpose,
+        (FactRequirement(
+            "fact-installed-docker-images", "docker.images", True,
+            "present", "refresh",
+        ),),
+        "refresh", "gap-installed-docker-images",
+    )
+    return EvidenceRecord.from_probe(
+        request,
+        "raw Docker table is audit-only",
+        observations=(FactObservation(
+            "fact-installed-docker-images", "confirmed", list(images),
+            "docker_images.docker.images",
+        ),),
+    )
+
+
 def test_port_conflict_decision_accepts_planner_normalized_modify_free_port():
     from klonet_agent.ops.privileged.workflow.change_planner import (
         _runtime_port_conflict_resolution,
@@ -142,9 +213,10 @@ def test_missing_role_with_foreign_listener_uses_checked_free_port_policy():
         46552, RuntimeInventory.from_bundle(bundle),
     )
 
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", {"ports": requested}, "candidate availability"),
-        "all requested ports are not listening",
+    bundle.add(_typed_port_record(
+        requested,
+        available=requested,
+        purpose="candidate availability",
     ))
     ready = ChangePlannerAgent._deterministic_runtime_restart(
         goal, bundle, intent_context=context,
@@ -596,9 +668,8 @@ def test_explicit_port_decision_replaces_inventory_port_before_freezing_plan():
         "worker_endpoint=healthy worker_identities=20:1000:/opt/python3.8 "
         "runtime_identities=20:1000:/opt/python3.8",
     ))
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", {"ports": [45556]}, "target availability"),
-        "environment unchanged",
+    bundle.add(_typed_port_record(
+        [45556], available=[45556], purpose="target availability",
     ))
 
     data = ChangePlannerAgent._deterministic_runtime_restart(goal, bundle)
@@ -698,9 +769,8 @@ def test_all_platform_plan_allocates_unique_checked_port_for_duplicate_roles():
             "web_terminal_port:5114 runtime_identities=20:1000:/opt/python3.8",
         ]),
     ))
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", {"ports": [5115]}, "candidate availability"),
-        "environment unchanged",
+    bundle.add(_typed_port_record(
+        [5115], available=[5115], purpose="candidate availability",
     ))
 
     data = ChangePlannerAgent._deterministic_runtime_restart(
@@ -1668,26 +1738,102 @@ def _bundle_and_conclusion():
         EvidenceClaim,
         EvidenceConclusion,
         EvidenceRecord,
+        FactObservation,
         ProbeRequest,
     )
 
     bundle = EvidenceBundle(goal="deploy v4e2e")
     record = bundle.add(
         EvidenceRecord.from_probe(
-            ProbeRequest("git_repository", {"repository": "/srv/source"}, "remote"),
+            ProbeRequest(
+                "git_repository", {"repository": "/srv/source"}, "remote",
+                (
+                    {
+                        "fact_id": "fact-source-remote",
+                        "predicate": "git.remote",
+                        "expected": "gitee:example/platform.git",
+                        "comparison": "contains",
+                    },
+                    {
+                        "fact_id": "fact-source-branch",
+                        "predicate": "git.branch",
+                        "expected": "develop",
+                        "comparison": "equals",
+                    },
+                ),
+                gap_id="gap-source-git",
+            ),
             "origin=gitee:example/platform.git branch=develop",
+            observations=(
+                FactObservation(
+                    "fact-source-remote", "confirmed",
+                    "origin=gitee:example/platform.git",
+                    "git_repository.git.remote",
+                ),
+                FactObservation(
+                    "fact-source-branch", "confirmed", "develop",
+                    "git_repository.git.branch",
+                ),
+            ),
         )
     )
-    bundle.add(
-        EvidenceRecord.from_probe(
-            ProbeRequest("ports", {"ports": [47001]}, "freeze port"),
-            "inspect_ports\nno matching listeners",
-        )
-    )
+    bundle.add(_typed_port_record(
+        [47001], available=[47001], purpose="freeze port",
+    ))
     conclusion = EvidenceConclusion(
         confirmed_facts=[EvidenceClaim("source repository identified", [record.evidence_id])]
     )
     return bundle, conclusion, record.evidence_id
+
+
+def test_planner_cannot_ground_git_resources_from_raw_output_without_observations():
+    from klonet_agent.ops.privileged.contracts import PlanResource
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, ProbeRequest,
+    )
+
+    bundle = EvidenceBundle(goal="create a new Klonet platform from Git")
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest(
+            "git_repository", {"repository": "/srv/source"}, "legacy Git text",
+        ),
+        "remote=gitee:example/platform.git branch=develop",
+    ))
+    data = {"changes": [{
+        "step_id": "clone", "title": "Clone source",
+        "objective": "Clone source into /srv/target",
+        "expected_changes": ["target exists"],
+        "postconditions": [{
+            "checker": "file_exists", "args": {"path": "/srv/target/.git"},
+        }],
+    }]}
+    resources = [
+        PlanResource(
+            "instance_root", "path", "frozen", "instance_root", "/srv/target",
+            "user_input", consumers=["clone.repository"],
+        ),
+        PlanResource(
+            "source_remote", "identifier", "frozen", "source_remote",
+            "gitee:example/platform.git", "evidence", consumers=["clone.url"],
+        ),
+        PlanResource(
+            "source_branch", "identifier", "frozen", "source_branch",
+            "develop", "evidence", consumers=["clone.ref"],
+        ),
+        PlanResource(
+            "instance_identifier", "identifier", "frozen",
+            "instance_identifier", "target", "user_input",
+            consumers=["clone.instance_name"],
+        ),
+    ]
+
+    errors = ChangePlannerAgent._ready_contract_errors(
+        data, bundle.goal, resources, bundle,
+    )
+
+    assert "source_remote is not grounded in evidence" in errors
+    assert "source_branch is not grounded in evidence" in errors
 
 
 def test_runtime_repair_plan_covers_every_unhealthy_backend_role():
@@ -2674,12 +2820,16 @@ def test_container_plan_requires_docker_image_discovery_before_binding():
 
     assert missing.status == "need_evidence"
     assert missing.evidence_requests[0].probe == "docker_images"
-    bundle.add(
-        EvidenceRecord.from_probe(
-            ProbeRequest("docker_images", {}, "select an installed image"),
-            "inspect_docker_images\nredis latest sha256:a sha256:b now 1MB",
-        )
-    )
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest("docker_images", {}, "legacy raw image table"),
+        "inspect_docker_images\nredis latest sha256:a sha256:b now 1MB",
+    ))
+    assert ChangePlannerAgent.finalize_candidate(
+        plan, bundle,
+    ).status == "need_evidence"
+    bundle.refresh(_typed_docker_images_record(
+        ["redis:latest"], purpose="select an installed image",
+    ))
     assert ChangePlannerAgent.finalize_candidate(plan, bundle).status == "need_execution"
 
 
@@ -2864,10 +3014,11 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
         EvidenceRecord,
         ProbeRequest,
     )
+    from klonet_agent.ops.privileged.workflow.discovery import DiscoveryAgent
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="use Screen prefix vemu_uestc as source")
-    bundle.add(
+    screen_record = bundle.add(
         EvidenceRecord.from_probe(
             ProbeRequest("screen", {}, "source"),
             (
@@ -2879,12 +3030,13 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             ),
         )
     )
+    DiscoveryAgent._add_derived_screen_source(bundle, screen_record)
     assert ChangePlannerAgent._authoritative_screen_source_roots(
         "use the selected Screen source",
         bundle,
     ) == {"/home/lzl/vemu_uestc"}
     section_only = EvidenceBundle(goal="use the selected Screen source")
-    section_only.add(
+    section_record = section_only.add(
         EvidenceRecord.from_probe(
             ProbeRequest("screen", {}, "source"),
             (
@@ -2894,19 +3046,16 @@ def test_planner_rejects_redundant_source_probe_when_screen_git_is_authoritative
             ),
         )
     )
+    DiscoveryAgent._add_derived_screen_source(section_only, section_record)
     assert ChangePlannerAgent._authoritative_screen_source_roots(
         section_only.goal,
         section_only,
     ) == {"/home/lzl/vemu_uestc"}
     derived_only = EvidenceBundle(goal="use Screen source")
     derived_only.add(
-        EvidenceRecord.from_probe(
-            ProbeRequest(
-                "git_repository",
-                {"repository": "/home/lzl/vemu_uestc"},
-                "derived authoritative Screen source Git repository",
-            ),
-            "inside_work_tree=true remote=gitee:example/vemu.git branch=develop",
+        next(
+            item for item in bundle.records
+            if item.request.probe == "git_repository"
         )
     )
     assert ChangePlannerAgent._authoritative_screen_source_roots(
@@ -3609,9 +3758,8 @@ def test_occupied_candidate_ports_report_affected_resource_consumers():
         )],
     )
     bundle = EvidenceBundle(goal=plan.goal)
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", {"ports": [47001]}, "verify port"),
-        "LISTEN 0 128 127.0.0.1:47001 0.0.0.0:*",
+    bundle.add(_typed_port_record(
+        [47001], available=[], purpose="verify port",
     ))
 
     outcome = ChangePlannerAgent.finalize_candidate(plan, bundle)
@@ -4000,15 +4148,14 @@ def test_missing_explicit_deployment_allocations_are_frozen_from_checked_evidenc
     ]
     bundle = EvidenceBundle(goal=goal)
     candidates = list(range(45560, 45570))
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", {"ports": candidates}, "candidate availability"),
-        "inspect_ports\nchecked_ports=%s\noccupied_ports=\navailable_ports=%s"
-        % (",".join(map(str, candidates)), ",".join(map(str, candidates))),
+    bundle.add(_typed_port_record(
+        candidates,
+        available=candidates,
+        purpose="candidate availability",
     ))
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("docker_images", {}, "select installed images"),
-        "inspect_docker_images\nmysql latest sha256:a\nredis 7 sha256:b\n"
-        "redis latest sha256:c\nrabbitmq latest sha256:d",
+    bundle.add(_typed_docker_images_record(
+        ["mysql:latest", "redis:7", "redis:latest", "rabbitmq:latest"],
+        purpose="select installed images",
     ))
 
     normalized = ChangePlannerAgent._normalize_missing_explicit_deployment_resources(
@@ -4433,6 +4580,24 @@ def test_planner_bounds_port_probe_candidates():
     assert requests[0].args == {"ports": list(range(10000, 10064))}
 
 
+def test_planner_rejects_boolean_port_subject_before_discovery_execution():
+    from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
+
+    with pytest.raises(ValueError, match="port_set requires list"):
+        ChangePlannerAgent._probe_requests([{
+            "probe": "ports",
+            "args": {},
+            "purpose": "check unspecified candidate ports",
+            "subject": {"kind": "port_set", "value": True},
+            "required_facts": [{
+                "fact_id": "fact-candidate-ports",
+                "predicate": "port.available",
+                "expected": True,
+                "comparison": "contains_all",
+            }],
+        }])
+
+
 def test_planner_routes_python_source_log_request_to_ops_file():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
@@ -4457,16 +4622,11 @@ def test_planner_reassigns_occupied_host_port_from_probed_free_candidates():
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle = EvidenceBundle(goal="deploy")
-    bundle.add(
-        EvidenceRecord.from_probe(
-            ProbeRequest(
-                "ports",
-                {"ports": [45551, 45552, 5011]},
-                "freeze candidates",
-            ),
-            "inspect_ports\nLISTEN 0 128 127.0.0.1:45551 0.0.0.0:*",
-        )
-    )
+    bundle.add(_typed_port_record(
+        [45551, 45552, 5011],
+        available=[45552, 5011],
+        purpose="freeze candidates",
+    ))
     data = {
         "changes": [
             {
@@ -4700,9 +4860,8 @@ def test_planner_reassigns_new_port_that_collides_with_another_active_config_rol
         "platform=vemu_uestc project_root=/home/lzl/vemu_uestc "
         "configured_ports=master_port:45551,worker_port:45552,public_port:45553",
     ))
-    bundle.add(EvidenceRecord.from_probe(
-        ProbeRequest("ports", {"ports": [45553, 45554]}, "candidates"),
-        "inspect_ports\nno matching listeners",
+    bundle.add(_typed_port_record(
+        [45553, 45554], available=[45553, 45554], purpose="candidates",
     ))
     data = {"changes": [
         {
@@ -6730,7 +6889,6 @@ def test_http_observation_does_not_claim_a_listening_port():
 
 
 def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
-    from klonet_agent.ops.privileged.workflow.contracts import EvidenceRecord, ProbeRequest
     from klonet_agent.ops.privileged.workflow.change_planner import ChangePlannerAgent
 
     bundle, conclusion, evidence_id = _bundle_and_conclusion()
@@ -6787,9 +6945,19 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     )
 
     assert outcome.status == "need_evidence"
-    assert outcome.evidence_requests == [
-        ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability")
-    ]
+    assert len(outcome.evidence_requests) == 1
+    request = outcome.evidence_requests[0]
+    assert request.probe == "ports"
+    assert request.args == {"ports": [47002]}
+    assert request.freshness == "refresh"
+    assert request.affected_steps == ("deploy",)
+    assert len(request.required_facts) == 1
+    requirement = request.required_facts[0]
+    assert requirement.fact_id.startswith("fact-port-available-47002-")
+    assert requirement.predicate == "port.available"
+    assert requirement.expected == 47002
+    assert requirement.comparison == "contains"
+    assert requirement.freshness == "refresh"
     assert outcome.candidate_plan is not None
     assert outcome.candidate_plan.goal == "deploy v4e2e to /srv/appe2e"
     assert next(
@@ -6797,12 +6965,9 @@ def test_deployment_planner_turns_unproven_frozen_port_into_evidence_request():
     ).value == 47002
     assert len(llm.calls) == 1
 
-    bundle.add(
-        EvidenceRecord.from_probe(
-            ProbeRequest("ports", {"ports": [47002]}, "verify frozen port availability"),
-            "inspect_ports\nno matching listeners",
-        )
-    )
+    bundle.add(_typed_port_record(
+        [47002], available=[47002], purpose="verify frozen port availability",
+    ))
     finalized = ChangePlannerAgent.finalize_candidate(
         outcome.candidate_plan,
         bundle,
