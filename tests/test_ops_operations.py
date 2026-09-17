@@ -12,7 +12,7 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 
-def test_ops_operation_tools_are_registered_and_profile_allowed():
+def test_legacy_operation_tools_remain_registered_but_are_not_public_ops_tools():
     from klonet_agent.agents import get_profile
     from klonet_agent.tools.registry import TOOLS
 
@@ -26,13 +26,13 @@ def test_ops_operation_tools_are_registered_and_profile_allowed():
     assert "execute_ops_operation_step" in tool_names
     assert "execute_ops_next_step" in tool_names
     assert "resolve_ops_blocked_step" in tool_names
-    assert "create_ops_operation_plan" in profile.allowed_tools
-    assert "list_ops_operation_plans" in profile.allowed_tools
-    assert "describe_ops_operation_plan" in profile.allowed_tools
-    assert "approve_ops_operation_plan" in profile.allowed_tools
-    assert "execute_ops_operation_step" in profile.allowed_tools
-    assert "execute_ops_next_step" in profile.allowed_tools
-    assert "resolve_ops_blocked_step" in profile.allowed_tools
+    assert "create_ops_operation_plan" not in profile.allowed_tools
+    assert "list_ops_operation_plans" not in profile.allowed_tools
+    assert "describe_ops_operation_plan" not in profile.allowed_tools
+    assert "approve_ops_operation_plan" not in profile.allowed_tools
+    assert "execute_ops_operation_step" not in profile.allowed_tools
+    assert "execute_ops_next_step" not in profile.allowed_tools
+    assert "resolve_ops_blocked_step" not in profile.allowed_tools
     assert "run_command" not in profile.allowed_tools
 
 
@@ -655,7 +655,7 @@ def test_executor_refuses_plan_approval_without_user_confirm_text():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -692,7 +692,7 @@ def test_executor_accepts_exact_user_confirm_text_and_requires_step_confirmation
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -745,7 +745,7 @@ def test_executor_marks_confirmed_step_blocked_when_recipe_is_missing():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -2359,12 +2359,16 @@ def test_write_ops_file_recipe_preserves_indented_anchor():
         )
 
 
-def test_write_ops_file_recipe_blocks_system_python_source_files():
+def test_write_ops_file_recipe_blocks_system_python_source_files(monkeypatch):
     from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops import recipes
     from klonet_agent.ops.recipes import ControlledRecipeRunner
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
+        # The legacy recipe's protected roots are POSIX deployment paths. Keep
+        # this compatibility assertion portable when the suite runs on Windows.
+        monkeypatch.setattr(recipes, "_is_system_ops_write_path", lambda path: True)
         store = OperationPlanStore(
             temp_dir / "plans",
             recipe_runner=ControlledRecipeRunner(dry_run=False),
@@ -3159,9 +3163,10 @@ def test_ensure_user_group_recipe_requires_step_confirmation_and_calls_helper():
     ]
 
 
-def test_remove_python_package_entries_requires_step_confirmation_and_removes_entries():
+def test_remove_python_package_entries_requires_step_confirmation_and_removes_entries(monkeypatch):
     import shutil
 
+    from klonet_agent.ops import recipes
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
 
@@ -3177,6 +3182,9 @@ def test_remove_python_package_entries_requires_step_confirmation_and_removes_en
     keep_file.write_text("keep\n", encoding="utf-8")
 
     try:
+        # This legacy recipe only allows Linux deployment venv paths. The
+        # mutation behavior remains importable and is tested directly here.
+        monkeypatch.setattr(recipes, "_allowed_site_packages_root", lambda path: True)
         store = OperationPlanStore(
             root / "plans",
             recipe_runner=ControlledRecipeRunner(dry_run=False),
@@ -3217,12 +3225,14 @@ def test_remove_python_package_entries_requires_step_confirmation_and_removes_en
     assert keep_file_exists
 
 
-def test_remove_python_package_entries_blocks_unallowlisted_entries():
+def test_remove_python_package_entries_blocks_unallowlisted_entries(monkeypatch):
     from klonet_agent.ops.operations import OperationPlanStore
+    from klonet_agent.ops import recipes
     from klonet_agent.ops.recipes import ControlledRecipeRunner
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
+        monkeypatch.setattr(recipes, "_allowed_site_packages_root", lambda path: True)
         store = OperationPlanStore(
             temp_dir,
             recipe_runner=ControlledRecipeRunner(dry_run=False),
@@ -3252,9 +3262,10 @@ def test_remove_python_package_entries_blocks_unallowlisted_entries():
     assert "invalid_package_entry=../flask" in result
 
 
-def test_remove_python_package_entries_accepts_stringified_entry_list():
+def test_remove_python_package_entries_accepts_stringified_entry_list(monkeypatch):
     import shutil
 
+    from klonet_agent.ops import recipes
     from klonet_agent.ops.operations import OperationPlanStore
     from klonet_agent.ops.recipes import ControlledRecipeRunner
 
@@ -3266,6 +3277,7 @@ def test_remove_python_package_entries_accepts_stringified_entry_list():
     stale_dir.mkdir(parents=True)
 
     try:
+        monkeypatch.setattr(recipes, "_allowed_site_packages_root", lambda path: True)
         store = OperationPlanStore(
             root / "plans",
             recipe_runner=ControlledRecipeRunner(dry_run=False),
@@ -3413,7 +3425,7 @@ def test_executor_blocks_bound_restart_when_real_execution_is_disabled(monkeypat
 
     monkeypatch.setenv("KLONET_AGENT_OPS_REAL_EXECUTION", "0")
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3473,7 +3485,7 @@ def test_executor_execute_ops_next_step_stops_at_step_confirmation_after_auto_pr
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3511,7 +3523,7 @@ def test_executor_resolve_ops_blocked_step_resets_step_to_pending():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3565,7 +3577,7 @@ def test_executor_describe_ops_operation_plan_returns_current_state():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3601,7 +3613,7 @@ def test_executor_list_ops_operation_plans_returns_recent_plan_summaries():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3650,7 +3662,7 @@ def test_executor_list_ops_operation_plans_filters_by_status():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3698,7 +3710,7 @@ def test_executor_list_ops_operation_plans_filters_by_target_and_operation():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3755,7 +3767,7 @@ def test_executor_create_deploy_plan_passes_operation_args_to_default_recipe():
     from tests.helpers import local_temp_dir
 
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(
             session=session,
@@ -3787,7 +3799,7 @@ def test_executor_operation_plan_store_blocks_when_real_execution_env_is_missing
 
     monkeypatch.delenv("KLONET_AGENT_OPS_REAL_EXECUTION", raising=False)
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(session=session, memory_store=store)
         operation_store = executor._operation_plan_store()
@@ -3804,7 +3816,7 @@ def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypa
 
     monkeypatch.setenv("KLONET_AGENT_OPS_REAL_EXECUTION", "1")
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u1", project_id="p1", mode="ops")
+        session = AgentSession(user_id="u1", project_id="p1")
         store = MemoryStore.for_session(temp_dir / "memory", "u1", "p1")
         executor = ToolExecutor(session=session, memory_store=store)
         operation_store = executor._operation_plan_store()
@@ -3818,7 +3830,7 @@ def test_ops_executor_rejects_removed_raw_shell_tool():
     from klonet_agent.tools.executor import ToolExecutor
 
     executor = ToolExecutor(
-        session=AgentSession(mode="ops"),
+        session=AgentSession(),
         allowed_tools={"run_privileged_command"},
     )
 
