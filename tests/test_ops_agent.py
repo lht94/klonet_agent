@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_PARENT = PROJECT_ROOT.parent
@@ -10,32 +11,14 @@ if str(PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_PARENT))
 
 
-def test_ops_profile_uses_read_only_environment_tools():
+def test_ops_profile_uses_privileged_supervisor_workflow():
     from klonet_agent.agents import get_profile
 
     profile = get_profile("ops")
 
     assert profile.name == "ops"
-    assert "search_knowledge" in profile.allowed_tools
-    assert "inspect_system_environment" in profile.allowed_tools
-    assert "inspect_klonet_runtime" in profile.allowed_tools
-    assert "read_klonet_logs" in profile.allowed_tools
-    assert "run_command" not in profile.allowed_tools
-    assert "write_file" in profile.allowed_tools
-    assert "run_privileged_command" not in profile.allowed_tools
-
-
-def test_ops_privilege_profile_uses_readonly_tools_and_supervisor_boundary():
-    from klonet_agent.agents import get_profile
-
-    profile = get_profile("ops-privilege")
-
-    assert profile.name == "ops-privilege"
-    assert "run_privileged_command" not in profile.allowed_tools
-    assert "run_readonly_command" in profile.allowed_tools
+    assert "supervisor -> exact plan control" in profile.default_workflow
     assert "create_ops_operation_plan" not in profile.allowed_tools
-    assert "write_file" not in profile.allowed_tools
-    assert profile.requires_review is True
 
 
 def test_ops_tool_round_limit_is_higher_than_default():
@@ -79,17 +62,11 @@ def test_agent_cli_accepts_ops_mode(monkeypatch):
     assert captured["mode"] == "ops"
 
 
-def test_agent_cli_accepts_ops_privilege_mode(monkeypatch):
+def test_agent_cli_rejects_removed_ops_privilege_mode(monkeypatch):
     from klonet_agent.agent import main
 
-    captured = {}
-
-    def fake_run_chat(**kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr("klonet_agent.app.run_chat", fake_run_chat)
+    monkeypatch.setattr("klonet_agent.app.run_chat", lambda **kwargs: None)
     monkeypatch.setattr("sys.argv", ["agent.py", "--mode", "ops-privilege"])
 
-    main()
-
-    assert captured["mode"] == "ops-privilege"
+    with pytest.raises(SystemExit):
+        main()

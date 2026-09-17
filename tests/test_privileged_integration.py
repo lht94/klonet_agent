@@ -7,11 +7,11 @@ import pytest
 from tests.helpers import local_temp_dir
 
 
-def test_ops_privilege_model_visible_tools_exclude_all_mutating_execution_paths():
+def test_ops_model_visible_tools_exclude_all_mutating_execution_paths():
     from klonet_agent.agents import get_profile
     from klonet_agent.tools.registry import TOOLS
 
-    profile = get_profile("ops-privilege")
+    profile = get_profile("ops")
     registered = {item["function"]["name"] for item in TOOLS}
 
     assert "run_privileged_command" not in registered
@@ -27,7 +27,7 @@ def test_tool_executor_cannot_be_used_as_raw_privileged_shell_escape():
     from klonet_agent.tools.executor import ToolExecutor
 
     executor = ToolExecutor(
-        session=AgentSession(mode="ops-privilege"),
+        session=AgentSession(mode="ops"),
         allowed_tools={"run_privileged_command"},
     )
 
@@ -113,8 +113,8 @@ def test_orchestrator_builds_workflow_as_the_only_privileged_runtime():
 
     with local_temp_dir() as temp_dir:
         orchestrator = AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
-            session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+            profile=get_profile("ops"),
+            session=AgentSession(user_id="u", project_id="p", mode="ops"),
             llm=NoCallLLM(),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
         )
@@ -169,8 +169,8 @@ def test_workflow_readonly_turn_runs_through_staged_runtime(capsys):
 
     with local_temp_dir() as temp_dir:
         orchestrator = AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
-            session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+            profile=get_profile("ops"),
+            session=AgentSession(user_id="u", project_id="p", mode="ops"),
             llm=QueueLLM(),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u", "p"),
         )
@@ -182,7 +182,7 @@ def test_workflow_readonly_turn_runs_through_staged_runtime(capsys):
     assert "工作流协调器：readonly response" not in output
 
 
-def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys):
+def test_orchestrator_sends_every_ops_turn_to_supervisor_first(capsys):
     from klonet_agent.agents import get_profile
     from klonet_agent.memory import MemoryStore
     from klonet_agent.orchestrator import AgentOrchestrator
@@ -190,10 +190,10 @@ def test_orchestrator_sends_every_ops_privilege_turn_to_supervisor_first(capsys)
 
     supervisor = StubPrivilegedSupervisor()
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
+        session = AgentSession(user_id="u", project_id="p", mode="ops")
         memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
         orchestrator = AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
+            profile=get_profile("ops"),
             session=session,
             llm=NoCallLLM(),
             memory_store=memory,
@@ -222,10 +222,10 @@ def test_orchestrator_returns_handled_supervisor_result_before_main_llm():
 
     supervisor = StubPrivilegedSupervisor()
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
+        session = AgentSession(user_id="u", project_id="p", mode="ops")
         memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
         orchestrator = AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
+            profile=get_profile("ops"),
             session=session,
             llm=NoCallLLM(),
             memory_store=memory,
@@ -270,8 +270,8 @@ def test_handled_privileged_turn_persists_episode_shared_memory_and_trace(tmp_pa
     memory = MemoryStore.for_session(tmp_path / "memory", "u", "p")
     trace_path = tmp_path / "trace.jsonl"
     orchestrator = AgentOrchestrator(
-        profile=get_profile("ops-privilege"),
-        session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+        profile=get_profile("ops"),
+        session=AgentSession(user_id="u", project_id="p", mode="ops"),
         llm=NoCallLLM(),
         memory_store=memory,
         trace_logger=TraceLogger(trace_path),
@@ -292,13 +292,12 @@ def test_handled_privileged_turn_persists_episode_shared_memory_and_trace(tmp_pa
     assert trace_rows[-1]["goal_status"] == "achieved"
 
 
-def test_ops_privilege_memory_prompt_includes_shared_ops_evidence(tmp_path):
+def test_ops_memory_prompt_includes_shared_ops_evidence(tmp_path):
     from klonet_agent.memory import MemoryStore
 
     memory = MemoryStore.for_session(tmp_path / "memory", "u", "p")
     memory.append_shared_episode("## Ops evidence\n- marker: shared-runtime-fact")
 
-    assert "shared-runtime-fact" in memory.memory_prompt(mode="ops-privilege")
     assert "shared-runtime-fact" in memory.memory_prompt(mode="ops")
     assert "shared-runtime-fact" not in memory.memory_prompt(mode="mentor")
 
@@ -316,10 +315,10 @@ def test_orchestrator_passes_recent_dialogue_to_privileged_classifier():
         {"role": "assistant", "content": "nginx 当前未运行"},
     ]
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
+        session = AgentSession(user_id="u", project_id="p", mode="ops")
         memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
         orchestrator = AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
+            profile=get_profile("ops"),
             session=session,
             llm=NoCallLLM(),
             memory_store=memory,
@@ -343,10 +342,10 @@ def test_orchestrator_continues_to_answerer_when_supervisor_delegates_conversati
     supervisor = DelegatingSupervisor()
     llm = AnswerLLM()
     with local_temp_dir() as temp_dir:
-        session = AgentSession(user_id="u", project_id="p", mode="ops-privilege")
+        session = AgentSession(user_id="u", project_id="p", mode="ops")
         memory = MemoryStore.for_session(temp_dir / "memory", "u", "p")
         orchestrator = AgentOrchestrator(
-            profile=get_profile("ops-privilege"),
+            profile=get_profile("ops"),
             session=session,
             llm=llm,
             memory_store=memory,
@@ -375,7 +374,7 @@ def test_trace_logger_records_privileged_lifecycle_event(tmp_path):
     logger.record_privileged_event(
         user_id="u",
         project_id="p",
-        mode="ops-privilege",
+        mode="ops",
         event="privileged_plan_created",
         payload={"plan_id": "priv-123", "risk": "medium"},
     )
