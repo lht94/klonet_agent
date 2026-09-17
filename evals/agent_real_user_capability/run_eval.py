@@ -53,7 +53,7 @@ def run_live(case, root: Path, python: str, timeout: int) -> dict | None:
         return None
     started = time.monotonic()
     command = [
-        python, "-m", "klonet_agent.agent", "--mode", "ops-privilege",
+        python, "-m", "klonet_agent.agent", "--mode", "ops",
         "--user-id", "real-capability-eval-" + case["id"].lower(),
         "--project-id", "round",
     ]

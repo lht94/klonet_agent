@@ -542,10 +542,9 @@ mentor、coding 或 ops 模式：
 python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
 python -m klonet_agent.agent --mode coding --user-id lht --project-id test
 python -m klonet_agent.agent --mode ops --user-id lht --project-id test
-python -m klonet_agent.agent --mode ops-privilege --user-id lht --project-id test
 ```
 
-`ops-privilege` 是独立的 Agentic 高权限运维模式。语义 Planner 先结合 Klonet RAG
+`ops` 是唯一的 Agentic 高权限运维模式，由 Supervisor 编排并以执行证据验证。语义 Planner 先结合 Klonet RAG
 Runbook 和统一服务器环境事实决定“做什么、为什么做、怎样算成功”，但看不到 Action
 名称，也不能输出命令。Execution Agent 再把每个语义步骤映射成注册 Action；确实没有
 对应能力时，才生成内容、工作目录、用户、环境、超时、哈希和有效期全部固定的一次性
@@ -554,9 +553,9 @@ Shell Artifact。Verifier 根据执行证据、Checker 和必要的只读探测�
 修改计划使用内容哈希绑定的 `confirm-priv-plan <plan_id> <sha256>` 精确确认。
 计划 ID、内容、环境指纹或有效期发生变化都会使确认失效；解析器会拒绝命令替换、
 嵌套 Shell、网络外传、敏感凭据、修改 Agent 安全边界和无边界删除。执行始终使用
-`shell=False` 的固定 argv。普通 `ops` 模式仍使用 OperationPlan/helper/sudoers 链路。
+`shell=False` 的固定 argv。`ops` 的所有环境修改都经过这条受控、可验证的执行链路。
 
-`ops-privilege` 的知识和执行能力分成四层：
+`ops` 的知识和执行能力分成四层：
 
 - RAG Runbook：部署、启停、重启、组件恢复、Nginx、环境部署、源码升级和回滚的
   经验与检查思路，只提供 Planner 参考，不规定固定路径。
@@ -575,7 +574,7 @@ Shell Artifact。Verifier 根据执行证据、Checker 和必要的只读探测�
 confirm-priv-plan <plan_id> <sha256>
 ```
 
-当前唯一的 Ops-Privilege 工作流位于 `ops/privileged/workflow/`。计划、执行绑定、
+当前唯一的 Ops 工作流位于 `ops/privileged/workflow/`。计划、执行绑定、
 Shell Artifact、授权哈希、步骤状态、探测证据和检查结果保存在当前 user/project 的
 `memory/sessions/.../privileged_ops_plans/` 下。进程中断时，原来处于
 `running`/`verifying` 的步骤会变成 `execution_unknown`；恢复流程先验证当前状态，

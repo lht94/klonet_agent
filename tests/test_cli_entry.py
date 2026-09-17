@@ -53,6 +53,17 @@ def test_module_cli_can_run_from_project_root():
     assert "--ops-privilege-workflow" not in result.stdout
 
 
+def test_real_user_capability_evaluator_launches_public_ops_mode():
+    """Live acceptance must exercise the only public privileged Ops entry."""
+
+    source = (
+        PROJECT_ROOT / "evals" / "agent_real_user_capability" / "run_eval.py"
+    ).read_text(encoding="utf-8")
+
+    assert '"--mode", "ops"' in source
+    assert '"--mode", "ops-privilege"' not in source
+
+
 def test_script_cli_can_run_from_project_root():
     """用户在仓库根目录下直接运行 agent.py 也应该可以查看帮助。"""
 

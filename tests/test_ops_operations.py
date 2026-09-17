@@ -3813,12 +3813,12 @@ def test_executor_operation_plan_store_can_enable_real_execution_by_env(monkeypa
     assert operation_store.recipe_runner.execution_config == "enabled"
 
 
-def test_ops_privilege_executor_rejects_removed_raw_shell_tool():
+def test_ops_executor_rejects_removed_raw_shell_tool():
     from klonet_agent.session import AgentSession
     from klonet_agent.tools.executor import ToolExecutor
 
     executor = ToolExecutor(
-        session=AgentSession(mode="ops-privilege"),
+        session=AgentSession(mode="ops"),
         allowed_tools={"run_privileged_command"},
     )
 

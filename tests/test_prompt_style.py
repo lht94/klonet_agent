@@ -241,7 +241,7 @@ def test_ops_privilege_prompt_describes_adaptive_pev_boundary():
 
 def test_ops_profile_declares_supervisor_single_entry_workflow():
     from klonet_agent.agents import get_profile
-    from klonet_agent.prompts import SAFETY_PROMPT
+    from klonet_agent.prompts import MODE_CAPABILITY_PROMPT, SAFETY_PROMPT
 
     workflow = get_profile("ops").default_workflow
 
@@ -249,7 +249,9 @@ def test_ops_profile_declares_supervisor_single_entry_workflow():
     assert "model intent" in workflow
     assert "readonly execute/check" in workflow
     assert "mutation PEV" in workflow
-    assert "Ops-Privilege 也不得让模型直接执行 shell/sudo" in SAFETY_PROMPT
+    assert "Ops 模式也不得让模型直接执行 shell/sudo" in SAFETY_PROMPT
+    assert "Ops-Privilege 模式" not in SAFETY_PROMPT
+    assert "Ops-Privilege 模式" not in MODE_CAPABILITY_PROMPT
 
 
 def test_ops_prompt_prioritizes_process_detail_for_port_owner_evidence():

@@ -1,6 +1,6 @@
 ﻿# klonet-agent-op 安装契约
 
-`klonet-agent-op` 是 Ops Agent 修改服务器环境时唯一应该被 sudoers 放行的入口。部署脚本会默认开启受控真实执行；但每次环境修改仍必须先经过 OperationPlan、计划确认、单步确认，并且只能通过 helper 与 sudoers 白名单进入真实执行链路。
+`klonet-agent-op` 是 Ops Agent 修改服务器环境时唯一应该被 sudoers 放行的入口。公开的 `ops` 模式是由 Supervisor 编排、以执行证据验证的受控高权限运维工作流；部署脚本会默认开启受控真实执行，但每次环境修改仍必须先经过计划、确认、单步确认，并且只能通过 helper 与 sudoers 白名单进入真实执行链路。
 
 ## 一键部署专用账户与服务
 
