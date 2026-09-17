@@ -136,7 +136,7 @@ OPS_PROMPT = """
 
 
 OPS_PRIVILEGE_PROMPT = """
-当前模式：Klonet Ops-Privilege Agent。
+当前模式：Klonet Ops Agent。
 
 行为规则：
 1. 这是用户显式选择的高权限运维模式，但模式授权不等于对任意命令的无限授权。

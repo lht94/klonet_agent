@@ -224,7 +224,7 @@ def test_ops_prompt_forbids_plaintext_secrets_in_plans():
 def test_ops_privilege_prompt_describes_adaptive_pev_boundary():
     from klonet_agent.prompts import OPS_PRIVILEGE_PROMPT, SAFETY_PROMPT
 
-    assert "当前模式：Klonet Ops-Privilege Agent" in OPS_PRIVILEGE_PROMPT
+    assert "当前模式：Klonet Ops Agent。" in OPS_PRIVILEGE_PROMPT
     assert "模型不可见、也不得请求任何任意 Shell 执行工具" in OPS_PRIVILEGE_PROMPT
     assert "独立 Planner" in OPS_PRIVILEGE_PROMPT
     assert "Checker Registry" in OPS_PRIVILEGE_PROMPT
@@ -239,11 +239,11 @@ def test_ops_privilege_prompt_describes_adaptive_pev_boundary():
     assert "不得输出“修正后的计划”" in OPS_PRIVILEGE_PROMPT
 
 
-def test_ops_privilege_profile_declares_supervisor_single_entry_workflow():
+def test_ops_profile_declares_supervisor_single_entry_workflow():
     from klonet_agent.agents import get_profile
     from klonet_agent.prompts import SAFETY_PROMPT
 
-    workflow = get_profile("ops-privilege").default_workflow
+    workflow = get_profile("ops").default_workflow
 
     assert workflow.startswith("supervisor -> exact plan control -> goal safety")
     assert "model intent" in workflow

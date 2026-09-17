@@ -132,15 +132,6 @@ def get_profile(name: str) -> AgentProfile:
     if normalized == "ops":
         return AgentProfile(
             name="ops",
-            mode_prompt=OPS_PROMPT,
-            allowed_tools=OPS_TOOLS,
-            default_workflow="route -> retrieve runbook -> inspect read-only environment -> plan -> confirm -> execute controlled recipe",
-            requires_rag=True,
-            requires_review=False,
-        )
-    if normalized == "ops-privilege":
-        return AgentProfile(
-            name="ops-privilege",
             mode_prompt=OPS_PRIVILEGE_PROMPT,
             allowed_tools=OPS_PRIVILEGE_TOOLS,
             default_workflow=(

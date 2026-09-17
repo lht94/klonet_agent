@@ -177,7 +177,7 @@ class AgentOrchestrator:
 
         self.privileged_supervisor = privileged_supervisor
         if (
-            self.profile.name == "ops-privilege"
+            self.profile.name == "ops"
             and self.privileged_supervisor is None
         ):
             planner_llm = self.llm
@@ -560,7 +560,7 @@ class AgentOrchestrator:
         # role 可以是 system、user、assistant、tool。
         recent_history_for_intent = self._recent_dialogue_history(
             history,
-            limit=20 if self.profile.name == "ops-privilege" else 6,
+            limit=20 if self.profile.name == "ops" else 6,
         )
         history.append({"role": "user", "content": user_input})
         self.memory_store.append_history({"role": "user", "content": user_input})
@@ -1029,7 +1029,7 @@ class AgentOrchestrator:
     ):
         """Send every Ops-Privilege turn through the Supervisor control plane."""
 
-        if self.profile.name != "ops-privilege":
+        if self.profile.name != "ops":
             return None
         if self.privileged_supervisor is None:
             raise RuntimeError("Ops-Privilege Supervisor is unavailable")
@@ -1149,7 +1149,7 @@ class AgentOrchestrator:
             ]
             self.memory_store.append_shared_ops_record(
                 question=user_input,
-                intent="ops-privilege / %s" % payload["kind"],
+                intent="ops / %s" % payload["kind"],
                 target=", ".join(roots) or "未确认",
                 tools=probe_names,
                 evidence=evidence_lines,
@@ -1185,19 +1185,19 @@ class AgentOrchestrator:
     def _show_visible_reasoning_trace(self) -> bool:
         """默认输出用户可见思考摘要；brief 模式只输出最终答案。"""
 
-        return self.profile.name not in {"ops", "ops-privilege"} and self.answer_style != "brief"
+        return self.profile.name != "ops" and self.answer_style != "brief"
 
     def _max_tool_rounds(self) -> int:
         """Return the tool loop budget for the current profile."""
 
-        if self.profile.name in {"ops", "ops-privilege"}:
+        if self.profile.name == "ops":
             return OPS_MAX_TOOL_ROUNDS
         return MAX_TOOL_ROUNDS
 
     def _show_progress_updates(self) -> bool:
         """Show safe CLI progress milestones without adding them to model context."""
 
-        return self.profile.name in {"mentor", "ops", "ops-privilege"} and self.answer_style != "brief"
+        return self.profile.name in {"mentor", "ops"} and self.answer_style != "brief"
 
     def _print_tool_loop_action(self, tool_name: str, tool_args: dict) -> None:
         """Print one safe Ops action before a tool executes."""

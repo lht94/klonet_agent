@@ -84,7 +84,14 @@ class RecordingToolExecutor:
         return "unexpected tool result"
 
 
-def test_ops_privilege_agents_share_the_same_bounded_workflow_client(
+class DelegatingPrivilegedSupervisor:
+    """Let legacy tool-loop coverage exercise the answerer after supervision."""
+
+    def handle(self, text, environment_context=""):
+        return SimpleNamespace(handled=False, status="conversation", message="")
+
+
+def test_ops_agents_share_the_same_bounded_workflow_client(
     tmp_path, monkeypatch,
 ):
     from klonet_agent.agents.profile import get_profile
@@ -93,9 +100,9 @@ def test_ops_privilege_agents_share_the_same_bounded_workflow_client(
 
     monkeypatch.setattr(module, "MEMORY_DIR", tmp_path)
     agent = module.AgentOrchestrator(
-        profile=get_profile("ops-privilege"),
+        profile=get_profile("ops"),
         session=AgentSession(
-            mode="ops-privilege", user_id="timeout-test", project_id="wiring",
+            mode="ops", user_id="timeout-test", project_id="wiring",
         ),
     )
     coordinator = agent.privileged_supervisor
@@ -787,6 +794,7 @@ def test_ops_klonet_search_budget_is_wider_than_mentor():
             tool_executor=executor,
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
+            privileged_supervisor=DelegatingPrivilegedSupervisor(),
         )
         history = orchestrator.init_history()
         _, history, _ = orchestrator.single_chat(
@@ -1151,6 +1159,7 @@ def test_ops_mode_prints_tool_loop_trace_without_reasoning_summary(capsys):
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
             intent_analyzer=OpsIntentAnalyzer(target="platform_runtime"),
+            privileged_supervisor=DelegatingPrivilegedSupervisor(),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat("帮我看看有哪些平台", history, 0)
@@ -1226,6 +1235,7 @@ def test_ops_progress_uses_route_summary_not_generic_task_type(capsys):
             intent_analyzer=OpsIntentAnalyzer(
                 target="web_terminal", symptom="port_conflict",
             ),
+            privileged_supervisor=DelegatingPrivilegedSupervisor(),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat(user_input, history, 0)
@@ -1689,6 +1699,7 @@ def test_ops_injects_deterministic_environment_plan_before_final_answer(capsys):
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
             intent_analyzer=PlatformStartIntentAnalyzer(),
+            privileged_supervisor=DelegatingPrivilegedSupervisor(),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat("我怎么启动 Klonet", history, 0)
@@ -1799,6 +1810,7 @@ def test_ops_plan_does_not_split_assistant_tool_response_pair(capsys, monkeypatc
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=MemoryStore.for_session(temp_dir / "memory", "u1", "p1"),
             intent_analyzer=PlatformStartIntentAnalyzer(),
+            privileged_supervisor=DelegatingPrivilegedSupervisor(),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat("鎴戞€庝箞鍚姩 Klonet", history, 0)
@@ -1883,6 +1895,7 @@ def test_ops_tool_observation_is_appended_to_shared_memory(capsys):
             tool_executor=RuntimeExecutor(),
             trace_logger=TraceLogger(temp_dir / "trace.jsonl"),
             memory_store=memory_store,
+            privileged_supervisor=DelegatingPrivilegedSupervisor(),
         )
         history = orchestrator.init_history()
         orchestrator.single_chat("看看有哪些平台", history, 0)
