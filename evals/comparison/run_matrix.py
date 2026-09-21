@@ -62,7 +62,14 @@ def build_command(arm: str, task: dict, out_dir: Path) -> tuple[list[str], str |
     if arm in {"mentor", "ops"}:
         argv = [
             "bash", str(ROOT / "scripts/run_eval_session.sh"),
-            arm, "eval", f"cmp-{task['id'].lower()}",
+            arm,
+            # 每个任务用独立的 user_id：实测发现共用 user 时，
+            # 上一个任务遗留的 FailureRecord 会被「待人工决策状态门」接住，
+            # 导致下一个任务的输入根本不进意图分类
+            # （H012×ops 只跑 2 秒就返回「当前会话没有可处理的失败记录」）。
+            # 每个任务必须从干净状态开始，否则测的不是任务本身。
+            f"eval-{task['id'].lower().replace('_', '-')}",
+            f"cmp-{task['id'].lower()}",
         ]
         # CLI 把非交互 stdin 的全部内容作为一个用户回合
         return argv, prompt + "\n"
@@ -235,6 +242,19 @@ def main() -> int:
         return 0
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    matrix_file = args.out_dir / "matrix.json"
+
+    # 与已有记录合并，而不是覆盖：不同批次（如先跑 baseline-record，再跑真实执行臂）
+    # 是同一实验的组成部分，覆盖会让先跑那批的结构化数据消失。
+    # 同 (task_id, arm) 以本次为准。
+    previous: dict[tuple[str, str], dict] = {}
+    if matrix_file.exists():
+        try:
+            for old in json.loads(matrix_file.read_text(encoding="utf-8")):
+                previous[(old.get("task_id"), old.get("arm"))] = old
+        except json.JSONDecodeError:
+            print("警告：已有 matrix.json 无法解析，将重新开始。", file=sys.stderr)
+
     records: list[dict] = []
     for index, (arm, task) in enumerate(plan, start=1):
         print(f"\n[{index}/{len(plan)}] {task['id']} × {arm} ...", flush=True)
@@ -247,14 +267,24 @@ def main() -> int:
             ),
             flush=True,
         )
-        # 每跑完一条就落盘，长批次中断也不丢已完成的证据
-        (args.out_dir / "matrix.json").write_text(
-            json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8",
+        # 每跑完一条就落盘（合并旧记录），长批次中断也不丢证据
+        merged = dict(previous)
+        for item in records:
+            merged[(item["task_id"], item["arm"])] = item
+        matrix_file.write_text(
+            json.dumps(list(merged.values()), ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
-    render_summary(records, args.out_dir / "SUMMARY.md")
+    # 本次批次的原始记录另存一份，便于追溯是哪一批跑出来的
+    batch_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    (args.out_dir / f"batch-{batch_stamp}.json").write_text(
+        json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+
+    render_summary(list(previous.values()) + records, args.out_dir / "SUMMARY.md")
     print(f"\n完成。汇总：{args.out_dir / 'SUMMARY.md'}")
-    print(f"原始记录：{args.out_dir / 'matrix.json'}")
+    print(f"原始记录（含历史批次）：{matrix_file}")
     return 0
 
 
