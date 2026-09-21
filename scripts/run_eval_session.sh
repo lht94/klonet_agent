@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
-# 对比测试专用启动器：在不修改 .env 的前提下，把模型与 provider 锁到实验配置。
+# 对比测试实验臂启动器：以锁定的模型配置运行 klonet_agent。
 #
-# 为什么需要单独一个启动器：
-#   1. config.py 会 load_dotenv(.env)，而仓库的 tests/test_llm_provider.py 直接断言
-#      .env 里的模型名（GLM-5.2）。把实验模型写进 .env 会让这些测试失败。
-#   2. load_dotenv 未开启 override，因此 shell 环境变量优先于 .env，
-#      可以在此处覆盖而完全不改动仓库配置。
-#   3. llm/provider.py 的 ProviderRouter 按北京时间切换 provider。必须让夜间分支
-#      也指向同一后端与同一模型，否则跨时段运行会把"模型差异"混入"Agent 差异"。
+# 模型与供给方的锁定逻辑全部在 scripts/eval_env.sh，由两个实验臂共同 source。
+# **不要在本文件里重复实现配置** —— 两臂各自读配置正是导致模型不一致的原因
+# （实测踩过：对照臂读到 .env 的 gemini-3.7-flash，实验臂用 gpt-5.6-sol）。
 #
 # 用法：
 #   bash scripts/run_eval_session.sh ops    lht test
 #   bash scripts/run_eval_session.sh mentor lht test
 #
-# 也可用环境变量覆盖模型：
+# 覆盖模型：
 #   KLONET_EVAL_MODEL=gpt-5.6-terra bash scripts/run_eval_session.sh ops lht test
 
 set -euo pipefail
@@ -21,31 +17,13 @@ set -euo pipefail
 MODE="${1:-ops}"
 USER_ID="${2:-lht}"
 PROJECT_ID="${3:-test}"
-MODEL="${KLONET_EVAL_MODEL:-gpt-5.6-sol}"
-BASE_URL="${KLONET_EVAL_BASE_URL:-https://api.yyds168.net/v1}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="$ROOT/.env"
 
-read_env() {
-  sed -n "s/^$1=//p" "$ENV_FILE" | head -1 | tr -d "\"'"
-}
+# shellcheck source=/dev/null
+source "$ROOT/scripts/eval_env.sh"
 
-CHAT_KEY="$(read_env CHAT_LLM_API_KEY)"
-if [ -z "$CHAT_KEY" ]; then
-  echo "错误：$ENV_FILE 中缺少 CHAT_LLM_API_KEY，无法进行实验。" >&2
-  exit 1
-fi
-
-# 日间与夜间两个 provider 指向同一目标：无论 is_night_window() 返回什么，
-# 解析出的 (model, base_url) 都只有一种组合。
-export CHAT_LLM_BASE_URL="$BASE_URL"
-export CHAT_LLM_MODEL="$MODEL"
-export CHAT_LLM_API_KEY="$CHAT_KEY"
-export PARATERA_BASE_URL="$BASE_URL"
-export PARATERA_MODEL="$MODEL"
-export PARATERA_API_KEY_1="$CHAT_KEY"
-export PARATERA_API_KEY_2="$CHAT_KEY"
+echo "运行清单 | mode=$MODE | model=$CHAT_LLM_MODEL | base_url=$CHAT_LLM_BASE_URL | user=$USER_ID | project=$PROJECT_ID" >&2
 
 cd "$ROOT"
 exec python -m klonet_agent.agent \

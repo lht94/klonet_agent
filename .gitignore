@@ -35,6 +35,10 @@ knowledge/code_vectors.jsonl
 evals/summary.md
 evals/retrieval_summary.md
 
+# 对比测试的原始运行产物（草稿与冒烟输出）。
+# 正式实验的证据如需入库，应显式提交到单独目录，而不是让 runs/ 直接进版本库。
+evals/comparison/runs/
+
 # Local raw Klonet materials
 klonet_knowledge/
 knowledge/extracted_docs/
