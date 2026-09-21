@@ -47,44 +47,87 @@
 2. **任务集**：同一批 case、同一顺序、同一判分脚本。
 3. **环境夹具**：同一服务器快照、同一故障注入方式、同一重置流程。
 
-### 2.3 让对照臂实现同模型（已实现并验证）
+### 2.3 对照臂：官方 Codex CLI 接入 DeepSeek（已落地并验证）
 
-通用 coding agent 默认使用自家模型，直接对比会被一句「你这是模型赢，不是工程赢」否定。
-因此对照臂**不使用任何第三方 CLI**，而是直接用官方 `openai` SDK 调同一后端，
-模型一致性由构造保证，不存在协议转换问题。
+对照臂的选择经历了一次修正。
 
-#### 对照臂实现：`evals/comparison/baseline_agent.py`
+**第一版（已废弃）**：自写的最小 tool-calling 循环
+（`evals/comparison/baseline_agent.py`，官方 `openai` SDK + 通用工具
+`bash` / `read_file` / `write_file` / `list_dir`）。优点是能锁死模型与工具集；
+缺点是**读者不认** —— 简历上写「相较通用 Coding Agent」，读者默认那是成熟产品，
+而自写循环不是。
 
-一个最小通用 Agent，只保留通用 Coding Agent 的共性能力：
+**最终方案**：**官方 Codex CLI 0.149.1**，通过隔离 `CODEX_HOME` 接入
+DeepSeek 官方 API。工具链、系统提示词、上下文管理都是 Codex 自带的 ——
+**这部分开销正是被测对象**（通用 Agent 的固有成本），端到端口径下应当计入。
 
-| 包含 | 刻意不包含（这些正是被测项目的差异点） |
+> 自写基线保留在仓库里作为**次级参照**（用来分离「harness 开销」与
+> 「通用 Agent 行为」），但对外结论以 Codex CLI 为准。
+
+#### 为什么不走中转站
+
+同一句提示连续三次实测：**49.6s / 22.2s / 13.0s（3.8 倍抖动）**；
+DeepSeek 直连 **1.45s**。含耗时的对比在中转站上全是噪声。
+因此两臂统一使用 `deepseek-v4-pro` 直连。
+
+#### 接入的三个硬约束（全部实测确认）
+
+| 约束 | 实测结果 |
 | --- | --- |
-| 官方 `openai` SDK，同一后端与模型 | RAG 检索（知识库、向量、BM25、rerank） |
-| 通用工具：`bash` / `read_file` / `write_file` / `list_dir` | 领域工具（`RuntimeInventory`、只读 Probe、Action Registry） |
-| 标准 tool-calling 循环，直到给出最终答复或达步数上限 | 记忆与项目日志 |
-| 完整审计记录（每次工具调用、命令、退出码、token、耗时） | 计划审批、硬拒绝、Verifier 验收 |
+| `wire_api` | codex-cli 0.149 起 **`chat` 已被移除**，报 `no longer supported`，只认 `responses` |
+| DeepSeek `/v1/responses` | **支持**（HTTP 200，返回标准 Responses 对象） |
+| `models.json` 模型元数据 | **必需**。缺失时报 `Model metadata for deepseek-v4-pro not found ... can degrade performance` 并退回降级元数据 —— **基线被削弱则对比失去意义** |
 
-> **对照臂的 `bash` 不做任何拦截，这是有意为之** —— 测量的正是「通用 Agent 在无人监督时
-> 会不会执行破坏性操作」。截断它的能力会污染结论。隔离靠容器，不靠工具里的护栏。
+`models.json` 取自 DeepSeek 官方脚本
+（`https://cdn.deepseek.com/api-docs/codex-deepseek-setup.sh`）内嵌的
+`CODEX_MODELS_JSON` heredoc，**按标记提取而非按行号**，脚本改版也不会取错。
 
-#### 模型一致性的唯一保证：共用 `scripts/eval_env.sh`
+#### 配置（隔离在 `~/.codex-eval`，不触碰用户既有 `~/.codex`）
 
-两个实验臂**必须**都通过 `scripts/eval_env.sh` 获取模型配置，不得各自读取：
+```toml
+model = "deepseek-v4-pro"
+model_provider = "deepseek"
+preferred_auth_method = "apikey"   # 走 API Key，不占 ChatGPT 订阅额度
+forced_login_method = "api"
+model_reasoning_effort = "medium"
+model_catalog_json = "<CODEX_HOME>/models.json"
 
-```bash
-bash scripts/run_eval_session.sh ops lht test              # 实验臂（klonet_agent）
-bash evals/comparison/run_baseline.sh <task_id> "<prompt>" # 对照臂
+[model_providers.deepseek]
+name = "deepseek"
+base_url = "https://api.deepseek.com/"
+wire_api = "responses"
+env_key = "DEEPSEEK_API_KEY"       # 密钥只经环境变量，不落盘
 ```
 
-**这不是假设性风险，而是实测踩到过。** 第一版对照臂直接回落读仓库 `.env`，
-拿到 `CHAT_LLM_MODEL=gemini-3.7-flash`，而实验臂经启动器注入 `gpt-5.6-sol`，
-两臂跑的根本不是同一个模型。修复方式：
+#### 推理档位必须对齐（容易漏掉）
 
-1. 抽出 `scripts/eval_env.sh` 由两臂共同 source；
-2. 对照臂把配置来源写入结果 JSON（`config_source` / `locked`），
-   未走锁定配置时打印显著警告 —— **让不一致在数据里可见**，而不是默默发生。
+`models.json` 声明 DeepSeek 支持 `low / high / max`，**没有 `medium`**；
+而项目侧 `config.py: DEFAULT_REASONING_EFFORT = "medium"`。
+实测 `medium` 并非被忽略，而是独立档位：
 
-已验证两臂解析结果一致：`model=gpt-5.6-sol`、`base_url=https://api.yyds168.net/v1`。
+| effort | 耗时 | 输出 tok | 推理 tok |
+| --- | --- | --- | --- |
+| low | 5.26s | 309 | 214 |
+| **medium** | 7.04s | 505 | 387 |
+| high | 9.89s | 725 | 609 |
+| max | 8.13s | 573 | 438 |
+| 默认 | 5.98s | 467 | 310 |
+
+→ Codex CLI 同样设 `medium`，两臂档位一致，token 与耗时才可比。
+
+#### 度量局限与实施要点
+
+- `codex exec --json` 的事件流**不暴露单次模型往返次数**，因此 `llm_calls`
+  记为 `null`（**不用 0 冒充未知**）。效率对比以 **token 与工具调用次数** 为准。
+- `codex exec` 在**非 TTY 下会把 stdin 当作追加输入并一直等待**。评测器通过 stdin
+  传脚本，所以必须 `stdin=DEVNULL`，否则整条命令挂死且无输出。
+- 实施：`evals/comparison/codex_agent.py`（环境引导 + 事件解析 + artifact 产出）、
+  `run_matrix.py` 的 `codex` 臂。无护栏臂扩为 `UNGUARDED_ARMS = {baseline, codex}` ——
+  两者都没有审批门，`baseline_only` 级任务对它们同样危险。
+
+> **历史数字已作废**：此前基于自写基线的「token 降低 65%~96%、耗时降低 40%~69%」
+> **基线侧全部无效**，须用 Codex CLI 重测。实验臂侧（ops / mentor）的数字不依赖基线，
+> 仍然有效，因此只需重跑少量对照臂任务，不必全部重来。
 
 > 行尾陷阱：bash 脚本上传到 Linux 前必须是 LF。CRLF 会产生
 > `$'\r': command not found` 与 `set: pipefail: invalid option name`。
