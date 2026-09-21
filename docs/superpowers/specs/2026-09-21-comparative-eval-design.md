@@ -133,6 +133,40 @@ env_key = "DEEPSEEK_API_KEY"       # 密钥只经环境变量，不落盘
 > `$'\r': command not found` 与 `set: pipefail: invalid option name`。
 > 已在 `.gitattributes` 加入 `*.sh text eol=lf` 从机制上防复发。
 
+### 2.4 实测结果（Codex CLI 基线，2026-09-21）
+
+两臂同为 `deepseek-v4-pro`、`reasoning_effort=medium`；均为端到端墙钟与总 token。
+
+| 任务 | 族 | Codex 工具调用 | Codex token | Codex 耗时 | 本方案最优 Profile | token | 耗时 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| C01 平台实例清点 | 诊断 | 33 | 1,172,273 | 186.5s | ops | **−99.1%** | −84.0% |
+| retrieval_008 幻觉检测 | 知识 | 4 | 53,355 | 25.3s | ops | −95.4% | −77.2% |
+| retrieval_013 架构分层 | 知识 | 8 | 165,749 | 60.0s | mentor | −91.4% | −69.8% |
+| H012 日志诊断 | 诊断 | 48 | 7,041,392 | 412.8s | **无可比结果** | — | — |
+
+**H012 必须单独说明，不得并入结论。** Codex CLI 给出了正确根因
+（Worker 绑定 45555 被占用，有 `error.log` 证据并经 `ss -ltnp` 现场复核）；
+而本方案两侧都未给出：`ops` 因**中文路由 bug** 秒退（1.98s、0 LLM 调用），
+`mentor` 明确说明没有运行态读取能力（设计边界，非缺陷）。
+**一边有答案、一边没答案，token 少只说明它没做事** —— 该格不可比。
+→ **诊断族是当前真实短板，不是优势。**
+
+**机制解释（必须随数字一起给出，否则 99% 会被当成不可信）**：
+Codex CLI 是探索型 —— C01 用了 33 次工具调用，其中前 32 次都在找路，
+第 33 次才调用到项目自带的 `tools/environment.py:inspect_running_platforms`；
+H012 用了 48 次。**每次调用都把增长中的全部上下文重新送回模型**
+（H012 单次往返均值约 146k token）。本方案的领域编排用 2 次结构化探测直接取到结论。
+**token 差距是工具调用次数差距的后果，不是模型能力差距。**
+
+**「最优 Profile」的口径**：取该任务上两个 Profile 里更省的那个，
+对应「按任务类型分派 Profile」的写法，引用时必须同时声明。
+
+**边界**：每格 n=1；token 为端到端总量，含 Codex CLI 自身的系统提示词与工具往返；
+缓存输入 token 单价更低但未做价格折算；本方案 token 来自 CLI 自报（「约」为四舍五入）。
+
+> 复现：`python evals/comparison/run_matrix.py --arms codex --out-dir evals/comparison/runs/codex`
+> 然后 `python evals/comparison/compare_arms.py`（全部数字读取落盘产物，不手工抄写）。
+
 ## 3. 任务集设计
 
 按族混编，**分族统计，不合并为单一总分**。
