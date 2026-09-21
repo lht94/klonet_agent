@@ -269,6 +269,7 @@ def run_task(
     cwd: Path,
     record_only: bool,
     max_steps: int,
+    max_tokens: int | None,
 ) -> dict:
     messages: list[dict] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -280,12 +281,20 @@ def run_task(
     llm_calls = 0
     started = time.monotonic()
     final_text = ""
+    stopped_on_answer = False
 
     for step in range(1, max_steps + 1):
+        request: dict = {
+            "model": model, "messages": messages,
+            "tools": TOOL_SPECS, "tool_choice": "auto",
+        }
+        # 推理模型（如 deepseek-v4-pro）会把推理 token 计入 completion，
+        # 不显式给足额度时可能出现「0 个工具调用 + content 为空」的假失败 ——
+        # 那其实是推理占满了配额、可见文本被截断，不是模型放弃作答。
+        if max_tokens is not None:
+            request["max_tokens"] = max_tokens
         try:
-            response = client.chat.completions.create(
-                model=model, messages=messages, tools=TOOL_SPECS, tool_choice="auto",
-            )
+            response = client.chat.completions.create(**request)
         except Exception as exc:  # noqa: BLE001
             events.append({"step": step, "event": "llm_error",
                            "error": f"{type(exc).__name__}: {exc}"})
@@ -306,13 +315,15 @@ def run_task(
         if response.usage is not None:
             total_tokens += int(getattr(response.usage, "total_tokens", 0) or 0)
 
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
         calls = list(message.tool_calls or [])
         events.append({
             "step": step,
             "event": "assistant",
             "content": message.content or "",
             "tool_call_count": len(calls),
+            "finish_reason": getattr(choice, "finish_reason", None),
         })
 
         assistant_message: dict = {"role": "assistant", "content": message.content}
@@ -329,6 +340,7 @@ def run_task(
 
         if not calls:
             final_text = message.content or ""
+            stopped_on_answer = True
             break
 
         for call in calls:
@@ -349,8 +361,16 @@ def run_task(
             })
 
     duration = round(time.monotonic() - started, 3)
+    if final_text:
+        status = "ok"
+    elif stopped_on_answer:
+        # 模型主动停止调用工具，却没有产出任何可见文本。
+        # 对推理模型而言这常意味着推理占满了 max_tokens，需要加大 --max-tokens 再看。
+        status = "stopped_without_answer"
+    else:
+        status = "max_steps_reached"
     return {
-        "status": "ok" if final_text else "max_steps_reached",
+        "status": status,
         "llm_calls": llm_calls,
         "tool_calls": len(tool_audit),
         "total_tokens": total_tokens,
@@ -371,6 +391,9 @@ def main() -> int:
                         help="工具执行的工作目录，默认当前目录")
     parser.add_argument("--model", default=None)
     parser.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    parser.add_argument("--max-tokens", type=int, default=8192,
+                        help="单次回复上限。推理模型需要给足，否则推理 token 会占满额度、"
+                             "可见文本为空，被误判成「未给结论」")
     parser.add_argument("--record-only", action="store_true",
                         help="只记录模型想执行什么，不真正执行（安全性任务本地取数用）")
     parser.add_argument("--quiet", action="store_true")
@@ -405,7 +428,8 @@ def main() -> int:
         print("-" * 60)
 
     result = run_task(prompt=args.prompt, client=client, model=creds["model"], cwd=cwd,
-                      record_only=args.record_only, max_steps=args.max_steps)
+                      record_only=args.record_only, max_steps=args.max_steps,
+                      max_tokens=args.max_tokens)
     result["task_id"] = args.task_id
     result["prompt"] = args.prompt
     result["model"] = creds["model"]

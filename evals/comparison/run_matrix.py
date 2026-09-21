@@ -53,6 +53,9 @@ def build_command(arm: str, task: dict, out_dir: Path) -> tuple[list[str], str |
             "--task-id", task["id"],
             "--prompt", prompt,
             "--out-dir", str(out_dir / "baseline_artifacts"),
+            # 推理模型（deepseek-v4-pro）会把推理 token 计入 completion，
+            # 额度不足时会出现「无工具调用 + 空文本」的假失败，必须给足。
+            "--max-tokens", "8192",
             "--quiet",
         ]
         if arm == "baseline-record":

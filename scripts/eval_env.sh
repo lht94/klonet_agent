@@ -23,8 +23,30 @@
 # 可用环境变量覆盖模型：
 #   KLONET_EVAL_MODEL=gpt-5.6-terra source scripts/eval_env.sh
 
-: "${KLONET_EVAL_MODEL:=gpt-5.6-sol}"
-: "${KLONET_EVAL_BASE_URL:=https://api.yyds168.net/v1}"
+# 模型供给方。两臂必须取同一个值，否则模型不一致、结论失效。
+#   deepseek —— 官方直连 https://api.deepseek.com
+#   relay    —— yyds168 中转（gpt-5.6-sol）
+# 选 deepseek 的原因：中转端点单次调用延迟在 2.6s~100s 之间抖动（28 倍），
+# 且 gpt-5.6-sol 每次调用带约 4392 固定 prompt token（deepseek 仅 35~88）。
+# 前者让耗时不可比，后者让 token 不可比。官方直连两者都干净。
+KLONET_EVAL_PROVIDER="${KLONET_EVAL_PROVIDER:-deepseek}"
+
+case "$KLONET_EVAL_PROVIDER" in
+  deepseek)
+    : "${KLONET_EVAL_MODEL:=deepseek-v4-pro}"
+    : "${KLONET_EVAL_BASE_URL:=https://api.deepseek.com}"
+    _KLONET_EVAL_KEY_NAME="DEEPSEEK_API_KEY"
+    ;;
+  relay)
+    : "${KLONET_EVAL_MODEL:=gpt-5.6-sol}"
+    : "${KLONET_EVAL_BASE_URL:=https://api.yyds168.net/v1}"
+    _KLONET_EVAL_KEY_NAME="CHAT_LLM_API_KEY"
+    ;;
+  *)
+    echo "错误：未知的 KLONET_EVAL_PROVIDER=$KLONET_EVAL_PROVIDER（可选 deepseek / relay）" >&2
+    exit 1
+    ;;
+esac
 
 _KLONET_EVAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -32,9 +54,9 @@ _klonet_read_env() {
   sed -n "s/^$1=//p" "$_KLONET_EVAL_ROOT/.env" | head -1 | tr -d "\"'"
 }
 
-_KLONET_EVAL_KEY="$(_klonet_read_env CHAT_LLM_API_KEY)"
+_KLONET_EVAL_KEY="$(_klonet_read_env "$_KLONET_EVAL_KEY_NAME")"
 if [ -z "$_KLONET_EVAL_KEY" ]; then
-  echo "错误：$_KLONET_EVAL_ROOT/.env 中缺少 CHAT_LLM_API_KEY，无法进行实验。" >&2
+  echo "错误：$_KLONET_EVAL_ROOT/.env 中缺少 $_KLONET_EVAL_KEY_NAME，无法进行实验。" >&2
   exit 1
 fi
 
@@ -48,5 +70,6 @@ export PARATERA_API_KEY_1="$_KLONET_EVAL_KEY"
 export PARATERA_API_KEY_2="$_KLONET_EVAL_KEY"
 
 # 供实验记录使用：把锁定后的模型写进运行清单，便于事后核对两臂是否一致。
+export KLONET_EVAL_LOCKED_PROVIDER="$KLONET_EVAL_PROVIDER"
 export KLONET_EVAL_LOCKED_MODEL="$KLONET_EVAL_MODEL"
 export KLONET_EVAL_LOCKED_BASE_URL="$KLONET_EVAL_BASE_URL"
