@@ -6,6 +6,32 @@ from types import SimpleNamespace
 from tests.helpers import local_temp_dir
 
 
+def test_orchestrator_aggregates_usage_across_distinct_workflow_clients():
+    from types import SimpleNamespace
+
+    from klonet_agent.orchestrator import AgentOrchestrator
+
+    orchestrator = object.__new__(AgentOrchestrator)
+    first = SimpleNamespace(usage_snapshot=lambda: {
+        "total_tokens": 11,
+        "successful_calls": 1,
+        "unavailable_calls": 0,
+    })
+    second = SimpleNamespace(usage_snapshot=lambda: {
+        "total_tokens": 19,
+        "successful_calls": 2,
+        "unavailable_calls": 1,
+    })
+    orchestrator.llm = first
+    orchestrator._usage_clients = [first, second, first]
+
+    assert orchestrator.usage_snapshot() == {
+        "total_tokens": 30,
+        "successful_calls": 3,
+        "unavailable_calls": 1,
+    }
+
+
 class FakeLLM:
     """记录调用参数并返回固定自然语言回答。"""
 

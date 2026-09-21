@@ -252,6 +252,30 @@ def test_cli_allows_missing_optional_readline(monkeypatch):
     )
 
 
+def test_cli_renders_provider_reported_usage_and_missing_usage_explicitly():
+    from types import SimpleNamespace
+
+    from klonet_agent.app.cli import render_token_usage
+
+    available = SimpleNamespace(llm=SimpleNamespace(
+        usage_snapshot=lambda: {
+            "total_tokens": 42,
+            "successful_calls": 2,
+            "unavailable_calls": 0,
+        }
+    ))
+    unavailable = SimpleNamespace(llm=SimpleNamespace(
+        usage_snapshot=lambda: {
+            "total_tokens": 0,
+            "successful_calls": 0,
+            "unavailable_calls": 1,
+        }
+    ))
+
+    assert render_token_usage(available) == "本次累计 token 约 42"
+    assert render_token_usage(unavailable) == "本次累计 token 统计不可用"
+
+
 def test_cli_does_not_hide_unrelated_readline_import_errors(monkeypatch):
     """readline 内部依赖故障不能被误当成可选模块缺失。"""
 

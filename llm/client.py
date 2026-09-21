@@ -71,6 +71,9 @@ class LLMClient:
         self._rate_limit_max_backoff_seconds = (
             PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS
         )
+        self._usage_total_tokens = 0
+        self._usage_successful_calls = 0
+        self._usage_unavailable_calls = 0
 
         # Normal Agent construction uses the time-aware provider router.
         # Explicit transport arguments remain a fixed-provider escape hatch for
@@ -234,20 +237,35 @@ class LLMClient:
                 request["max_tokens"] = max(1, int(max_tokens))
             if extra_body is not None:
                 request["extra_body"] = extra_body
+            if stream and (
+                "stream_options" in parameters
+                or any(
+                    item.kind == inspect.Parameter.VAR_KEYWORD
+                    for item in parameters.values()
+                )
+            ):
+                request["stream_options"] = {"include_usage": True}
             try:
-                return create(**request)
+                response = create(**request)
+                if stream:
+                    return self._track_stream_usage(response)
+                self._record_usage(response)
+                return response
             except Exception as exc:
                 last_error = exc
                 if not self._may_try_next_key(exc):
+                    self._record_usage(None)
                     raise
                 is_rate_limit = self._is_rate_limit(exc)
                 if not is_rate_limit:
                     # Authentication/quota failures may fail over to each
                     # configured key once, but must never cycle indefinitely.
                     if attempt + 1 >= len(targets):
+                        self._record_usage(None)
                         raise
                     continue
                 if not paratera_active or attempt + 1 >= max_attempts:
+                    self._record_usage(None)
                     raise RuntimeError(
                         "LLM provider rate limit remained active after "
                         "bounded key rotation and backoff"
@@ -277,4 +295,82 @@ class LLMClient:
                     if delay > 0:
                         time.sleep(delay)
         assert last_error is not None
+        self._record_usage(None)
         raise last_error
+
+    @staticmethod
+    def _usage_tokens(response: Any) -> int | None:
+        """Read common OpenAI-compatible usage shapes without estimating text."""
+
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage") or response.get("usage_metadata")
+        if usage is None:
+            usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            return None
+
+        def value(name: str) -> Any:
+            if isinstance(usage, dict):
+                return usage.get(name)
+            return getattr(usage, name, None)
+
+        for name in ("total_tokens", "total_token_count"):
+            total = value(name)
+            if total is not None:
+                try:
+                    return max(0, int(total))
+                except (TypeError, ValueError):
+                    return None
+        for input_name, output_name in (
+            ("prompt_tokens", "completion_tokens"),
+            ("input_tokens", "output_tokens"),
+            ("prompt_token_count", "candidates_token_count"),
+        ):
+            input_tokens = value(input_name)
+            output_tokens = value(output_name)
+            if input_tokens is None or output_tokens is None:
+                continue
+            try:
+                return max(0, int(input_tokens)) + max(0, int(output_tokens))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _record_usage(self, response: Any) -> None:
+        # Some compatibility tests construct LLMClient via object.__new__.
+        if not hasattr(self, "_usage_total_tokens"):
+            self._usage_total_tokens = 0
+            self._usage_successful_calls = 0
+            self._usage_unavailable_calls = 0
+        tokens = self._usage_tokens(response) if response is not None else None
+        if tokens is None:
+            self._usage_unavailable_calls += 1
+            return
+        self._usage_successful_calls += 1
+        self._usage_total_tokens += tokens
+
+    def _track_stream_usage(self, stream: Any):
+        """Record the final stream usage exactly once after it is consumed."""
+
+        latest_usage = None
+        try:
+            for chunk in stream:
+                if self._usage_tokens(chunk) is not None:
+                    latest_usage = chunk
+                yield chunk
+        finally:
+            self._record_usage(latest_usage)
+
+    def usage_snapshot(self) -> dict[str, int]:
+        """Return process-local provider-reported usage for this client."""
+
+        if not hasattr(self, "_usage_total_tokens"):
+            self._usage_total_tokens = 0
+            self._usage_successful_calls = 0
+            self._usage_unavailable_calls = 0
+        return {
+            "total_tokens": self._usage_total_tokens,
+            "successful_calls": self._usage_successful_calls,
+            "unavailable_calls": self._usage_unavailable_calls,
+        }

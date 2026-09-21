@@ -152,3 +152,63 @@ def test_complete_forwards_max_tokens_bound():
         max_tokens=8000,
     ) == "response"
     assert captured["max_tokens"] == 8000
+
+
+def test_llm_client_accumulates_non_stream_and_stream_provider_usage():
+    from types import SimpleNamespace
+
+    from klonet_agent.llm.client import LLMClient
+
+    captured = []
+
+    class Completions:
+        @staticmethod
+        def create(**kwargs):
+            captured.append(kwargs)
+            if kwargs["stream"]:
+                return iter([
+                    SimpleNamespace(usage=None),
+                    SimpleNamespace(usage=SimpleNamespace(total_tokens=13)),
+                ])
+            return SimpleNamespace(usage=SimpleNamespace(
+                prompt_tokens=7, completion_tokens=5,
+            ))
+
+    llm = object.__new__(LLMClient)
+    llm.model = "compatible-model"
+    llm.client = type(
+        "Client", (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    llm.complete(messages=[], stream=False)
+    list(llm.complete(messages=[], stream=True))
+
+    assert captured[1]["stream_options"] == {"include_usage": True}
+    assert llm.usage_snapshot() == {
+        "total_tokens": 25,
+        "successful_calls": 2,
+        "unavailable_calls": 0,
+    }
+
+
+def test_llm_client_marks_missing_provider_usage_unavailable():
+    from types import SimpleNamespace
+
+    from klonet_agent.llm.client import LLMClient
+
+    class Completions:
+        @staticmethod
+        def create(**kwargs):
+            return SimpleNamespace(choices=[])
+
+    llm = object.__new__(LLMClient)
+    llm.model = "compatible-model"
+    llm.client = type(
+        "Client", (),
+        {"chat": type("Chat", (), {"completions": Completions()})()},
+    )()
+
+    llm.complete(messages=[])
+
+    assert llm.usage_snapshot()["unavailable_calls"] == 1

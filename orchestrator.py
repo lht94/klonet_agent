@@ -103,6 +103,7 @@ class AgentOrchestrator:
         self.session = session or AgentSession(mode=self.profile.name)
         supplied_llm = llm
         self.llm = llm or LLMClient()
+        self._usage_clients = [self.llm]
         self._ops_semantic_routing = intent_analyzer is not None or supplied_llm is None
         self.answer_style = answer_style
         if intent_analyzer is not None:
@@ -111,12 +112,12 @@ class AgentOrchestrator:
             # Test/custom callers commonly provide one deterministic client.
             self.intent_analyzer = IntentAnalyzer(self.llm)
         else:
-            self.intent_analyzer = IntentAnalyzer(
-                LLMClient(
-                    model=RAG_QUERY_PLANNER_MODEL,
-                    timeout=RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
-                )
+            query_planner_llm = LLMClient(
+                model=RAG_QUERY_PLANNER_MODEL,
+                timeout=RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
             )
+            self._usage_clients.append(query_planner_llm)
+            self.intent_analyzer = IntentAnalyzer(query_planner_llm)
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
             MEMORY_DIR,
@@ -193,6 +194,7 @@ class AgentOrchestrator:
                     timeout=OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
                     max_retries=0,
                 )
+                self._usage_clients.extend([planner_llm, classifier_llm])
             context_builder = PrivilegedPlanContextBuilder(
                 on_progress=privileged_progress("Discovery"),
             )
@@ -257,6 +259,27 @@ class AgentOrchestrator:
                 ),
                 on_progress=privileged_progress("Klonet Agent"),
             )
+
+    def usage_snapshot(self) -> dict[str, int]:
+        """Aggregate provider-reported usage across every orchestration client."""
+
+        totals = {
+            "total_tokens": 0,
+            "successful_calls": 0,
+            "unavailable_calls": 0,
+        }
+        seen: set[int] = set()
+        for client in getattr(self, "_usage_clients", [self.llm]):
+            if id(client) in seen:
+                continue
+            seen.add(id(client))
+            snapshot_method = getattr(client, "usage_snapshot", None)
+            if not callable(snapshot_method):
+                continue
+            snapshot = snapshot_method()
+            for key in totals:
+                totals[key] += int(snapshot.get(key, 0))
+        return totals
 
     def init_history(self) -> list[dict]:
         """初始化对话记忆，包含系统提示词、记忆提示词、技能描述和任务规划规则。"""
@@ -1108,6 +1131,38 @@ class AgentOrchestrator:
             if str(getattr(resource, "role", "") or "")
             in {"instance_root", "target_root", "deployment_root"}
         })
+        identifiers = sorted({
+            str(resource.value)
+            for resource in list(getattr(plan, "resources", ()) or ())
+            if str(getattr(resource, "role", "") or "")
+            in {
+                "instance_identifier", "instance_name",
+                "platform_instance_name",
+            }
+        })
+        for record in records:
+            request = getattr(record, "request", None)
+            if str(getattr(request, "probe", "") or "") != "user_decision":
+                continue
+            args = dict(getattr(request, "args", {}) or {})
+            target_root = str(args.get("target_directory") or "").strip()
+            if target_root.startswith("/") and target_root not in roots:
+                roots.append(target_root)
+            target_name = str(args.get("instance_identifier") or "").strip()
+            if target_name and target_name not in identifiers:
+                identifiers.append(target_name)
+        if not identifiers:
+            match = re.search(
+                r"(?:平台名|实例名|instance\s+name)\s*[:：=是为]?\s*"
+                r"([A-Za-z0-9_.-]{2,64})",
+                goal,
+                re.I,
+            )
+            if match is not None:
+                identifiers.append(match.group(1))
+        roots = sorted(dict.fromkeys(roots))
+        identifiers = sorted(dict.fromkeys(identifiers))
+        target_identity = ", ".join([*identifiers, *roots])
         probe_names = list(dict.fromkeys(
             str(getattr(getattr(record, "request", None), "probe", "") or "")
             for record in records
@@ -1150,7 +1205,7 @@ class AgentOrchestrator:
             self.memory_store.append_shared_ops_record(
                 question=user_input,
                 intent="ops / %s" % payload["kind"],
-                target=", ".join(roots) or "未确认",
+                target=target_identity or "未确认",
                 tools=probe_names,
                 evidence=evidence_lines,
                 conclusion=str(getattr(result, "message", "") or ""),
