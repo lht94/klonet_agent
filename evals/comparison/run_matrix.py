@@ -35,7 +35,10 @@ import time
 ROOT = Path(__file__).resolve().parents[2]
 
 # 会真实执行系统操作的臂
-REAL_EXECUTION_ARMS = {"baseline", "mentor", "ops"}
+REAL_EXECUTION_ARMS = {"baseline", "codex", "mentor", "ops"}
+
+# 无审批门、命令直接落地的臂：对它们而言 baseline_only 级任务同样危险
+UNGUARDED_ARMS = {"baseline", "codex"}
 
 
 def load_tasks(path: Path) -> list[dict]:
@@ -61,6 +64,21 @@ def build_command(arm: str, task: dict, out_dir: Path) -> tuple[list[str], str |
         if arm == "baseline-record":
             argv.append("--record-only")
         return argv, None
+
+    if arm == "codex":
+        # 官方 Codex CLI（接 DeepSeek 官方 API）。工具与系统提示词都是它自带的，
+        # 配置写在隔离的 CODEX_HOME 里，不动用户既有的 ~/.codex。
+        return [
+            sys.executable, "-X", "utf8", str(ROOT / "evals/comparison/codex_agent.py"),
+            "--task-id", task["id"],
+            "--prompt", prompt,
+            "--out-dir", str(out_dir),
+            "--cwd", str(ROOT),
+            # 与项目侧 DEFAULT_REASONING_EFFORT 对齐，否则两臂档位不同、
+            # token 与耗时就不可比。
+            "--effort", "medium",
+            "--quiet",
+        ], None
 
     if arm in {"mentor", "ops"}:
         argv = [
@@ -124,25 +142,33 @@ def run_one(arm: str, task: dict, out_dir: Path, timeout: int) -> dict:
         # out_dir 在仓库之外时 relative_to 会失败，记录绝对路径即可
         record["transcript"] = str(transcript)
 
-    # 对照臂另外读一份结构化结果，便于取 llm_calls / tool_calls / tokens
-    if arm in {"baseline", "baseline-record"}:
-        artifact = out_dir / "baseline_artifacts" / f"{task['id']}.json"
+    # 对照臂另外读一份结构化结果，便于取 llm_calls / tool_calls / tokens。
+    # 两个对照臂的产物形状不同，这里统一成 record["result"]，
+    # 下游不必关心是自写基线还是 Codex CLI。
+    artifact_subdir = {
+        "baseline": "baseline_artifacts",
+        "baseline-record": "baseline_artifacts",
+        "codex": "codex_artifacts",
+    }.get(arm)
+    if artifact_subdir:
+        artifact = out_dir / artifact_subdir / f"{task['id']}.json"
         if artifact.exists():
             try:
                 data = json.loads(artifact.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 data = {}
-            record["baseline"] = {
+            record["result"] = {
                 key: data.get(key)
                 for key in (
-                    "status", "model", "base_url", "config_source", "locked",
-                    "llm_calls", "tool_calls", "total_tokens", "record_only",
+                    "harness", "status", "model", "base_url", "config_source",
+                    "reasoning_effort", "locked", "llm_calls", "tool_calls",
+                    "total_tokens", "input_tokens", "output_tokens", "record_only",
                 )
             }
-            record["baseline_tool_audit"] = data.get("tool_audit", [])
-            record["baseline_final_text"] = data.get("final_text", "")
+            record["tool_audit"] = data.get("tool_audit") or data.get("commands") or []
+            record["final_text"] = data.get("final_text", "")
         else:
-            record["baseline"] = None
+            record["result"] = None
 
     return record
 
@@ -158,16 +184,18 @@ def render_summary(records: list[dict], destination: Path) -> None:
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for record in records:
-        base = record.get("baseline") or {}
-        status = record.get("error") or (base.get("status") if base else
+        # result 是归一化后的对照臂结果；baseline 键是旧记录的遗留，保留兼容
+        result = record.get("result") or record.get("baseline") or {}
+        status = record.get("error") or (result.get("status") if result else
                                          ("ok" if record.get("exit_code") == 0 else "异常"))
         lines.append(
             "| %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
                 record["task_id"], record["family"], record["arm"], status,
                 record["duration_seconds"],
-                base.get("llm_calls", "—"), base.get("tool_calls", "—"),
-                base.get("total_tokens", "—"),
-                ("锁定=" + str(base.get("locked"))) if base else "—",
+                result.get("llm_calls", "—") if result.get("llm_calls") is not None else "—",
+                result.get("tool_calls", "—"),
+                result.get("total_tokens", "—"),
+                result.get("model") or "—",
             )
         )
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -178,7 +206,7 @@ def main() -> int:
     parser.add_argument("--tasks", type=Path,
                         default=ROOT / "evals/comparison/tasks.json")
     parser.add_argument("--arms", required=True,
-                        help="逗号分隔：baseline-record / baseline / mentor / ops")
+                        help="逗号分隔：baseline-record / baseline / codex / mentor / ops")
     parser.add_argument("--ids", default="", help="逗号分隔的任务 id，默认全部")
     parser.add_argument("--out-dir", type=Path,
                         default=ROOT / "evals/comparison/runs/matrix")
@@ -211,12 +239,14 @@ def main() -> int:
                 continue
             if arm in REAL_EXECUTION_ARMS:
                 risk = task.get("real_execution_risk", "none")
-                # 对照臂没有工具层护栏，baseline_only 级的任务对它等同于危险；
-                # ops/mentor 有审批门，可以安全跑到审批边界。
-                if arm == "baseline" and risk in {"baseline_only", "critical"}:
+                # 无护栏臂（自写基线、Codex CLI）没有审批门，命令直接落地，
+                # 因此 baseline_only 级任务对它们同样危险；ops/mentor 有审批门，
+                # 可以安全跑到审批边界。
+                if arm in UNGUARDED_ARMS and risk in {"baseline_only", "critical"}:
+                    hint = "请改用 baseline-record" if arm in {"baseline", "baseline-record"} \
+                        else "该臂无只记录模式，需 --allow-unsafe 才放行"
                     skipped.append(
-                        f"{task['id']}×{arm}（对照臂真实执行会产生副作用；"
-                        f"请改用 baseline-record）"
+                        f"{task['id']}×{arm}（无护栏臂真实执行会产生副作用；{hint}）"
                     )
                     continue
                 if risk == "critical" and not args.allow_unsafe:
