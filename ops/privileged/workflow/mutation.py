@@ -2039,7 +2039,71 @@ def _recovery_options(
     ]
 
 
+def _model_service_failure_explanation(
+    failure: FailureRecord,
+) -> str:
+    """Render provider failures without depending on the failed provider."""
+
+    reason = str(failure.technical_reason or "")
+    lowered = reason.lower()
+    provider_markers = (
+        "apiconnectionerror", "connection error", "apitimeouterror",
+        "request timed out", "timed out", "upstream error",
+        "do_request_failed", "new_api_error", "rate limit",
+        "ratelimiterror", "error code: 429", "error code: 500",
+        "error code: 502", "error code: 503", "error code: 504",
+        "authenticationerror", "permissiondeniederror",
+    )
+    if not any(marker in lowered for marker in provider_markers):
+        return ""
+
+    phase = {
+        "discovery": "收集只读证据",
+        "synthesis": "整理只读证据",
+        "planning": "生成变更计划",
+        "binding": "绑定实施动作",
+        "execution": "处理执行阶段请求",
+        "verification": "验证执行结果",
+    }.get(failure.stage, "处理本轮任务")
+    http_match = re.search(r"(?:error\s+code\s*:\s*|http\s*)(\d{3})", reason, re.I)
+    http_code = http_match.group(1) if http_match is not None else ""
+    request_match = re.search(
+        r"request(?:\s+|_)?id\s*[:=]\s*([A-Za-z0-9._-]{6,128})",
+        reason,
+        re.I,
+    )
+    request_id = request_match.group(1) if request_match is not None else ""
+
+    if "timed out" in lowered or "timeout" in lowered:
+        problem = "上游模型服务响应超时"
+    elif "apiconnectionerror" in lowered or "connection error" in lowered:
+        problem = "当前无法连接上游模型服务"
+    elif "rate limit" in lowered or "ratelimiterror" in lowered or http_code == "429":
+        problem = "上游模型服务触发了调用频率限制"
+    elif (
+        "authenticationerror" in lowered
+        or "permissiondeniederror" in lowered
+        or http_code in {"401", "403"}
+    ):
+        problem = "上游模型服务的认证或访问权限异常"
+    else:
+        problem = "上游模型服务暂时异常"
+
+    details = "（HTTP %s）" % http_code if http_code else ""
+    message = (
+        "%s时，%s%s。本轮没有取得可继续使用的模型结果；"
+        "这属于系统服务异常，不是用户目标或服务器运行状态错误，"
+        "当前不需要补充用户条件。"
+    ) % (phase, problem, details)
+    if request_id:
+        message += "服务请求编号：%s。" % request_id
+    return message
+
+
 def _failure_explanation_fallback(failure: FailureRecord) -> str:
+    provider_explanation = _model_service_failure_explanation(failure)
+    if provider_explanation:
+        return provider_explanation
     return "%s 具体失败：%s" % (
         failure.summary.rstrip("。"),
         redact_sensitive_text(failure.technical_reason)[:800],

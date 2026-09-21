@@ -2978,11 +2978,76 @@ def test_invalid_response_text_cannot_replace_deterministic_failure_facts(tmp_pa
     )
 
     assert "失败阶段：binding" in result.message
-    assert "实施绑定的模型调用超时" in result.message
-    assert "APITimeoutError" in result.message
+    assert "绑定实施动作时" in result.message
+    assert "上游模型服务响应超时" in result.message
+    assert "APITimeoutError" not in result.message
     assert "失败说明：false" not in result.message
     assert "Binding 语义步骤：provision-containers" in result.message
     assert "Binding 原子步骤索引：2" in result.message
+
+
+def test_upstream_500_has_deterministic_user_copy_and_keeps_technical_details(
+    tmp_path,
+):
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+
+    workflow = MutationWorkflow(
+        planner=object(), binder=object(),
+        store=ChangePlanStore(tmp_path, user_id="u", project_id="p"),
+        executor=object(), verifier=object(),
+    )
+    technical = (
+        "Change Planner model request failed: Error code: 500 - "
+        "{'error': {'message': 'upstream error: do request failed "
+        "(request id: 202608301042198873921078268d9d6SFlJPZBc)', "
+        "'type': 'new_api_error'}}"
+    )
+
+    result = workflow.failure_result(
+        stage="planning",
+        category="planning_provider_error",
+        summary="变更规划未形成可审批计划。",
+        technical_reason=technical,
+        goal="部署新平台",
+        goal_kind="execution",
+        attempted_recoveries=["保留原目标和只读证据"],
+    )
+
+    assert "生成变更计划时，上游模型服务暂时异常（HTTP 500）" in result.message
+    assert "不是用户目标或服务器运行状态错误" in result.message
+    assert "当前不需要补充用户条件" in result.message
+    assert "202608301042198873921078268d9d6SFlJPZBc" in result.message
+    assert "do request failed" not in result.message
+    assert "new_api_error" not in result.message
+
+    details = workflow.handle_control(
+        "show-priv-failure-details %s" % result.failure.failure_id
+    )
+    assert details.kind == "failure_details"
+    assert technical in details.message
+
+
+def test_model_connection_error_has_deterministic_user_copy(tmp_path):
+    from klonet_agent.ops.privileged.workflow.mutation import MutationWorkflow
+    from klonet_agent.ops.privileged.workflow.plan_store import ChangePlanStore
+
+    workflow = MutationWorkflow(
+        planner=object(), binder=object(),
+        store=ChangePlanStore(tmp_path, user_id="u", project_id="p"),
+        executor=object(), verifier=object(),
+    )
+    result = workflow.failure_result(
+        stage="discovery",
+        category="discovery_provider_error",
+        summary="只读证据收集发生异常。",
+        technical_reason="APIConnectionError: Connection error.",
+        goal="检查平台",
+        goal_kind="health_check",
+    )
+
+    assert "收集只读证据时，当前无法连接上游模型服务" in result.message
+    assert "APIConnectionError" not in result.message
 
 
 def test_repeated_failure_keeps_the_same_three_user_control_exits(tmp_path):

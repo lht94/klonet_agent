@@ -269,3 +269,21 @@ def test_retriever_rejects_low_coverage_match():
         )
 
     assert results == []
+
+
+def test_jieba_cache_is_scoped_to_a_writable_user_directory():
+    """Tokenizer instances must never fall back to the shared /tmp cache."""
+
+    from klonet_agent.knowledge.tokenizer import _configure_jieba_cache
+
+    class Tokenizer:
+        tmp_dir = None
+
+    with local_temp_dir() as temp_dir:
+        tokenizer = Tokenizer()
+        cache_dir = _configure_jieba_cache(tokenizer, cache_root=temp_dir)
+
+        assert cache_dir == temp_dir / "klonet_agent" / "jieba"
+        assert cache_dir.is_dir()
+        assert tokenizer.tmp_dir == str(cache_dir)
+        assert cache_dir != Path("/tmp")

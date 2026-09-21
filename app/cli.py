@@ -74,6 +74,24 @@ def read_piped_prompt(stdin=None) -> Optional[str]:
     return clean_user_input(stdin.read())
 
 
+def render_token_usage(orchestrator, legacy_token: int = 0) -> str:
+    """Render only provider-reported usage; never present missing data as zero."""
+
+    snapshot_method = getattr(orchestrator, "usage_snapshot", None)
+    if not callable(snapshot_method):
+        snapshot_method = getattr(
+            getattr(orchestrator, "llm", None), "usage_snapshot", None,
+        )
+    if not callable(snapshot_method):
+        return f"本次累计 token 约 {legacy_token}" if legacy_token else "本次累计 token 统计不可用"
+    snapshot = snapshot_method()
+    if int(snapshot.get("unavailable_calls", 0)) > 0:
+        return "本次累计 token 统计不可用"
+    if int(snapshot.get("successful_calls", 0)) <= 0:
+        return "本次累计 token 统计不可用"
+    return f"本次累计 token 约 {int(snapshot.get('total_tokens', 0))}"
+
+
 def run_chat(
     mode: str = "mentor",
     user_id: str = DEFAULT_USER_ID,
@@ -105,7 +123,7 @@ def run_chat(
                     history,
                     token,
                 )
-            print(f"Klonet Agent：本次累计 token 约 {token}")
+            print(f"Klonet Agent：{render_token_usage(orchestrator, token)}")
             return
 
         while True:
@@ -118,7 +136,7 @@ def run_chat(
             # 处理退出逻辑。
             if user_input == "exit":
                 print("Klonet Agent：本次会话结束。")
-                print(f"Klonet Agent：本次累计 token 约 {token}")
+                print(f"Klonet Agent：{render_token_usage(orchestrator, token)}")
                 break
 
             _, history, token = orchestrator.single_chat(user_input, history, token)
@@ -129,10 +147,10 @@ def run_chat(
             "请将管道输出设置为 UTF-8，或使用 UTF-8 输入文件。"
         )
     except EOFError:
-        print(f"Klonet Agent：输入结束，本次累计 token 约 {token}")
+        print(f"Klonet Agent：输入结束，{render_token_usage(orchestrator, token)}")
     except KeyboardInterrupt:
         # 捕捉 Ctrl+C 强制退出。
-        print(f"\nKlonet Agent：会话被中断，本次累计 token 约 {token}")
+        print(f"\nKlonet Agent：会话被中断，{render_token_usage(orchestrator, token)}")
 
 
 if __name__ == "__main__":

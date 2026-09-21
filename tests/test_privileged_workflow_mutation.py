@@ -3267,6 +3267,8 @@ def test_change_planner_repairs_blocked_discoverable_implementation_details():
                 "nginx config content",
                 "screen session names",
                 "startup commands",
+                "instance name",
+                "target directory",
             ],
         }
     )

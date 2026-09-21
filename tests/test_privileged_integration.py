@@ -292,6 +292,74 @@ def test_handled_privileged_turn_persists_episode_shared_memory_and_trace(tmp_pa
     assert trace_rows[-1]["goal_status"] == "achieved"
 
 
+def test_failed_new_deployment_persists_the_user_frozen_target_identity(tmp_path):
+    from klonet_agent.agents import get_profile
+    from klonet_agent.memory import MemoryStore
+    from klonet_agent.ops.privileged.workflow.contracts import (
+        EvidenceBundle, EvidenceRecord, FailureRecord, ProbeRequest,
+        RecoveryOption,
+    )
+    from klonet_agent.orchestrator import AgentOrchestrator
+    from klonet_agent.session import AgentSession
+
+    goal = (
+        "创建新平台，平台名 create_agent_e2e，"
+        "目标目录 /home/lzl/create_agent_e2e/vemu_uestc"
+    )
+    bundle = EvidenceBundle(goal=goal)
+    bundle.add(EvidenceRecord.from_probe(
+        ProbeRequest(
+            "user_decision",
+            {"target_directory": "/home/lzl/create_agent_e2e/vemu_uestc"},
+            "freeze target",
+        ),
+        "target_directory=/home/lzl/create_agent_e2e/vemu_uestc",
+    ))
+    failure = FailureRecord(
+        failure_id="failure-new-deployment",
+        stage="binding",
+        category="binding_provider_transient",
+        summary="binding timeout",
+        technical_reason="APITimeoutError",
+        goal=goal,
+        goal_kind="execution",
+        options=[RecoveryOption(
+            option_id="continue_current_goal",
+            label="继续处理",
+            description="resume",
+            action="continue_current_goal",
+            recommended=True,
+        )],
+    )
+
+    class Supervisor:
+        def handle(self, text, environment_context=""):
+            return SimpleNamespace(
+                handled=True,
+                kind="awaiting_user_decision",
+                message="binding timeout",
+                plan=None,
+                failure=failure,
+                evidence=bundle,
+                outcome=None,
+            )
+
+    memory = MemoryStore.for_session(tmp_path / "memory", "u", "p")
+    orchestrator = AgentOrchestrator(
+        profile=get_profile("ops-privilege"),
+        session=AgentSession(user_id="u", project_id="p", mode="ops-privilege"),
+        llm=NoCallLLM(),
+        memory_store=memory,
+        privileged_supervisor=Supervisor(),
+    )
+
+    orchestrator.single_chat(goal, [], 0)
+
+    shared = memory.read_shared_memory()
+    assert "target: create_agent_e2e, /home/lzl/create_agent_e2e/vemu_uestc" in shared
+    assert "target: 未确认" not in shared
+
+
 def test_ops_privilege_memory_prompt_includes_shared_ops_evidence(tmp_path):
     from klonet_agent.memory import MemoryStore
 

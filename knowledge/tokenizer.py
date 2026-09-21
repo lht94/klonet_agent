@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+import tempfile
 import warnings
+from pathlib import Path
 
 with warnings.catch_warnings():
     warnings.filterwarnings(
@@ -15,6 +18,30 @@ with warnings.catch_warnings():
     import jieba
 
 jieba.setLogLevel(logging.ERROR)
+
+
+def _configure_jieba_cache(
+    tokenizer: object,
+    *,
+    cache_root: Path | None = None,
+) -> Path:
+    """Give one tokenizer a private, writable cache directory."""
+
+    if cache_root is None:
+        configured_root = os.environ.get("XDG_CACHE_HOME", "").strip()
+        cache_root = (
+            Path(configured_root).expanduser()
+            if configured_root else Path.home() / ".cache"
+        )
+    cache_dir = Path(cache_root) / "klonet_agent" / "jieba"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not os.access(cache_dir, os.W_OK | os.X_OK):
+            raise PermissionError("jieba cache directory is not writable")
+    except OSError:
+        cache_dir = Path(tempfile.mkdtemp(prefix="klonet-agent-jieba-"))
+    setattr(tokenizer, "tmp_dir", str(cache_dir))
+    return cache_dir
 
 
 DOMAIN_TERMS = (
@@ -51,6 +78,7 @@ class MixedTokenizer:
 
     def __init__(self, domain_terms: tuple[str, ...] = DOMAIN_TERMS):
         self._tokenizer = jieba.Tokenizer()
+        _configure_jieba_cache(self._tokenizer)
         for term in domain_terms:
             self._tokenizer.add_word(term, freq=1_000_000)
 
