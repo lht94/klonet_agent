@@ -192,6 +192,9 @@ class PrivilegedIntentDecision:
     operation: str = "none"
     scope: str = "none"
     components: tuple[str, ...] = ()
+    used_decision_model: bool = False
+    decision_latency_seconds: float = 0.0
+    decision_fallback_reason: str = ""
 
     @property
     def should_clarify(self) -> bool:
@@ -199,8 +202,18 @@ class PrivilegedIntentDecision:
 
 
 class PrivilegedIntentClassifier:
-    def __init__(self, llm: Any) -> None:
+    def __init__(
+        self,
+        llm: Any,
+        *,
+        decision_model: Any | None = None,
+        min_decision_confidence: float = 0.85,
+    ) -> None:
         self.llm = llm
+        self.decision_model = decision_model
+        self.min_decision_confidence = max(
+            0.0, min(float(min_decision_confidence), 1.0),
+        )
 
     def classify(
         self,
@@ -208,6 +221,66 @@ class PrivilegedIntentClassifier:
         *,
         conversation_context: str = "",
     ) -> PrivilegedIntentDecision:
+        decision_fallback_reason = ""
+        if self.decision_model is not None:
+            try:
+                result = self.decision_model.classify_privileged_intent(
+                    {
+                        "request": text,
+                        "recent_conversation": conversation_context,
+                        "safety_boundary": (
+                            "classification only; never authorize execution"
+                        ),
+                    }
+                )
+                confidence = _decision_confidence(
+                    result, ("intent", "requires_execution"),
+                )
+                if confidence >= self.min_decision_confidence:
+                    intent = str(result.answers.get("intent") or "")
+                    requires_execution = bool(
+                        result.answers.get("requires_execution", False)
+                    )
+                    if requires_execution != (intent in ACTION_INTENTS):
+                        raise ValueError("Jev intent/execution contradiction")
+                    data = {"intent": intent}
+                    if intent in ACTION_INTENTS:
+                        operation_confidence = float(
+                            result.confidences.get("operation", 0.0)
+                        )
+                        if operation_confidence < self.min_decision_confidence:
+                            raise _LowDecisionConfidence(
+                                "low_operation_confidence"
+                            )
+                        data["operation"] = result.answers.get("operation", "none")
+                        if float(result.confidences.get("scope", 0.0)) >= self.min_decision_confidence:
+                            data["scope"] = result.answers.get("scope", "none")
+                    data.update({
+                        "components": list(_extract_components(text)),
+                        "plan_reference": _extract_plan_reference(
+                            text, str(data.get("intent") or ""),
+                        ),
+                        "command": "",
+                        "confidence": confidence,
+                        "reason": "jev_typed_decision",
+                        "clarification_question": (
+                            "请明确要处理的目标或预期结果。"
+                            if data.get("goal_clarity") == "missing" else ""
+                        ),
+                    })
+                    decision = self._decision(data)
+                    return PrivilegedIntentDecision(
+                        **{
+                            **decision.__dict__,
+                            "used_decision_model": True,
+                            "decision_latency_seconds": result.latency_seconds,
+                        }
+                    )
+                decision_fallback_reason = "low_confidence"
+            except _LowDecisionConfidence as exc:
+                decision_fallback_reason = str(exc)
+            except Exception:
+                decision_fallback_reason = "provider_error"
         messages = [
             {
                 "role": "system",
@@ -230,7 +303,15 @@ class PrivilegedIntentClassifier:
                 response = self._complete(messages)
                 content = response.choices[0].message.content or ""
                 data = _parse_json_object(content)
-                return self._decision(data)
+                decision = self._decision(data)
+                if decision_fallback_reason:
+                    return PrivilegedIntentDecision(
+                        **{
+                            **decision.__dict__,
+                            "decision_fallback_reason": decision_fallback_reason,
+                        }
+                    )
+                return decision
             except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 failure_reason = (
                     "意图分类器返回无效 JSON 或字段：%s"
@@ -392,3 +473,37 @@ def _safe_classifier_error(exc: Exception) -> str:
         error_name,
         "：%s" % message if message else "",
     )
+
+
+def _decision_confidence(result: Any, fields: tuple[str, ...] | None = None) -> float:
+    values = [float(result.confidences[name]) for name in (fields or tuple(result.confidences)) if name in result.confidences]
+    return min(values) if values else 0.0
+
+
+class _LowDecisionConfidence(Exception):
+    pass
+
+
+_COMPONENT_NAMES = ("master", "worker", "celery", "web_terminal")
+
+
+def _extract_components(text: str) -> tuple[str, ...]:
+    normalized = str(text or "").lower().replace("web terminal", "web_terminal")
+    excluded = set()
+    for match in re.finditer(
+        r"(?:不要动|不要|不重启|排除|不涉及)\s*(master|worker|celery|web_terminal)",
+        normalized,
+    ):
+        excluded.add(match.group(1))
+    return tuple(
+        name for name in _COMPONENT_NAMES
+        if re.search(r"(?<![a-z_])%s(?![a-z_])" % name, normalized)
+        and name not in excluded
+    )
+
+
+def _extract_plan_reference(text: str, intent: str) -> str:
+    if intent != "resume_plan":
+        return ""
+    match = re.search(r"\bpriv-[A-Za-z0-9_-]+\b", str(text or ""))
+    return match.group(0) if match else "latest"

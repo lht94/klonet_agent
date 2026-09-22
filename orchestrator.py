@@ -28,6 +28,7 @@ from klonet_agent.config import (
     RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
     TRACE_FILE,
+    JEV_MIN_CONFIDENCE,
 )
 from klonet_agent.knowledge.clarification import (
     decide_model_intent_clarification,
@@ -51,6 +52,7 @@ from klonet_agent.knowledge.turn_intent import (
 from klonet_agent.knowledge import SKILL_LOADER, route_query
 from klonet_agent.journal import ProjectJournal, ProjectJournalMaintainer
 from klonet_agent.llm import LLMClient
+from klonet_agent.llm.decision import configured_jev_decision_model
 from klonet_agent.memory import MemoryStore
 from klonet_agent.memory.store import sanitize_openai_tool_history
 from klonet_agent.ops.planner import build_ops_environment_plan
@@ -97,6 +99,7 @@ class AgentOrchestrator:
         journal_maintainer: ProjectJournalMaintainer | None = None,
         privileged_workflow: object | None = None,
         privileged_supervisor: object | None = None,
+        decision_model: object | None = None,
         answer_style: str = "default",
     ):
         self.profile = profile or get_profile("mentor")
@@ -104,20 +107,31 @@ class AgentOrchestrator:
         supplied_llm = llm
         self.llm = llm or LLMClient()
         self._usage_clients = [self.llm]
+        self.decision_model = decision_model or configured_jev_decision_model(
+            self.session.user_id, self.session.project_id,
+        )
         self._ops_semantic_routing = intent_analyzer is not None or supplied_llm is None
         self.answer_style = answer_style
         if intent_analyzer is not None:
             self.intent_analyzer = intent_analyzer
         elif supplied_llm is not None:
             # Test/custom callers commonly provide one deterministic client.
-            self.intent_analyzer = IntentAnalyzer(self.llm)
+            self.intent_analyzer = IntentAnalyzer(
+                self.llm,
+                decision_model=self.decision_model,
+                min_decision_confidence=JEV_MIN_CONFIDENCE,
+            )
         else:
             query_planner_llm = LLMClient(
                 model=RAG_QUERY_PLANNER_MODEL,
                 timeout=RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
             )
             self._usage_clients.append(query_planner_llm)
-            self.intent_analyzer = IntentAnalyzer(query_planner_llm)
+            self.intent_analyzer = IntentAnalyzer(
+                query_planner_llm,
+                decision_model=self.decision_model,
+                min_decision_confidence=JEV_MIN_CONFIDENCE,
+            )
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
             MEMORY_DIR,
@@ -246,7 +260,11 @@ class AgentOrchestrator:
             )
             self.privileged_workflow = mutation_workflow
             self.privileged_supervisor = PrivilegedOpsCoordinator(
-                classifier=PrivilegedIntentClassifier(classifier_llm),
+                classifier=PrivilegedIntentClassifier(
+                    classifier_llm,
+                    decision_model=self.decision_model,
+                    min_decision_confidence=JEV_MIN_CONFIDENCE,
+                ),
                 discovery=discovery,
                 synthesis=synthesis,
                 response=response_agent,

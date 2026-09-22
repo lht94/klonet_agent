@@ -1,0 +1,9 @@
+{"id":"turn-concept","kind":"turn","prompt":"Klonet 的拓扑部署流程是什么？","expected":{"scope":"klonet","task_type":"concept","operation":"unknown","requires_retrieval":true}}
+{"id":"turn-general","kind":"turn","prompt":"Python 的 GIL 是什么？不需要 Klonet 相关内容。","expected":{"scope":"general","task_type":"general","operation":"unknown","requires_retrieval":false}}
+{"id":"turn-runtime-error","kind":"turn","prompt":"Klonet web_terminal 启动时报 address already in use，应该排查什么？","expected":{"scope":"klonet","task_type":"troubleshooting","operation":"platform_start","requires_environment_diagnosis":true}}
+{"id":"turn-correction","kind":"turn","prompt":"不是安装环境，是启动已经安装好的 Klonet 平台。","expected":{"scope":"klonet","task_type":"deployment_guidance","operation":"platform_start","is_correction":true}}
+{"id":"ops-readonly","kind":"privileged","prompt":"检查 Klonet 当前有哪些平台正在运行，不要修改任何服务。","expected":{"intent":"readonly_action","operation":"inspect","goal_kind":"health_check"}}
+{"id":"ops-mutating","kind":"privileged","prompt":"帮我重启 Klonet 平台。","expected":{"intent":"mutating_action","operation":"restart","goal_kind":"execution"}}
+{"id":"ops-negated","kind":"privileged","prompt":"不要重启，只检查运行平台的状态。","expected":{"intent":"readonly_action","operation":"inspect","goal_kind":"health_check"}}
+{"id":"ops-history","kind":"privileged","prompt":"为什么之前会把不要重启识别成重启计划？","expected":{"intent":"conversation","operation":"none","goal_kind":"conversation"}}
+{"id":"ops-resume","kind":"privileged","prompt":"继续上次的部署计划 priv-demo-123。","expected":{"intent":"resume_plan","operation":"none","goal_kind":"conversation"}}

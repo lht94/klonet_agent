@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from klonet_agent.knowledge.intent_cases import (
@@ -111,13 +111,27 @@ class IntentAnalysis:
     semantic_frame: SemanticFrame | None = None
     decision: IntentDecision | None = None
     retrieval_plan: RetrievalPlan | None = None
+    used_decision_model: bool = False
+    decision_latency_seconds: float = 0.0
+    decision_fallback_reason: str = ""
 
 
 class IntentAnalyzer:
     """Use an LLM to parse the user's request before retrieval/tool routing."""
 
-    def __init__(self, llm, intent_case_retriever: IntentCaseRetriever | None = None):
+    def __init__(
+        self,
+        llm,
+        intent_case_retriever: IntentCaseRetriever | None = None,
+        *,
+        decision_model=None,
+        min_decision_confidence: float = 0.85,
+    ):
         self.llm = llm
+        self.decision_model = decision_model
+        self.min_decision_confidence = max(
+            0.0, min(float(min_decision_confidence), 1.0),
+        )
         self.intent_case_retriever = (
             intent_case_retriever or build_default_intent_case_retriever()
         )
@@ -129,6 +143,46 @@ class IntentAnalyzer:
         recent_history: list[dict] | None = None,
     ) -> IntentAnalysis:
         history = recent_history or []
+        decision_result = None
+        trusted_decision_answers: dict[str, Any] = {}
+        decision_fallback_reason = ""
+        if self.decision_model is not None:
+            try:
+                decision_result = self.decision_model.classify_turn(
+                    {
+                        "request": user_input,
+                        "recent_history": _bounded_history(history),
+                    }
+                )
+                confidence = _decision_confidence(
+                    decision_result, ("scope", "requires_retrieval"),
+                )
+                # These fields were validated separately; task_type and
+                # correction remain LLM-owned and must not reject a safe gate.
+                if confidence < min(self.min_decision_confidence, 0.70):
+                    decision_fallback_reason = "low_confidence"
+                    decision_result = None
+                else:
+                    trusted_decision_answers = {
+                        name: decision_result.answers[name]
+                        for name in ("scope", "requires_retrieval")
+                        if name in decision_result.answers
+                    }
+            except Exception:
+                decision_fallback_reason = "provider_error"
+                decision_result = None
+        if decision_result is not None and (
+            trusted_decision_answers.get("scope") == "general"
+            and not bool(trusted_decision_answers.get("requires_retrieval", True))
+        ):
+            mapping = dict(trusted_decision_answers)
+            mapping.update({"task_type": "general", "operation": "unknown"})
+            mapping["confidence"] = confidence
+            return IntentAnalysis(
+                intent=QueryIntent.from_mapping(mapping),
+                used_decision_model=True,
+                decision_latency_seconds=decision_result.latency_seconds,
+            )
         user_message = _build_analysis_user_message(user_input, history)
         plan_support_text = user_message
         intent_cases = self.intent_case_retriever.search_for_prompt(
@@ -137,6 +191,14 @@ class IntentAnalyzer:
             min_score=0.1,
         )
         user_message = _append_intent_cases(user_message, intent_cases)
+        if decision_result is not None:
+            user_message += (
+                "\n\nJev 已确定字段（这些值是约束，不得改写）：\n"
+                + json.dumps(
+                    trusted_decision_answers, ensure_ascii=False, sort_keys=True,
+                )
+                + "\n只补全 target、symptom、clarification_question 和检索计划。"
+            )
         messages = [
             {"role": "system", "content": INTENT_ANALYSIS_PROMPT},
             {"role": "user", "content": user_message},
@@ -161,6 +223,9 @@ class IntentAnalyzer:
         content = response.choices[0].message.content or ""
         token_usage = getattr(getattr(response, "usage", None), "total_tokens", 0)
         raw = _parse_json_object(content)
+        if decision_result is not None:
+            raw.update(trusted_decision_answers)
+            raw["confidence"] = confidence
         retrieval_plan = validate_plan(
             user_input,
             raw,
@@ -173,6 +238,21 @@ class IntentAnalyzer:
                 frame,
                 SemanticState.from_history(recent_history or []),
             )
+            if decision_result is not None:
+                extracted_intent = QueryIntent.from_mapping(raw)
+                constrained = {
+                    **decision.intent.__dict__,
+                    "target": extracted_intent.target,
+                    "symptom": extracted_intent.symptom,
+                    "clarification_question": extracted_intent.clarification_question,
+                    "excluded_intents": extracted_intent.excluded_intents,
+                    "prerequisites": extracted_intent.prerequisites,
+                    **trusted_decision_answers,
+                    "confidence": confidence,
+                }
+                decision = replace(
+                    decision, intent=QueryIntent.from_mapping(constrained),
+                )
             return IntentAnalysis(
                 intent=decision.intent,
                 token_usage=token_usage,
@@ -181,6 +261,12 @@ class IntentAnalyzer:
                 semantic_frame=frame,
                 decision=decision,
                 retrieval_plan=retrieval_plan,
+                used_decision_model=decision_result is not None,
+                decision_latency_seconds=(
+                    decision_result.latency_seconds
+                    if decision_result is not None else 0.0
+                ),
+                decision_fallback_reason=decision_fallback_reason,
             )
         return IntentAnalysis(
             intent=QueryIntent.from_mapping(raw),
@@ -188,6 +274,11 @@ class IntentAnalyzer:
             used_model=True,
             raw_content=content,
             retrieval_plan=retrieval_plan,
+            used_decision_model=decision_result is not None,
+            decision_latency_seconds=(
+                decision_result.latency_seconds if decision_result is not None else 0.0
+            ),
+            decision_fallback_reason=decision_fallback_reason,
         )
 
 
@@ -311,3 +402,21 @@ def _build_analysis_user_message(user_input: str, recent_history: list[dict]) ->
         + "\n\n如果当前输入包含“第一种/第二种/场景一/场景二/上面那个/你刚说的/继续”等指代，"
         "必须结合最近对话解析，不得直接追问这些指代是什么意思。"
     )
+
+
+def _decision_confidence(result: Any, fields: tuple[str, ...] | None = None) -> float:
+    values = [float(result.confidences[name]) for name in (fields or tuple(result.confidences)) if name in result.confidences]
+    return min(values) if values else 0.0
+
+
+def _bounded_history(history: list[dict]) -> list[dict[str, str]]:
+    result = []
+    for message in history[-6:]:
+        role = str(message.get("role") or "")
+        if role not in {"user", "assistant"}:
+            continue
+        result.append({
+            "role": role,
+            "content": str(message.get("content") or "")[:800],
+        })
+    return result

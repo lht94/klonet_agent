@@ -46,6 +46,26 @@ DEFAULT_LLM_TIMEOUT_SECONDS = max(
 DEFAULT_LLM_MAX_RETRIES = max(
     0, int(os.getenv("DEFAULT_LLM_MAX_RETRIES", "0")),
 )
+JEV_ENABLED = os.getenv("JEV_ENABLED", "false").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+JEV_API_KEY_ENV = os.getenv("JEV_API_KEY_ENV", "TYPESAFE_API_KEY").strip()
+JEV_BASE_URL = os.getenv(
+    "JEV_BASE_URL", "https://api.typesafe.ai/v1/systemone",
+).strip()
+JEV_MODEL = os.getenv("JEV_MODEL", "jev-latest").strip()
+JEV_TIMEOUT_SECONDS = max(
+    0.1, float(os.getenv("JEV_TIMEOUT_SECONDS", "3")),
+)
+JEV_GRAY_PERCENT = max(
+    0, min(int(os.getenv("JEV_GRAY_PERCENT", "0")), 100),
+)
+JEV_MIN_CONFIDENCE = max(
+    0.0, min(float(os.getenv("JEV_MIN_CONFIDENCE", "0.85")), 1.0),
+)
+JEV_SHADOW_COMPARE = os.getenv("JEV_SHADOW_COMPARE", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 PARATERA_BASE_URL = os.getenv(
     "PARATERA_BASE_URL", "https://llmapi.paratera.com/v1",
 ).strip()
