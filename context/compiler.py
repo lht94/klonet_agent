@@ -33,6 +33,58 @@ class ContextOverflowError(Exception):
         self.areas = areas or {}
 
 
+# 只剥离本地记账字段，其余字段原样保留：部分供应商（如 DeepSeek 推理模型）
+# 要求把 reasoning_content 原样回传，白名单会误删这类供应商字段。
+_LOCAL_MESSAGE_KEYS = frozenset({"event_id", "ts"})
+
+
+def to_provider_messages(messages: list[dict]) -> list[dict]:
+    """剥离本地事件身份字段，返回可直接发送的消息列表。"""
+
+    cleaned: list[dict] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            cleaned.append(message)
+            continue
+        cleaned.append(
+            {
+                key: value
+                for key, value in message.items()
+                if key not in _LOCAL_MESSAGE_KEYS and not key.startswith("_")
+            }
+        )
+    return cleaned
+
+
+def assert_within_hard_limit(
+    messages: list[dict],
+    model: str,
+    tool_definitions: list[dict] | None = None,
+) -> int:
+    """在调用供应商前做最后一次硬预算断言。
+
+    返回估算输入 token。超过 hard input limit 时抛出 ContextOverflowError，
+    调用方必须拒绝发送请求，而不是回退到未编译的完整历史。
+
+    注意 hard_input_limit 已经扣掉了输出预留、tool schema 和安全余量，
+    因此这里只比较消息本身的 token，不重复计入 tool schema。
+    """
+
+    budget = build_context_budget(model, tool_definitions)
+    estimated = estimate_messages_tokens(messages)
+    if estimated > budget.hard_input_limit:
+        raise ContextOverflowError(
+            "发送前硬预算断言失败：估算输入 token 超过模型 hard limit，拒绝请求供应商。",
+            areas={
+                "estimated_input": estimated,
+                "hard_input_limit": budget.hard_input_limit,
+                "reserved_output": budget.reserved_output_tokens,
+                "reserved_tools": budget.reserved_tool_tokens,
+            },
+        )
+    return estimated
+
+
 @dataclass(frozen=True)
 class ContextRequest:
     """一次模型调用需要的全部上下文材料。"""

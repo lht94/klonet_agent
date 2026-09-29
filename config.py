@@ -95,6 +95,9 @@ PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS = max(
 LLM_NIGHT_TIMEZONE = os.getenv("LLM_NIGHT_TIMEZONE", "Asia/Shanghai").strip()
 LLM_NIGHT_START_HOUR = int(os.getenv("LLM_NIGHT_START_HOUR", "21"))
 LLM_NIGHT_END_HOUR = int(os.getenv("LLM_NIGHT_END_HOUR", "9"))
+# 旧版上下文压缩（模型回调 write_memory/write_user 全量覆盖）的历史常量。
+# 新主链路是 ContextCompiler + TaskCheckpoint，不再在运行时读取这两个值；
+# 只有显式打开 KLONET_AGENT_ENABLE_LEGACY_COMPRESSION 时才作为回退路径的参数。
 MAX_TOKEN = 500000
 HISTORY_MAX_MESSAGES = 20
 # 上下文编译器：调用前按模型预算组装上下文。默认启用；
@@ -102,6 +105,16 @@ HISTORY_MAX_MESSAGES = 20
 CONTEXT_COMPILER_ENABLED = os.getenv(
     "KLONET_AGENT_DISABLE_CONTEXT_COMPILER", "0",
 ).strip().lower() not in {"1", "true", "yes", "on"}
+# 旧版 compress_memory() + MAX_TOKEN 后置压缩。默认关闭，只保留一个版本周期
+# 供 A/B 对比与安全回退；打开它意味着恢复“模型自由决定写什么记忆”的旧行为。
+LEGACY_MEMORY_COMPRESSION_ENABLED = os.getenv(
+    "KLONET_AGENT_ENABLE_LEGACY_COMPRESSION", "0",
+).strip().lower() in {"1", "true", "yes", "on"}
+# 软阈值触发压缩时，待覆盖历史低于该 token 数就跳过压缩：收益不足以抵掉
+# 一次额外的压缩模型调用（软阈值也可能由系统规则/证据区单独造成）。
+CONTEXT_COMPACTION_MIN_TOKENS = max(
+    0, int(os.getenv("KLONET_AGENT_COMPACTION_MIN_TOKENS", "512")),
+)
 MAX_TOOL_ROUNDS = 8
 OPS_MAX_TOOL_ROUNDS = 16
 SHARED_OPS_MEMORY_RECENT_DAYS = 3

@@ -207,7 +207,10 @@ def test_orchestrator_sends_every_ops_turn_to_supervisor_first(capsys):
 
     assert reply == "privileged supervisor completed"
     assert supervisor.calls == [("请重启 nginx 服务", "")]
-    assert history[-1] == {"role": "assistant", "content": reply}
+    # 载入历史的 assistant 消息会带本地事件行号（event_id），
+    # 它是 checkpoint 区间扣减的身份，不会进入请求体。
+    assert history[-1]["role"] == "assistant"
+    assert history[-1]["content"] == reply
     assert token == 0
     output = capsys.readouterr().out
     assert "Klonet Agent：privileged supervisor completed" in output
@@ -428,7 +431,10 @@ def test_orchestrator_continues_to_answerer_when_supervisor_delegates_conversati
 
     assert supervisor.calls == [("什么是 tc qdisc？", "")]
     assert reply == "ordinary ops answer"
-    assert history[-1] == {"role": "assistant", "content": reply}
+    # 载入历史的 assistant 消息会带本地事件行号（event_id），
+    # 它是 checkpoint 区间扣减的身份，不会进入请求体。
+    assert history[-1]["role"] == "assistant"
+    assert history[-1]["content"] == reply
     assert llm.calls
 
 

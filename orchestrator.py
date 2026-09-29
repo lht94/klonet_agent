@@ -15,7 +15,9 @@ from klonet_agent.agents import AgentProfile, get_profile
 from klonet_agent.answer_policy import build_answer_policy
 from klonet_agent.config import (
     CONTEXT_COMPILER_ENABLED,
+    CONTEXT_COMPACTION_MIN_TOKENS,
     HISTORY_MAX_MESSAGES,
+    LEGACY_MEMORY_COMPRESSION_ENABLED,
     MAX_TODO_CONTINUATIONS,
     MAX_TOKEN,
     MAX_TOOL_ROUNDS,
@@ -31,8 +33,14 @@ from klonet_agent.config import (
     TRACE_FILE,
     JEV_MIN_CONFIDENCE,
 )
-from klonet_agent.context.compiler import CompiledContext, ContextCompiler
-from klonet_agent.context.compiler import ContextOverflowError
+from klonet_agent.context.compiler import (
+    CompiledContext,
+    ContextCompiler,
+    ContextOverflowError,
+    assert_within_hard_limit,
+    to_provider_messages,
+)
+from klonet_agent.context.tokens import estimate_messages_tokens
 from klonet_agent.knowledge.clarification import (
     decide_model_intent_clarification,
     decide_pre_llm_clarification,
@@ -177,6 +185,11 @@ class AgentOrchestrator:
         # 结构化检查点：超过软阈值时生成 TaskCheckpoint，重启后可恢复。
         self.checkpoint_store = CheckpointStore(self.memory_store.memory_dir)
         self.memory_compactor = MemoryCompactor(self._llm_complete_text)
+        # 事件水位：checkpoint 已覆盖到 history.jsonl 的哪一行之前。
+        # None 表示尚未从 checkpoint 读取，首次使用时按 load_latest 解析。
+        self._covered_rows: int | None = None
+        # 下一个可分配的事件行号；惰性初始化为 history.jsonl 的当前行数。
+        self._next_event_row: int | None = None
         self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
             ProjectJournal.from_session(self.session),
             # Test doubles and deterministic callers should not receive a
@@ -363,23 +376,74 @@ class AgentOrchestrator:
     def _load_recovered_history(self) -> list[dict]:
         """从 checkpoint + 后续事件恢复工作历史。
 
-        checkpoint 损坏或覆盖范围无法解析时，回退到旧的
-        compact_event 标记 + 最近 N 条的恢复方式。
+        恢复不再使用固定消息条数：checkpoint 覆盖区间之后的事件全部作为
+        候选，最终保留多少由 ContextCompiler 的 token 预算和完整消息组
+        选择决定。
+
+        checkpoint 损坏或覆盖范围无法解析时，回退到旧的 compact_event
+        标记恢复方式（仍然不限条数）。
         """
 
         checkpoint = self.checkpoint_store.load_latest()
         if checkpoint is not None:
             covered = _parse_covered_rows(checkpoint.source_event_end)
             if covered is not None:
+                self._covered_rows = covered
                 recovered = self.memory_store.load_history_after(
                     covered,
-                    max_messages=HISTORY_MAX_MESSAGES,
+                    max_messages=self._legacy_history_cap(),
                 )
                 if recovered:
                     return recovered
+                # 区间之后没有新事件：checkpoint 已经代表全部有效历史。
+                return []
         return self.memory_store.load_unarchived_history(
-            max_messages=HISTORY_MAX_MESSAGES,
+            max_messages=self._legacy_history_cap(),
         )
+
+    @staticmethod
+    def _legacy_history_cap() -> int:
+        """旧路径回退时才按条数截断；新主链路为 0（不限条数）。"""
+
+        return HISTORY_MAX_MESSAGES if LEGACY_MEMORY_COMPRESSION_ENABLED else 0
+
+    def _current_covered_rows(self) -> int:
+        """返回当前 checkpoint 已覆盖的事件行数（无 checkpoint 时为 0）。"""
+
+        if self._covered_rows is None:
+            checkpoint = self.checkpoint_store.load_latest()
+            covered = (
+                _parse_covered_rows(checkpoint.source_event_end)
+                if checkpoint is not None
+                else None
+            )
+            self._covered_rows = covered or 0
+        return self._covered_rows
+
+    def _next_history_row(self) -> int:
+        """分配下一个 history.jsonl 事件行号。"""
+
+        if self._next_event_row is None:
+            self._next_event_row = self.memory_store.count_history_rows()
+        ordinal = self._next_event_row
+        self._next_event_row += 1
+        return ordinal
+
+    def _emit_turn_message(self, history: list[dict], message: dict) -> dict:
+        """追加一条已持久化的对话事件，并绑定它的事件行号。
+
+        同时写入内存 history 与 history.jsonl，保证两边的
+        `event_id`（"rows-<n>"）一致：这样“checkpoint 覆盖到哪一行”既能在
+        本轮编译时按行扣减，也能在重启后按同一行号恢复。
+        """
+
+        if not message.get("event_id"):
+            # 注意不要用 setdefault：默认值会被提前求值，导致行号被白白消耗。
+            message["event_id"] = f"rows-{self._next_history_row()}"
+        history.append(message)
+        self.memory_store.append_history(message)
+        return message
+
 
     def chat_with_llm(
         self,
@@ -413,12 +477,18 @@ class AgentOrchestrator:
         if len(sanitized_history) != len(history):
             history[:] = sanitized_history
         tools = self._visible_tools()
-        send_messages = history
-        compiled: CompiledContext | None = None
+        model = getattr(self.llm, "model", None) or "unknown"
         if CONTEXT_COMPILER_ENABLED:
+            # 编译失败（必需区超过硬预算）不允许回退到完整历史，
+            # 由 ContextOverflowError 向上抛出并在回合层给出确定性本地错误。
             compiled = self._compile_context(history, tools)
-            if compiled is not None:
-                send_messages = compiled.messages
+            send_messages = compiled.messages
+        else:
+            # 显式关闭编译器时的旧路径：仍然在发送前做硬预算断言，
+            # 保证“供应商不会收到超过 hard input limit 请求”这条不变量成立。
+            send_messages = history
+        send_messages = to_provider_messages(send_messages)
+        assert_within_hard_limit(send_messages, model, tools)
         if not stream:
             return self.llm.complete(messages=send_messages, tools=tools)
         try:
@@ -436,12 +506,15 @@ class AgentOrchestrator:
         self,
         history: list[dict],
         tools: list[dict],
-    ) -> CompiledContext | None:
+    ) -> CompiledContext:
         """编译本次请求的上下文视图。
 
-        编译失败（如必需区超过硬预算）时记录事件并回退到完整清洗后的
-        历史，保持旧行为；正常情况下返回的编译结果才是发给模型的内容。
-        超过软阈值时先做一次结构化压缩，再携带 checkpoint 重新编译。
+        超过软阈值时先做一次结构化压缩，再携带 checkpoint 重新编译；重新编译
+        时只保留 checkpoint 覆盖区间之后的事件候选，避免同一请求里
+        checkpoint 与原始历史重复出现。
+
+        必需区超过硬预算时不做任何回退：记录事件后抛出 ContextOverflowError，
+        由回合层给出确定性本地错误，绝不把未编译的完整历史发给供应商。
         """
 
         model = getattr(self.llm, "model", None) or "unknown"
@@ -459,24 +532,58 @@ class AgentOrchestrator:
                 event="context_compile_overflow",
                 payload={"model": model, "areas": exc.areas},
             )
-            print("Klonet Agent：上下文必需区超过模型预算，回退到未编译历史。")
-            return None
+            raise
 
-        checkpoint_message: dict | None = None
         if compiled.compression_required:
-            checkpoint_message = self._compact_context_once(history)
+            covered_prefix = self._covered_prefix_length(
+                history, compiled.omitted_event_ids
+            )
+            coverable = self._non_system_messages(history)[:covered_prefix]
+            coverable_tokens = estimate_messages_tokens(coverable)
+            checkpoint_message = None
+            if covered_prefix and coverable_tokens >= CONTEXT_COMPACTION_MIN_TOKENS:
+                checkpoint_message = self._compact_context_once(
+                    history, covered_prefix
+                )
+            else:
+                # 没有可压缩的旧事件，或压缩收益低于阈值（软阈值可能由系统
+                # 规则/证据区单独造成）：不重复压缩，避免每轮多一次模型调用。
+                self.trace_logger.record_privileged_event(
+                    user_id=self.session.user_id,
+                    project_id=self.session.project_id,
+                    mode=self.session.mode,
+                    event="context_compression_skipped",
+                    payload={
+                        "reason": (
+                            "no_covered_events"
+                            if not covered_prefix
+                            else "below_min_tokens"
+                        ),
+                        "coverable_tokens": coverable_tokens,
+                        "estimated_input_tokens": compiled.estimated_input_tokens,
+                        "areas": compiled.areas,
+                    },
+                )
 
-        if checkpoint_message is not None:
-            try:
+            if checkpoint_message is not None:
+                uncovered = self._history_after_covered(history, covered_prefix)
                 compiled = self.context_compiler.compile_history(
-                    history,
+                    uncovered,
                     model=model,
                     tool_definitions=tools,
                     checkpoint_message=checkpoint_message,
                 )
-            except ContextOverflowError:
-                # 注入 checkpoint 后仍超硬预算：回退到未编译历史。
-                return None
+                if compiled.compression_required:
+                    self.trace_logger.record_privileged_event(
+                        user_id=self.session.user_id,
+                        project_id=self.session.project_id,
+                        mode=self.session.mode,
+                        event="context_compression_still_required",
+                        payload={
+                            "estimated_input_tokens": compiled.estimated_input_tokens,
+                            "areas": compiled.areas,
+                        },
+                    )
 
         self.trace_logger.record_context_compile(
             user_id=self.session.user_id,
@@ -494,31 +601,141 @@ class AgentOrchestrator:
         )
         return compiled
 
-    def _llm_complete_text(self, messages: list[dict]) -> str:
-        """供 MemoryCompactor 使用的纯文本完成函数。"""
+    @staticmethod
+    def _row_of(message: dict) -> int | None:
+        """读取消息绑定的 history.jsonl 行号（"rows-<n>"）。"""
 
-        response = self.llm.complete(messages=messages)
+        raw = str(message.get("event_id") or "").strip()
+        if not raw.startswith("rows-"):
+            return None
+        try:
+            return int(raw[len("rows-") :])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _non_system_messages(history: list[dict]) -> list[dict]:
+        return [message for message in history if message.get("role") != "system"]
+
+    @classmethod
+    def _covered_prefix_length(
+        cls,
+        history: list[dict],
+        omitted_event_ids: tuple[str, ...],
+    ) -> int:
+        """把编译器的 omitted 事件 id 映射成“需要被 checkpoint 覆盖的前缀长度”。
+
+        omitted 事件 id 有两种来源：
+        - "rows-<n>"：已持久化事件，用行号定位；
+        - "msg-<index>"：旧格式/未持久化事件，用它在非 system 消息序列中的位置定位。
+
+        返回覆盖前缀的非 system 消息条数；当前用户输入永远不计入，避免把本轮
+        输入压缩掉。编译器没有报告被淘汰事件时，退化为覆盖当前用户输入之前的
+        全部事件 —— 历史整体超过软阈值时，正需要把整段历史折叠成 checkpoint。
+        出现无法映射的 id 时同样保守地整体覆盖：宁可多覆盖，也不能把未总结的
+        事件当成已覆盖。
+        """
+
+        non_system = cls._non_system_messages(history)
+        if not non_system:
+            return 0
+        newest_is_user = non_system[-1].get("role") == "user"
+        max_coverable = len(non_system) - (1 if newest_is_user else 0)
+        if max_coverable <= 0:
+            return 0
+        if not omitted_event_ids:
+            return max_coverable
+
+        row_to_position: dict[int, int] = {}
+        for position, message in enumerate(non_system):
+            row = cls._row_of(message)
+            if row is not None:
+                row_to_position[row] = position
+
+        max_position = -1
+        unmapped = False
+        for event_id in omitted_event_ids:
+            raw = str(event_id or "").strip()
+            if raw.startswith("msg-"):
+                try:
+                    position = int(raw[len("msg-") :])
+                except ValueError:
+                    unmapped = True
+                    continue
+                max_position = max(max_position, position)
+                continue
+            row = cls._row_of({"event_id": raw})
+            if row is not None and row in row_to_position:
+                max_position = max(max_position, row_to_position[row])
+            else:
+                unmapped = True
+        if max_position < 0 or unmapped:
+            return max_coverable
+        return min(max_position + 1, max_coverable)
+
+    @classmethod
+    def _history_after_covered(cls, history: list[dict], covered_prefix: int) -> list[dict]:
+        """返回只保留未覆盖事件的历史视图。
+
+        系统/本轮控制消息始终保留；非 system 消息丢掉被 checkpoint 覆盖的前
+        `covered_prefix` 条，当前用户输入永远在尾部因而不受影响。
+        """
+
+        if covered_prefix <= 0:
+            return list(history)
+        remaining = covered_prefix
+        kept: list[dict] = []
+        for message in history:
+            if message.get("role") == "system" or remaining <= 0:
+                kept.append(message)
+                continue
+            remaining -= 1
+        return kept
+
+
+    def _llm_complete_text(self, messages: list[dict]) -> str:
+        """供 MemoryCompactor 使用的纯文本完成函数。
+
+        压缩是受控调用：显式传 tools=None，兼容把 tools 作为必填位置的
+        LLM/FakeLLM 实现，避免压缩路径因接口差异直接 TypeError。
+        """
+
+        response = self.llm.complete(messages=messages, tools=None)
         choices = getattr(response, "choices", None) or []
         if not choices:
             return ""
         return str(getattr(choices[0].message, "content", None) or "")
 
-    def _compact_context_once(self, history: list[dict]) -> dict | None:
-        """超过软阈值时生成一次结构化 checkpoint。
+    def _compact_context_once(
+        self,
+        history: list[dict],
+        covered_prefix: int,
+    ) -> dict | None:
+        """超过软阈值时为已覆盖的旧事件生成一次结构化 checkpoint。
 
+        压缩输入是“被 checkpoint 覆盖的那部分事件”（增量），而不是完整
+        history：已覆盖区间由上一版 checkpoint 承载，作为 previous 传入。
         每次请求最多压缩一次；压缩失败保留旧 checkpoint，不阻断主流程。
         """
 
         previous = self.checkpoint_store.load_latest()
+        covered_before = self._current_covered_rows()
+        covered_messages = self._non_system_messages(history)[:covered_prefix]
+        if not covered_messages:
+            return None
+        covered_rows = sum(
+            1 for message in covered_messages if self._row_of(message) is not None
+        )
+        covered_until = covered_before + covered_rows
         try:
             checkpoint = self.memory_compactor.compact(
-                history,
+                covered_messages,
                 previous,
                 user_id=self.session.user_id,
                 project_id=self.session.project_id,
                 mode=self.session.mode,
-                source_event_start="rows-0",
-                source_event_end=f"rows-{self.memory_store.count_history_rows()}",
+                source_event_start=f"rows-{covered_before}",
+                source_event_end=f"rows-{covered_until}",
             )
         except CompactionError as exc:
             self.trace_logger.record_privileged_event(
@@ -533,9 +750,11 @@ class AgentOrchestrator:
 
         if previous is not None and checkpoint.checkpoint_id == previous.checkpoint_id:
             # 压缩失败回退到了旧 checkpoint：不产生新版本。
+            self._covered_rows = covered_before
             return previous.render_system_message()
 
         saved = self.checkpoint_store.save(checkpoint)
+        self._covered_rows = covered_until
         self.trace_logger.record_privileged_event(
             user_id=self.session.user_id,
             project_id=self.session.project_id,
@@ -544,7 +763,9 @@ class AgentOrchestrator:
             payload={
                 "checkpoint_id": saved.checkpoint_id,
                 "version": saved.version,
+                "source_event_start": saved.source_event_start,
                 "source_event_end": saved.source_event_end,
+                "covered_messages": len(covered_messages),
             },
         )
         print(
@@ -682,7 +903,13 @@ class AgentOrchestrator:
         return base
 
     def compress_memory(self, history: list[dict], token: int):
-        """触发记忆复盘与压缩。"""
+        """触发记忆复盘与压缩（旧路径，默认关闭）。
+
+        仅当 KLONET_AGENT_ENABLE_LEGACY_COMPRESSION 打开时由 single_chat 调用。
+        它让模型自行决定调用 write_memory / write_user 整篇覆盖记忆，属于
+        新版候选—决策写入管线要替换的行为；保留一个版本周期用于 A/B 对比和
+        安全回退，不作为默认路径。
+        """
 
         print("Klonet Agent：正在进行记忆复盘与折叠...")
         compress_instruction = """【系统强制指令 - 记忆反思折叠】
@@ -707,8 +934,7 @@ class AgentOrchestrator:
                 comp_assistant = self._assistant_tool_message(
                     compress_response.choices[0].message
                 )
-                history.append(comp_assistant)
-                self.memory_store.append_history(comp_assistant)
+                self._emit_turn_message(history, comp_assistant)
 
                 # 执行归档压缩中的工具调用。
                 for tool_call in compress_response.choices[0].message.tool_calls:
@@ -720,8 +946,7 @@ class AgentOrchestrator:
                             "tool_call_id": tool_call.id,
                             "content": parse_error,
                         }
-                        history.append(comp_tool_msg)
-                        self.memory_store.append_history(comp_tool_msg)
+                        self._emit_turn_message(history, comp_tool_msg)
                         continue
 
                     tool_result = self.use_tool(tool_name, tool_args)
@@ -731,8 +956,7 @@ class AgentOrchestrator:
                         "tool_call_id": tool_call.id,
                         "content": tool_result,
                     }
-                    history.append(comp_tool_msg)
-                    self.memory_store.append_history(comp_tool_msg)
+                    self._emit_turn_message(history, comp_tool_msg)
 
                     if tool_name in ["write_memory", "write_user"]:
                         self._refresh_memory_prompt(history)
@@ -749,8 +973,7 @@ class AgentOrchestrator:
                         compress_response.choices[0].message.reasoning_content
                     )
 
-                history.append(comp_assistant)
-                self.memory_store.append_history(comp_assistant)
+                self._emit_turn_message(history, comp_assistant)
 
                 print(f"Klonet Agent：{compress_reply}")
                 # 打入压缩标记，表示前面的内容已经被压缩归档。
@@ -775,8 +998,7 @@ class AgentOrchestrator:
             history,
             limit=20 if self.profile.name == "ops" else 6,
         )
-        history.append({"role": "user", "content": user_input})
-        self.memory_store.append_history({"role": "user", "content": user_input})
+        self._emit_turn_message(history, {"role": "user", "content": user_input})
 
         reply = ""
         tool_rounds = 0
@@ -809,8 +1031,7 @@ class AgentOrchestrator:
         if privileged_result is not None and privileged_result.handled:
             privileged_reply = privileged_result.message
             assistant_msg = {"role": "assistant", "content": privileged_reply}
-            history.append(assistant_msg)
-            self.memory_store.append_history(assistant_msg)
+            self._emit_turn_message(history, assistant_msg)
             self._record_privileged_turn(user_input, privileged_result)
             print(f"Klonet Agent：{privileged_reply}")
             return privileged_reply, history, token
@@ -937,8 +1158,7 @@ class AgentOrchestrator:
             if credential_boundary.should_stop:
                 reply = credential_boundary.reply
                 assistant_msg = {"role": "assistant", "content": reply}
-                history.append(assistant_msg)
-                self.memory_store.append_history(assistant_msg)
+                self._emit_turn_message(history, assistant_msg)
                 clear_thinking_prompt()
                 print(f"Klonet Agent\uff1a{reply}")
                 return reply, history, token
@@ -959,8 +1179,7 @@ class AgentOrchestrator:
             if clarification.should_stop:
                 reply = clarification.reply
                 assistant_msg = {"role": "assistant", "content": reply}
-                history.append(assistant_msg)
-                self.memory_store.append_history(assistant_msg)
+                self._emit_turn_message(history, assistant_msg)
                 clear_thinking_prompt()
                 print(f"Klonet Agent\uff1a{reply}")
                 return reply, history, token
@@ -1023,11 +1242,35 @@ class AgentOrchestrator:
                 print(delta, end="", flush=True)
 
             refresh_ops_environment_plan()
-            response = self.chat_with_llm(
-                history,
-                stream=True,
-                on_delta=print_reply_delta,
-            )
+            try:
+                response = self.chat_with_llm(
+                    history,
+                    stream=True,
+                    on_delta=print_reply_delta,
+                )
+            except ContextOverflowError as exc:
+                # 上下文必需区超过硬预算：不回退、不截断，直接给出确定性本地
+                # 错误并结束本回合，禁止向供应商发送超限请求。
+                clear_thinking_prompt()
+                areas = "、".join(
+                    f"{name}={value}" for name, value in sorted((exc.areas or {}).items())
+                )
+                overflow_reply = (
+                    "【本地错误】本轮上下文（系统规则 + 检查点 + 当前输入）"
+                    "已超过当前模型的硬输入上限，为避免请求被供应商拒绝，"
+                    "本轮未调用模型。请缩短当前输入，或开一个新的会话/项目继续。"
+                )
+                if areas:
+                    overflow_reply += f"（预算占用：{areas}）"
+                self.trace_logger.record_privileged_event(
+                    user_id=self.session.user_id,
+                    project_id=self.session.project_id,
+                    mode=self.session.mode,
+                    event="context_overflow_refused",
+                    payload={"areas": exc.areas, "detail": str(exc)[:500]},
+                )
+                print(f"\nKlonet Agent：{overflow_reply}")
+                return overflow_reply, history, token
             # 记录 token 要放在外层，避免只有调用工具时才计数。
             token += response.usage.total_tokens
 
@@ -1040,8 +1283,7 @@ class AgentOrchestrator:
                 # 总共要记录两次记忆：模型发起了哪些工具调用、工具返回了什么。
                 # 注意不能直接把复杂 SDK 对象 append 到 history，要转换成普通字典。
                 assistant_msg = self._assistant_tool_message(response.choices[0].message)
-                history.append(assistant_msg)
-                self.memory_store.append_history(assistant_msg)
+                self._emit_turn_message(history, assistant_msg)
 
                 for tool_call in response.choices[0].message.tool_calls:
                     # 工具名，即 schema 中 function.name。
@@ -1058,8 +1300,7 @@ class AgentOrchestrator:
                             "tool_call_id": tool_call.id,
                             "content": parse_error,
                         }
-                        history.append(tool_msg)
-                        self.memory_store.append_history(tool_msg)
+                        self._emit_turn_message(history, tool_msg)
                         continue
                     if tool_name == "search_knowledge":
                         candidate_intent = QueryIntent.from_mapping(
@@ -1130,8 +1371,7 @@ class AgentOrchestrator:
                         "tool_call_id": tool_call.id,
                         "content": result,
                     }
-                    history.append(tool_msg)
-                    self.memory_store.append_history(tool_msg)
+                    self._emit_turn_message(history, tool_msg)
 
                     # 核心补丁：记忆同步刷新机制。
                     # 如果刚才执行的工具修改了长期记忆文件，要立刻刷新系统提示词中的记忆内容。
@@ -1168,9 +1408,9 @@ class AgentOrchestrator:
                             "如果仍无法完成，请将状态改为 waiting_user 或 blocked：\n"
                             + render_todos(self.session.todos)
                         )
-                        history.append({"role": "user", "content": continue_prompt})
-                        self.memory_store.append_history(
-                            {"role": "user", "content": continue_prompt}
+                        self._emit_turn_message(
+                            history,
+                            {"role": "user", "content": continue_prompt},
                         )
                         continue
                     elif actionable:
@@ -1195,8 +1435,7 @@ class AgentOrchestrator:
                         response.choices[0].message.reasoning_content
                     )
 
-                history.append(assistant_msg)
-                self.memory_store.append_history(assistant_msg)
+                self._emit_turn_message(history, assistant_msg)
                 self._maintain_project_journal(effective_user_input, reply)
                 self._record_ops_shared_turn(effective_user_input, tool_events, reply)
                 self._last_turn_state = self._snapshot_turn_state(effective_user_input)
@@ -1209,8 +1448,7 @@ class AgentOrchestrator:
             self._paused_turn_state = self._snapshot_turn_state(effective_user_input)
             self._last_turn_state = self._paused_turn_state
             assistant_msg = {"role": "assistant", "content": reply}
-            history.append(assistant_msg)
-            self.memory_store.append_history(assistant_msg)
+            self._emit_turn_message(history, assistant_msg)
             self._maintain_project_journal(effective_user_input, reply)
             print(f"Klonet Agent\uff1a{reply}")
 
@@ -1226,11 +1464,17 @@ class AgentOrchestrator:
             )
         ]
 
-        # 条件触发对话压缩。这里沿用旧版逻辑，用本轮 context token 判断。
-        current_context_size = response.usage.total_tokens
-        if current_context_size >= MAX_TOKEN:
-            print(f"\nKlonet Agent：当前上下文约 {current_context_size} token，开始整理记忆。")
-            history, token = self.compress_memory(history, token)
+        # 旧版后置压缩：默认关闭。新主链路在调用前由 ContextCompiler 按预算
+        # 编译，超过软阈值时生成 TaskCheckpoint，不再依赖本轮 token 计数。
+        # 只在显式打开 KLONET_AGENT_ENABLE_LEGACY_COMPRESSION 时保留该回退。
+        if LEGACY_MEMORY_COMPRESSION_ENABLED:
+            current_context_size = response.usage.total_tokens
+            if current_context_size >= MAX_TOKEN:
+                print(
+                    f"\nKlonet Agent：当前上下文约 {current_context_size} token，"
+                    "开始整理记忆（旧压缩路径）。"
+                )
+                history, token = self.compress_memory(history, token)
 
         return reply, history, token
 

@@ -143,7 +143,11 @@ def test_memory_history_drops_unclosed_tool_calls():
 
         history = store.load_unarchived_history(max_messages=20)
 
-    assert history == [{"role": "user", "content": "start deploy"}]
+    # 载入的消息会带稳定的事件行号（event_id），用于 checkpoint 区间扣减。
+    assert [
+        {"role": message["role"], "content": message["content"]} for message in history
+    ] == [{"role": "user", "content": "start deploy"}]
+    assert history[0]["event_id"] == "rows-0"
 
 
 def test_shared_ops_memory_is_visible_across_users():

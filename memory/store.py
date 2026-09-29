@@ -293,6 +293,14 @@ class MemoryStore:
 
         位置从 0 开始按消息行计数，与 checkpoint 的 source_event_end
         （形如 "rows-<n>"）配套；读取旧 JSONL 时自动兼容缺失字段。
+
+        每条返回的消息都带有稳定 `event_id`（形如 "rows-<n>"）：已有的沿用，
+        旧格式按行号补齐。它是事件在 history.jsonl 中的身份，用于把
+        “checkpoint 覆盖到哪一行”表达成可重放的事件区间。发送给供应商前
+        必须剥离该字段（见 orchestrator._provider_messages）。
+
+        max_messages<=0 表示不按条数截断：最近历史的裁剪由 token 预算和
+        完整消息组选择决定，不再使用消息数量作为主要上限。
         """
 
         if not self.history_file.exists() or covered_rows < 0:
@@ -312,6 +320,7 @@ class MemoryStore:
                     continue
                 if index >= covered_rows:
                     msg = {key: value for key, value in row.items() if key != "ts"}
+                    msg["event_id"] = str(row.get("event_id") or f"rows-{index}")
                     collected.append(msg)
                 index += 1
         messages = sanitize_openai_tool_history(collected)
@@ -321,12 +330,18 @@ class MemoryStore:
             messages.pop(0)
         return messages
 
-    def load_unarchived_history(self, max_messages: int = 20) -> list[dict[str, Any]]:
-        """返回最新的工作记忆。"""
+    def load_unarchived_history(self, max_messages: int = 0) -> list[dict[str, Any]]:
+        """返回最新的工作记忆。
+
+        与 load_history_after 一样，返回的消息带稳定 `event_id`；
+        max_messages<=0 表示不按条数截断。
+        """
 
         if not self.history_file.exists():
             return []
+        total_rows = self.count_history_rows()
         unarchived_reversed = []
+        seen_rows = 0
         for line in _iter_jsonl_lines_reverse(self.history_file):
             if not line:
                 continue
@@ -338,7 +353,10 @@ class MemoryStore:
             if row.get("type") == "compact_event":
                 break
             if "role" in row:
+                seen_rows += 1
+                index = max(0, total_rows - seen_rows)
                 msg = {key: value for key, value in row.items() if key != "ts"}
+                msg["event_id"] = str(row.get("event_id") or f"rows-{index}")
                 unarchived_reversed.append(msg)
                 if max_messages > 0 and len(unarchived_reversed) >= max_messages:
                     break
