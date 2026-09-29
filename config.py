@@ -39,7 +39,16 @@ DEFAULT_EMBEDDING_BASE_URL = os.getenv(
     "DEFAULT_EMBEDDING_BASE_URL",
     "https://ws-o108vxrjw8kdvbrm.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
 )
-DEFAULT_REASONING_EFFORT = "medium"
+# 推理力度：部分中转站的 Gemini 上游不支持 reasoning_effort 参数（会回 500），
+# 可通过 KLONET_AGENT_REASONING_EFFORT=off/none/空 关闭该参数的发送。
+_reasoning_effort_env = os.getenv(
+    "KLONET_AGENT_REASONING_EFFORT", "medium",
+).strip().lower()
+DEFAULT_REASONING_EFFORT = (
+    None
+    if _reasoning_effort_env in {"", "none", "off"}
+    else _reasoning_effort_env
+)
 DEFAULT_LLM_TIMEOUT_SECONDS = max(
     1.0, float(os.getenv("DEFAULT_LLM_TIMEOUT_SECONDS", "60")),
 )
