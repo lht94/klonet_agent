@@ -70,6 +70,42 @@ class TraceLogger:
             }
         )
 
+    def record_context_compile(
+        self,
+        user_id: str,
+        project_id: str,
+        mode: str,
+        model: str,
+        estimated_input_tokens: int,
+        hard_input_limit: int,
+        soft_input_limit: int,
+        compression_required: bool,
+        included_event_ids: int,
+        omitted_event_ids: int,
+        areas: dict | None = None,
+        profile_source: str = "builtin",
+    ):
+        """记录一次上下文编译结果，用于回答 token 消耗分布与预算命中率。"""
+
+        self._append(
+            {
+                "ts": datetime.now(_UTC8).isoformat(timespec="seconds"),
+                "event": "context_compile",
+                "user_id": user_id,
+                "project_id": project_id,
+                "mode": mode,
+                "model": model,
+                "estimated_input_tokens": estimated_input_tokens,
+                "hard_input_limit": hard_input_limit,
+                "soft_input_limit": soft_input_limit,
+                "compression_required": compression_required,
+                "included_event_ids": included_event_ids,
+                "omitted_event_ids": omitted_event_ids,
+                "areas": areas or {},
+                "profile_source": profile_source,
+            }
+        )
+
     def record_privileged_event(
         self,
         user_id: str,

@@ -10,6 +10,7 @@ RUNTIME_PATHS = (
     "answer_policy.py",
     "agents",
     "app",
+    "context",
     "evals",
     "journal",
     "knowledge",

@@ -271,6 +271,56 @@ class MemoryStore:
         with self.history_file.open("a", encoding="utf-8") as file:
             file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    def count_history_rows(self) -> int:
+        """统计 history.jsonl 中的消息行数（不含 compact_event 等元数据行）。"""
+
+        if not self.history_file.exists():
+            return 0
+        count = 0
+        for line in _iter_jsonl_lines_reverse(self.history_file):
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "role" in row:
+                count += 1
+        return count
+
+    def load_history_after(self, covered_rows: int, max_messages: int = 0):
+        """读取第 covered_rows 条消息之后的行，作为未压缩历史候选。
+
+        位置从 0 开始按消息行计数，与 checkpoint 的 source_event_end
+        （形如 "rows-<n>"）配套；读取旧 JSONL 时自动兼容缺失字段。
+        """
+
+        if not self.history_file.exists() or covered_rows < 0:
+            return []
+        collected: list[dict[str, Any]] = []
+        index = 0
+        with self.history_file.open("r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "role" not in row:
+                    continue
+                if index >= covered_rows:
+                    msg = {key: value for key, value in row.items() if key != "ts"}
+                    collected.append(msg)
+                index += 1
+        messages = sanitize_openai_tool_history(collected)
+        if max_messages > 0 and len(messages) > max_messages:
+            messages = messages[-max_messages:]
+        while messages and messages[0].get("role") == "tool":
+            messages.pop(0)
+        return messages
+
     def load_unarchived_history(self, max_messages: int = 20) -> list[dict[str, Any]]:
         """返回最新的工作记忆。"""
 

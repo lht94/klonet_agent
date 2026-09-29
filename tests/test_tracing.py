@@ -151,9 +151,17 @@ def test_orchestrator_records_llm_trace():
             trace_logger=logger,
         )
         response = orchestrator.chat_with_llm([{"role": "user", "content": "hi"}])
-        row = json.loads((temp_dir / "trace.jsonl").read_text(encoding="utf-8"))
+        rows = [
+            json.loads(line)
+            for line in (temp_dir / "trace.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
 
     assert response.usage.total_tokens == 77
-    assert row["event"] == "llm_call"
+    llm_rows = [row for row in rows if row.get("event") == "llm_call"]
+    assert len(llm_rows) == 1
+    row = llm_rows[0]
     assert row["mode"] == "mentor"
     assert row["total_tokens"] == 77

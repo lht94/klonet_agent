@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from klonet_agent.agents import AgentProfile, get_profile
 from klonet_agent.answer_policy import build_answer_policy
 from klonet_agent.config import (
+    CONTEXT_COMPILER_ENABLED,
     HISTORY_MAX_MESSAGES,
     MAX_TODO_CONTINUATIONS,
     MAX_TOKEN,
@@ -30,6 +31,8 @@ from klonet_agent.config import (
     TRACE_FILE,
     JEV_MIN_CONFIDENCE,
 )
+from klonet_agent.context.compiler import CompiledContext, ContextCompiler
+from klonet_agent.context.compiler import ContextOverflowError
 from klonet_agent.knowledge.clarification import (
     decide_model_intent_clarification,
     decide_pre_llm_clarification,
@@ -54,7 +57,24 @@ from klonet_agent.journal import ProjectJournal, ProjectJournalMaintainer
 from klonet_agent.llm import LLMClient
 from klonet_agent.llm.decision import configured_jev_decision_model
 from klonet_agent.memory import MemoryStore
+from klonet_agent.memory.checkpoint_store import CheckpointStore
+from klonet_agent.memory.compactor import CompactionError, MemoryCompactor
+from klonet_agent.memory.models import TaskCheckpoint
 from klonet_agent.memory.store import sanitize_openai_tool_history
+
+
+def _parse_covered_rows(source_event_end: str) -> int | None:
+    """解析 checkpoint 覆盖范围的 "rows-<n>" 标记。"""
+
+    raw = str(source_event_end or "").strip()
+    prefix = "rows-"
+    if not raw.startswith(prefix):
+        return None
+    try:
+        value = int(raw[len(prefix) :])
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 from klonet_agent.ops.planner import build_ops_environment_plan
 from klonet_agent.ops.privileged.executor import PrivilegedCommandExecutor
 from klonet_agent.ops.privileged.execution_agent import (
@@ -152,6 +172,11 @@ class AgentOrchestrator:
         self._paused_turn_state: dict | None = None
         self._last_turn_state: dict | None = None
         self._ops_route: OpsRoute | None = None
+        # 上下文编译器：调用前按模型预算组装上下文（见 docs/superpowers/plans）。
+        self.context_compiler = ContextCompiler()
+        # 结构化检查点：超过软阈值时生成 TaskCheckpoint，重启后可恢复。
+        self.checkpoint_store = CheckpointStore(self.memory_store.memory_dir)
+        self.memory_compactor = MemoryCompactor(self._llm_complete_text)
         self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
             ProjectJournal.from_session(self.session),
             # Test doubles and deterministic callers should not receive a
@@ -328,13 +353,33 @@ class AgentOrchestrator:
         """
         history.append({"role": "system", "content": session_prompt})
 
-        # 载入上一次对话，即把未归档压缩的工作记忆加入上下文。
-        last_history = self.memory_store.load_unarchived_history(
-            max_messages=HISTORY_MAX_MESSAGES,
-        )
+        # 载入上一次对话。优先使用最新任务检查点恢复：checkpoint 覆盖
+        # 之前的历史行，只把其后的事件作为未压缩历史候选。
+        last_history = self._load_recovered_history()
         history.extend(last_history)
 
         return history
+
+    def _load_recovered_history(self) -> list[dict]:
+        """从 checkpoint + 后续事件恢复工作历史。
+
+        checkpoint 损坏或覆盖范围无法解析时，回退到旧的
+        compact_event 标记 + 最近 N 条的恢复方式。
+        """
+
+        checkpoint = self.checkpoint_store.load_latest()
+        if checkpoint is not None:
+            covered = _parse_covered_rows(checkpoint.source_event_end)
+            if covered is not None:
+                recovered = self.memory_store.load_history_after(
+                    covered,
+                    max_messages=HISTORY_MAX_MESSAGES,
+                )
+                if recovered:
+                    return recovered
+        return self.memory_store.load_unarchived_history(
+            max_messages=HISTORY_MAX_MESSAGES,
+        )
 
     def chat_with_llm(
         self,
@@ -368,18 +413,145 @@ class AgentOrchestrator:
         if len(sanitized_history) != len(history):
             history[:] = sanitized_history
         tools = self._visible_tools()
+        send_messages = history
+        compiled: CompiledContext | None = None
+        if CONTEXT_COMPILER_ENABLED:
+            compiled = self._compile_context(history, tools)
+            if compiled is not None:
+                send_messages = compiled.messages
         if not stream:
-            return self.llm.complete(messages=history, tools=tools)
+            return self.llm.complete(messages=send_messages, tools=tools)
         try:
-            return self.llm.complete(messages=history, tools=tools, stream=True)
+            return self.llm.complete(messages=send_messages, tools=tools, stream=True)
         except TypeError as exc:
             if "stream" not in str(exc):
                 raise
-            return self.llm.complete(messages=history, tools=tools)
+            return self.llm.complete(messages=send_messages, tools=tools)
         except Exception as exc:
             if not self._is_timeout_error(exc):
                 raise
-            return self.llm.complete(messages=history, tools=tools)
+            return self.llm.complete(messages=send_messages, tools=tools)
+
+    def _compile_context(
+        self,
+        history: list[dict],
+        tools: list[dict],
+    ) -> CompiledContext | None:
+        """编译本次请求的上下文视图。
+
+        编译失败（如必需区超过硬预算）时记录事件并回退到完整清洗后的
+        历史，保持旧行为；正常情况下返回的编译结果才是发给模型的内容。
+        超过软阈值时先做一次结构化压缩，再携带 checkpoint 重新编译。
+        """
+
+        model = getattr(self.llm, "model", None) or "unknown"
+        try:
+            compiled = self.context_compiler.compile_history(
+                history,
+                model=model,
+                tool_definitions=tools,
+            )
+        except ContextOverflowError as exc:
+            self.trace_logger.record_privileged_event(
+                user_id=self.session.user_id,
+                project_id=self.session.project_id,
+                mode=self.session.mode,
+                event="context_compile_overflow",
+                payload={"model": model, "areas": exc.areas},
+            )
+            print("Klonet Agent：上下文必需区超过模型预算，回退到未编译历史。")
+            return None
+
+        checkpoint_message: dict | None = None
+        if compiled.compression_required:
+            checkpoint_message = self._compact_context_once(history)
+
+        if checkpoint_message is not None:
+            try:
+                compiled = self.context_compiler.compile_history(
+                    history,
+                    model=model,
+                    tool_definitions=tools,
+                    checkpoint_message=checkpoint_message,
+                )
+            except ContextOverflowError:
+                # 注入 checkpoint 后仍超硬预算：回退到未编译历史。
+                return None
+
+        self.trace_logger.record_context_compile(
+            user_id=self.session.user_id,
+            project_id=self.session.project_id,
+            mode=self.session.mode,
+            model=model,
+            estimated_input_tokens=compiled.estimated_input_tokens,
+            hard_input_limit=compiled.hard_input_limit,
+            soft_input_limit=compiled.soft_input_limit,
+            compression_required=compiled.compression_required,
+            included_event_ids=len(compiled.included_event_ids),
+            omitted_event_ids=len(compiled.omitted_event_ids),
+            areas=compiled.areas,
+            profile_source=compiled.profile_source,
+        )
+        return compiled
+
+    def _llm_complete_text(self, messages: list[dict]) -> str:
+        """供 MemoryCompactor 使用的纯文本完成函数。"""
+
+        response = self.llm.complete(messages=messages)
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            return ""
+        return str(getattr(choices[0].message, "content", None) or "")
+
+    def _compact_context_once(self, history: list[dict]) -> dict | None:
+        """超过软阈值时生成一次结构化 checkpoint。
+
+        每次请求最多压缩一次；压缩失败保留旧 checkpoint，不阻断主流程。
+        """
+
+        previous = self.checkpoint_store.load_latest()
+        try:
+            checkpoint = self.memory_compactor.compact(
+                history,
+                previous,
+                user_id=self.session.user_id,
+                project_id=self.session.project_id,
+                mode=self.session.mode,
+                source_event_start="rows-0",
+                source_event_end=f"rows-{self.memory_store.count_history_rows()}",
+            )
+        except CompactionError as exc:
+            self.trace_logger.record_privileged_event(
+                user_id=self.session.user_id,
+                project_id=self.session.project_id,
+                mode=self.session.mode,
+                event="context_compaction_failed",
+                payload={"detail": str(exc)[:500]},
+            )
+            print("Klonet Agent：上下文压缩失败，保留原始历史继续。")
+            return None
+
+        if previous is not None and checkpoint.checkpoint_id == previous.checkpoint_id:
+            # 压缩失败回退到了旧 checkpoint：不产生新版本。
+            return previous.render_system_message()
+
+        saved = self.checkpoint_store.save(checkpoint)
+        self.trace_logger.record_privileged_event(
+            user_id=self.session.user_id,
+            project_id=self.session.project_id,
+            mode=self.session.mode,
+            event="context_compaction",
+            payload={
+                "checkpoint_id": saved.checkpoint_id,
+                "version": saved.version,
+                "source_event_end": saved.source_event_end,
+            },
+        )
+        print(
+            f"Klonet Agent：已生成任务检查点 v{saved.version}，"
+            "旧上下文将以压缩状态保留。"
+        )
+        return saved.render_system_message()
 
     def _is_complete_response(self, response) -> bool:
         choices = getattr(response, "choices", None) or []

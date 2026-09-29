@@ -4,6 +4,33 @@
 开发或让 Coding Agent 修改本项目之前，请先阅读
 [`docs/DEVELOPMENT_GUIDELINES.md`](docs/DEVELOPMENT_GUIDELINES.md)。该文档是当前架构收敛、状态边界、证据合同、Shell 安全和测试验收的统一开发规范；带日期的历史设计稿不能覆盖它与当前代码/测试合同。
 
+## 上下文管理（ContextCompiler）
+
+聊天模型调用前统一经过 `context/` 包的上下文编译器，取代
+"history 无限增长 + 超限后自然语言总结"的旧模式：
+
+```text
+原始事件持续写入 history.jsonl（不可变）
+    → 每次调用前按模型预算编译（context/budget.py + compiler.py）
+    → 超过软阈值时生成结构化 TaskCheckpoint（memory/compactor.py）
+    → checkpoint + 预算内最近完整回合继续任务
+    → 超过硬阈值时本地拒绝发送，不再请求失败后补救
+```
+
+- **动态预算**：按模型解析窗口/输出预留/安全余量（`ModelContextProfile`），
+  已知 `gemini-3.7-flash`、`GLM-5.2`；未知模型回退保守默认，
+  可用 `KLONET_AGENT_CONTEXT_WINDOW`、`KLONET_AGENT_MAX_OUTPUT_TOKENS`、
+  `KLONET_AGENT_SAFETY_MARGIN_TOKENS`、`KLONET_AGENT_SOFT_LIMIT_RATIO` 覆盖。
+- **完整消息组**：裁剪单位是语义完整的回合/工具交换，而不是"最近 20 条"，
+  tool call 与 tool result 整组保留或整组淘汰。
+- **结构化 TaskCheckpoint**：压缩结果为固定 schema（目标/约束/已完成/
+  失败尝试/下一步等），版本化原子写入 `memory/checkpoints/`，损坏自动
+  回退上一版本；重启后从 checkpoint 覆盖范围之后的事件恢复。
+- **可审计**：每次编译的估算 token、各区域占用、淘汰数量写入
+  `trace.jsonl`（event=`context_compile`）。
+
+临时回退旧路径：设置 `KLONET_AGENT_DISABLE_CONTEXT_COMPILER=1`。
+
 ## 聊天模型供应商
 
 聊天模型统一通过 `llm.LLMClient` 调用。默认按北京时间选择供应商：

@@ -1,0 +1,796 @@
+# Klonet Agent 上下文管理升级计划
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use `subagent-driven-development` (recommended) or `executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**目标：** 将 Klonet Agent 从“不断增长的 history + 超限后自然语言总结”升级为“调用前按预算组装上下文 + 结构化任务检查点 + 可审计事件历史”。
+
+**架构：** 在 `AgentOrchestrator` 与 `LLMClient` 之间增加统一的 `ContextCompiler`。它根据当前模型的上下文窗口和各内容区的优先级，在每次模型调用前构造合法、完整且留有输出空间的消息列表；当历史超过软阈值时，由独立 `MemoryCompactor` 生成结构化 `TaskCheckpoint`，原始历史仍作为不可变事件保留。
+
+**技术栈：** Python 3.8+、dataclass、现有 JSONL 存储、现有 OpenAI-compatible Chat Completions 客户端、pytest。
+
+---
+
+## 1. 文档范围
+
+本文只讨论上下文管理，不改造长期记忆和用户画像系统。范围包括：
+
+1. 上下文管理入口；
+2. 上下文容量判断；
+3. 压缩触发时机；
+4. 最近对话保留；
+5. 工具消息处理；
+6. 压缩结果；
+7. 压缩实现位置；
+8. 原始历史的保留与恢复。
+
+下列内容不属于本次升级：
+
+- 将 `MEMORY.md`、`USER.md` 迁移为原子记忆；
+- 情景记忆向量检索；
+- A-MEM/知识图谱；
+- 替换现有知识库 RAG；
+- 改造 Ops 权限和执行状态机；
+- 迁移到某个供应商专属 Agent 框架。
+
+## 2. 当前实现基线
+
+当前上下文链路如下：
+
+```text
+init_history()
+  ├─ 固定系统提示词
+  ├─ 完整 MEMORY.md / USER.md
+  ├─ skill 描述
+  ├─ session 信息
+  └─ 最近 20 条未归档消息
+           ↓
+single_chat() 继续向 history 追加用户、助手和工具消息
+           ↓
+LLMClient.complete(messages=history)
+           ↓
+模型调用结束后检查 response.usage.total_tokens
+           ↓
+达到 MAX_TOKEN=500000 时触发 compress_memory()
+           ↓
+模型自由调用 append_episode/write_memory/write_user
+           ↓
+写入 compact_event，重新初始化 history
+```
+
+关键代码位置：
+
+- `config.py:89-90`：全局 `MAX_TOKEN = 500000` 和 `HISTORY_MAX_MESSAGES = 20`；
+- `orchestrator.py:302-337`：初始化完整上下文；
+- `orchestrator.py:366-378`：直接将 history 交给模型；
+- `orchestrator.py:512-591`：压缩逻辑耦合在编排器中；
+- `orchestrator.py:1057-1061`：模型调用完成后才判断是否压缩；
+- `memory/store.py:264-299`：使用压缩标记和固定消息条数恢复工作历史；
+- `memory/compactor.py`：目前只有模块说明，没有实际实现。
+
+当前设计的优点应当保留：
+
+- 原始消息持续写入 `history.jsonl`，具备审计基础；
+- 已按 `user_id/project_id` 隔离；
+- 已有工具消息链修复逻辑 `sanitize_openai_tool_history()`；
+- 临时的 turn scope 消息会在本轮结束后移除；
+- 工具结果已有统一字符截断保护；
+- `ConversationState` 已证明结构化小状态可以与自然语言历史并存。
+
+## 3. 目标架构
+
+```text
+                           ┌─────────────────────┐
+当前输入 ─────────────────►│                     │
+系统规则 ─────────────────►│                     │
+任务 checkpoint ─────────►│   ContextCompiler   │──► compiled messages ─► LLM
+最近完整对话 ─────────────►│                     │
+本轮临时上下文 ───────────►│                     │
+                           └──────────┬──────────┘
+                                      │ 超过软阈值
+                                      ▼
+                           ┌─────────────────────┐
+                           │   MemoryCompactor   │
+                           │  生成 TaskCheckpoint│
+                           └──────────┬──────────┘
+                                      ▼
+                           ┌─────────────────────┐
+                           │  CheckpointStore    │
+                           └─────────────────────┘
+
+history.jsonl：始终保留原始事件，不因编译或压缩而删除
+```
+
+核心不变量：
+
+1. 模型调用前必须已经确认编译后上下文不超过硬预算。
+2. 当前用户输入、系统安全规则和活动任务状态不得因压缩丢失。
+3. assistant tool-call 与其对应的 tool result 必须作为原子消息组保留或淘汰。
+4. 压缩只生成派生 checkpoint，不删除或改写原始事件。
+5. checkpoint 必须能回答“当前目标、已完成什么、失败过什么、下一步是什么”。
+6. token 计数不可用时必须采用保守估算，不允许跳过预算保护。
+7. 上下文编译不能改变 Ops 权限边界或把历史文本升级为当前运行态事实。
+
+## 4. 升级总览
+
+| 升级项 | 现在 | 升级后 | 优先级 |
+| --- | --- | --- | --- |
+| 管理入口 | `AgentOrchestrator` 直接维护 history | `ContextCompiler` 统一编译 | P0 |
+| 容量判断 | 全局固定 500,000 token | 模型感知的动态预算 | P0 |
+| 触发时机 | 调用完成后判断 | 调用前预检查、分级阈值 | P0 |
+| 最近对话 | 最近 20 条消息 | token 预算内的最近完整 turn | P0 |
+| 工具消息 | 单条消息截断与事后修复 | assistant/tool 原子消息组 | P0 |
+| 压缩结果 | 自然语言复盘 | 结构化 `TaskCheckpoint` | P1 |
+| 实现位置 | 压缩逻辑位于 orchestrator | 独立 compactor/store | P1 |
+| 原始历史 | compact marker 划分有效历史 | append-only 事件 + checkpoint 范围索引 | P1 |
+
+## 5. 逐项设计
+
+### 5.1 引入统一 Context Compiler
+
+#### 优化什么
+
+当前 `init_history()`、`single_chat()`、工具循环和 `compress_memory()` 都会直接修改同一个 history 列表。消息“如何存储”和“本次给模型看什么”没有分开。
+
+升级后：
+
+- history/event store 负责真实记录；
+- `ContextCompiler` 负责生成某一次 LLM 请求的视图；
+- `AgentOrchestrator` 只提交上下文材料，不再自行做容量裁剪；
+- `LLMClient` 只接收已经验证过的 compiled messages。
+
+#### 原理
+
+上下文窗口不是聊天记录容器，而是模型在本次推理中可以使用的有限工作空间。编译阶段需要对不同内容执行选择、排序、预算分配和完整性检查。这类似编译器把多个源输入转换成符合目标平台约束的产物，因此使用 `ContextCompiler` 比继续扩展 history 操作更清晰。
+
+建议接口：
+
+```python
+@dataclass(frozen=True)
+class ContextRequest:
+    model: str
+    system_messages: list[dict]
+    checkpoint_message: dict | None
+    history_messages: list[dict]
+    transient_messages: list[dict]
+    current_user_message: dict
+    tool_definitions: list[dict]
+
+
+@dataclass(frozen=True)
+class CompiledContext:
+    messages: list[dict]
+    estimated_input_tokens: int
+    hard_input_limit: int
+    included_event_ids: tuple[str, ...]
+    omitted_event_ids: tuple[str, ...]
+    checkpoint_id: str | None
+    compression_required: bool
+
+
+class ContextCompiler:
+    def compile(self, request: ContextRequest) -> CompiledContext:
+        ...
+```
+
+#### 好处
+
+- 编排、持久化、压缩、模型调用的职责不再混在一起；
+- 同一套历史可以针对不同模型编译出不同大小的上下文；
+- 能对“最终送给模型的内容”单独测试和记录；
+- 后续接入供应商原生 compaction 时只需增加适配器；
+- 更容易排查到底是检索问题、压缩问题还是模型问题。
+
+#### 参考资料
+
+- Anthropic 将 context engineering 定义为管理 system instructions、tools、外部数据和消息历史的整体工程，并强调只保留完成当前任务所需的高信号信息：<https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>
+- Anthropic 的 managed agents 设计将“可恢复会话存储”和“harness 中任意上下文管理”分离：<https://www.anthropic.com/engineering/managed-agents>
+- 本项目现有的 `ConversationState` 已经采用“小型结构化状态 + 对话历史”的局部模式，可作为内部迁移依据。
+
+### 5.2 从固定阈值升级为模型感知的动态预算
+
+#### 优化什么
+
+删除业务逻辑对单一 `MAX_TOKEN = 500000` 的依赖。为每个模型建立能力配置，并为输入、输出、工具定义和安全余量分别预算。
+
+建议数据结构：
+
+```python
+@dataclass(frozen=True)
+class ModelContextProfile:
+    context_window: int
+    max_output_tokens: int
+    safety_margin_tokens: int
+    soft_limit_ratio: float = 0.70
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    hard_input_limit: int
+    soft_input_limit: int
+    reserved_output_tokens: int
+    reserved_tool_tokens: int
+    reserved_safety_tokens: int
+```
+
+预算关系：
+
+```text
+hard_input_limit
+  = model_context_window
+  - reserved_output_tokens
+  - tool_schema_tokens
+  - safety_margin_tokens
+```
+
+配置解析优先级：
+
+1. 环境变量中的明确模型配置；
+2. 代码中已知模型 profile；
+3. 保守的默认窗口；
+4. 不允许未知模型回退到 500,000。
+
+#### 原理
+
+模型的总上下文窗口通常由输入和输出共享。只比较历史 token 与总窗口，会遗漏输出空间、tool schema、系统提示词以及供应商计算方式的差异。动态预算在调用前为这些内容预留空间，可以把“是否可能成功”变成确定性检查。
+
+#### 好处
+
+- 避免不同模型共用错误阈值；
+- 避免输入恰好塞满窗口后没有输出空间；
+- 模型路由切换时不需要修改编排器；
+- 可以准确记录各上下文区域的 token 成本；
+- 为后续成本和延迟优化提供可观测数据。
+
+#### 参考资料
+
+- OpenAI compaction 允许根据 rendered token count 设置 `compact_threshold`，体现了压缩应基于实际请求上下文而非消息条数：<https://developers.openai.com/api/docs/guides/compaction>
+- Anthropic context engineering 强调 context 是一种有限资源，需要选择高信号 token，而不只是扩大窗口：<https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>
+
+### 5.3 将压缩从“调用后补救”改为“调用前分级控制”
+
+#### 优化什么
+
+当前代码在模型已经返回后才读取 `response.usage.total_tokens` 判断是否压缩。升级后每次调用前估算 compiled context，并设置两个阈值：
+
+```text
+正常区：usage < soft_limit
+    直接编译并调用
+
+软压缩区：soft_limit <= usage <= hard_limit
+    先生成/更新 checkpoint，再重新编译
+
+硬拒绝区：usage > hard_limit
+    禁止发送请求；必须压缩、裁剪或返回结构化错误
+```
+
+建议软阈值默认设置为窗口可用输入预算的 70%，通过配置调整，而不是硬编码到算法中。
+
+#### 原理
+
+压缩是上下文进入危险区之前的控制动作，不是请求完成后的清理动作。提前压缩还可以避免在一次长工具结果或长用户输入之后突然越界。
+
+#### 好处
+
+- 不会出现“还没来得及压缩，请求先失败”；
+- 压缩过程本身也有可控的上下文空间；
+- 可以在软阈值阶段保留更多高价值原文；
+- 超过硬限制时产生本地确定性错误，不依赖供应商报错文本。
+
+#### 参考资料
+
+- OpenAI server-side compaction 在上下文达到配置阈值时自动运行，并将 compaction item 带入后续窗口：<https://developers.openai.com/api/docs/guides/compaction>
+- ReSum 通过周期性地把增长中的交互历史转换为紧凑 reasoning state，使长时间探索可以继续：<https://arxiv.org/abs/2509.13313>
+
+### 5.4 从“最近 20 条消息”升级为“token 预算内的最近完整 turn”
+
+#### 优化什么
+
+不再将单条 message 作为裁剪单位。先把历史解析为逻辑单元：
+
+```python
+@dataclass(frozen=True)
+class MessageGroup:
+    event_ids: tuple[str, ...]
+    messages: tuple[dict, ...]
+    group_type: str  # system, user_turn, assistant_turn, tool_exchange
+    estimated_tokens: int
+```
+
+保留顺序：
+
+1. 当前用户消息；
+2. 当前未结束的工具交换；
+3. 最近完整用户回合；
+4. 更早完整回合，直到 history budget 用尽；
+5. 已由 checkpoint 覆盖的旧回合优先淘汰。
+
+“一个完整回合”至少保证：
+
+- user 消息不会脱离对应回答；
+- assistant 的 tool calls 与全部 tool results 不分开；
+- 工具结果后的最终 assistant 回答尽可能同组保留。
+
+#### 原理
+
+消息数量与 token 数没有稳定关系。按 token 预算能控制真实成本；按语义组裁剪能保持局部因果关系，避免模型只看到工具输出却不知道调用原因，或者只看到 tool call 看不到结果。
+
+#### 好处
+
+- 一条巨大工具输出不会令“最近 20 条”策略失效；
+- 不再从对话或工具链中间切断；
+- 最近对话连贯性更高；
+- 初始化、运行时调用和压缩后恢复使用同一种选择算法。
+
+#### 参考资料
+
+- OpenAI compaction 文档建议在拥有最新 compaction item 后丢弃更早 input items，说明裁剪应围绕可继续推理的状态边界进行：<https://developers.openai.com/api/docs/guides/compaction>
+- MemGPT 将有限上下文视为类似主存的资源，通过分层和换入换出提供虚拟上下文：<https://arxiv.org/abs/2310.08560>
+
+### 5.5 将工具调用链作为原子消息组管理
+
+#### 优化什么
+
+保留现有 `sanitize_openai_tool_history()` 作为最后一道兼容保护，但正常编译流程不应先制造残缺工具链再修复。
+
+新增 `ToolExchangeGrouper`：
+
+```text
+assistant(tool_calls=[A, B])
+  + tool(tool_call_id=A)
+  + tool(tool_call_id=B)
+  + optional assistant final response
+  = 一个 ToolExchangeGroup
+```
+
+组装时的规则：
+
+- tool exchange 整组保留或整组淘汰；
+- 活跃、尚未产生结果的 exchange 永不进入普通模型调用；
+- 中断残片仍保存在事件日志，但 compiled context 中排除；
+- 工具原始输出与工具摘要分开存储；
+- 超长结果只在展示视图中替换为“结构化摘要 + 原始事件引用”，不改写原始事件。
+
+#### 原理
+
+OpenAI-compatible 协议要求 assistant tool call 后紧跟对应 tool result。更重要的是，工具调用的意图、参数、结果与后续结论构成一个推理单元，单条截断会破坏协议完整性和语义完整性。
+
+#### 好处
+
+- 减少请求 400 和历史修复分支；
+- 避免模型把无来源的工具输出当成用户文本；
+- 失败、中断和多工具并行结果更容易恢复；
+- 工具结果压缩后仍可追溯原始证据。
+
+#### 参考资料
+
+- 本项目 `sanitize_openai_tool_history()` 已经证明残缺工具交换会导致 OpenAI 请求失败；新设计把事后修复前移为编译不变量。
+- Anthropic 的工具设计建议通过清晰、边界明确的工具把计算和数据移出有限上下文：<https://www.anthropic.com/engineering/writing-tools-for-agents>
+- OpenAI 对长任务的说明指出工具调用、结果和 reasoning summaries 会迅速填满上下文，因此需要 compaction：<https://openai.com/index/equip-responses-api-computer-environment/>
+
+### 5.6 将自然语言压缩升级为结构化 TaskCheckpoint
+
+#### 优化什么
+
+压缩结果不再只是“记忆复盘完成”的自然语言回复，而是符合固定 schema 的任务检查点：
+
+```python
+@dataclass(frozen=True)
+class TaskCheckpoint:
+    checkpoint_id: str
+    version: int
+    user_id: str
+    project_id: str
+    mode: str
+    goal: str
+    status: str
+    constraints: tuple[str, ...]
+    decisions: tuple[str, ...]
+    completed_steps: tuple[str, ...]
+    pending_steps: tuple[str, ...]
+    failed_attempts: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+    touched_files: tuple[str, ...]
+    verification: tuple[str, ...]
+    unresolved_questions: tuple[str, ...]
+    next_action: str
+    source_event_start: str
+    source_event_end: str
+    created_at: str
+```
+
+checkpoint 的系统提示必须强调：
+
+- 只总结 source event 范围内可证明的内容；
+- 不得把 assistant 猜测升级为已验证事实；
+- failed attempts 必须记录方法和失败原因；
+- next action 必须是一个具体、可执行的动作；
+- 对 Ops 运行态只保存历史证据引用，不宣称当前仍有效。
+
+模型生成后由 Python 校验 schema；校验失败时最多做一次结构修复，仍失败则保留旧 checkpoint 并拒绝删除对应上下文。
+
+#### 原理
+
+普通摘要擅长描述主题，却不一定保存任务恢复所需的控制状态。结构化 checkpoint 明确要求目标、约束、决策、失败历史、证据和下一步，使长任务可以从压缩点继续，而不是重新理解整段对话。
+
+#### 好处
+
+- 压缩后能回答“接下来做什么”；
+- 避免重复已经失败的尝试；
+- 可以确定 checkpoint 覆盖了哪些原始事件；
+- 字段级验证比自然语言质量判断更稳定；
+- Mentor、Coding 和 Ops 可以共享基础 schema，再增加模式扩展字段。
+
+#### 参考资料
+
+- ReSum 的核心是把不断增长的交互轨迹转换为 compact reasoning state，而不是只做对话摘要：<https://arxiv.org/abs/2509.13313>
+- Anthropic 建议长任务维护外部 notes/todo，以保存进度、依赖和关键上下文：<https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>
+- Anthropic 长时运行 agent harness 强调跨 session 留下清晰的进展和下一步：<https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents>
+
+### 5.7 将压缩职责移出 AgentOrchestrator
+
+#### 优化什么
+
+把当前 `orchestrator.py:512-591` 的压缩循环拆为三个组件：
+
+```text
+memory/compactor.py
+    MemoryCompactor
+    选择压缩事件范围、请求结构化摘要、校验 checkpoint
+
+memory/checkpoint_store.py
+    CheckpointStore
+    原子写入、读取最新版、保存版本
+
+context/compiler.py
+    ContextCompiler
+    决定何时需要 checkpoint，并使用 checkpoint 编译上下文
+```
+
+`AgentOrchestrator` 只执行：
+
+```python
+compiled = self.context_compiler.compile(request)
+if compiled.compression_required:
+    self.memory_compactor.compact(...)
+    compiled = self.context_compiler.compile(request)
+response = self.llm.complete(messages=compiled.messages, tools=tools)
+```
+
+#### 原理
+
+编排器负责推进 Agent 回合；压缩器负责从历史生成派生状态；存储器负责持久化；编译器负责一次调用的上下文选择。职责拆开后，每个组件可以在不调用完整 Agent 的情况下测试。
+
+#### 好处
+
+- 显著降低 `AgentOrchestrator` 复杂度；
+- 单元测试不需要模拟完整工具循环；
+- 压缩失败不会顺带破坏主历史；
+- 便于替换本地压缩器或增加供应商原生适配器；
+- 后续上下文策略实验可以独立进行。
+
+#### 参考资料
+
+- Anthropic managed agents 将稳定的 session interface 与可变化的 harness context management 解耦：<https://www.anthropic.com/engineering/managed-agents>
+- 本项目开发规范已经要求组件职责唯一、持久化状态与自然语言判断分离；本次拆分延续这一原则。
+
+### 5.8 将 history.jsonl 明确为不可变事件日志
+
+#### 优化什么
+
+保留 JSONL，但为每个事件增加稳定元数据：
+
+```python
+@dataclass(frozen=True)
+class ConversationEvent:
+    event_id: str
+    session_id: str
+    sequence: int
+    timestamp: str
+    role: str
+    content: object
+    event_type: str
+    turn_id: str
+    tool_exchange_id: str | None
+```
+
+checkpoint 通过 `source_event_start/source_event_end` 声明覆盖范围。`compact_event` 可以保留用于兼容，但不再代表旧事件失效或不可读取。
+
+恢复过程：
+
+1. 加载最新合法 checkpoint；
+2. 从 checkpoint 的 `source_event_end` 之后读取事件；
+3. 解析完整 message groups；
+4. 交给 `ContextCompiler` 按预算选择；
+5. 如果 checkpoint 损坏，回退到上一版本或从事件重新生成。
+
+#### 原理
+
+事件溯源将事实记录与派生视图分开。checkpoint、摘要和 compiled context 都可以重新生成，原始历史则提供审计、回放与故障恢复的依据。
+
+#### 好处
+
+- 压缩错误不会造成永久数据丢失；
+- 能重放某轮上下文，复现 Agent 行为；
+- 可以比较不同压缩算法在同一历史上的效果；
+- checkpoint 损坏时可恢复；
+- 为后续上下文评估集提供真实轨迹。
+
+#### 参考资料
+
+- OpenAI compaction 产生可继续携带状态的 compaction item，同时区分之前的原始 input items：<https://developers.openai.com/api/docs/guides/compaction>
+- MemGPT 的虚拟上下文思想区分当前上下文中的工作状态与外部持久存储：<https://arxiv.org/abs/2310.08560>
+
+## 6. 上下文区域与预算优先级
+
+建议编译顺序如下：
+
+| 区域 | 是否必须 | 默认策略 | 超预算时处理 |
+| --- | --- | --- | --- |
+| 安全与模式系统规则 | 是 | 完整保留 | 不允许裁剪 |
+| 当前用户输入 | 是 | 完整保留 | 输入本身过长则返回明确错误或走文档处理流程 |
+| 活动 TaskCheckpoint | 是 | 固定 schema 渲染 | 压缩字段值但不删除核心字段 |
+| 本轮临时控制上下文 | 是 | 仅本轮注入 | 回合结束移除 |
+| 当前未完成工具交换 | 是 | 原子组保留 | 不完整时禁止调用并先恢复状态 |
+| 最近完整对话 | 否 | 从新到旧填充 | 淘汰最早完整组 |
+| 相关项目日志/RAG | 否 | 独立预算 | 减少 top-k 或片段长度 |
+| 已由 checkpoint 覆盖的旧对话 | 否 | 默认不注入 | 首先淘汰 |
+
+建议首版预算只区分以下几类，避免过度设计：
+
+```text
+required = system + current input + checkpoint + transient controls
+tools = tool definitions
+evidence = RAG/journal/tool summaries
+recent = recent complete message groups
+reserved = output + safety margin
+```
+
+## 7. 实施计划
+
+### 阶段 0：建立基线与回归轨迹
+
+**文件：**
+
+- 修改：`tracing/logger.py`
+- 新建：`tests/fixtures/context_traces/*.jsonl`
+- 新建：`tests/test_context_baseline.py`
+
+- [ ] 记录当前每次调用的模型名、消息数、输入 token、输出 token、工具 schema 估算、最长消息字符数。
+- [ ] 从 Mentor、Coding、Ops 各选至少两条真实脱敏轨迹作为固定 fixture。
+- [ ] 增加长工具结果、多个 tool calls、中断工具链、超长单轮用户输入四种合成轨迹。
+- [ ] 运行 `python -m pytest tests/test_context_baseline.py -q`，确认 fixture 可重复加载且不包含敏感字段。
+- [ ] 提交：`test: add context management baseline traces`。
+
+**完成标准：** 在改算法前能够回答一轮请求的 token 主要消耗在哪里，并能重放至少十条上下文轨迹。
+
+### 阶段 1：实现模型感知预算
+
+**文件：**
+
+- 新建：`context/__init__.py`
+- 新建：`context/budget.py`
+- 修改：`config.py`
+- 新建：`tests/test_context_budget.py`
+
+- [ ] 为已配置聊天模型定义 `ModelContextProfile`，环境变量允许覆盖窗口、最大输出和安全余量。
+- [ ] 实现 `build_context_budget(model, tool_definitions)`。
+- [ ] 未知模型使用保守默认值，并在 trace 中记录 `profile_source=fallback`。
+- [ ] 测试输出预留、tool schema 增长、未知模型和非法配置。
+- [ ] 运行 `python -m pytest tests/test_context_budget.py -q`。
+- [ ] 提交：`feat: add model-aware context budgets`。
+
+**完成标准：** 任意已配置模型都能在调用前得到明确的 hard/soft input limit；不存在对 500,000 常量的运行时依赖。
+
+### 阶段 2：解析完整消息组
+
+**文件：**
+
+- 新建：`context/message_groups.py`
+- 修改：`memory/store.py`
+- 新建：`tests/test_context_message_groups.py`
+
+- [ ] 实现 user/assistant 普通回合和 tool exchange 的分组器。
+- [ ] 为历史事件补充可选 `event_id`、`turn_id`、`tool_exchange_id`；读取旧 JSONL 时自动兼容缺失字段。
+- [ ] 实现从新到旧按 token 预算选择完整组。
+- [ ] 保留 `sanitize_openai_tool_history()` 作为最终断言前的兼容清洗。
+- [ ] 测试多 tool call、缺失 tool result、孤立 tool result、旧格式历史和单个组超过预算。
+- [ ] 运行 `python -m pytest tests/test_context_message_groups.py tests/test_session.py -q`。
+- [ ] 提交：`feat: preserve complete turns in context history`。
+
+**完成标准：** 编译结果中不存在残缺工具调用链；最近历史不再使用消息数量作为主要上限。
+
+### 阶段 3：引入 ContextCompiler
+
+**文件：**
+
+- 新建：`context/compiler.py`
+- 修改：`orchestrator.py`
+- 修改：`tracing/logger.py`
+- 新建：`tests/test_context_compiler.py`
+
+- [ ] 定义 `ContextRequest` 和 `CompiledContext`。
+- [ ] 按“必需区—证据区—最近历史区”的顺序分配预算。
+- [ ] 在 `_complete_llm()` 前调用 compiler，并只发送 `compiled.messages`。
+- [ ] 对超过 hard limit 的结果本地拒绝，禁止继续请求供应商。
+- [ ] trace 记录每个区域的估算 token、包含/省略事件数和编译原因。
+- [ ] 测试必需区不被删除、旧历史优先淘汰、临时消息只存在于本轮。
+- [ ] 运行 `python -m pytest tests/test_context_compiler.py tests/test_orchestrator_controls.py -q`。
+- [ ] 提交：`feat: compile bounded context before model calls`。
+
+**完成标准：** 所有非 Ops-Privilege 的聊天调用都经过统一编译；供应商不会收到超过 hard input limit 的请求。
+
+### 阶段 4：实现结构化 TaskCheckpoint
+
+**文件：**
+
+- 修改：`memory/models.py`
+- 实现：`memory/compactor.py`
+- 新建：`memory/checkpoint_store.py`
+- 新建：`tests/test_memory_compactor.py`
+- 新建：`tests/test_checkpoint_store.py`
+
+- [ ] 定义 `TaskCheckpoint` schema 和字段校验。
+- [ ] 实现版本化、原子写入的 `CheckpointStore`。
+- [ ] 实现 `MemoryCompactor.compact(event_range, previous_checkpoint)`。
+- [ ] 压缩响应结构无效时只允许一次结构修复；失败后保留旧 checkpoint 和原始事件。
+- [ ] 为 checkpoint 增加稳定、短小的 system message 渲染器。
+- [ ] 测试未完成步骤、失败尝试、证据引用、下一动作和事件范围不会缺失。
+- [ ] 运行 `python -m pytest tests/test_memory_compactor.py tests/test_checkpoint_store.py -q`。
+- [ ] 提交：`feat: add structured task checkpoints`。
+
+**完成标准：** 给定同一事件区间能够生成通过 schema 验证的 checkpoint；损坏的最新 checkpoint 可以回退到上一版本。
+
+### 阶段 5：调用前软压缩与恢复
+
+**文件：**
+
+- 修改：`context/compiler.py`
+- 修改：`orchestrator.py`
+- 修改：`memory/store.py`
+- 修改：`tests/test_context_compiler.py`
+- 新建：`tests/test_context_recovery.py`
+
+- [ ] compiler 在超过 soft limit 时返回明确的 `compression_required` 和建议事件范围。
+- [ ] orchestrator 调用 compactor 后只重新编译一次，避免无限压缩循环。
+- [ ] 启动恢复时加载最新 checkpoint，并只将其后事件作为未压缩历史候选。
+- [ ] 保留旧 `compact_event` 的读取兼容，但新流程不依赖它划分有效历史。
+- [ ] 测试软阈值压缩、硬阈值拒绝、压缩失败、进程重启和 checkpoint 损坏恢复。
+- [ ] 运行 `python -m pytest tests/test_context_recovery.py tests/test_context_compiler.py tests/test_session.py -q`。
+- [ ] 提交：`feat: compact context before requests and recover checkpoints`。
+
+**完成标准：** 长轨迹在到达硬限制前自动形成 checkpoint；重启后能够从 checkpoint + 后续事件恢复任务。
+
+### 阶段 6：覆盖全部模式并移除旧主路径
+
+**文件：**
+
+- 修改：`orchestrator.py`
+- 修改：`config.py`
+- 修改：`doc/05_prompt_context_harness_design.md`
+- 修改：`doc/06_current_implementation_notes.md`
+- 修改：`README.md`
+- 新建：`evals/context_management_cases.jsonl`
+- 新建：`evals/run_context_management_eval.py`
+
+- [ ] 将 Mentor、Coding 和普通 Ops Answerer 全部接入 compiler。
+- [ ] 对 Ops-Privilege 单独核对其 bounded client、持久化目标和证据合同，不允许 checkpoint 覆盖权威状态。
+- [ ] 删除旧 `compress_memory()` 主路径和 `MAX_TOKEN` 运行时判断。
+- [ ] 保留一个版本周期的 feature flag，以支持新旧路径 A/B 对比和安全回退。
+- [ ] 更新架构文档和运行配置说明。
+- [ ] 执行上下文专项 eval 和完整 `python -m pytest -q`。
+- [ ] 提交：`refactor: make context compiler the default path`。
+
+**完成标准：** 新路径默认启用；完整测试通过；旧路径只能通过显式 feature flag 临时回退。
+
+## 8. 测试与验收指标
+
+### 8.1 正确性不变量
+
+- 编译后估算 token 始终不超过 hard input limit；
+- 当前用户输入保留率 100%；
+- 安全和模式系统规则保留率 100%；
+- 完整 tool exchange 比例 100%；
+- checkpoint 必填字段完整率 100%；
+- 压缩失败时原始历史丢失数为 0；
+- 不同 user/project 的 event 和 checkpoint 交叉率为 0；
+- Ops 当前事实仍只来自持久化状态和本轮工具证据。
+
+### 8.2 任务恢复指标
+
+对同一批长任务分别运行旧版和新版：
+
+- `goal_recovery_accuracy`：能否说出当前目标；
+- `next_action_accuracy`：能否给出正确下一步；
+- `constraint_retention`：关键约束保留比例；
+- `failed_attempt_repetition_rate`：重复失败方案的比例；
+- `evidence_traceability`：结论能否定位到原始事件；
+- `restart_recovery_success`：进程重启后能否继续任务。
+
+### 8.3 性能指标
+
+- 每轮实际输入 token；
+- p50/p95 LLM 调用延迟；
+- 每 100 轮触发压缩次数；
+- checkpoint 生成额外 token 和延迟；
+- tool schema、系统提示、证据、最近历史分别占比；
+- prompt cache 可用时的命中情况。
+
+首版验收目标不应预先承诺不现实的百分比。基线采集完成后再设定相对目标，但至少必须满足：不增加上下文溢出错误、恢复正确性不低于旧版、平均输入 token 不高于旧版。
+
+## 9. 风险与控制
+
+| 风险 | 表现 | 控制措施 |
+| --- | --- | --- |
+| token 估算与供应商不一致 | 本地认为合法，远端仍超限 | 保守 safety margin；记录误差；供应商错误触发 profile 修正而非无限重试 |
+| checkpoint 摘要遗漏 | 压缩后忘记约束或失败历史 | 固定 schema；字段校验；保留原始事件；恢复 eval |
+| 压缩模型产生错误事实 | checkpoint 把猜测当事实 | 强制 evidence refs；Ops 状态不由 checkpoint 决定；当前工具证据优先 |
+| 工具结果过长 | 单个原子组超过整个 recent budget | 生成结构化工具摘要并引用原始事件；不能从 JSON/代码中间任意抽词压缩 |
+| 压缩循环 | 压缩后仍超过阈值 | 每次请求最多压缩一次；仍超限则确定性失败并报告各区域占用 |
+| 旧历史不兼容 | 缺少 event_id/turn_id | 读取时生成稳定兼容 ID，不批量重写用户历史 |
+| 大规模重构影响 Ops | 权威状态被对话 checkpoint 替代 | Ops-Privilege 分阶段接入；checkpoint 只辅助对话理解 |
+| 供应商锁定 | 使用专属 compaction 后无法切换模型 | 本地 checkpoint 为标准路径；原生 compaction 只做可选 adapter |
+
+## 10. 暂不采用的方案
+
+### 10.1 不直接迁移到 OpenAI Responses 原生 compaction
+
+原生 compaction 能减少自行维护状态的成本，但本项目当前使用多个 OpenAI-compatible 供应商，能力不一致。首版应保留本地、可审计的 checkpoint；未来可增加 `OpenAIResponsesCompactor`，但不能让核心历史只存在于供应商的 opaque compaction item 中。
+
+### 10.2 不把 LLMLingua-2 用作主压缩器
+
+LLMLingua-2 是抽取式 prompt compression，在自然语言材料上有速度和压缩率优势：<https://arxiv.org/abs/2403.12968>。但本项目上下文包含代码、JSON、tool call ID、命令参数和错误栈，逐 token 删除可能破坏协议和证据。它未来可以用于普通文档片段，但不能替代 TaskCheckpoint。
+
+### 10.3 不在本阶段升级长期记忆
+
+上下文压缩和长期记忆解决不同问题：checkpoint 负责恢复当前任务，长期记忆负责跨任务复用信息。如果同时改造，无法判断质量变化来自哪条链路。本计划先确保当前任务不会因窗口变化失忆。
+
+## 11. 推荐落地顺序
+
+```text
+基线轨迹
+  → 动态预算
+  → 完整消息组
+  → ContextCompiler
+  → TaskCheckpoint
+  → 调用前软压缩与恢复
+  → 全模式接入和 A/B 验收
+```
+
+不建议先写 compactor，再补预算和分组。没有统一预算时无法确定何时压缩；没有完整消息组时无法安全确定压缩边界。
+
+## 12. 参考资料
+
+1. Anthropic, *Effective context engineering for AI agents*  
+   <https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents>
+2. Anthropic, *Effective harnesses for long-running agents*  
+   <https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents>
+3. Anthropic, *Scaling managed agents: decoupling the brain from the hands*  
+   <https://www.anthropic.com/engineering/managed-agents>
+4. Anthropic, *Writing effective tools for AI agents—using AI agents*  
+   <https://www.anthropic.com/engineering/writing-tools-for-agents>
+5. OpenAI, *Compaction*  
+   <https://developers.openai.com/api/docs/guides/compaction>
+6. OpenAI, *From model to agent: Equipping the Responses API with a computer environment*  
+   <https://openai.com/index/equip-responses-api-computer-environment/>
+7. Wu et al., *ReSum: Unlocking Long-Horizon Search Intelligence via Context Summarization*  
+   <https://arxiv.org/abs/2509.13313>
+8. Packer et al., *MemGPT: Towards LLMs as Operating Systems*  
+   <https://arxiv.org/abs/2310.08560>
+9. Pan et al., *LLMLingua-2: Data Distillation for Efficient and Faithful Task-Agnostic Prompt Compression*  
+   <https://arxiv.org/abs/2403.12968>
+
+## 13. 决策摘要
+
+本次升级的核心不是“写一个更好的摘要 prompt”，而是改变上下文生命周期：
+
+```text
+旧：history 增长 → 模型调用 → 超限后总结 → 标记旧历史
+
+新：原始事件持续保存
+    → 调用前按模型预算编译
+    → 超过软阈值时生成结构化 checkpoint
+    → checkpoint + 最近完整回合继续任务
+    → 超过硬阈值时禁止发送不合法请求
+```
+
+这样得到的直接价值是：上下文边界可预测、工具链保持完整、任务可以恢复、历史可以审计，而且不会把项目锁定到某一个模型供应商。

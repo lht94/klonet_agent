@@ -1,0 +1,2 @@
+{"role": "user", "content": "重启一下 klonet-agent 服务，然后确认状态。"}
+{"role": "assistant", "content": null, "tool_calls": [{"id": "call_broken_1", "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"systemctl restart klonet-agent.service\"}"}}]}
