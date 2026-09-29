@@ -51,3 +51,8 @@ skills/.system/
 
 # Local Git worktrees
 .worktrees/
+
+# Local agent workspace state (session logs, project memory, scratch dirs).
+# Lives on disk and syncs via OneDrive; not part of the source tree.
+.workbuddy/
+.codex_stage/
