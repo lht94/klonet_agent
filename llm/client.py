@@ -217,6 +217,17 @@ class LLMClient:
             }
             create = client.chat.completions.create
             parameters = inspect.signature(create).parameters
+            # 调试：设置 KLONET_DEBUG_DUMP_REQUEST 后，把最终请求体落盘，
+            # 用于离线重放与供应商问题定位（不含额外脱敏需求时使用）。
+            dump_path = os.getenv("KLONET_DEBUG_DUMP_REQUEST")
+            if dump_path:
+                try:
+                    import json as _json
+
+                    with open(dump_path, "w", encoding="utf-8") as dump_file:
+                        _json.dump(request, dump_file, ensure_ascii=False, default=str)
+                except OSError:
+                    pass
             if reasoning_effort is not None and (
                 "reasoning_effort" in parameters
                 or any(
