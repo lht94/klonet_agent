@@ -25,6 +25,12 @@ jieba>=0.42.1
 rank-bm25>=0.2.2
 numpy>=1.24,<2.0
 
+# Memory store (PostgreSQL + pgvector). psycopg 同时提供驱动和连接池；
+# pgvector 是可选加速包——装了它驱动会把向量解析成对象，没装就是字符串，
+# memory/postgres.py 两种情况都兼容。
+psycopg[binary,pool]>=3.2
+pgvector>=0.3
+
 # Parser-backed review for one-time privileged shell artifacts
 bashlex>=0.18
 
