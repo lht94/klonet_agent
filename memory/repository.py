@@ -175,6 +175,40 @@ class MemoryRepository(Protocol):
 
         ...
 
+    def add_candidate_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        user_id: str,
+        project_id: str | None,
+        idempotency_key: str,
+        source_event_range: Mapping[str, Any],
+    ) -> str:
+        """用**原始 payload** 登记候选，不经过 ``MemoryCandidate`` 校验。
+
+        给策略层用：被策略拒绝的候选往往构造不出合法的领域对象
+        （作用域越权、来源不可核对、正文过短……），但计划 §7.1 要求
+        "拒绝只记录在 candidate 表" —— 审计要留下"模型提过什么、我们为什么拒"。
+        所以这里允许直接落 payload。
+
+        ⚠️ 调用方**必须**保证 payload 里没有敏感原文（口令/密钥/连接串）。
+        含敏感的候选只应进 trace，不应进任何数据库表。
+        与 :meth:`add_candidate` 一致，同一 ``idempotency_key`` 幂等。
+        """
+
+        ...
+
+    def processed_source_ranges(
+        self, *, limit: int = 1000
+    ) -> list[Mapping[str, Any]]:
+        """返回已登记过候选的事件区间（含已决策的）。
+
+        计划 §7.2 要求补扫时"不能重复处理已有 source range"，两份状态容易漂移，
+        所以直接把候选表当台账用——它本来就是"每个区间处理过一次"的记录。
+        """
+
+        ...
+
     def record_decision(
         self,
         candidate_id: str,

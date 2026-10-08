@@ -6,6 +6,75 @@
 
 from __future__ import annotations
 
+from klonet_agent.config import MEMORY_WRITE_PIPELINE_ENABLED
+
+
+# 三个记忆工具的描述随写入路径切换。开关关闭（默认）时模型看到的是旧语义，
+# 打开后模型必须知道"整篇覆盖"这件事已经不存在了——否则它会继续按老提示词
+# 试图融合整份 MEMORY.md，而那条路径已经被受控写入取代。
+_APPEND_EPISODE_LEGACY = (
+    "【主动调用：记录今日事件】向当天的情景记忆（日记）追加文本。"
+    "当你与用户完成了某个具体任务、探讨了某个技术难点（如跑完了一次实验、"
+    "解决了一个 Bug）、或者用户做出了重要决定时，必须主动调用此工具记录。"
+    "不要记录无意义的闲聊。"
+)
+_APPEND_EPISODE_CONTROLLED = (
+    "【主动调用：记录今日事件】把一次具体经历提交为一条**原子情景记忆候选**。"
+    "当你与用户完成了某个具体任务、探讨了某个技术难点（如跑完了一次实验、"
+    "解决了一个 Bug）、或者用户做出了重要决定时，主动调用此工具记录。"
+    "不要记录无意义的闲聊，也不要把口令/密钥等敏感内容写进来。"
+    "提交后由受控写入管线决定它是否入库；被拒绝时会返回原因，不要绕过它重复提交。"
+)
+
+_WRITE_MEMORY_LEGACY = (
+    "【危险操作：整篇覆盖】更新长期记忆文件 MEMORY.md。这会完全抹除旧文件。"
+    "当项目状态有重大变更、或得出了需要长期记住的客观结论时调用。\n"
+    "注意：你必须从你的系统提示词（System Prompt）中读取当前的 MEMORY.md 内容，"
+    "在脑海中将新事实与旧内容进行融合，然后传入一份排版清晰、结构完整的全新 "
+    "Markdown 文本！绝对不能只传入新增的碎片化句子，否则会导致历史数据永久丢失！"
+)
+_WRITE_MEMORY_CONTROLLED = (
+    "【已停用：整篇覆盖不再有效】长期记忆现在是**受控写入**：这个工具不能再整体"
+    "替换 MEMORY.md，调用只会被记录并返回说明。\n"
+    "需要长期保留的项目事实，请直接在回答里讲清楚结论与依据"
+    "（例如来自哪次工具输出、哪份配置），回合结束后由写入管线从对话中提取成"
+    "版本化事实；同一 subject 的取值变化会被记为新版本而不是覆盖历史。"
+)
+
+_WRITE_USER_LEGACY = (
+    "【危险操作：整篇覆盖】更新用户偏好文件 USER.md。这会完全抹除旧文件。"
+    "当你发现用户的习惯、喜好或个人背景（如开发环境、工作流）发生变化时调用。\n"
+    "注意：你必须从你的系统提示词（System Prompt）中读取当前的 USER.md 内容，"
+    "将新发现的喜好与旧画像融合，传入一份完整的全新 Markdown 文本！"
+    "千万不要只传一条新喜好，否则用户的旧档案会被清空！"
+)
+_WRITE_USER_CONTROLLED = (
+    "【已停用：整篇覆盖不再有效】用户画像现在是**受控写入**：这个工具不能再整体"
+    "替换 USER.md，调用只会被记录并返回说明。\n"
+    "只有用户**明确表达**的稳定偏好才会被写进长期画像；一次任务里的临时要求只留在"
+    "本轮上下文。请把用户的原话讲清楚，由写入管线在回合结束后提取。"
+)
+
+_APPEND_EPISODE_DESCRIPTION = (
+    _APPEND_EPISODE_CONTROLLED if MEMORY_WRITE_PIPELINE_ENABLED else _APPEND_EPISODE_LEGACY
+)
+_WRITE_MEMORY_DESCRIPTION = (
+    _WRITE_MEMORY_CONTROLLED if MEMORY_WRITE_PIPELINE_ENABLED else _WRITE_MEMORY_LEGACY
+)
+_WRITE_USER_DESCRIPTION = (
+    _WRITE_USER_CONTROLLED if MEMORY_WRITE_PIPELINE_ENABLED else _WRITE_USER_LEGACY
+)
+_WRITE_MEMORY_CONTENT_DESCRIPTION = (
+    "（已停用）不再需要传入整份 MEMORY.md。"
+    if MEMORY_WRITE_PIPELINE_ENABLED
+    else "融合了新老知识的、完整的全新 MEMORY.md 文本内容。"
+)
+_WRITE_USER_CONTENT_DESCRIPTION = (
+    "（已停用）不再需要传入整份 USER.md。"
+    if MEMORY_WRITE_PIPELINE_ENABLED
+    else "融合了新老画像的、完整的全新 USER.md 文本内容。"
+)
+
 
 # 工具数组定义。LLM 会通过这段 JSON schema 判断什么时候需要调用什么工具，
 # 并输出调用该工具的标准参数。
@@ -795,13 +864,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "append_episode",
-            "description": "【主动调用：记录今日事件】向当天的情景记忆（日记）追加文本。当你与用户完成了某个具体任务、探讨了某个技术难点（如跑完了一次实验、解决了一个 Bug）、或者用户做出了重要决定时，必须主动调用此工具记录。不要记录无意义的闲聊。",
+            "description": _APPEND_EPISODE_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "要追加的 Markdown 格式文本。请用 '## HH:MM 事件标题' 开头，简明扼要地记录事件的起因、过程和结论。",
+                        "description": "要记录的 Markdown 格式文本。请用 '## HH:MM 事件标题' 开头，简明扼要地记录事件的起因、过程和结论。",
                     }
                 },
                 "required": ["content"],
@@ -812,13 +881,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_memory",
-            "description": "【危险操作：整篇覆盖】更新长期记忆文件 MEMORY.md。这会完全抹除旧文件。当项目状态有重大变更、或得出了需要长期记住的客观结论时调用。\n注意：你必须从你的系统提示词（System Prompt）中读取当前的 MEMORY.md 内容，在脑海中将新事实与旧内容进行融合，然后传入一份排版清晰、结构完整的全新 Markdown 文本！绝对不能只传入新增的碎片化句子，否则会导致历史数据永久丢失！",
+            "description": _WRITE_MEMORY_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "融合了新老知识的、完整的全新 MEMORY.md 文本内容。",
+                        "description": _WRITE_MEMORY_CONTENT_DESCRIPTION,
                     }
                 },
                 "required": ["content"],
@@ -829,13 +898,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_user",
-            "description": "【危险操作：整篇覆盖】更新用户偏好文件 USER.md。这会完全抹除旧文件。当你发现用户的习惯、喜好或个人背景（如开发环境、工作流）发生变化时调用。\n注意：你必须从你的系统提示词（System Prompt）中读取当前的 USER.md 内容，将新发现的喜好与旧画像融合，传入一份完整的全新 Markdown 文本！千万不要只传一条新喜好，否则用户的旧档案会被清空！",
+            "description": _WRITE_USER_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "融合了新老画像的、完整的全新 USER.md 文本内容。",
+                        "description": _WRITE_USER_CONTENT_DESCRIPTION,
                     }
                 },
                 "required": ["content"],

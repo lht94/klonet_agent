@@ -110,6 +110,16 @@ CONTEXT_COMPILER_ENABLED = os.getenv(
 LEGACY_MEMORY_COMPRESSION_ENABLED = os.getenv(
     "KLONET_AGENT_ENABLE_LEGACY_COMPRESSION", "0",
 ).strip().lower() in {"1", "true", "yes", "on"}
+# 受控写入管线（记忆系统阶段 3）：候选提取 + 策略过滤 + consolidation。
+# 默认关闭。打开前必须有可用的记忆库 DSN，否则候选无处可落；打开之后
+# write_memory / write_user 不再有整篇覆盖的权限，改为候选提交与审计。
+MEMORY_WRITE_PIPELINE_ENABLED = os.getenv(
+    "KLONET_AGENT_MEMORY_WRITE_PIPELINE", "0",
+).strip().lower() in {"1", "true", "yes", "on"}
+# 一次补扫最多处理多少个未处理事件区间（checkpoint / session 结束时用）。
+MEMORY_BACKFILL_LIMIT = max(
+    1, int(os.getenv("KLONET_AGENT_MEMORY_BACKFILL_LIMIT", "20")),
+)
 # 软阈值触发压缩时，待覆盖历史低于该 token 数就跳过压缩：收益不足以抵掉
 # 一次额外的压缩模型调用（软阈值也可能由系统规则/证据区单独造成）。
 CONTEXT_COMPACTION_MIN_TOKENS = max(

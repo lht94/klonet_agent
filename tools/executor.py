@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from time import perf_counter
+from typing import Any
 
 from klonet_agent.config import DEFAULT_RAG_TOP_K, ops_real_execution_mode
 from klonet_agent.journal import ProjectJournal
@@ -78,12 +79,21 @@ class ToolExecutor:
         allowed_tools: set[str] | None = None,
         trace_logger: TraceLogger | None = None,
         memory_store: MemoryStore | None = None,
+        memory_tool_bridge: Any | None = None,
     ):
         self.session = session or AgentSession()
         self.allowed_tools = allowed_tools
         self.trace_logger = trace_logger
         self.memory_store = memory_store or MEMORY_STORE
         self._current_user_input = ""
+        # 受控写入管线的适配层（阶段 3）。为 None 时三个记忆工具保持旧行为，
+        # 这样在记忆库还没接进来（或开关关闭）时不会突然失去记忆能力。
+        self._memory_tool_bridge = memory_tool_bridge
+
+    def set_memory_tool_bridge(self, bridge: Any | None) -> None:
+        """注入/清除记忆写入适配层。由编排层在开关打开且记忆库可用时调用。"""
+
+        self._memory_tool_bridge = bridge
 
     def set_user_authorization_context(self, user_input: str) -> None:
         """Set raw user text used to validate Ops confirmation commands."""
@@ -316,16 +326,30 @@ class ToolExecutor:
             return show_diff(self.session.workspace_path)
 
         if tool_name == "append_episode":
+            # 阶段 3：接了受控写入管线之后，情景记忆变成原子 episode 候选，
+            # 而不是直接往日记文件里追加文本。
+            if self._memory_tool_bridge is not None:
+                return self._memory_tool_bridge.submit_episode(tool_args.get("content", ""))
             print("Klonet Agent：正在记录本次有价值的进展。")
             self.memory_store.append_episode(tool_args["content"])
             return "已成功追加到今天的情景记忆日志中。"
 
         if tool_name == "write_memory":
+            # 管线开启后这里**不再有整篇覆盖的权限**：长期记忆是受控写入的，
+            # 一次工具调用不能整体替换它。调用会被审计并返回替代做法。
+            if self._memory_tool_bridge is not None:
+                return self._memory_tool_bridge.block_overwrite(
+                    "write_memory", tool_args.get("content", "")
+                )
             print("Klonet Agent：正在更新长期记忆。")
             self.memory_store.write_memory(tool_args["content"])
             return "长期记忆 MEMORY.md 已被成功覆盖更新。"
 
         if tool_name == "write_user":
+            if self._memory_tool_bridge is not None:
+                return self._memory_tool_bridge.block_overwrite(
+                    "write_user", tool_args.get("content", "")
+                )
             print("Klonet Agent：正在更新用户画像。")
             self.memory_store.write_user(tool_args["content"])
             return "用户偏好 USER.md 已被成功覆盖更新。"

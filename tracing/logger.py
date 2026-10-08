@@ -126,6 +126,48 @@ class TraceLogger:
         row.update(_json_safe(payload or {}))
         self._append(row)
 
+    def record_memory_candidate(
+        self,
+        *,
+        user_id: str,
+        project_id: str | None,
+        stage: str,
+        memory_type: str,
+        scope: str,
+        subject_key: str,
+        decision: str,
+        reason: str,
+        content_preview: str,
+        source_event_range: dict | None = None,
+        redactions: list | None = None,
+        warnings: list | None = None,
+    ):
+        """记录一条记忆候选的处理经过（阶段 3 的写入管线）。
+
+        与其它入口一样，**调用方必须已经做过脱敏与限长**：
+        ``memory/write_pipeline.py`` 会先过 ``safe_for_trace``。
+        这里再兜一道，把长度硬性压到上限——trace 是长期落盘文件，
+        一条候选不该在里面占几千字。
+        """
+
+        row = {
+            "ts": datetime.now(_UTC8).isoformat(timespec="seconds"),
+            "event": "memory_candidate",
+            "user_id": user_id,
+            "project_id": project_id or "",
+            "stage": stage,
+            "memory_type": memory_type,
+            "scope": scope,
+            "subject_key": subject_key,
+            "decision": decision,
+            "reason": str(reason)[:300],
+            "content_preview": str(content_preview)[:200],
+            "source_event_range": _json_safe(source_event_range or {}),
+            "redactions": _json_safe(list(redactions or [])),
+            "warnings": _json_safe(list(warnings or [])),
+        }
+        self._append(row)
+
     def _append(self, row: dict):
         """追加一行 JSONL。"""
 

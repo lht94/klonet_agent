@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from time import perf_counter
 from types import SimpleNamespace
 
@@ -21,7 +22,9 @@ from klonet_agent.config import (
     MAX_TODO_CONTINUATIONS,
     MAX_TOKEN,
     MAX_TOOL_ROUNDS,
+    MEMORY_BACKFILL_LIMIT,
     MEMORY_DIR,
+    MEMORY_WRITE_PIPELINE_ENABLED,
     OPS_MAX_TOOL_ROUNDS,
     OPS_PRIVILEGE_CLASSIFIER_MODEL,
     OPS_PRIVILEGE_CLASSIFIER_TIMEOUT_SECONDS,
@@ -190,6 +193,16 @@ class AgentOrchestrator:
         self._covered_rows: int | None = None
         # 下一个可分配的事件行号；惰性初始化为 history.jsonl 的当前行数。
         self._next_event_row: int | None = None
+        # 本轮已持久化的事件行号。受控写入管线靠它核对"候选引用的来源是否真的存在"，
+        # 因此只保留最近若干条，不随会话无限增长。
+        self._recent_event_ids: list[str] = []
+        # 受控写入管线实例（记忆系统阶段 3）。惰性构造：开关关闭、没有记忆库 DSN、
+        # 或者数据库连不上时都保持 None，主链路完全不受影响。
+        self._memory_pipeline = None
+        self._memory_pipeline_error: str | None = None
+        # 本轮 history 列表的引用。工具循环里的记忆工具需要通过它拿到本轮事件，
+        # 而 single_chat 只在开始时把引用放进来（列表本身是就地修改的）。
+        self._turn_history_ref: list[dict] | None = None
         self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
             ProjectJournal.from_session(self.session),
             # Test doubles and deterministic callers should not receive a
@@ -442,6 +455,10 @@ class AgentOrchestrator:
             message["event_id"] = f"rows-{self._next_history_row()}"
         history.append(message)
         self.memory_store.append_history(message)
+        # 记录本轮事件行号，供写入管线核对候选引用的来源。只留最近 200 条。
+        self._recent_event_ids.append(message["event_id"])
+        if len(self._recent_event_ids) > 200:
+            del self._recent_event_ids[:-200]
         return message
 
 
@@ -755,6 +772,9 @@ class AgentOrchestrator:
 
         saved = self.checkpoint_store.save(checkpoint)
         self._covered_rows = covered_until
+        # checkpoint 之后的事件未必都被写过候选：这里补扫一次未处理区间
+        # （计划 §7.2："session 结束和 checkpoint 只负责扫描尚未处理的事件区间"）。
+        self._backfill_memory_candidates()
         self.trace_logger.record_privileged_event(
             user_id=self.session.user_id,
             project_id=self.session.project_id,
@@ -985,6 +1005,211 @@ class AgentOrchestrator:
 
         return history, token
 
+    # ------------------------------------------------------- 受控写入管线（阶段 3） --
+
+    def _memory_write_pipeline(self):
+        """惰性构造本会话的受控写入管线；不可用时返回 None。
+
+        构造失败**只记录一次**原因：记忆库没配好的话，每个回合都去连一次数据库
+        既慢又吵。开关关闭（默认）时直接返回 None，主链路一行都不走。
+        """
+
+        if self._memory_pipeline is not None:
+            return self._memory_pipeline
+        if self._memory_pipeline_error is not None:
+            return None
+        if not MEMORY_WRITE_PIPELINE_ENABLED:
+            return None
+        try:
+            # 惰性导入：没装 psycopg / 没配库的环境不该因为"有记忆功能"而起不来。
+            from klonet_agent.memory.candidate_extractor import CandidateExtractor
+            from klonet_agent.memory.database import MemoryDatabase, memory_dsn
+            from klonet_agent.memory.domain import Tenant
+            from klonet_agent.memory.postgres import PostgresMemoryRepository
+            from klonet_agent.memory.write_pipeline import (
+                LegacyMemoryToolBridge,
+                MemoryWritePipeline,
+            )
+            from klonet_agent.memory.write_policy import MemoryWritePolicy
+
+            dsn = memory_dsn()
+            if not dsn:
+                self._memory_pipeline_error = "未配置记忆库 DSN"
+                return None
+
+            database = MemoryDatabase(dsn)
+            database.open()
+            tenant = Tenant(
+                user_id=self.session.user_id, project_id=self.session.project_id
+            )
+            repository = PostgresMemoryRepository(database, tenant)
+            pipeline = MemoryWritePipeline(
+                repository,
+                # 复用压缩路径已有的纯文本完成函数：显式 tools=None，
+                # 提取不该看到工具表，否则模型可能回 tool_calls 而不是 JSON。
+                extractor=CandidateExtractor(complete=self._llm_complete_text),
+                policy=MemoryWritePolicy(),
+                tracer=self.trace_logger,
+                backfill_limit=MEMORY_BACKFILL_LIMIT,
+            )
+            self.tool_executor.set_memory_tool_bridge(
+                LegacyMemoryToolBridge(
+                    pipeline,
+                    context_provider=self._memory_turn_context,
+                    event_id_provider=lambda: (
+                        self._recent_event_ids[-1] if self._recent_event_ids else ""
+                    ),
+                )
+            )
+            self._memory_pipeline = pipeline
+            return pipeline
+        except Exception as exc:  # noqa: BLE001 - 记忆库不可用不能影响主链路
+            self._memory_pipeline_error = f"{type(exc).__name__}: {exc}"
+            print(f"Klonet Agent：（记忆写入管线不可用：{self._memory_pipeline_error}）")
+            return None
+
+    def _memory_turn_context(self, history: list[dict] | None = None):
+        """构造当前回合的写入上下文（含"哪些来源可以被引用"的白名单）。"""
+
+        from klonet_agent.memory.domain import Tenant
+        from klonet_agent.memory.write_policy import TurnContext, allowed_source_ids
+
+        turn_history = history if history is not None else (self._turn_history_ref or [])
+        allowed = set(self._recent_event_ids)
+        messages = [
+            message
+            for message in turn_history
+            if str(message.get("event_id") or "") in allowed
+        ]
+        return TurnContext(
+            tenant=Tenant(
+                user_id=self.session.user_id, project_id=self.session.project_id
+            ),
+            observed_at=datetime.now(timezone.utc),
+            allowed_sources=allowed_source_ids(messages),
+            project_id=self.session.project_id,
+            # 只有 ops 档位允许写共享运维记忆；其它档位即使模型提了也会被策略拒。
+            allow_shared_ops=self.profile.name == "ops",
+        )
+
+    def _capture_memory_candidates(
+        self,
+        *,
+        user_input: str,
+        reply: str,
+        history: list[dict],
+        tool_events: list[dict],
+    ) -> None:
+        """回合持久化之后触发候选提取（计划 §7.2 的正常触发点）。
+
+        **任何失败都只打印一行提示**：候选提取是附加收益，绝不允许它把
+        已经生成的回答变成异常（"候选失败不影响用户回答"）。
+        """
+
+        if not MEMORY_WRITE_PIPELINE_ENABLED:
+            return
+        pipeline = self._memory_write_pipeline()
+        if pipeline is None:
+            return
+        try:
+            from klonet_agent.memory.candidate_extractor import TurnDigest
+
+            context = self._memory_turn_context(history)
+            tool_names = ", ".join(
+                str(item.get("name") or "") for item in tool_events
+            )
+            digest = TurnDigest(
+                source_event_range=self._turn_event_range(),
+                user_input=user_input,
+                assistant_reply=reply,
+                events=tuple(
+                    {
+                        "role": str(message.get("role") or ""),
+                        "content": str(message.get("content") or ""),
+                        "event_id": str(message.get("event_id") or ""),
+                    }
+                    for message in history
+                    if str(message.get("event_id") or "") in set(self._recent_event_ids)
+                ),
+                source_ids=tuple(sorted(context.allowed_sources)),
+                project_id=self.session.project_id,
+                extra_context=(
+                    f"本轮调用过的工具：{tool_names}" if tool_names else ""
+                ),
+            )
+            outcome = pipeline.process_turn(digest, context)
+            if outcome.error:
+                print(f"Klonet Agent：（记忆候选提取跳过：{outcome.error}）")
+            elif outcome.accepted:
+                print(
+                    f"Klonet Agent：已写入 {len(outcome.accepted)} 条长期记忆候选。"
+                )
+        except Exception as exc:  # noqa: BLE001 - 见方法说明
+            print(f"Klonet Agent：（记忆候选提取失败，已忽略：{type(exc).__name__}）")
+
+    def _turn_event_range(self) -> dict:
+        """本轮事件区间。
+
+        两个端点**都是包含关系**（与 checkpoint 的 ``source_event_end`` 半开语义不同）：
+        这里只是"这一批事件处理过没有"的台账标识，不做覆盖区间计算。
+        """
+
+        rows = list(self._recent_event_ids)
+        if not rows:
+            return {"start": "", "end": ""}
+        return {"start": rows[0], "end": rows[-1], "kind": "turn"}
+
+    def _backfill_memory_candidates(self) -> None:
+        """checkpoint / 会话结束时补扫尚未处理的事件区间（计划 §7.2）。
+
+        水位取自 checkpoint 的已覆盖行数：它之后的事件如果还没被任何候选登记过，
+        就在这里作为**一个区间**补扫。失败同样只打印提示。
+        """
+
+        if not MEMORY_WRITE_PIPELINE_ENABLED:
+            return
+        pipeline = self._memory_write_pipeline()
+        if pipeline is None:
+            return
+        try:
+            from klonet_agent.memory.candidate_extractor import TurnDigest
+
+            covered = self._current_covered_rows()
+            messages = [
+                message
+                for message in self.memory_store.load_history_after(covered)
+                if message.get("event_id")
+            ]
+            if not messages:
+                return
+            context = self._memory_turn_context(messages)
+            digest = TurnDigest(
+                source_event_range={
+                    "start": str(messages[0]["event_id"]),
+                    "end": str(messages[-1]["event_id"]),
+                    "kind": "backfill",
+                },
+                user_input="",
+                assistant_reply="",
+                events=tuple(
+                    {
+                        "role": str(message.get("role") or ""),
+                        "content": str(message.get("content") or ""),
+                        "event_id": str(message.get("event_id") or ""),
+                    }
+                    for message in messages
+                ),
+                source_ids=tuple(sorted(context.allowed_sources)),
+                project_id=self.session.project_id,
+                extra_context=f"补扫 checkpoint 之后的事件（已覆盖 {covered} 行）。",
+            )
+            outcomes = pipeline.backfill([(digest, context)])
+            written = sum(len(item.accepted) for item in outcomes)
+            if written:
+                print(f"Klonet Agent：补扫写入 {written} 条长期记忆候选。")
+        except Exception as exc:  # noqa: BLE001 - 补扫失败不影响主流程
+            print(f"Klonet Agent：（记忆补扫失败，已忽略：{type(exc).__name__}）")
+
     def single_chat(self, user_input: str, history: list[dict], token: int):
         """实现一次完整的用户输入处理。
 
@@ -998,6 +1223,10 @@ class AgentOrchestrator:
             history,
             limit=20 if self.profile.name == "ops" else 6,
         )
+        # 本轮事件从空开始计数：写入管线只允许引用本轮真实出现过的事件行号，
+        # 上一轮的行号留在列表里会让"来源能不能核对"变成摆设。
+        self._recent_event_ids = []
+        self._turn_history_ref = history
         self._emit_turn_message(history, {"role": "user", "content": user_input})
 
         reply = ""
@@ -1475,6 +1704,16 @@ class AgentOrchestrator:
                     "开始整理记忆（旧压缩路径）。"
                 )
                 history, token = self.compress_memory(history, token)
+
+        # 受控写入管线（记忆系统阶段 3，默认关闭）：回合事件全部持久化之后再提取候选。
+        # 放在这里而不是工具循环内部，是因为计划 §7.2 的触发点就是
+        # "一个用户回合及其工具循环成功持久化之后"。任何失败都不影响上面的回答。
+        self._capture_memory_candidates(
+            user_input=effective_user_input,
+            reply=reply,
+            history=history,
+            tool_events=tool_events,
+        )
 
         return reply, history, token
 

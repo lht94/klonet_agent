@@ -384,10 +384,28 @@ class PostgresMemoryRepository:
         idempotency_key: str,
         source_event_range: Mapping[str, Any],
     ) -> str:
+        self._require_tenant_scope(candidate.user_id, candidate.project_id)
+        return self.add_candidate_payload(
+            _candidate_payload(candidate),
+            user_id=candidate.user_id,
+            project_id=candidate.project_id,
+            idempotency_key=idempotency_key,
+            source_event_range=source_event_range,
+        )
+
+    def add_candidate_payload(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        user_id: str,
+        project_id: str | None,
+        idempotency_key: str,
+        source_event_range: Mapping[str, Any],
+    ) -> str:
         key = str(idempotency_key or "").strip()
         if not key:
             raise MemoryDomainError("候选必须带 idempotency_key")
-        self._require_tenant_scope(candidate.user_id, candidate.project_id)
+        self._require_tenant_scope(user_id, project_id)
 
         candidate_id = uuid4()
         sql = """
@@ -410,10 +428,10 @@ class PostgresMemoryRepository:
                 (
                     candidate_id,
                     key,
-                    candidate.user_id,
-                    candidate.project_id,
+                    user_id,
+                    project_id,
                     _jsonb(dict(source_event_range)),
-                    _jsonb(_candidate_payload(candidate)),
+                    _jsonb(dict(payload)),
                     key,
                 ),
             ).fetchone()
@@ -422,6 +440,25 @@ class PostgresMemoryRepository:
             # 返回别人的候选 id。
             raise MemoryRepositoryError(f"幂等键 {key!r} 已被当前租户之外的数据占用")
         return str(row["id"])
+
+    def processed_source_ranges(
+        self, *, limit: int = 1000
+    ) -> list[Mapping[str, Any]]:
+        if limit <= 0:
+            raise MemoryDomainError("limit 必须为正整数")
+        scope, scope_params = self._candidate_scope()
+        with self._session(readonly=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT source_event_range
+                  FROM memory_write_candidates
+                 WHERE {scope}
+                 ORDER BY source_event_range
+                 LIMIT %s
+                """,
+                [*scope_params, limit],
+            ).fetchall()
+        return [dict(row["source_event_range"] or {}) for row in rows]
 
     def record_decision(
         self,
