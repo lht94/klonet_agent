@@ -952,27 +952,48 @@ def test_as_of_returns_the_value_that_was_valid_then(db) -> None:
         _new_record(subject_key=subject, content=PY311, valid_from=switch),
     )
 
+    # 注意：本文件的 `db` 夹具是 **module scope**，同一个库里还有本文件其它用例
+    # 造的数据。这些记录的 lexical_text 往往与本文相同（都是 "python 项目 运行 要求"），
+    # ts_rank_cd 分数完全相同，而 `ORDER BY ts_rank_cd DESC, v.id` 在同分组里
+    # 退化成**随机 UUID 顺序**——limit 给小了，本条会被挤到候选之外，断言随机失败
+    # （实测 8 次里偶发 1 次）。所以这里显式给一个大 limit，让"当前视图 / as_of
+    # 视图的语义"成为唯一被检验的东西。
+    wide_limit = 200
+
     # 切换之前：这个 subject 只能看到 3.8。
     # 断言里按 subject_key 过滤：库里还有同一轮其它用例造的记录，
     # 直接比对整个结果列表会在加用例时误伤。
-    before = repo.search(MemoryQuery(text="Python 3.8", as_of=old_version.valid_from))
+    before = repo.search(
+        MemoryQuery(
+            text="Python 3.8",
+            limit=wide_limit,
+            as_of=old_version.valid_from,
+        )
+    )
     assert [
         hit.version.content for hit in before if hit.record.subject_key == subject
     ] == [PY38]
 
     # 切换之后：只能看到 3.11。
     after = repo.search(
-        MemoryQuery(text="Python 3.11", as_of=switch + timedelta(seconds=1))
+        MemoryQuery(
+            text="Python 3.11",
+            limit=wide_limit,
+            as_of=switch + timedelta(seconds=1),
+        )
     )
     assert [
         hit.version.content for hit in after if hit.record.subject_key == subject
     ] == [PY311]
 
     # 当前视图只看新值。
-    current = repo.search(MemoryQuery(text="Python"))
+    current = repo.search(MemoryQuery(text="Python", limit=wide_limit))
     assert [hit.record.id for hit in current if hit.record.subject_key == subject] == [
         new.id
     ]
+    # 再给一条不依赖排序的等价断言：按 subject 找 active 记忆就该是新记录。
+    active = repo.find_active_by_subject(subject)
+    assert active is not None and active.id == new.id
 
 
 def test_mark_expired_rejects_non_active_and_bad_window(db) -> None:
@@ -1010,7 +1031,13 @@ def test_episodes_are_not_folded_by_search_after_multiple_versions(db) -> None:
             memory_id=episode.id, content=unique + "，根因是镜像里缺 libpq"
         )
     )
-    hits = [hit for hit in repo.search(MemoryQuery(text="依赖安装")) if hit.record.subject_key == subject]
+    # limit 同样给宽：理由与 test_as_of 那处相同（module scope 共享库 +
+    # 同分排序退化成随机 UUID 顺序）。
+    hits = [
+        hit
+        for hit in repo.search(MemoryQuery(text="依赖安装", limit=200))
+        if hit.record.subject_key == subject
+    ]
     assert len(hits) == 1
     assert hits[0].version.version == 2
     # 旧版本的正文不再出现在当前视图里。
