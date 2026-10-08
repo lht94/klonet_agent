@@ -104,7 +104,11 @@ def db(admin_dsn: str) -> Any:
         database = MemoryDatabase(dsn, min_size=1, max_size=4)
         database.open()
         try:
-            assert database.run_migrations() == ["0001_init", "0002_roles_and_grants"]
+            assert database.run_migrations() == [
+                "0001_init",
+                "0002_roles_and_grants",
+                "0003_immutable_versions",
+            ]
             yield database
         finally:
             database.close()
@@ -211,7 +215,11 @@ def _fact(
 def test_migration_creates_extension_tables_indexes_and_policies(db: MemoryDatabase) -> None:
     info = db.assert_ready()
     assert info["pgvector_version"]
-    assert info["applied_migrations"] == ["0001_init", "0002_roles_and_grants"]
+    assert info["applied_migrations"] == [
+        "0001_init",
+        "0002_roles_and_grants",
+        "0003_immutable_versions",
+    ]
     # 报告里带回来的 DSN 必须已脱敏。注意这里要同时检查 URL 形式和 libpq 关键字
     # 形式——`temporary_database` 用 make_conninfo() 拼出来的正是关键字形式。
     assert "password=klonet" not in info["dsn"]

@@ -129,6 +129,10 @@ class NewVersionCommand:
     sources: tuple[MemorySource, ...] = ()
     lexical_text: str | None = None
     version_id: str | None = None
+    verified: bool = False
+    # None 表示"不改动逻辑记录上的置信度"；给值时只允许抬高不允许降低——
+    # 置信度是随证据积累单调上升的量，一次描述改写不应该让它倒退。
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -201,7 +205,34 @@ class MemoryRepository(Protocol):
         confidence: float = 1.0,
         reason: str | None = None,
     ) -> None:
-        """在同一事务内建立 supersedes 关系并失效旧记忆。"""
+        """在同一事务内建立 supersedes 关系并失效旧记忆。
+
+        要求新旧两条记忆**已经存在**。当新值会占用同一个 ``subject_key`` 时用不了
+        这条路径（插入新记录会撞上"一个 subject 只能有一条 active"的唯一索引），
+        要用 :meth:`replace_active`。
+        """
+
+        ...
+
+    def replace_active(
+        self,
+        old_memory_id: str,
+        command: NewRecordCommand,
+        *,
+        relation_confidence: float = 1.0,
+        reason: str | None = None,
+    ) -> MemoryRecord:
+        """用一条新记忆原子替代当前的 active 记忆（同一 subject_key）。
+
+        这是 SUPERSEDE 决策的落地点。计划 §6.5 的例子（subject 不变、有效值变化）
+        要求新旧两条记忆拥有**同一个** subject_key，因此不能拆成
+        "先 add_record 再 supersede"：中间那一步会让库里同时存在两条 active。
+        实现必须在同一事务里先让旧记录离开 active，再插入新记录。
+
+        ``command.subject_key`` 必须与被替代的记忆一致；旧记忆的当前版本结束
+        有效期，新记忆成为该 subject 唯一的 active 版本，两者之间建立
+        ``supersedes`` 关系（``reason`` 落在关系的 reason 列，便于审计）。
+        """
 
         ...
 
@@ -212,6 +243,28 @@ class MemoryRepository(Protocol):
 
     def add_source(self, version_id: str, source: MemorySource) -> None:
         """给版本追加一条来源。重复来源必须幂等。"""
+
+        ...
+
+    def attach_sources(
+        self,
+        memory_id: str,
+        sources: Sequence[MemorySource],
+        *,
+        confidence: float | None = None,
+        verified: bool = False,
+    ) -> MemoryVersion:
+        """把新来源挂到**当前 active 版本**上，不新增版本。
+
+        这是 plan §7.1 里 UPDATE 的一种形态："同一事实含义未变，只补充来源或
+        置信度"。内容等价时不能走 ``add_version``——版本表上有
+        ``(memory_id, content_hash)`` 唯一约束，同一段正文在一个记忆里只允许
+        存在一个版本，数据库会在那里挡住。
+
+        ``confidence`` 给定时只抬高不降低；``verified=True`` 需要把这批来源与
+        已有来源合起来看仍然成立（校验规则见 domain 层）。
+        返回刷新后的 active 版本。
+        """
 
         ...
 

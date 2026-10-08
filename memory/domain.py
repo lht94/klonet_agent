@@ -65,6 +65,58 @@ class MemoryStatus(str, Enum):
     DELETED = "deleted"
 
 
+# 状态机。ACTIVE 是唯一的非终态：被替代、过期、删除都是终态。
+#
+# 这样定义的依据是计划 §6.5：旧记忆不是"错误"而是"已经过期"，因此它的历史版本
+# 必须保留；一条记忆失效之后就永远读得到它的历史，但不允许被"复活"——
+# 同一 subject 再次成立时会产生**新的**逻辑记录（唯一索引此时已经放行），
+# 旧记录仍然是当初那条事实的完整历史。这条约束同时保证了
+# `valid_to` 只会被写一次，不会被后来的操作覆盖。
+_ALLOWED_STATUS_TRANSITIONS: Mapping[MemoryStatus, frozenset[MemoryStatus]] = {
+    MemoryStatus.ACTIVE: frozenset(
+        {MemoryStatus.SUPERSEDED, MemoryStatus.EXPIRED, MemoryStatus.DELETED}
+    ),
+    MemoryStatus.SUPERSEDED: frozenset(),
+    MemoryStatus.EXPIRED: frozenset(),
+    MemoryStatus.DELETED: frozenset(),
+}
+
+
+def allowed_status_transitions(status: MemoryStatus | str) -> frozenset[MemoryStatus]:
+    """返回某状态允许迁移到的目标状态集合。"""
+
+    try:
+        resolved = MemoryStatus(status)
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法记忆状态: {status!r}") from exc
+    return _ALLOWED_STATUS_TRANSITIONS[resolved]
+
+
+def ensure_status_transition(
+    current: MemoryStatus | str, target: MemoryStatus | str, *, subject: str = ""
+) -> None:
+    """校验状态迁移是否被允许，不允许时抛 InvalidStatusTransitionError。"""
+
+    try:
+        resolved_current = MemoryStatus(current)
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法记忆状态: {current!r}") from exc
+    try:
+        resolved_target = MemoryStatus(target)
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法记忆状态: {target!r}") from exc
+
+    if resolved_target is resolved_current:
+        return
+    if resolved_target not in _ALLOWED_STATUS_TRANSITIONS[resolved_current]:
+        where = f"（{subject}）" if subject else ""
+        raise InvalidStatusTransitionError(
+            f"不允许把记忆{where}从 {resolved_current.value} 迁移到 "
+            f"{resolved_target.value}：{resolved_current.value} 是终态，"
+            "同一 subject 再次成立时应创建新的逻辑记录"
+        )
+
+
 class SourceType(str, Enum):
     """记忆结论的证据来源类型。"""
 
@@ -93,8 +145,41 @@ class WriteDecision(str, Enum):
     REJECT = "reject"
 
 
+class ImportanceLevel(str, Enum):
+    """复用价值等级。
+
+    §7.1 要求 importance "由枚举规则映射为数值"，而不是让模型直接给一个
+    浮点数——浮点数既不可复现，也没法在评测里被断言。
+    """
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+IMPORTANCE_BY_LEVEL: Mapping[ImportanceLevel, float] = {
+    ImportanceLevel.LOW: 0.3,
+    ImportanceLevel.MEDIUM: 0.6,
+    ImportanceLevel.HIGH: 0.9,
+}
+
+
+def importance_for_level(level: ImportanceLevel | str) -> float:
+    """把复用价值等级映射成数值。"""
+
+    try:
+        resolved = ImportanceLevel(level)
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法复用价值等级: {level!r}") from exc
+    return IMPORTANCE_BY_LEVEL[resolved]
+
+
 class MemoryDomainError(ValueError):
     """领域模型校验失败。调用方必须修正输入，不允许静默兜底。"""
+
+
+class InvalidStatusTransitionError(MemoryDomainError):
+    """试图做状态机不允许的迁移（例如把已失效的记忆再失效一次）。"""
 
 
 # --------------------------------------------------------------------------- #
@@ -217,6 +302,199 @@ def parse_subject_key(raw: str) -> SubjectKey:
 
 
 # --------------------------------------------------------------------------- #
+# 三类记忆各自的领域规则
+# --------------------------------------------------------------------------- #
+#
+# 这里集中放"哪类记忆允许哪些作用域/能否被替代/需要什么才能算已验证"。
+# 放在领域层而不是仓库层，是因为这些约束对候选人（还没落库）和正式记忆
+# （已落库）同样成立：候选在写入前就应该被同一套规则拦下，而不是先进库再报错。
+
+ALLOWED_SCOPES_BY_TYPE: Mapping[MemoryType, frozenset[Scope]] = {
+    # 经历可以属于某个人、某个项目，也可以作为运维共享经历。
+    MemoryType.EPISODE: frozenset({Scope.USER, Scope.PROJECT, Scope.SHARED_OPS}),
+    # 事实同理：项目事实、用户事实、平台共享事实。
+    MemoryType.FACT: frozenset({Scope.USER, Scope.PROJECT, Scope.SHARED_OPS}),
+    # 偏好一定有归属人。shared_ops 里放"某人的偏好"没有意义——
+    # 计划 §6.3 把偏好限定为"全局稳定偏好 / 仅某个项目有效的偏好"。
+    MemoryType.PREFERENCE: frozenset({Scope.USER, Scope.PROJECT}),
+}
+
+# 情景记忆按事件身份去重（subject_key = episode:<uuid>），两次不同的经历
+# 可以拥有同一个话题。计划 §6.5 第 3 条明确："情景记忆：保留各自事件，
+# 不因结果不同而互相覆盖"——因此 episode 不参与 supersede。
+SUPERSEDABLE_TYPES: frozenset[MemoryType] = frozenset(
+    {MemoryType.FACT, MemoryType.PREFERENCE}
+)
+
+# 能把一条记忆标为"已验证"的来源：用户明确陈述，或工具成功执行的证据。
+# history_event 只是对话原文，assistant 的自述也在里面，所以不算证据——
+# §7.1："仅 assistant 自述不能标为已验证"。
+VERIFYING_SOURCE_TYPES: frozenset[SourceType] = frozenset(
+    {SourceType.USER_STATEMENT, SourceType.TOOL_RESULT}
+)
+
+# 有资格"替用户说话"的来源。偏好是主观的，工具证据不能替用户决定，
+# 见 §6.5 冲突规则第 2 条。
+USER_AUTHORITATIVE_SOURCE_TYPES: frozenset[SourceType] = frozenset(
+    {SourceType.USER_STATEMENT}
+)
+
+# 来源等级决定的 confidence 上限：用户明确陈述最高，工具验证次之，
+# 项目日志再次，原始对话事件最低（§7.1："confidence 来自来源等级"）。
+SOURCE_CONFIDENCE_CEILING: Mapping[SourceType, float] = {
+    SourceType.USER_STATEMENT: 1.0,
+    SourceType.TOOL_RESULT: 0.95,
+    SourceType.JOURNAL: 0.8,
+    SourceType.HISTORY_EVENT: 0.6,
+}
+
+# 完全没有来源时的 confidence。候选缺来源本身会被决策层 REJECT，
+# 这个常量只用于"来源齐全但都没定级"的兜底。
+DEFAULT_CONFIDENCE = 0.5
+
+
+def validate_type_scope(memory_type: MemoryType | str, scope: Scope | str) -> None:
+    """校验记忆类型与作用域的组合是否合法。"""
+
+    try:
+        resolved_type = MemoryType(memory_type)
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法记忆类型: {memory_type!r}") from exc
+    try:
+        resolved_scope = Scope(scope)
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法作用域: {scope!r}") from exc
+
+    allowed = ALLOWED_SCOPES_BY_TYPE[resolved_type]
+    if resolved_scope not in allowed:
+        raise MemoryDomainError(
+            f"{resolved_type.value} 不允许 {resolved_scope.value} 作用域，"
+            f"允许取值为 {sorted(item.value for item in allowed)}"
+        )
+
+
+def type_allows_supersede(memory_type: MemoryType | str) -> bool:
+    """该类型是否参与替代（supersede）。"""
+
+    try:
+        return MemoryType(memory_type) in SUPERSEDABLE_TYPES
+    except ValueError as exc:
+        raise MemoryDomainError(f"非法记忆类型: {memory_type!r}") from exc
+
+
+def verifying_sources(
+    sources: Sequence[MemorySource] | None,
+) -> tuple[MemorySource, ...]:
+    """从来源里挑出有验证资格的（用户陈述 / 工具结果）。"""
+
+    return tuple(
+        source for source in (sources or ()) if source.source_type in VERIFYING_SOURCE_TYPES
+    )
+
+
+def qualifies_as_verified(
+    memory_type: MemoryType | str, sources: Sequence[MemorySource] | None
+) -> bool:
+    """按类型判断这组来源能不能支撑 verified=True。
+
+    - 事实 / 经历：用户明确陈述或工具成功证据任一即可。
+    - 偏好：只认用户明确陈述——工具证据不得替用户决定主观偏好（§6.5 规则 2）。
+    """
+
+    candidates = verifying_sources(sources)
+    if not candidates:
+        return False
+    if MemoryType(memory_type) is MemoryType.PREFERENCE:
+        return any(
+            source.source_type in USER_AUTHORITATIVE_SOURCE_TYPES for source in candidates
+        )
+    return True
+
+
+def ensure_verification_supported(
+    memory_type: MemoryType | str,
+    verified: bool,
+    sources: Sequence[MemorySource] | None,
+) -> None:
+    """`verified=True` 必须有合格来源；否则直接报错，不允许"自封已验证"。"""
+
+    if not verified:
+        return
+    if qualifies_as_verified(memory_type, sources):
+        return
+    if MemoryType(memory_type) is MemoryType.PREFERENCE:
+        raise MemoryDomainError(
+            "偏好只有在用户明确陈述时才能标为已验证；工具证据不能替用户决定主观偏好"
+        )
+    raise MemoryDomainError(
+        "标为已验证的记忆必须带用户明确陈述或工具成功证据（history_event 不算）"
+    )
+
+
+def confidence_ceiling(sources: Sequence[MemorySource] | None) -> float:
+    """一组来源允许的置信度上限。无来源时返回默认值。"""
+
+    ceilings = [
+        SOURCE_CONFIDENCE_CEILING[source.source_type]
+        for source in (sources or ())
+        if source.source_type in SOURCE_CONFIDENCE_CEILING
+    ]
+    return max(ceilings) if ceilings else DEFAULT_CONFIDENCE
+
+
+def same_content(left: str, right: str) -> bool:
+    """两条正文在"判重"意义下是否等价（按规范化后的 sha256 比较）。"""
+
+    return content_hash(left) == content_hash(right)
+
+
+def source_keys(
+    sources: Sequence[MemorySource] | None,
+) -> frozenset[tuple[SourceType, str]]:
+    """来源的身份集合，用于判断"新来源是否带来新信息"。"""
+
+    return frozenset((source.source_type, source.source_id) for source in (sources or ()))
+
+
+def additional_source_keys(
+    existing: Sequence[MemorySource] | None,
+    incoming: Sequence[MemorySource] | None,
+) -> frozenset[tuple[SourceType, str]]:
+    """incoming 里 existing 没有的来源身份。为空表示没有新增信息。"""
+
+    return source_keys(incoming) - source_keys(existing)
+
+
+def validate_validity_window(
+    valid_from: datetime, valid_to: datetime | None
+) -> None:
+    """有效期必须是半开区间 ``[valid_from, valid_to)``。
+
+    ``valid_from`` 允许早于 ``observed_at``：事实在被观察到之前就可能已经成立
+    （计划 §6.5 的 Python 3.8→3.11 迁移例子就是这个形状）。
+    """
+
+    if valid_from is None:
+        raise MemoryDomainError("valid_from 不能为空")
+    if valid_to is not None and valid_to <= valid_from:
+        raise MemoryDomainError(
+            f"valid_to({valid_to.isoformat()}) 必须晚于 valid_from({valid_from.isoformat()})"
+        )
+
+
+def is_valid_at(version: "MemoryVersion", moment: datetime) -> bool:
+    """``as_of`` 语义：version 在给定时刻是否有效。
+
+    默认查询用 ``version.is_current``（只认未失效版本），只有回看历史状态
+    才用这个函数。
+    """
+
+    if moment < version.valid_from:
+        return False
+    return version.valid_to is None or moment < version.valid_to
+
+
+# --------------------------------------------------------------------------- #
 # 领域对象
 # --------------------------------------------------------------------------- #
 
@@ -269,7 +547,13 @@ class MemorySource:
 
 @dataclass(frozen=True)
 class MemoryVersion:
-    """一条不可变版本。正文、有效时间、embedding 都挂在这里。"""
+    """一条不可变版本。正文、有效时间、embedding 都挂在这里。
+
+    "不可变"是硬约束：正文、哈希、时间戳、分词结果都不允许事后修改，
+    数据库侧还有触发器兜底（见 ``migrations/0003``）。全列里只有三类可以变——
+    ``valid_to``（失效/替代时结束有效期）、``embedding`` 三列（worker 异步补算）、
+    以及 ``verified`` 从 false 翻到 true（后续来源补齐了证据）。
+    """
 
     id: str
     memory_id: str
@@ -288,6 +572,19 @@ class MemoryVersion:
     created_at: datetime | None = None
     verified: bool = False
     sources: tuple[MemorySource, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not str(self.content).strip():
+            raise MemoryDomainError("版本正文不能为空")
+        if not str(self.content_hash).strip():
+            raise MemoryDomainError("版本必须带 content_hash")
+        validate_validity_window(self.valid_from, self.valid_to)
+        if self.embedding is not None and not (
+            self.embedding_model and self.embedding_version
+        ):
+            raise MemoryDomainError(
+                "写入向量必须同时给出 embedding_model 与 embedding_version"
+            )
 
     @property
     def is_current(self) -> bool:
@@ -317,6 +614,7 @@ class MemoryRecord:
     def __post_init__(self) -> None:
         if not str(self.user_id).strip():
             raise MemoryDomainError("记忆必须绑定 user_id")
+        validate_type_scope(self.memory_type, self.scope)
         if self.scope is Scope.PROJECT and not self.project_id:
             raise MemoryDomainError("项目作用域记忆必须带 project_id")
         if self.scope is not Scope.PROJECT and self.project_id:
@@ -361,6 +659,11 @@ class MemoryCandidate:
     """待审计的写入候选。
 
     主模型只能产出这个结构；它能不能变成正式记忆由 write pipeline 决定。
+
+    ``proposed_decision`` 是模型的**提议**，不是最终决定：consolidation 会拿它
+    和数据库现状核对（见 ``memory/versioning.py``）。模型可以说"这替代了旧值"，
+    但同一 subject 是否真的存在 active 记忆、旧值是不是已验证的，
+    只能由 Python 和数据库判定。
     """
 
     memory_type: MemoryType
@@ -377,24 +680,68 @@ class MemoryCandidate:
     valid_from: datetime | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
     sources: tuple[MemorySource, ...] = ()
+    proposed_decision: WriteDecision | None = None
 
     def __post_init__(self) -> None:
         if not normalize_content(self.content):
             raise MemoryDomainError("候选正文为空")
+        validate_type_scope(self.memory_type, self.scope)
+        if self.scope is Scope.PROJECT and not self.project_id:
+            raise MemoryDomainError("项目作用域候选必须带 project_id")
+        if self.scope is not Scope.PROJECT and self.project_id:
+            raise MemoryDomainError(
+                f"{self.scope.value} 作用域候选不应带 project_id"
+            )
         _check_ratio("importance", self.importance)
         _check_ratio("confidence", self.confidence)
-        parse_subject_key(self.subject_key)
+        parsed = parse_subject_key(self.subject_key)
+        if parsed.memory_type is not self.memory_type:
+            raise MemoryDomainError(
+                f"subject_key 类型 {parsed.memory_type.value} 与候选类型 "
+                f"{self.memory_type.value} 不一致"
+            )
+        if parsed.scope is not None and parsed.scope is not self.scope:
+            raise MemoryDomainError(
+                f"subject_key 作用域 {parsed.scope.value} 与候选作用域 "
+                f"{self.scope.value} 不一致"
+            )
+        ensure_verification_supported(self.memory_type, self.verified, self.sources)
+        if self.valid_from is not None:
+            validate_validity_window(self.valid_from, None)
+        if self.proposed_decision is not None:
+            try:
+                WriteDecision(self.proposed_decision)
+            except ValueError as exc:
+                raise MemoryDomainError(
+                    f"非法写入提议: {self.proposed_decision!r}"
+                ) from exc
 
 
 @dataclass(frozen=True)
-class WriteDecisionResult:
-    """consolidation 的结果。五种决策之一，必须带原因。"""
+class ConsolidationPlan:
+    """consolidation 的结论：要做什么、为什么、以谁为目标。
+
+    这是**计划**而不是结果——真正的写入由 ``memory/versioning.py`` 执行。
+    决策必须带 reason：候选表里的 ``decision_reason`` 是唯一的事后审计依据。
+    """
 
     decision: WriteDecision
     reason: str
-    candidate_id: str | None = None
-    record_id: str | None = None
-    version_id: str | None = None
+    subject_key: str
+    # UPDATE / SUPERSEDE 的目标逻辑记录。
+    target_memory_id: str | None = None
+    # REJECT 时建议建立的关系（例如"旧值已验证，新值只能先记为矛盾"）。
+    suggested_relation: RelationType | None = None
+
+    @property
+    def writes(self) -> bool:
+        """这条计划是否会产生正式记忆写入。"""
+
+        return self.decision in (
+            WriteDecision.ADD,
+            WriteDecision.UPDATE,
+            WriteDecision.SUPERSEDE,
+        )
 
 
 @dataclass(frozen=True)

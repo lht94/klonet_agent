@@ -45,7 +45,11 @@ from klonet_agent.memory.domain import (
     Tenant,
     WriteDecision,
     content_hash,
+    ensure_status_transition,
+    ensure_verification_supported,
     normalize_content,
+    type_allows_supersede,
+    validate_validity_window,
 )
 from klonet_agent.memory.repository import (
     ActiveSubjectConflictError,
@@ -119,6 +123,13 @@ def _as_uuid(value: str | UUID | None, field: str) -> UUID | None:
         return UUID(str(value))
     except (ValueError, AttributeError, TypeError) as exc:
         raise MemoryDomainError(f"{field} 不是合法 UUID: {value!r}") from exc
+
+
+def _check_confidence(value: float) -> float:
+    number = float(value)
+    if not 0.0 <= number <= 1.0:
+        raise MemoryDomainError(f"confidence 必须落在 [0, 1]: {value!r}")
+    return number
 
 
 def _jsonb(value: Any) -> Any:
@@ -243,6 +254,7 @@ def _version_from_row(row: Mapping[str, Any]) -> MemoryVersion:
         valid_from=row["valid_from"],
         valid_to=row["valid_to"],
         created_at=row["created_at"],
+        verified=bool(row.get("verified", False)),
     )
 
 
@@ -305,6 +317,24 @@ class PostgresMemoryRepository:
                 f"写入 project_id={project_id!r} 与当前会话项目 "
                 f"{self._tenant.project_id!r} 不一致"
             )
+
+    @staticmethod
+    def _resolve_verified(
+        memory_type: MemoryType | None,
+        verified: bool,
+        sources: Sequence[MemorySource] | None,
+    ) -> bool:
+        """校验 ``verified`` 的说法有没有证据支撑。
+
+        刻意**不从来源自动推导** verified：用户陈述是证据，但"这条陈述是否确认了
+        当前这个值"是逐版本的判断，仅凭"来源里有 user_statement"就自动打勾会把
+        verified 变成装饰。所以这里只做校验——声称已验证就必须拿得出合格来源
+        （见计划 §7.1）。
+        """
+
+        if memory_type is not None:
+            ensure_verification_supported(memory_type, verified, sources)
+        return bool(verified)
 
     def _record_scope(
         self, alias: str = "r"
@@ -439,6 +469,12 @@ class PostgresMemoryRepository:
         version_id = _as_uuid(command.version_id, "version_id") or uuid4()
         observed_at = command.observed_at or _now()
         valid_from = command.valid_from or observed_at
+        validate_validity_window(valid_from, None)
+        # 只有第一条版本能这么插：库里 uq_memory_records_active_subject 保证
+        # 一个 subject 至多一条 active 记忆。
+        verified = self._resolve_verified(
+            command.memory_type, command.verified, command.sources
+        )
         psycopg, _ = load_psycopg()
 
         with self._session() as conn:
@@ -471,8 +507,9 @@ class PostgresMemoryRepository:
                 """
                 INSERT INTO memory_versions
                     (id, memory_id, version, content, summary, metadata,
-                     lexical_text, content_hash, observed_at, valid_from, valid_to)
-                VALUES (%s, %s, 1, %s, %s, %s, %s, %s, %s, %s, NULL)
+                     lexical_text, content_hash, observed_at, valid_from, valid_to,
+                     verified)
+                VALUES (%s, %s, 1, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
                 """,
                 (
                     version_id,
@@ -484,6 +521,7 @@ class PostgresMemoryRepository:
                     digest,
                     observed_at,
                     valid_from,
+                    verified,
                 ),
             )
             if isinstance(failure, psycopg.errors.UniqueViolation):
@@ -508,6 +546,8 @@ class PostgresMemoryRepository:
         content = normalize_content(command.content)
         if not content:
             raise MemoryDomainError("记忆正文为空")
+        if command.confidence is not None:
+            _check_confidence(command.confidence)
         digest = content_hash(content)
         lexical = (
             command.lexical_text
@@ -517,6 +557,7 @@ class PostgresMemoryRepository:
         version_id = _as_uuid(command.version_id, "version_id") or uuid4()
         observed_at = command.observed_at or _now()
         valid_from = command.valid_from or observed_at
+        validate_validity_window(valid_from, None)
         psycopg, _ = load_psycopg()
 
         with self._session() as conn:
@@ -524,10 +565,19 @@ class PostgresMemoryRepository:
             # 串行化，否则两个并发事务会算出同一个版本号。
             record = self._locked_record(conn, memory_id)
             if record["status"] != MemoryStatus.ACTIVE.value:
+                # 状态机只有 ACTIVE 是非终态，这里直接给出可读原因。
+                ensure_status_transition(
+                    record["status"], MemoryStatus.SUPERSEDED, subject=command.memory_id
+                )
                 raise RecordNotActiveError(
                     f"记忆 {command.memory_id} 当前状态为 {record['status']}，"
                     "不能再追加版本"
                 )
+            # verified 的合法性依赖记忆类型（偏好只认用户陈述），
+            # 类型在逻辑记录上，所以只能锁住记录之后再校验。
+            verified = self._resolve_verified(
+                MemoryType(record["memory_type"]), command.verified, command.sources
+            )
 
             next_version = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM memory_versions "
@@ -535,13 +585,30 @@ class PostgresMemoryRepository:
                 (memory_id,),
             ).fetchone()["next"]
 
+            # 结束上一版的有效期。**必须做**：否则同一时刻会有两个版本
+            # 同时满足 `valid_from <= t AND valid_to IS NULL`，as_of 查询会
+            # 对同一个 subject 返回两条"当时有效"的记录。
+            # 用 GREATEST 兜住"新版本 valid_from 不晚于旧版本"的极端输入，
+            # 同时保证满足 `valid_to > valid_from` 的 CHECK。
+            if record["active_version_id"]:
+                conn.execute(
+                    """
+                    UPDATE memory_versions
+                       SET valid_to = GREATEST(%s::timestamptz,
+                                               valid_from + interval '1 microsecond')
+                     WHERE id = %s AND valid_to IS NULL
+                    """,
+                    (valid_from, record["active_version_id"]),
+                )
+
             failure = self._try_execute(
                 conn,
                 """
                 INSERT INTO memory_versions
                     (id, memory_id, version, content, summary, metadata,
-                     lexical_text, content_hash, observed_at, valid_from, valid_to)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL)
+                     lexical_text, content_hash, observed_at, valid_from, valid_to,
+                     verified)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
                 """,
                 (
                     version_id,
@@ -554,6 +621,7 @@ class PostgresMemoryRepository:
                     digest,
                     observed_at,
                     valid_from,
+                    verified,
                 ),
             )
             if isinstance(failure, psycopg.errors.UniqueViolation):
@@ -561,16 +629,187 @@ class PostgresMemoryRepository:
             if failure is not None:
                 raise failure
 
-            conn.execute(
-                "UPDATE memory_records SET active_version_id = %s, updated_at = now() "
-                "WHERE id = %s",
-                (version_id, memory_id),
-            )
+            # 置信度只允许抬高：它是随证据积累单调上升的量，
+            # 一次描述改写不该让它倒退。
+            if command.confidence is not None:
+                conn.execute(
+                    "UPDATE memory_records SET active_version_id = %s, "
+                    "confidence = GREATEST(confidence, %s), updated_at = now() "
+                    "WHERE id = %s",
+                    (version_id, command.confidence, memory_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE memory_records SET active_version_id = %s, updated_at = now() "
+                    "WHERE id = %s",
+                    (version_id, memory_id),
+                )
             self._insert_sources(conn, version_id, command.sources)
             self._enqueue_outbox(conn, version_id)
             row = self._select_version(conn, version_id)
 
         return _version_from_row(row)
+
+    def replace_active(
+        self,
+        old_memory_id: str,
+        command: NewRecordCommand,
+        *,
+        relation_confidence: float = 1.0,
+        reason: str | None = None,
+    ) -> MemoryRecord:
+        """用同一 subject 的新记忆原子替代当前的 active 记忆。
+
+        计划 §6.5 的迁移例子（Python 3.8 → 3.11）要求新旧记忆拥有**同一个**
+        ``subject_key``。这种情况下不能拆成"先 add_record 再 supersede"：
+        插入新记录时会撞上 ``uq_memory_records_active_subject``，因为旧记录此刻
+        仍然是 active。唯一正确的顺序是在**同一个事务里**先让旧记录离开 active
+        （状态转 superseded、当前版本结束有效期），再插入新记录——事务提交时
+        该 subject 恰好只剩一条 active。
+
+        ``relation_confidence`` 是新建的 ``supersedes`` 关系的置信度，
+        与被替代/新建记忆各自的 confidence 无关。
+        """
+
+        self._require_tenant_scope(command.user_id, command.project_id)
+        old_id = _as_uuid(old_memory_id, "old_memory_id")
+        content = normalize_content(command.content)
+        if not content:
+            raise MemoryDomainError("记忆正文为空")
+        digest = content_hash(content)
+        lexical = (
+            command.lexical_text
+            if command.lexical_text is not None
+            else default_lexical_text(content)
+        )
+        record_id = _as_uuid(command.record_id, "record_id") or uuid4()
+        version_id = _as_uuid(command.version_id, "version_id") or uuid4()
+        observed_at = command.observed_at or _now()
+        valid_from = command.valid_from or observed_at
+        validate_validity_window(valid_from, None)
+        verified = self._resolve_verified(
+            command.memory_type, command.verified, command.sources
+        )
+        psycopg, _ = load_psycopg()
+
+        with self._session() as conn:
+            old_record = self._locked_record(conn, old_id)
+            if old_record["status"] != MemoryStatus.ACTIVE.value:
+                raise RecordNotActiveError(
+                    f"记忆 {old_memory_id} 状态为 {old_record['status']}，无需再替代"
+                )
+            if old_record["subject_key"] != command.subject_key:
+                raise MemoryDomainError(
+                    "替代只允许发生在同一 subject 上："
+                    f"旧记忆是 {old_record['subject_key']!r}，"
+                    f"新记忆是 {command.subject_key!r}。"
+                    "不同 subject 之间请用 add_record + supersede()"
+                )
+            if not type_allows_supersede(old_record["memory_type"]):
+                # 情景记忆按事件身份去重，两次不同的经历可以拥有同一个话题，
+                # 所以"新经历替代旧经历"没有意义（计划 §6.5 规则 3）。
+                # consolidation 层已经把这种候选降级成 UPDATE，这里再兜一道。
+                raise MemoryDomainError(
+                    f"{old_record['memory_type']} 不参与替代："
+                    "情景记忆保留各自事件，请改用 add_version()"
+                )
+
+            # ① 旧记录先离开 active，腾出"一个 subject 一条 active"的名额。
+            conn.execute(
+                "UPDATE memory_records SET status = %s, updated_at = now() WHERE id = %s",
+                (MemoryStatus.SUPERSEDED.value, old_id),
+            )
+            # ② 旧值结束有效期：这才是"当时有效的事实"的依据。
+            if old_record["active_version_id"]:
+                conn.execute(
+                    """
+                    UPDATE memory_versions
+                       SET valid_to = GREATEST(%s::timestamptz,
+                                               valid_from + interval '1 microsecond')
+                     WHERE id = %s AND valid_to IS NULL
+                    """,
+                    (valid_from, old_record["active_version_id"]),
+                )
+
+            # ③ 新记录成为该 subject 唯一的 active。
+            failure = self._try_execute(
+                conn,
+                """
+                INSERT INTO memory_records
+                    (id, user_id, project_id, scope, memory_type, subject_key,
+                     importance, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    record_id,
+                    command.user_id,
+                    command.project_id,
+                    command.scope.value,
+                    command.memory_type.value,
+                    command.subject_key,
+                    command.importance,
+                    command.confidence,
+                ),
+            )
+            if isinstance(failure, psycopg.errors.UniqueViolation):
+                raise self._active_subject_conflict(conn, failure, command.subject_key)
+            if failure is not None:
+                raise failure
+
+            failure = self._try_execute(
+                conn,
+                """
+                INSERT INTO memory_versions
+                    (id, memory_id, version, content, summary, metadata,
+                     lexical_text, content_hash, observed_at, valid_from, valid_to,
+                     verified)
+                VALUES (%s, %s, 1, %s, %s, %s, %s, %s, %s, %s, NULL, %s)
+                """,
+                (
+                    version_id,
+                    record_id,
+                    content,
+                    command.summary,
+                    _jsonb(dict(command.metadata)),
+                    lexical,
+                    digest,
+                    observed_at,
+                    valid_from,
+                    verified,
+                ),
+            )
+            if isinstance(failure, psycopg.errors.UniqueViolation):
+                raise self._duplicate_content(conn, record_id, digest)
+            if failure is not None:
+                raise failure
+
+            conn.execute(
+                "UPDATE memory_records SET active_version_id = %s, updated_at = now() "
+                "WHERE id = %s",
+                (version_id, record_id),
+            )
+            # ④ 关系与替代同事务落库，保证"有替代必有关系"。
+            conn.execute(
+                """
+                INSERT INTO memory_relations
+                    (from_memory_id, relation_type, to_memory_id, confidence, reason)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (from_memory_id, relation_type, to_memory_id) DO NOTHING
+                """,
+                (
+                    str(record_id),
+                    RelationType.SUPERSEDES.value,
+                    str(old_id),
+                    relation_confidence,
+                    reason,
+                ),
+            )
+            self._insert_sources(conn, version_id, command.sources)
+            self._enqueue_outbox(conn, version_id)
+            row = self._select_record(conn, record_id)
+            version = self._select_version_object(conn, version_id)
+
+        return _record_from_row(row, active_version=version)
 
     def supersede(
         self,
@@ -621,7 +860,8 @@ class PostgresMemoryRepository:
             conn.execute(
                 """
                 UPDATE memory_versions AS v
-                   SET valid_to = now()
+                   SET valid_to = GREATEST(now(),
+                                           v.valid_from + interval '1 microsecond')
                   FROM memory_records AS r
                  WHERE r.id = %s
                    AND r.active_version_id = v.id
@@ -636,11 +876,30 @@ class PostgresMemoryRepository:
             )
 
     def mark_expired(self, memory_id: str, valid_to: datetime) -> None:
+        """让一条记忆在 ``valid_to`` 之后失效，历史版本全部保留。
+
+        只对 **active** 记忆有效。早期实现无条件更新"当前版本"的 ``valid_to``，
+        对一条已经被替代的记忆调用它会把一个已经封存的版本的时间窗再改一次
+        （记录状态因为 `status = 'active'` 条件不变，于是变成一次静默的历史篡改）。
+        现在先锁记录再看状态，非 active 直接报错。
+        """
+
         if valid_to is None:
             raise MemoryDomainError("过期时间不能为空")
         mid = _as_uuid(memory_id, "memory_id")
         with self._session() as conn:
-            self._locked_record(conn, mid)
+            record = self._locked_record(conn, mid)
+            if record["status"] != MemoryStatus.ACTIVE.value:
+                raise RecordNotActiveError(
+                    f"记忆 {memory_id} 状态为 {record['status']}，"
+                    "只有 active 记忆才能被标记过期"
+                )
+            if record["active_version_id"]:
+                current = self._select_version(conn, record["active_version_id"])
+                if current is not None:
+                    # 先按领域规则校验，避免把越界输入交给数据库 CHECK 报一个
+                    # 看不出上下文的错误。
+                    validate_validity_window(current["valid_from"], valid_to)
             conn.execute(
                 """
                 UPDATE memory_versions AS v
@@ -648,9 +907,9 @@ class PostgresMemoryRepository:
                   FROM memory_records AS r
                  WHERE r.id = %s
                    AND r.active_version_id = v.id
-                   AND (v.valid_to IS NULL OR v.valid_to > %s)
+                   AND v.valid_to IS NULL
                 """,
-                (valid_to, mid, valid_to),
+                (valid_to, mid),
             )
             conn.execute(
                 "UPDATE memory_records SET status = %s, updated_at = now() "
@@ -664,6 +923,70 @@ class PostgresMemoryRepository:
             if self._select_version(conn, vid) is None:
                 raise RecordNotFoundError(f"版本 {version_id} 不存在或不属于当前租户")
             self._insert_sources(conn, vid, (source,))
+
+    def attach_sources(
+        self,
+        memory_id: str,
+        sources: Sequence[MemorySource],
+        *,
+        confidence: float | None = None,
+        verified: bool = False,
+    ) -> MemoryVersion:
+        """把新来源挂到当前 active 版本上（"只补充来源/置信度"的 UPDATE）。"""
+
+        mid = _as_uuid(memory_id, "memory_id")
+        if confidence is not None:
+            _check_confidence(confidence)
+
+        with self._session() as conn:
+            record = self._locked_record(conn, mid)
+            if record["status"] != MemoryStatus.ACTIVE.value:
+                raise RecordNotActiveError(
+                    f"记忆 {memory_id} 状态为 {record['status']}，不能补充来源"
+                )
+            version_id = record["active_version_id"]
+            if not version_id:
+                # 逻辑记录没有当前版本说明数据被外部改坏了（正常写入永远
+                # 记录与版本同事务创建）。不猜，直接报错。
+                raise MemoryRepositoryError(
+                    f"记忆 {memory_id} 没有当前版本，无法补充来源"
+                )
+            current = self._select_version(conn, version_id)
+            if current is None:
+                raise RecordNotFoundError(f"记忆 {memory_id} 的当前版本不可见")
+
+            # verified 的说法要拿"已有来源 + 这批新来源"一起校验，
+            # 只看到新来源会误判（例如已有 user_statement，新来的是 history_event）。
+            known = self._existing_source_objects(conn, version_id)
+            resolved_verified = self._resolve_verified(
+                MemoryType(record["memory_type"]), verified, (*known, *sources)
+            )
+
+            self._insert_sources(conn, version_id, sources)
+
+            if resolved_verified and not current["verified"]:
+                conn.execute(
+                    "UPDATE memory_versions SET verified = true WHERE id = %s",
+                    (version_id,),
+                )
+            if confidence is not None:
+                conn.execute(
+                    "UPDATE memory_records SET confidence = GREATEST(confidence, %s), "
+                    "updated_at = now() WHERE id = %s",
+                    (confidence, mid),
+                )
+            row = self._select_version(conn, version_id)
+
+        return _version_from_row(row)
+
+    def _existing_source_objects(
+        self, conn: Any, version_id: UUID
+    ) -> tuple[MemorySource, ...]:
+        rows = conn.execute(
+            "SELECT * FROM memory_sources WHERE memory_version_id = %s",
+            (version_id,),
+        ).fetchall()
+        return tuple(_source_from_row(row) for row in rows)
 
     def add_relation(
         self,
@@ -800,7 +1123,13 @@ class PostgresMemoryRepository:
                 "LIMIT 1",
                 [subject_key, *scope_params],
             ).fetchone()
-        return _record_from_row(row) if row is not None else None
+            if row is None:
+                return None
+            # 必须把 active 版本一起带出来：consolidation 要拿它比内容 hash、
+            # 比来源、读 verified。少这一步的话调用方会拿到一个
+            # ``active_version is None`` 的记录，判重会全部失效。
+            version = self._select_version_object(conn, row["active_version_id"])
+        return _record_from_row(row, active_version=version)
 
     def list_sources(self, version_id: str) -> list[MemorySource]:
         vid = _as_uuid(version_id, "version_id")
@@ -934,15 +1263,26 @@ class PostgresMemoryRepository:
         """
 
         scope, params = self._record_scope("r")
-        clauses = ["r.status = 'active'", "r.active_version_id = v.id", scope]
 
-        if query.as_of is not None:
+        if query.as_of is None:
+            # 当前视图：每条记忆只看它当前的 active 版本，且该版本尚未失效。
+            clauses = [
+                "r.status = 'active'",
+                "r.active_version_id = v.id",
+                "v.valid_to IS NULL",
+                scope,
+            ]
+        else:
+            # as_of 视图：问的不是"谁是当前 active"，而是"哪个版本在那个时刻有效"。
+            # 一条事实被替代之后，它的历史版本恰恰是 as_of 要回答的对象，
+            # 所以这里**不能**要求 r.status = 'active'，也不能要求
+            # r.active_version_id = v.id——否则 as_of 永远只能返回当前版本，
+            # 时态查询等于没实现。
+            clauses = ["r.status <> 'deleted'", scope]
             clauses.append("v.valid_from <= %s")
             params.append(query.as_of)
             clauses.append("(v.valid_to IS NULL OR v.valid_to > %s)")
             params.append(query.as_of)
-        else:
-            clauses.append("v.valid_to IS NULL")
 
         if query.scopes:
             clauses.append("r.scope = ANY(%s)")
