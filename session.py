@@ -47,13 +47,17 @@ class AgentSession:
         self.token_total = 0                                        # 当前会话累计 token
         self.loaded_skills: list[str] = []                          # 已加载技能名
         self.todos: list[dict] = []                                 # 当前会话任务列表
+        # 运行治理观察者（03 计划阶段 2）：todos 落内存前先通知权威状态机。
+        # 观察者抛异常 = 状态改变被拒绝（fail closed），内存列表不会更新。
+        # 默认 None：治理层是可选部署件，关闭时主链路逐字不变。
+        self.on_todos_updated = None
         self.workspace_path = workspace_path or WORKSPACE_DIR / user_id / project_id
         self.journal_path = journal_path or JOURNAL_DIR / user_id / f"{project_id}.md"
 
     def update_todos(self, todos: list[dict]) -> str:
         """更新当前会话的任务进度。"""
 
-        return update_todos(self.todos, todos)
+        return update_todos(self.todos, todos, observer=self.on_todos_updated)
 
 
 def render_todos(todos: list[dict]) -> str:
@@ -71,10 +75,14 @@ def render_todos(todos: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def update_todos(target: list[dict], todos: list[dict]) -> str:
+def update_todos(target: list[dict], todos: list[dict], observer=None) -> str:
     """更新任务进度，并对模型输出做二次校验。
 
     模型输出的 todos 通常能直接使用，这里额外做格式清洗、状态校验和 in_progress 数量校验。
+
+    ``observer`` 是治理层的状态改变入口（计划 §3.3-2：状态改变必须同时留下
+    事件）：在内存列表被修改**之前**调用，观察者抛异常时整个更新被拒绝，
+    内存列表保持原状——禁止"只改内存对象"。
     """
 
     cleaned = []
@@ -95,6 +103,10 @@ def update_todos(target: list[dict], todos: list[dict]) -> str:
     in_progress = [todo for todo in cleaned if todo["status"] == "in_progress"]
     if len(in_progress) > 1:
         return "Error: 同一时间只能有一个 in_progress 任务，请重新规划。"
+
+    # 治理观察者在内存变更前执行：异常向上传播，更新整体拒绝。
+    if observer is not None:
+        observer(cleaned)
 
     # 注意这里用 clear + extend 原地更新，保持外部持有的列表对象引用不变。
     target.clear()

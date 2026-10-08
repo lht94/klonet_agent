@@ -108,6 +108,7 @@ def db(admin_dsn: str) -> Any:
                 "0001_init",
                 "0002_roles_and_grants",
                 "0003_immutable_versions",
+                "0004_governance",
             ]
             yield database
         finally:
@@ -219,6 +220,7 @@ def test_migration_creates_extension_tables_indexes_and_policies(db: MemoryDatab
         "0001_init",
         "0002_roles_and_grants",
         "0003_immutable_versions",
+        "0004_governance",
     ]
     # 报告里带回来的 DSN 必须已脱敏。注意这里要同时检查 URL 形式和 libpq 关键字
     # 形式——`temporary_database` 用 make_conninfo() 拼出来的正是关键字形式。

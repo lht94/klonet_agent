@@ -145,6 +145,15 @@ MEMORY_AUTHORITY = os.getenv(
 if MEMORY_AUTHORITY not in {"legacy", "shadow", "compare", "cutover"}:
     MEMORY_AUTHORITY = "legacy"
 
+# 运行治理层（通用功能升级计划 03，阶段 1）。默认关闭：治理层与记忆库同为
+# 可选部署件（状态必须落到 PostgreSQL，没有 DSN 时打开只会每轮多一次失败
+# 连接）。打开后：任务/失败状态改变 fail closed，telemetry 事件降级缓冲；
+# 治理事件同时导出到 GOVERNANCE_TRACE_FILE（JSONL 只是导出，不是权威）。
+RUNTIME_GOVERNANCE_ENABLED = os.getenv(
+    "KLONET_AGENT_RUNTIME_GOVERNANCE", "0",
+).strip().lower() in {"1", "true", "yes", "on"}
+GOVERNANCE_TRACE_FILE = PROJECT_ROOT / "tracing" / "governance.jsonl"
+
 
 def markdown_memory_is_authoritative() -> bool:
     """Markdown 是否仍是回答时读取的记忆来源。

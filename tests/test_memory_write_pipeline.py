@@ -1263,6 +1263,7 @@ def db(admin_dsn: str):
                 "0001_init",
                 "0002_roles_and_grants",
                 "0003_immutable_versions",
+                "0004_governance",
             ]
             yield database
         finally:

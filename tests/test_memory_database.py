@@ -143,7 +143,12 @@ def test_migration_files_are_discovered_in_order() -> None:
     migrations = load_migration_files()
     versions = [item.version for item in migrations]
     assert versions == sorted(versions)
-    assert versions == ["0001_init", "0002_roles_and_grants", "0003_immutable_versions"]
+    assert versions == [
+        "0001_init",
+        "0002_roles_and_grants",
+        "0003_immutable_versions",
+        "0004_governance",
+    ]
     for item in migrations:
         assert item.sql.strip()
         assert len(item.checksum) == 64

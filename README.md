@@ -456,6 +456,21 @@ run.py ->
 3. 再定义一个工具函数，用来查看与更新任务执行状态
 4. 最后做一个检验，模型说完成任务之后再手动二次检验，避免llm出错而导致需要用户自己提醒
 
+## 运行治理层（Agent Runtime Governance）
+
+任务状态、失败、模型/工具调用现在共享一套**运行标识 + 事件账本 + 状态投影**
+（计划见 [`通用功能升级计划/03-Agent运行治理升级计划.md`](通用功能升级计划/03-Agent运行治理升级计划.md)，
+实施记录见 [`doc/18_runtime_governance_upgrade.md`](doc/18_runtime_governance_upgrade.md)）。
+
+- `runtime/governance/`：models / privacy / repository / postgres / service / exporters / bootstrap；
+- `migrations/0004_governance.sql`：`governance` schema 九张表，RLS 与记忆系统同一套租户变量；
+- 开关 `KLONET_AGENT_RUNTIME_GOVERNANCE=1`（默认关闭，与记忆库共用
+  `KLONET_AGENT_MEMORY_DSN`，没有 DSN 时自动降级）；
+- 降级规则：**任务状态改变与失败关闭 fail closed**（存储不可用时内存 todos
+  不会被修改），模型/工具调用的 telemetry 事件进缓冲按幂等键补投；
+- secret 级数据（API key、密码、私钥）被最小隐私网关拒绝持久化，事件降级为
+  不含原文的 tombstone；`tracing/governance.jsonl` 只是导出，不是权威。
+
 ## 记忆系统（PostgreSQL + pgvector）
 
 长期记忆已经从"几个 Markdown 文件 + 模型自由覆写"升级为**有 schema、有版本、

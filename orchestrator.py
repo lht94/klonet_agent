@@ -17,6 +17,7 @@ from klonet_agent.answer_policy import build_answer_policy
 from klonet_agent.config import (
     CONTEXT_COMPILER_ENABLED,
     CONTEXT_COMPACTION_MIN_TOKENS,
+    GOVERNANCE_TRACE_FILE,
     HISTORY_MAX_MESSAGES,
     LEGACY_MEMORY_COMPRESSION_ENABLED,
     MAX_TODO_CONTINUATIONS,
@@ -38,6 +39,7 @@ from klonet_agent.config import (
     RAG_QUERY_PLANNER_MODEL,
     RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
     RAG_SEARCH_BUDGETS,
+    RUNTIME_GOVERNANCE_ENABLED,
     TRACE_FILE,
     JEV_MIN_CONFIDENCE,
 )
@@ -216,6 +218,10 @@ class AgentOrchestrator:
         # 本轮 history 列表的引用。工具循环里的记忆工具需要通过它拿到本轮事件，
         # 而 single_chat 只在开始时把引用放进来（列表本身是就地修改的）。
         self._turn_history_ref: list[dict] | None = None
+        # 运行治理层（03 计划阶段 1-3）。惰性构造：开关关闭、没有 DSN 时保持
+        # None，主链路逐字不变；打开后任务状态改变 fail closed。
+        self._governance = None
+        self._governance_error: str | None = None
         self.journal_maintainer = journal_maintainer or ProjectJournalMaintainer(
             ProjectJournal.from_session(self.session),
             # Test doubles and deterministic callers should not receive a
@@ -505,6 +511,15 @@ class AgentOrchestrator:
             total_tokens=getattr(response.usage, "total_tokens", 0),
             duration_ms=duration_ms,
         )
+        # 治理层模型调用记录（telemetry 级：不可用时进缓冲，不阻断主链路）。
+        governance = self._governance
+        if governance is not None:
+            governance.record_model_call(
+                model=getattr(self.llm, "model", None) or "unknown",
+                total_tokens=getattr(getattr(response, "usage", None), "total_tokens", 0) or 0,
+                duration_ms=duration_ms,
+                succeeded=True,
+            )
         return response
 
     def _complete_llm(self, history: list[dict], *, stream: bool):
@@ -918,7 +933,7 @@ class AgentOrchestrator:
             return "本轮属于 generic 问题，禁止读取 Klonet 项目日志。"
 
         if tool_name != "search_knowledge":
-            return self.tool_executor.run(tool_name, tool_args)
+            return self._execute_tool(tool_name, tool_args)
 
         budget = self._rag_search_budget(scope)
         if self._knowledge_search_count >= budget:
@@ -928,7 +943,7 @@ class AgentOrchestrator:
             )
 
         self._knowledge_search_count += 1
-        result = self.tool_executor.run(tool_name, tool_args)
+        result = self._execute_tool(tool_name, tool_args)
         if scope == "general":
             return (
                 "【secondary Klonet evidence】\n"
@@ -936,6 +951,63 @@ class AgentOrchestrator:
                 f"{result}"
             )
         return result
+
+    def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
+        """执行工具并记录治理事件（03 计划阶段 1/3）。
+
+        成功 → ``tool_call.completed``；异常 → ``tool_call.failed``（结果
+        不明时 outcome 取 ``outcome_unknown``，阻断自动重试）并打开失败记录。
+        治理存储不可用时按 fail-closed 语义抛出：副作用不明的失败不允许
+        静默吞掉治理痕迹。
+        """
+
+        governance = self._governance
+        start = perf_counter()
+        try:
+            result = self.tool_executor.run(tool_name, tool_args)
+        except Exception as exc:
+            duration_ms = int((perf_counter() - start) * 1000)
+            if governance is not None:
+                governance.record_tool_call(
+                    tool_name=tool_name,
+                    duration_ms=duration_ms,
+                    outcome="outcome_unknown",
+                    args_preview=self._safe_tool_args_preview(tool_args),
+                    error_class=type(exc).__name__,
+                )
+                governance.record_failure(
+                    stage="tool_execution",
+                    error_class=(type(exc).__name__ or "UnknownError")[:80],
+                    message=str(exc)[:500],
+                    retryable=False,
+                )
+            raise
+        duration_ms = int((perf_counter() - start) * 1000)
+        if governance is not None:
+            governance.record_tool_call(
+                tool_name=tool_name,
+                duration_ms=duration_ms,
+                outcome="succeeded",
+                args_preview=self._safe_tool_args_preview(tool_args),
+            )
+        return result
+
+    @staticmethod
+    def _safe_tool_args_preview(tool_args: dict) -> dict:
+        """工具参数预览：只保留键与脱敏后的标量值，防秘密进入治理库。"""
+
+        preview: dict = {}
+        for key, value in dict(tool_args or {}).items():
+            if isinstance(value, str):
+                from klonet_agent.runtime.governance.privacy import redact_text
+
+                sanitized, _ = redact_text(value)
+                preview[str(key)] = sanitized[:300]
+            elif isinstance(value, (int, float, bool)) or value is None:
+                preview[str(key)] = value
+            else:
+                preview[str(key)] = f"<{type(value).__name__}>"
+        return preview
 
     def _rag_search_budget(self, scope: str) -> int:
         """Return the per-turn knowledge retrieval budget for the active profile."""
@@ -1412,12 +1484,60 @@ class AgentOrchestrator:
         except Exception as exc:  # noqa: BLE001 - 补扫失败不影响主流程
             print(f"Klonet Agent：（记忆补扫失败，已忽略：{type(exc).__name__}）")
 
+    def _ensure_governance(self):
+        """惰性构造治理层（03 计划阶段 1）。
+
+        开关关闭或没有 DSN 时返回 ``None`` 并保持静默——治理层是可选部署件，
+        与记忆系统的降级哲学一致。构造成功后把 ``session.on_todos_updated``
+        指向 ``apply_todos``：todos 的内存变更从此先过权威状态机（fail closed）。
+        """
+
+        if self._governance is not None or self._governance_error is not None:
+            return self._governance
+        if not RUNTIME_GOVERNANCE_ENABLED:
+            self._governance_error = "disabled"
+            return None
+        try:
+            from klonet_agent.memory.domain import Tenant
+            from klonet_agent.runtime.governance.bootstrap import (
+                runtime_governance_from_env,
+            )
+
+            tenant = Tenant(
+                user_id=self.session.user_id,
+                project_id=self.session.project_id,
+            )
+            governance = runtime_governance_from_env(
+                tenant,
+                session_id=f"{self.session.user_id}:{self.session.project_id}",
+                mode=self.session.mode,
+                trace_file=GOVERNANCE_TRACE_FILE,
+            )
+        except Exception as exc:  # 构造失败：记录原因，本轮起保持关闭。
+            self._governance_error = str(exc)
+            print(f"Klonet Agent：运行治理层初始化失败，已降级关闭（{self._governance_error}）")
+            return None
+        if governance is None:
+            self._governance_error = "missing-dsn"
+            return None
+        self._governance = governance
+        self.session.on_todos_updated = governance.apply_todos
+        return governance
+
     def single_chat(self, user_input: str, history: list[dict], token: int):
         """实现一次完整的用户输入处理。
 
         这对应旧版 runner.py 中的内循环：
         用户输入 -> 调用 LLM -> 可能调用工具 -> 把工具结果送回 LLM -> 输出自然语言。
         """
+
+        # 治理层：每轮一次 turn 事件（telemetry 级，失败不阻断对话）。
+        governance = self._ensure_governance()
+        if governance is not None:
+            try:
+                governance.start_turn()
+            except Exception as exc:
+                print(f"Klonet Agent：治理层本轮不可用（{exc}），telemetry 将缓冲补投。")
 
         # 设定对话消息。消息列表中的每个消息都包含 role 和 content。
         # role 可以是 system、user、assistant、tool。
