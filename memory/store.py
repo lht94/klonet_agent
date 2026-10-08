@@ -366,8 +366,14 @@ class MemoryStore:
             messages.pop(0)
         return messages
 
-    def memory_prompt(self, mode: str = "ops") -> str:
-        """生成记忆系统提示词，让大模型知道如何主动维护记忆。"""
+    def memory_prompt(self, mode: str = "ops", *, include_long_term: bool = True) -> str:
+        """生成记忆系统提示词，让大模型知道如何主动维护记忆。
+
+        ``include_long_term=False``（阶段 5 的 MemoryPack 路径）时不再把 MEMORY.md
+        与 USER.md 的正文常驻粘贴在这里，只留一行说明——正文改由每轮按问题检索出的
+        证据块承担（见 ``memory/pack.py``）。默认值为 True，所以既有调用方输出
+        逐字不变。
+        """
 
         current_memory = self.read_memory()
         current_user = self.read_user()
@@ -382,9 +388,20 @@ class MemoryStore:
             shared_ops_baseline = ""
             shared_ops_memory = ""
             shared_ops_policy = "当前模式不注入共享 Ops 环境记忆；如需读取服务器运行态，请切换到 Ops 模式。"
+        # 缩进写进变量内部，这样 include_long_term=True 时拼出来的文本与改造前逐字一致。
+        if include_long_term:
+            memory_block = f"【当前长期记忆 (MEMORY.md)】\n            {current_memory}"
+            user_block = f"【用户画像与偏好 (USER.md)】\n            {current_user}"
+        else:
+            memory_block = (
+                "【长期记忆改为按需注入】\n"
+                "            与当前问题相关的长期事实与用户偏好会在每轮以独立证据块给出；\n"
+                "            这里不再常驻 MEMORY.md 与 USER.md 全文，避免无关内容干扰当前推理。\n"
+                "            需要某个具体的历史事实时，请直接用自然语言描述问题，让检索把它带进来。"
+            )
+            user_block = ""
         return f"""
-            【当前长期记忆 (MEMORY.md)】
-            {current_memory}
+            {memory_block}
 
             【多用户共享 Ops 情景记忆】
             {shared_ops_policy}
@@ -394,8 +411,7 @@ class MemoryStore:
             这部分来自 inspect_ops_context 的 baseline 快照，可作为 Ubuntu/内核/架构/CPU/内存/磁盘/虚拟化/工具版本等低频变化事实的起点；涉及端口、进程、服务、screen、容器等运行态问题时仍必须刷新 runtime。
             {shared_ops_baseline}
 
-            【用户画像与偏好 (USER.md)】
-            {current_user}
+            {user_block}
 
             【记忆维护规则】
             只有出现可复用的重要进展时才使用记忆工具，普通问答不要写记忆：

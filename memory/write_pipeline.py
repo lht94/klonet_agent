@@ -297,6 +297,12 @@ class MemoryWritePipeline:
             idempotency_key=idempotency_key,
         )
 
+    @property
+    def repository(self):
+        """底层记忆仓库。召回链路（MemoryPack）复用它，避免同一租户开两个连接池。"""
+
+        return self._repository
+
     # ------------------------------------------------------------ 补扫入口 --
 
     def backfill(

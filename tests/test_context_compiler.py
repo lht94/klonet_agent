@@ -235,3 +235,87 @@ def test_tool_loop_tail_without_user_message_compiles():
     compiled = _compiler().compile_history(history, model="glm-5.2")
     text = "".join(str(m.get("content")) for m in compiled.messages)
     assert "redis ok" in text
+
+
+# --------------------------------------------------------------------------- #
+# Memory Pack（阶段 5）：记忆是证据，不是系统规则
+# --------------------------------------------------------------------------- #
+
+
+def _pack_message(
+    text: str = "【按问题检索到的相关记忆】\n- 本项目运行时要求 Python 3.11",
+    memory_ids: tuple[str, ...] = ("mem-1",),
+) -> dict:
+    return {
+        "role": "user",
+        "content": text,
+        "_memory_pack": True,
+        "_memory_pack_ids": list(memory_ids),
+    }
+
+
+def test_memory_pack_lands_in_evidence_zone_not_system_zone():
+    compiled = _compiler().compile(_request(memory_pack_message=_pack_message()))
+
+    all_text = "".join(str(m.get("content")) for m in compiled.messages)
+    system_text = "".join(
+        str(m.get("content")) for m in compiled.messages if m.get("role") == "system"
+    )
+    assert "Python 3.11" in all_text
+    # 检索到的记忆不拥有系统规则的优先级。
+    assert "Python 3.11" not in system_text
+    assert compiled.areas["memory_pack"] > 0
+    assert compiled.memory_pack_ids == ("mem-1",)
+
+
+def test_memory_pack_sits_after_required_zone_and_before_current_input():
+    compiled = _compiler().compile(_request(memory_pack_message=_pack_message()))
+    contents = [str(m.get("content")) for m in compiled.messages]
+
+    pack_index = next(
+        index for index, text in enumerate(contents) if "按问题检索到的相关记忆" in text
+    )
+    assert pack_index >= 2  # 两条系统规则在前面
+    # 当前用户输入必须仍是最后一条。
+    assert contents[-1] == "当前问题"
+    assert pack_index < len(contents) - 1
+
+
+def test_memory_pack_has_a_budget_separate_from_other_evidence(monkeypatch):
+    _small_window(monkeypatch)
+    evidence = [{"role": "user", "content": "证据 " + "e" * 300} for _ in range(4)]
+    compiled = _compiler().compile(
+        _request(
+            memory_pack_message=_pack_message(),
+            evidence_messages=evidence,
+        )
+    )
+
+    assert compiled.areas["memory_pack"] > 0
+    assert compiled.areas["evidence"] > 0
+    text = "".join(str(m.get("content")) for m in compiled.messages)
+    # 两者互不挤占：记忆包与证据都在。
+    assert "按问题检索到的相关记忆" in text
+    assert "证据 " in text
+
+
+def test_memory_pack_is_dropped_whole_when_it_cannot_fit(monkeypatch):
+    """放不下就整条丢掉（不截断），并且必须被记为 omitted。"""
+
+    _small_window(monkeypatch)
+    huge = _pack_message(text="【按问题检索到的相关记忆】\n" + "记" * 20000)
+    compiled = _compiler().compile(_request(memory_pack_message=huge))
+
+    assert compiled.areas["memory_pack"] == 0
+    assert compiled.memory_pack_ids == ()
+    text = "".join(str(m.get("content")) for m in compiled.messages)
+    assert "按问题检索到的相关记忆" not in text
+    assert "memory_pack" in compiled.omitted_event_ids
+
+
+def test_context_request_without_memory_pack_is_unchanged():
+    compiled = _compiler().compile(_request())
+
+    assert compiled.areas["memory_pack"] == 0
+    assert compiled.memory_pack_ids == ()
+    assert compiled.omitted_event_ids == ()

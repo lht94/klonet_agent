@@ -23,6 +23,9 @@ from klonet_agent.config import (
     MAX_TOKEN,
     MAX_TOOL_ROUNDS,
     MEMORY_BACKFILL_LIMIT,
+    MEMORY_PACK_ENABLED,
+    MEMORY_PACK_RECALL_LIMIT,
+    MEMORY_PACK_TOKEN_BUDGET,
     MEMORY_DIR,
     MEMORY_WRITE_PIPELINE_ENABLED,
     OPS_MAX_TOOL_ROUNDS,
@@ -200,6 +203,14 @@ class AgentOrchestrator:
         # 或者数据库连不上时都保持 None，主链路完全不受影响。
         self._memory_pipeline = None
         self._memory_pipeline_error: str | None = None
+        # 记忆召回链路（阶段 5）。读路径的仓库、召回器与构包器各自惰性构造：
+        # 开关关闭或记忆库不可用时保持 None，编译器拿到的就是"这轮不注入记忆"。
+        self._memory_read_repository = None
+        self._memory_read_database = None
+        self._memory_read_error: str | None = None
+        self._memory_retriever_cache = None
+        self._memory_retriever_error: str | None = None
+        self._memory_pack_builder_cache = None
         # 本轮 history 列表的引用。工具循环里的记忆工具需要通过它拿到本轮事件，
         # 而 single_chat 只在开始时把引用放进来（列表本身是就地修改的）。
         self._turn_history_ref: list[dict] | None = None
@@ -359,7 +370,11 @@ class AgentOrchestrator:
             history.append({"role": "system", "content": prompt})
 
         # 把记忆设定加入到系统提示词中。
-        memory_prompt = self.memory_store.memory_prompt(mode=self.profile.name)
+        # 打开 MemoryPack 开关后，这里不再常驻 MEMORY.md / USER.md 全文：正文改由
+        # 每轮按问题召回的证据块承担（见 _memory_pack_message）。
+        memory_prompt = self.memory_store.memory_prompt(
+            mode=self.profile.name, include_long_term=not MEMORY_PACK_ENABLED
+        )
         history.append({"role": "system", "content": memory_prompt})
 
         # 把目前已有的 skill 加入到系统提示词中。
@@ -535,11 +550,15 @@ class AgentOrchestrator:
         """
 
         model = getattr(self.llm, "model", None) or "unknown"
+        # 记忆包在同一回合里只构造一次：压缩后重编译时复用同一份，
+        # 不为同一句用户输入跑两遍召回与嵌入。
+        memory_pack_message = self._memory_pack_message(history)
         try:
             compiled = self.context_compiler.compile_history(
                 history,
                 model=model,
                 tool_definitions=tools,
+                memory_pack_message=memory_pack_message,
             )
         except ContextOverflowError as exc:
             self.trace_logger.record_privileged_event(
@@ -589,6 +608,7 @@ class AgentOrchestrator:
                     model=model,
                     tool_definitions=tools,
                     checkpoint_message=checkpoint_message,
+                    memory_pack_message=memory_pack_message,
                 )
                 if compiled.compression_required:
                     self.trace_logger.record_privileged_event(
@@ -1004,6 +1024,175 @@ class AgentOrchestrator:
                 break
 
         return history, token
+
+    # ------------------------------------------------------- 记忆召回（阶段 5） --
+
+    def _memory_pack_message(self, history: list[dict]) -> dict | None:
+        """按当前问题构建记忆包消息；不可用时返回 None。
+
+        失败一律降级为"这轮不注入记忆"：记忆是增强项，不该成为回答的阻塞点，
+        更不该在用户请求路径上抛异常。
+        """
+
+        if not MEMORY_PACK_ENABLED:
+            return None
+        query_text = self._memory_query_text(history)
+        if not query_text.strip():
+            return None
+        retriever = self._memory_retriever()
+        if retriever is None:
+            return None
+        try:
+            from klonet_agent.memory.domain import MemoryQuery
+
+            report = retriever.retrieve(
+                MemoryQuery(text=query_text, limit=MEMORY_PACK_RECALL_LIMIT)
+            )
+        except Exception as exc:  # noqa: BLE001 - 召回失败不能影响回答
+            self._trace_memory_pack(
+                "recall_failed", {"error": type(exc).__name__}
+            )
+            return None
+
+        pack = self._memory_pack_builder().build(report, mode=self.profile.name)
+        if pack.empty:
+            self._trace_memory_pack(
+                "empty",
+                {
+                    "query_chars": len(query_text),
+                    "degraded": list(report.degraded),
+                    "dropped": len(pack.dropped),
+                },
+            )
+            return None
+        self._trace_memory_pack(
+            "injected",
+            {
+                "memory_ids": list(pack.memory_ids),
+                "tokens": pack.tokens,
+                "dropped": [
+                    {"id": item.memory_id, "reason": item.reason}
+                    for item in pack.dropped
+                ],
+                "degraded": list(report.degraded),
+                "rerank": report.rerank,
+                "conflicts": list(pack.conflict_ids),
+            },
+        )
+        return pack.to_message()
+
+    def _memory_query_text(self, history: list[dict]) -> str:
+        """召回用的查询文本：本轮用户输入。
+
+        取 history 里最后一条 user 消息——编译器也是这么认"当前输入"的，两处口径
+        必须一致，否则会出现"注入的记忆与正在回答的问题不是同一个"这种很难查的错位。
+        """
+
+        for message in reversed(history):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+        return ""
+
+    def _memory_retriever(self):
+        """惰性构造召回器；不可用时返回 None（只记一次原因）。"""
+
+        if self._memory_retriever_cache is not None:
+            return self._memory_retriever_cache
+        if self._memory_retriever_error is not None:
+            return None
+        if not MEMORY_PACK_ENABLED:
+            return None
+        repository = self._memory_repository()
+        if repository is None:
+            return None
+        try:
+            from klonet_agent.llm.embeddings import (
+                EmbeddingClient,
+                get_embedding_api_key,
+            )
+            from klonet_agent.llm.reranker import RerankClient
+            from klonet_agent.memory.repository import EMBEDDING_DIMENSIONS
+            from klonet_agent.memory.retriever import MemoryRetriever
+
+            embedder = None
+            if get_embedding_api_key():
+                # 显式给维度：schema 是 vector(1024)，维度不符要在客户端就变成
+                # 可见的降级，而不是等 SQL 报一个看不懂的错。
+                embedder = EmbeddingClient(
+                    dimensions=EMBEDDING_DIMENSIONS
+                ).embed_text
+            retriever = MemoryRetriever(
+                repository, embedder=embedder, reranker=RerankClient()
+            )
+            self._memory_retriever_cache = retriever
+            return retriever
+        except Exception as exc:  # noqa: BLE001 - 召回链路不可用不能影响主链路
+            self._memory_retriever_error = f"{type(exc).__name__}: {exc}"
+            return None
+
+    def _memory_pack_builder(self):
+        if self._memory_pack_builder_cache is None:
+            from klonet_agent.memory.pack import MemoryPackBuilder
+
+            self._memory_pack_builder_cache = MemoryPackBuilder(
+                token_budget=MEMORY_PACK_TOKEN_BUDGET
+            )
+        return self._memory_pack_builder_cache
+
+    def _memory_repository(self):
+        """本会话的记忆仓库（读路径）。
+
+        优先复用写入管线已经建好的那个——两个开关同时打开时不该为同一个租户开
+        两个连接池。写管线没开时读路径自己建一个：读不需要写权限，不该被写入开关
+        连带关掉。
+        """
+
+        pipeline = self._memory_write_pipeline()
+        if pipeline is not None:
+            return pipeline.repository
+        if self._memory_read_repository is not None:
+            return self._memory_read_repository
+        if self._memory_read_error is not None:
+            return None
+        try:
+            from klonet_agent.memory.database import MemoryDatabase, memory_dsn
+            from klonet_agent.memory.domain import Tenant
+            from klonet_agent.memory.postgres import PostgresMemoryRepository
+
+            dsn = memory_dsn()
+            if not dsn:
+                self._memory_read_error = "未配置记忆库 DSN"
+                return None
+            database = MemoryDatabase(dsn)
+            database.open()
+            self._memory_read_database = database
+            self._memory_read_repository = PostgresMemoryRepository(
+                database,
+                Tenant(
+                    user_id=self.session.user_id, project_id=self.session.project_id
+                ),
+            )
+            return self._memory_read_repository
+        except Exception as exc:  # noqa: BLE001
+            self._memory_read_error = f"{type(exc).__name__}: {exc}"
+            return None
+
+    def _trace_memory_pack(self, event: str, payload: dict) -> None:
+        """记录一次记忆包事件。trace 失败同样不能影响主链路。"""
+
+        try:
+            self.trace_logger.record_privileged_event(
+                user_id=self.session.user_id,
+                project_id=self.session.project_id,
+                mode=self.session.mode,
+                event=f"memory_pack_{event}",
+                payload=payload,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------- 受控写入管线（阶段 3） --
 
@@ -3105,7 +3294,9 @@ class AgentOrchestrator:
 
         for msg in history:
             if msg.get("role") == "system" and "MEMORY.md" in msg.get("content", ""):
-                msg["content"] = self.memory_store.memory_prompt(mode=self.profile.name)
+                msg["content"] = self.memory_store.memory_prompt(
+                    mode=self.profile.name, include_long_term=not MEMORY_PACK_ENABLED
+                )
                 return
 
     def _query_intent_tool_args(self) -> dict:

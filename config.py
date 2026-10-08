@@ -120,6 +120,21 @@ MEMORY_WRITE_PIPELINE_ENABLED = os.getenv(
 MEMORY_BACKFILL_LIMIT = max(
     1, int(os.getenv("KLONET_AGENT_MEMORY_BACKFILL_LIMIT", "20")),
 )
+# 记忆包（MemoryPack）开关：默认关闭。打开后不再把 MEMORY.md / USER.md 全文常驻
+# 注入系统提示词，改为每轮按当前问题召回并作为独立证据块注入（计划 §6.7、阶段 5）。
+# 关闭时记忆提示词与主链路逐字保持原状。
+MEMORY_PACK_ENABLED = os.getenv(
+    "KLONET_AGENT_MEMORY_PACK", "0",
+).strip().lower() in {"1", "true", "yes", "on"}
+# 记忆包自身的 token 上限。它是**最终硬约束**：超预算时整条淘汰最低分的记忆
+# （先相似经历、再项目事实、用户偏好最后），绝不截断单条结构。
+MEMORY_PACK_TOKEN_BUDGET = max(
+    120, int(os.getenv("KLONET_AGENT_MEMORY_PACK_TOKEN_BUDGET", "900")),
+)
+# 召回时取回的候选条数（进包前还会按类型与 token 再裁一遍）。
+MEMORY_PACK_RECALL_LIMIT = max(
+    10, int(os.getenv("KLONET_AGENT_MEMORY_PACK_RECALL_LIMIT", "40")),
+)
 # 软阈值触发压缩时，待覆盖历史低于该 token 数就跳过压缩：收益不足以抵掉
 # 一次额外的压缩模型调用（软阈值也可能由系统规则/证据区单独造成）。
 CONTEXT_COMPACTION_MIN_TOKENS = max(

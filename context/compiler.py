@@ -98,6 +98,10 @@ class ContextRequest:
     tool_definitions: list[dict] | None = None
     # evidence_messages：RAG/日志/工具摘要等证据消息，独立预算。
     evidence_messages: list[dict] = field(default_factory=list)
+    # memory_pack_message：按问题检索到的记忆包，**独立**预算且先于普通证据。
+    # 它必须留在证据区：检索到的记忆是与当前任务相关的历史信息，
+    # 不具备系统规则的优先级，不能伪装成 system policy（计划 §6.7）。
+    memory_pack_message: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +118,9 @@ class CompiledContext:
     compression_required: bool
     areas: dict[str, int] = field(default_factory=dict)
     profile_source: str = "builtin"
+    # 实际进入上下文的记忆 id（来自 MemoryPack 的本地记账字段），供 trace 断言
+    # "相关记忆确实进了证据区、无关记忆一条都没进"。
+    memory_pack_ids: tuple[str, ...] = ()
 
 
 class ContextCompiler:
@@ -128,6 +135,7 @@ class ContextCompiler:
             "checkpoint": 0,
             "transient": 0,
             "current_input": 0,
+            "memory_pack": 0,
             "evidence": 0,
             "recent_history": 0,
             "tools": budget.reserved_tool_tokens,
@@ -169,6 +177,20 @@ class ContextCompiler:
                 areas=areas,
             )
 
+        # ---- 记忆区：独立预算，先于普通证据 ----
+        # Memory Pack 在构建时已经按自己的条数与 token 上限裁过一遍，这里只是
+        # 最后一道"整条放不下就不放"。_fit_messages 按整条保留/整条丢弃处理，
+        # 所以不会把一条记忆切成半条——残缺条目比少一条更糟。
+        memory_pack: list[dict] = []
+        pack_omitted: list[dict] = []
+        remaining = budget.hard_input_limit - required_tokens
+        if request.memory_pack_message is not None:
+            memory_pack, pack_omitted = _fit_messages(
+                [request.memory_pack_message], int(remaining * 0.15)
+            )
+            areas["memory_pack"] = estimate_messages_tokens(memory_pack)
+            required_tokens += areas["memory_pack"]
+
         # ---- 证据区：独立预算（可用空间的一部分） ----
         remaining = budget.hard_input_limit - required_tokens
         evidence_budget = int(remaining * 0.25)
@@ -196,6 +218,8 @@ class ContextCompiler:
         omitted_ids = tuple(
             event_id for group in omitted for event_id in group.event_ids
         )
+        if pack_omitted:
+            omitted_ids = omitted_ids + ("memory_pack",)
         if evidence_omitted:
             omitted_ids = omitted_ids + tuple(
                 f"evidence-{index}" for index in range(len(evidence_omitted))
@@ -205,6 +229,7 @@ class ContextCompiler:
         final_messages.extend(system_messages)
         final_messages.extend(checkpoint_messages)
         final_messages.extend(transient)
+        final_messages.extend(memory_pack)
         final_messages.extend(evidence_messages)
         final_messages.extend(recent)
         if current_user is not None:
@@ -212,6 +237,11 @@ class ContextCompiler:
 
         estimated = required_tokens + areas["recent_history"]
         compression_required = estimated > budget.soft_input_limit
+
+        memory_pack_ids: tuple[str, ...] = ()
+        if memory_pack:
+            raw_ids = memory_pack[0].get("_memory_pack_ids") or ()
+            memory_pack_ids = tuple(str(item) for item in raw_ids)
 
         return CompiledContext(
             messages=final_messages,
@@ -224,6 +254,7 @@ class ContextCompiler:
             compression_required=compression_required,
             areas=areas,
             profile_source=budget.profile_source,
+            memory_pack_ids=memory_pack_ids,
         )
 
     def compile_history(
@@ -233,6 +264,7 @@ class ContextCompiler:
         tool_definitions: list[dict] | None = None,
         checkpoint_message: dict | None = None,
         evidence_messages: list[dict] | None = None,
+        memory_pack_message: dict | None = None,
     ) -> CompiledContext:
         """从扁平 history 编译（编排器当前主路径的便捷入口）。
 
@@ -260,6 +292,7 @@ class ContextCompiler:
             current_user_message=current_user,
             tool_definitions=tool_definitions,
             evidence_messages=evidence_messages or [],
+            memory_pack_message=memory_pack_message,
         )
         return self.compile(request)
 
