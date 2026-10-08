@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -52,13 +52,17 @@ from klonet_agent.memory.domain import (
     validate_validity_window,
 )
 from klonet_agent.memory.repository import (
+    DEFAULT_EMBEDDING_PROFILE_ID,
+    EMBEDDING_DIMENSIONS,
     ActiveSubjectConflictError,
     CandidateNotFoundError,
     CandidateRecord,
     DuplicateVersionError,
+    EmbeddingOutboxStats,
     MemoryRepositoryError,
     NewRecordCommand,
     NewVersionCommand,
+    PendingEmbedding,
     RecordNotFoundError,
     RecordNotActiveError,
     ScopeViolationError,
@@ -72,12 +76,9 @@ __all__ = [
 ]
 
 
-# 与 migrations/0001_init.sql 里 vector(1024) 保持一致。
-# 换维度属于阶段 4 的 profile 迁移，不允许在这里悄悄改。
-EMBEDDING_DIMENSIONS = 1024
-
-# 阶段 1 只允许一个 active embedding profile，名字固定。
-DEFAULT_EMBEDDING_PROFILE_ID = "default"
+# 阶段 1 只允许一个 active embedding profile，名字固定；维度对应 schema 的
+# ``vector(1024)``。两个常量都定义在 ``memory/repository.py``（契约侧），
+# 这里 import 后再导出，避免同一件事在契约与实现里各写一遍、改一处漏一处。
 
 # 与 knowledge/multi_stage.py 对齐的融合参数。
 _RRF_K = 60
@@ -101,6 +102,10 @@ _EXACT_TOKEN_RE = re.compile(
 # 单通道候选池大小：最终按 limit 截断，先多取一些给融合留空间。
 _CANDIDATE_POOL_FACTOR = 4
 _CANDIDATE_POOL_MIN = 20
+
+# ``last_error`` 只用于诊断，不承担"完整日志"的职责：整篇 traceback 会把
+# outbox 表撑大，而且错误串本身可能带上调用方没预料到的敏感内容。
+_MAX_OUTBOX_ERROR_LENGTH = 2000
 
 
 # --------------------------------------------------------------------------- #
@@ -265,6 +270,16 @@ def _source_from_row(row: Mapping[str, Any]) -> MemorySource:
         observed_at=row["observed_at"],
         memory_version_id=str(row["memory_version_id"]),
         source_excerpt=row["source_excerpt"] or "",
+    )
+
+
+def _relation_from_row(row: Mapping[str, Any]) -> MemoryRelation:
+    return MemoryRelation(
+        from_memory_id=str(row["from_memory_id"]),
+        relation_type=RelationType(row["relation_type"]),
+        to_memory_id=str(row["to_memory_id"]),
+        confidence=float(row["confidence"]),
+        created_at=row["created_at"],
     )
 
 
@@ -1107,11 +1122,133 @@ class PostgresMemoryRepository:
             conn.execute(
                 """
                 UPDATE memory_embedding_outbox
-                   SET status = 'completed', last_error = NULL, updated_at = now()
+                   SET status = 'completed', last_error = NULL,
+                       next_attempt_at = NULL, updated_at = now()
                  WHERE memory_version_id = %s AND embedding_profile_id = %s
                 """,
                 (vid, DEFAULT_EMBEDDING_PROFILE_ID),
             )
+
+    # --------------------------------------------------------- embedding 队列 --
+
+    def claim_pending_embeddings(
+        self,
+        *,
+        limit: int = 20,
+        lease_seconds: float = 300.0,
+        profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID,
+        now: datetime | None = None,
+    ) -> list[PendingEmbedding]:
+        if limit <= 0:
+            return []
+        profile = str(profile_id or "").strip()
+        if not profile:
+            raise MemoryDomainError("embedding_profile_id 不能为空")
+        moment = now or _now()
+        lease_until = moment + timedelta(seconds=max(1.0, float(lease_seconds)))
+        scope, scope_params = self._record_scope("r")
+
+        # 领取条件把三种情况都压在 ``next_attempt_at`` 这一个时间列上：
+        #   pending + next_attempt_at IS NULL   → 新任务
+        #   pending + next_attempt_at <= now()  → 失败退避到点了
+        #   processing + 租约过期               → 上一个 worker 崩了
+        # 于是"崩溃恢复"不需要额外的清理进程，一个越界的租约就是它的全部机制。
+        sql = f"""
+        WITH claimed AS (
+            SELECT o.memory_version_id, o.embedding_profile_id
+              FROM memory_embedding_outbox o
+              JOIN memory_versions v ON v.id = o.memory_version_id
+              JOIN memory_records r ON r.id = v.memory_id
+             WHERE o.embedding_profile_id = %s
+               AND o.status IN ('pending', 'processing')
+               AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= %s)
+               AND {scope}
+             ORDER BY o.created_at, o.memory_version_id
+             LIMIT %s
+             FOR UPDATE OF o SKIP LOCKED
+        )
+        UPDATE memory_embedding_outbox o
+           SET status = 'processing',
+               attempt_count = o.attempt_count + 1,
+               next_attempt_at = %s,
+               updated_at = now()
+          FROM claimed c, memory_versions v
+         WHERE o.memory_version_id = c.memory_version_id
+           AND o.embedding_profile_id = c.embedding_profile_id
+           AND v.id = o.memory_version_id
+        RETURNING o.memory_version_id, o.attempt_count, o.embedding_profile_id,
+                  v.memory_id, v.content
+        """
+        with self._session() as conn:
+            rows = conn.execute(
+                sql,
+                [profile, moment, *scope_params, int(limit), lease_until],
+            ).fetchall()
+        return [
+            PendingEmbedding(
+                version_id=str(row["memory_version_id"]),
+                memory_id=str(row["memory_id"]),
+                content=row["content"] or "",
+                attempt_count=int(row["attempt_count"]),
+                embedding_profile_id=str(row["embedding_profile_id"]),
+            )
+            for row in rows
+        ]
+
+    def mark_embedding_failed(
+        self,
+        version_id: str,
+        error: str,
+        *,
+        retry_at: datetime | None,
+        profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID,
+    ) -> None:
+        vid = _as_uuid(version_id, "version_id")
+        profile = str(profile_id or "").strip() or DEFAULT_EMBEDDING_PROFILE_ID
+        message = str(error or "").strip()[:_MAX_OUTBOX_ERROR_LENGTH]
+        # retry_at 为空表示放弃自动重试。这条记录仍然留在 outbox 里（不删），
+        # 因为"这个版本没有向量"本身就是要被观测到的事实。
+        status = "pending" if retry_at is not None else "failed"
+        with self._session() as conn:
+            updated = conn.execute(
+                """
+                UPDATE memory_embedding_outbox
+                   SET status = %s, last_error = %s, next_attempt_at = %s,
+                       updated_at = now()
+                 WHERE memory_version_id = %s AND embedding_profile_id = %s
+                RETURNING memory_version_id
+                """,
+                (status, message or None, retry_at, vid, profile),
+            ).fetchone()
+            if updated is None:
+                raise RecordNotFoundError(
+                    f"版本 {version_id} 的 embedding 任务不存在或不属于当前租户"
+                )
+
+    def embedding_outbox_stats(
+        self, *, profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID
+    ) -> EmbeddingOutboxStats:
+        profile = str(profile_id or "").strip() or DEFAULT_EMBEDDING_PROFILE_ID
+        scope, scope_params = self._record_scope("r")
+        with self._session(readonly=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT o.status AS status, count(*) AS n
+                  FROM memory_embedding_outbox o
+                  JOIN memory_versions v ON v.id = o.memory_version_id
+                  JOIN memory_records r ON r.id = v.memory_id
+                 WHERE o.embedding_profile_id = %s AND {scope}
+                 GROUP BY o.status
+                """,
+                [profile, *scope_params],
+            ).fetchall()
+        counts = {str(row["status"]): int(row["n"]) for row in rows}
+        return EmbeddingOutboxStats(
+            pending=counts.get("pending", 0),
+            processing=counts.get("processing", 0),
+            completed=counts.get("completed", 0),
+            failed=counts.get("failed", 0),
+        )
 
     # ---------------------------------------------------------------- 读取 --
 
@@ -1200,6 +1337,39 @@ class PostgresMemoryRepository:
                 [mid, *scope_params],
             ).fetchall()
         return [_version_from_row(row) for row in rows]
+
+    def list_relations(
+        self,
+        memory_id: str,
+        *,
+        relation_type: RelationType | None = None,
+    ) -> list[MemoryRelation]:
+        mid = _as_uuid(memory_id, "memory_id")
+        # 关系表没有 user_id，租户约束要沿两端外键回溯到 memory_records。
+        # 两端都必须可见：一端可见就返回关系，等于把另一端的 id 泄露出去。
+        left, left_params = self._record_scope("rf")
+        right, right_params = self._record_scope("rt")
+        clauses = [
+            "(rel.from_memory_id = %s OR rel.to_memory_id = %s)",
+            "EXISTS (SELECT 1 FROM memory_records rf "
+            f"WHERE rf.id = rel.from_memory_id AND {left})",
+            "EXISTS (SELECT 1 FROM memory_records rt "
+            f"WHERE rt.id = rel.to_memory_id AND {right})",
+        ]
+        params: list[Any] = [mid, mid, *left_params, *right_params]
+        if relation_type is not None:
+            clauses.append("rel.relation_type = %s")
+            params.append(RelationType(relation_type).value)
+        with self._session(readonly=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT rel.* FROM memory_relations rel
+                 WHERE {" AND ".join(clauses)}
+                 ORDER BY rel.created_at, rel.from_memory_id, rel.to_memory_id
+                """,
+                params,
+            ).fetchall()
+        return [_relation_from_row(row) for row in rows]
 
     def list_candidates(
         self, *, decision: WriteDecision | None = None, limit: int = 100

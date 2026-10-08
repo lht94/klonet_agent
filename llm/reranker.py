@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Mapping
+from typing import TYPE_CHECKING, Any, List, Mapping, Sequence
 
 from openai import BaseModel
 
@@ -79,17 +79,37 @@ class RerankClient:
         if not self.client or not candidates:
             return []
         documents = [_document_text(item) for item in candidates]
+        return self.rerank_documents(query, documents, top_n=top_n)
+
+    def rerank_documents(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_n: int,
+    ) -> list[RerankItem]:
+        """对任意文本候选做 rerank。
+
+        与 :meth:`rerank` 分开，是因为后者的文档格式是知识库 chunk 的形状
+        （``title/path/layer``）。记忆渲染成什么样只有召回器知道，把
+        ``MemoryHit`` 硬塞进 chunk 的字段里会产生一份假数据。两个入口共用同一个
+        客户端和同一套响应解析，所以"文档格式"是它们唯一的差别。
+        """
+
+        docs = [str(text) for text in documents]
+        if not self.client or not docs:
+            return []
         response = self.client.post(
             "/reranks",
             body={
                 "model": self.model,
                 "query": query,
-                "documents": documents,
-                "top_n": min(max(1, top_n), len(documents)),
+                "documents": docs,
+                "top_n": min(max(1, top_n), len(docs)),
             },
             cast_to=_RerankResponse,
         )
-        return _parse_response(response, candidate_count=len(candidates))
+        return _parse_response(response, candidate_count=len(docs))
 
 
 def _document_text(item: RetrievedChunk) -> str:

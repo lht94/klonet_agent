@@ -20,12 +20,24 @@ from klonet_agent.memory.domain import (
     MemoryHit,
     MemoryQuery,
     MemoryRecord,
+    MemoryRelation,
     MemorySource,
     MemoryType,
     MemoryVersion,
+    RelationType,
     Scope,
     WriteDecision,
 )
+
+# 阶段 1 只允许一个 active embedding profile，名字固定（见
+# ``migrations/0001_init.sql`` 里 memory_embedding_outbox 的复合主键）。
+# 换维度要新建 profile 并在后台回填，不原地改已有 vector 的维度（计划 §7.3）。
+DEFAULT_EMBEDDING_PROFILE_ID = "default"
+
+# 与 ``migrations/0001_init.sql`` 的 ``embedding vector(1024)`` 一致。
+# 放在契约侧而不是实现侧，因为"这个维度"是 schema 事实，worker 与召回器
+# 都要用它做校验，不该各自去 import 具体数据库实现。
+EMBEDDING_DIMENSIONS = 1024
 
 
 class MemoryRepositoryError(RuntimeError):
@@ -149,6 +161,54 @@ class CandidateRecord:
     decision_reason: str | None = None
     processed_at: datetime | None = None
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PendingEmbedding:
+    """一条待生成向量的任务，连同正文一起取出。
+
+    正文随任务一起返回，避免 worker 拿到 id 后再查一次版本——那会让"读取要
+    嵌入的内容"和"内容在返回后被改写"之间出现窗口（虽然版本不可变，但多一次
+    查询就多一次可能落在不同事务里的机会）。
+    """
+
+    version_id: str
+    memory_id: str
+    content: str
+    attempt_count: int = 0
+    embedding_profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID
+
+
+@dataclass(frozen=True)
+class EmbeddingOutboxStats:
+    """embedding 队列的可观测快照。
+
+    ``coverage`` 是"已算出向量的版本占比"，也是判断能否依赖向量通道、以及
+    要不要建 HNSW 的依据（计划 §12：先测量再决定）。
+    """
+
+    pending: int = 0
+    processing: int = 0
+    completed: int = 0
+    failed: int = 0
+
+    @property
+    def outstanding(self) -> int:
+        """尚未闭环的任务数：待处理 + 正在处理（含崩溃后待重领的）。"""
+
+        return self.pending + self.processing
+
+    @property
+    def total(self) -> int:
+        return self.pending + self.processing + self.completed + self.failed
+
+    @property
+    def coverage(self) -> float:
+        """向量覆盖率；队列为空时定义为 1.0（没有欠账）。"""
+
+        if self.total == 0:
+            return 1.0
+        return self.completed / self.total
 
 
 class MemoryRepository(Protocol):
@@ -338,6 +398,52 @@ class MemoryRepository(Protocol):
 
         ...
 
+    # --- embedding outbox（阶段 4）---
+
+    def claim_pending_embeddings(
+        self,
+        *,
+        limit: int = 20,
+        lease_seconds: float = 300.0,
+        profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID,
+        now: datetime | None = None,
+    ) -> list[PendingEmbedding]:
+        """领取待生成向量的任务并标记为 ``processing``。
+
+        领取即把 ``attempt_count`` 加一，所以进程在生成途中崩溃也会留下痕迹，
+        不会无限重试。领取同时写入租约（``next_attempt_at``）：崩溃留下的
+        ``processing`` 记录在租约到期后可以被重新领取，不需要人工介入。
+
+        多个 worker 并发时用行锁跳过已被别人领走的记录（``SKIP LOCKED``），
+        不互相阻塞。
+        """
+
+        ...
+
+    def mark_embedding_failed(
+        self,
+        version_id: str,
+        error: str,
+        *,
+        retry_at: datetime | None,
+        profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID,
+    ) -> None:
+        """记录一次生成失败。
+
+        ``retry_at`` 指出下次可重试时间（退避）；为 ``None`` 表示不再自动重试，
+        任务进入 ``failed`` 终态。终态只表示"放弃自动重试"，不表示数据不可用——
+        该版本仍然会被全文和精确通道召回，只是少了语义通道。
+        """
+
+        ...
+
+    def embedding_outbox_stats(
+        self, *, profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID
+    ) -> EmbeddingOutboxStats:
+        """按状态统计 outbox 队列（只统计当前租户可见的版本）。"""
+
+        ...
+
     # --- 读取 ---
 
     def get_record(self, memory_id: str) -> MemoryRecord | None:
@@ -367,6 +473,21 @@ class MemoryRepository(Protocol):
 
     def list_versions(self, memory_id: str) -> list[MemoryVersion]:
         """按版本号升序读取全部历史版本。"""
+
+        ...
+
+    def list_relations(
+        self,
+        memory_id: str,
+        *,
+        relation_type: RelationType | None = None,
+    ) -> list[MemoryRelation]:
+        """读取与一条记忆相关的关系，两个方向都返回。
+
+        召回需要它来标注冲突：一条命中的事实若被别的记忆
+        ``contradicts``，必须在结果里显式说出来，而不是让模型自己猜
+        （计划 §6.5 规则 5：模型不得静默合并互斥事实）。
+        """
 
         ...
 
