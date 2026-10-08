@@ -218,6 +218,10 @@ SQL
 
 ## 4. 运维要点
 
+> 备份、恢复、删除权与 cutover 的完整流程见
+> [`17_memory_lifecycle_operations.md`](17_memory_lifecycle_operations.md)。
+> 本节的"备份"只给最小可用的 pg_dump 形态。
+
 ### 备份
 
 ```bash

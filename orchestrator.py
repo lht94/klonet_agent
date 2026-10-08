@@ -22,10 +22,12 @@ from klonet_agent.config import (
     MAX_TODO_CONTINUATIONS,
     MAX_TOKEN,
     MAX_TOOL_ROUNDS,
+    MEMORY_AUTHORITY,
     MEMORY_BACKFILL_LIMIT,
     MEMORY_PACK_ENABLED,
     MEMORY_PACK_RECALL_LIMIT,
     MEMORY_PACK_TOKEN_BUDGET,
+    markdown_memory_is_authoritative,
     MEMORY_DIR,
     MEMORY_WRITE_PIPELINE_ENABLED,
     OPS_MAX_TOOL_ROUNDS,
@@ -373,7 +375,8 @@ class AgentOrchestrator:
         # 打开 MemoryPack 开关后，这里不再常驻 MEMORY.md / USER.md 全文：正文改由
         # 每轮按问题召回的证据块承担（见 _memory_pack_message）。
         memory_prompt = self.memory_store.memory_prompt(
-            mode=self.profile.name, include_long_term=not MEMORY_PACK_ENABLED
+            mode=self.profile.name,
+            include_long_term=self._markdown_memory_is_injected(),
         )
         history.append({"role": "system", "content": memory_prompt})
 
@@ -1024,6 +1027,16 @@ class AgentOrchestrator:
                 break
 
         return history, token
+
+    def _markdown_memory_is_injected(self) -> bool:
+        """Markdown 记忆是否仍常驻注入系统提示词。
+
+        两个条件同时成立才注入：Markdown 还是权威（未 cutover），且按需召回没有
+        接管常驻注入（MemoryPack 开关没开）。任一条件成立就不再注入——
+        "新路径已接管"与"旧权威已下线"是两个独立的理由，都足以撤掉常驻文本。
+        """
+
+        return markdown_memory_is_authoritative() and not MEMORY_PACK_ENABLED
 
     # ------------------------------------------------------- 记忆召回（阶段 5） --
 
@@ -3295,7 +3308,8 @@ class AgentOrchestrator:
         for msg in history:
             if msg.get("role") == "system" and "MEMORY.md" in msg.get("content", ""):
                 msg["content"] = self.memory_store.memory_prompt(
-                    mode=self.profile.name, include_long_term=not MEMORY_PACK_ENABLED
+                    mode=self.profile.name,
+                    include_long_term=self._markdown_memory_is_injected(),
                 )
                 return
 

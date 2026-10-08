@@ -1250,6 +1250,127 @@ class PostgresMemoryRepository:
             failed=counts.get("failed", 0),
         )
 
+    # -------------------------------------------------- 删除权与生命周期 --
+
+    def delete_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        mid = _as_uuid(memory_id, "memory_id")
+        moment = now or _now()
+        with self._session() as conn:
+            record = self._locked_record(conn, mid)
+            if record["status"] == MemoryStatus.DELETED.value:
+                return  # 幂等：重复删除是安全的，不该报错
+            version_ids = [
+                row["id"]
+                for row in conn.execute(
+                    "SELECT id FROM memory_versions WHERE memory_id = %s", (mid,)
+                ).fetchall()
+            ]
+            conn.execute(
+                "UPDATE memory_records SET status = %s, updated_at = now() WHERE id = %s",
+                (MemoryStatus.DELETED.value, mid),
+            )
+            # 结束当前版本的有效期：as_of 视图不该再把已删除的内容当成"当时有效"。
+            # GREATEST 保证 valid_to 严格晚于 valid_from（触发器与 CHECK 都要求）。
+            conn.execute(
+                """
+                UPDATE memory_versions
+                   SET valid_to = COALESCE(
+                           valid_to,
+                           GREATEST(%s::timestamptz,
+                                    valid_from + interval '1 microsecond')
+                       )
+                 WHERE memory_id = %s AND valid_to IS NULL
+                """,
+                (moment, mid),
+            )
+            # 正文之外还必须清向量与 outbox 任务：只清正文而留着向量，
+            # 语义通道仍然能召回它，而接口上看起来已经删了。
+            conn.execute(
+                """
+                UPDATE memory_versions
+                   SET embedding = NULL, embedding_model = NULL, embedding_version = NULL
+                 WHERE memory_id = %s
+                """,
+                (mid,),
+            )
+            if version_ids:
+                conn.execute(
+                    "DELETE FROM memory_embedding_outbox WHERE memory_version_id = ANY(%s)",
+                    (version_ids,),
+                )
+
+    def purge_deleted(self, *, older_than: datetime, limit: int = 1000) -> int:
+        if older_than is None:
+            raise MemoryDomainError("purge_deleted 必须给出保留期门槛 older_than")
+        if limit <= 0:
+            return 0
+        scope, scope_params = self._record_scope("r")
+        with self._session() as conn:
+            rows = conn.execute(
+                f"""
+                DELETE FROM memory_records
+                 WHERE id IN (
+                     SELECT r.id FROM memory_records r
+                      WHERE r.status = %s
+                        AND r.updated_at <= %s
+                        AND {scope}
+                      ORDER BY r.updated_at
+                      LIMIT %s
+                 )
+                RETURNING id
+                """,
+                [MemoryStatus.DELETED.value, older_than, *scope_params, int(limit)],
+            ).fetchall()
+        return len(rows)
+
+    def list_records(
+        self,
+        *,
+        limit: int = 100,
+        memory_type: MemoryType | None = None,
+        scope: Scope | None = None,
+        status: str | None = None,
+    ) -> list[MemoryRecord]:
+        if limit <= 0:
+            raise MemoryDomainError("limit 必须为正整数")
+        clause, params = self._record_scope("r")
+        clauses = [clause]
+        if memory_type is not None:
+            clauses.append("r.memory_type = %s")
+            params.append(MemoryType(memory_type).value)
+        if scope is not None:
+            clauses.append("r.scope = %s")
+            params.append(Scope(scope).value)
+        if status is not None:
+            clauses.append("r.status = %s")
+            params.append(str(status))
+        with self._session(readonly=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT r.* FROM memory_records r
+                 WHERE {" AND ".join(clauses)}
+                 ORDER BY r.created_at DESC, r.id
+                 LIMIT %s
+                """,
+                [*params, int(limit)],
+            ).fetchall()
+            records: list[MemoryRecord] = []
+            for row in rows:
+                # 带上 active 版本，管理界面才有正文可看。
+                version = None
+                if row["active_version_id"]:
+                    version_row = self._select_version(conn, row["active_version_id"])
+                    if version_row is not None:
+                        version = _version_from_row(version_row)
+                records.append(_record_from_row(row, active_version=version))
+        return records
+
     # ---------------------------------------------------------------- 读取 --
 
     def get_record(self, memory_id: str) -> MemoryRecord | None:

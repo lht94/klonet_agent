@@ -114,6 +114,30 @@ Coding 不需要：
 - 大量闲聊历史。
 - 与当前任务无关的长期记忆。
 
+### 长期记忆的注入形态（记忆系统阶段 5 起）
+
+长期记忆不再以"`MEMORY.md` / `USER.md` 全文常驻"的方式注入，而是每轮按当前
+问题召回、构包、作为**独立证据块**注入：
+
+- 入口：`orchestrator._memory_pack_message()`，同一回合只构包一次（压缩后重编译复用）；
+- 构包：`memory/pack.py` 的 `MemoryPackBuilder`——按类型子预算（偏好 2 / 事实 4 /
+  经历 3）先选候选，token 是最终硬约束，超预算按 episode → fact → preference
+  整条淘汰；
+- 预算位：`context/compiler.py` 给记忆包**独立预算**（剩余空间 15%，先于普通证据
+  消息分配），不挤占 RAG 证据；
+- 渲染：每条带 id / 类型 / 作用域 / 置信度 / 有效期 / 来源，冲突项显式提示；
+  正文超长会截断并标注，但**六项元数据永不截断**；放不下就返回**空包**而不是
+  "只有标题"的包；
+- 剥离：完整 id 只存在于 `CompiledContext.memory_pack_ids`，发送供应商前由
+  `to_provider_messages()` 去掉。
+
+**降级一律"这一轮不注入"**：召回失败、构包失败、记忆库不可用都不抛异常，
+trace 记为 `memory_pack_recall_failed` / `memory_pack_empty`。
+
+开关与权威切换（`KLONET_AGENT_MEMORY_PACK`、`KLONET_AGENT_MEMORY_AUTHORITY`）
+见 README 的"记忆系统"一节；评测门槛与运维见
+[`17_memory_lifecycle_operations.md`](17_memory_lifecycle_operations.md)。
+
 ### Token 优化策略
 
 - RAG 只返回 top-k。

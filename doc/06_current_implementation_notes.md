@@ -292,6 +292,42 @@ python -m klonet_agent.evals.retrieval_runner
 - 管道中的多行文本一次读取为一个用户回合，避免否定条件与需求列表被拆开。
 - PowerShell 管道需要设置 `$OutputEncoding`，Python 建议使用 `-X utf8`。
 
+### 11.5 记忆系统（PostgreSQL + pgvector，02 计划阶段 1–7）
+
+长期记忆已从 Markdown 文件升级为数据库子系统，分七个阶段落地（每个阶段都在
+本机真库与远端测试服务器上做过逐用例 A/B 回归）：
+
+| 阶段 | 交付 | 一句话 |
+| :--- | :--- | :--- |
+| 1 | `memory/domain.py`、`repository.py`、`database.py`、`postgres.py`、`migrations/0001+0002` | 六表 + 索引 + RLS；三角色分工；租户过滤双层强制 |
+| 2 | `memory/versioning.py`、`migrations/0003` | 13 条确定性 consolidation 规则；正文不可变由触发器兜底 |
+| 3 | `candidate_extractor.py`、`write_policy.py`、`write_pipeline.py` | 候选 → 策略 → 决策 → 审计，来源白名单防编造证据 |
+| 4 | `embedding_worker.py`、`retriever.py` | outbox 补向量（租约式崩溃恢复）；三通道 + 加权 RRF 召回 |
+| 5 | `memory/pack.py` + `context/compiler.py` 接入 | 记忆包独立预算、token 硬约束、按问题召回 |
+| 6 | `memory/migration.py` + `scripts/migrate_markdown_memory.py` | Markdown 幂等迁移；`legacy→shadow→compare→cutover` 四态 |
+| 7 | `memory/admin.py`、`evals/memory_cases.jsonl`、`evals/run_memory_eval.py`、`scripts/memory_cutover.py` | 删除权 + 联合评测 + 有门槛的默认切换 |
+
+验收资产（可重放）：
+
+```bash
+# 记忆库测试：266 passed / 0 skipped（需要 KLONET_AGENT_TEST_PG_DSN）
+python -m pytest tests/test_memory_*.py -q
+
+# 记忆专项评测：9 个用例，阈值核验 9/9 通过
+KLONET_AGENT_TEST_PG_DSN=postgresql://... python -m evals.run_memory_eval
+```
+
+几条在实现中被实测确认的设计结论（都写进了代码注释）：
+
+- **删除必须同时清向量**：只删正文会让语义通道继续召回它，而接口上看起来已经删了。
+- **来源白名单为空时一律拒绝**，不做"为空就放行"的兜底。
+- **失败分类靠异常上的 `permanent` 标记**，worker 不去 `isinstance` 具体客户端类型。
+- **召回按 SQLSTATE 分类**：`42xxx` 抛部署错误而不降级——静默少一路召回比报错更危险。
+- **HNSW 暂不建**：80 条记忆下 exact 扫描 < 2s，按"先测量再决定"留待上量。
+
+细节见 README 的"记忆系统"一节、[`17_memory_lifecycle_operations.md`](17_memory_lifecycle_operations.md)
+与 [`通用功能升级计划/02-记忆系统升级计划.md`](../通用功能升级计划/02-记忆系统升级计划.md)。
+
 ### 12. Tests
 
 新增：
@@ -354,8 +390,11 @@ python -m pytest -q
 ## 当前还没做的事情
 
 - 真正接入 Klonet 源码仓库。
-- 向量数据库。
-- SQLite 多用户元数据。
+- ~~向量数据库~~ → **已完成**：记忆库选型定为 PostgreSQL + pgvector（02 计划阶段 1–7）。
+- ~~SQLite 多用户元数据~~ → **不再做**：只维护一套 PostgreSQL 语义，避免两套
+  SQL/全文检索/向量实现长期漂移（计划 §12）。
+- cutover 尚未切到默认：代码默认仍是 `legacy`，需要部署侧执行
+  `scripts/memory_cutover.py --apply` 才算完成切换。
 - 独立 ReviewAgent。
 - Web/API 服务。
 - LangGraph 状态图。

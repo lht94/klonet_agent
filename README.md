@@ -456,7 +456,80 @@ run.py ->
 3. 再定义一个工具函数，用来查看与更新任务执行状态
 4. 最后做一个检验，模型说完成任务之后再手动二次检验，避免llm出错而导致需要用户自己提醒
 
+## 记忆系统（PostgreSQL + pgvector）
+
+长期记忆已经从"几个 Markdown 文件 + 模型自由覆写"升级为**有 schema、有版本、
+有召回策略**的数据库子系统。设计与迁移计划见
+[`通用功能升级计划/02-记忆系统升级计划.md`](通用功能升级计划/02-记忆系统升级计划.md)，
+部署与运维见 [`doc/15_memory_postgres_deployment.md`](doc/15_memory_postgres_deployment.md)
+（安装）与 [`doc/17_memory_lifecycle_operations.md`](doc/17_memory_lifecycle_operations.md)
+（评测门槛、cutover、备份恢复、删除权）。
+
+七条不变量，出问题先看这几条：
+
+1. **正文不可变**：版本表上的触发器冻结正文/哈希/时间/分词结果，只放行
+   `valid_to`、`embedding` 三列、`verified`（false→true），违反报 SQLSTATE `2F002`。
+   改一条事实只能"新增版本 + 替代旧记录"，历史一律保留。
+2. **模型不能自由决定覆盖**：候选只带"提议"，`memory/versioning.py` 的
+   `plan_consolidation`（13 条确定性规则）判 ADD/UPDATE/SUPERSEDE/NOOP/REJECT，
+   `apply_plan` 是唯一写入出口。
+3. **模型不能编造证据**：候选的来源 `source_id` 只能取本回合真实出现过的
+   `rows-<n>` 或工具调用 id；**白名单为空时一律拒绝**。
+4. **租户隔离是双层的**：应用层 SQL（`_record_scope()`）+ PostgreSQL RLS
+   （六表 `FORCE ROW LEVEL SECURITY`，连表 owner 也被约束）。
+5. **向量是异步补算的**：正文先提交，`memory_versions` 入 outbox，由
+   `memory/embedding_worker.py` 领取后写回；失败按异常上的 `permanent` 标记
+   分类（瞬时退避重试、永久放弃），崩溃靠租约自动回收。
+6. **召回是三通道 + 加权 RRF**：全文（jieba 分词）/ 向量 / 精确标识符，
+   `k=60`，与 `knowledge/multi_stage.py` 同口径；`42xxx` 类 SQLSTATE 直接抛
+   部署错误而不降级（静默少一路召回比报错更危险）。
+7. **注入有硬预算**：`memory/pack.py` 按类型（偏好 2 / 事实 4 / 经历 3）与
+   token 双重上限构包，淘汰顺序 episode → fact → preference；六项元数据
+   （id/类型/作用域/置信度/有效期/来源）永不截断，放不下就返回**空包**。
+
+### 开关与切换
+
+| 环境变量 | 默认 | 作用 |
+| :--- | :--- | :--- |
+| `KLONET_AGENT_MEMORY_AUTHORITY` | `legacy` | `legacy`/`shadow`/`compare`/`cutover` 四态。设成 `cutover` 会一次性打开下面两个开关，Markdown 降级为迁移/导出源 |
+| `KLONET_AGENT_MEMORY_WRITE_PIPELINE` | `0` | 受控写入管线（候选提取 + 策略过滤 + consolidation） |
+| `KLONET_AGENT_MEMORY_PACK` | `0` | 不再常驻注入 `MEMORY.md`/`USER.md`，改为每轮按问题召回 |
+| `KLONET_AGENT_MEMORY_PACK_TOKEN_BUDGET` | `900` | 记忆包 token 硬上限 |
+| `KLONET_AGENT_MEMORY_DSN` | 空 | 业务侧记忆库连接串（`/etc/klonet-agent/klonet-agent.env`） |
+
+**默认值刻意保留旧行为**：记忆库是可选部署件，没有 DSN 的环境里默认打开新路径
+只会让每次对话多一次失败的连接尝试。所以"默认启用"落在一个部署变量上——
+切到 `cutover` 必须先通过冻结的验收阈值：
+
+```bash
+# 1) 跑记忆专项评测（会建/删临时库，用测试 DSN）
+KLONET_AGENT_TEST_PG_DSN=postgresql://... python -m evals.run_memory_eval
+# 2) 评测达标后切换（就地修改部署环境文件）
+KLONET_AGENT_TEST_PG_DSN=postgresql://... \
+    python scripts/memory_cutover.py --apply /etc/klonet-agent/klonet-agent.env
+# 3) 回滚：Markdown 重新成为权威
+python scripts/memory_cutover.py --rollback /etc/klonet-agent/klonet-agent.env
+```
+
+### 记忆专项评测
+
+| 路径 | recall@k | precision@k | 过期误召回率 | 跨租户泄漏 | 平均注入 token |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Markdown 全量注入（baseline） | 1.00 | 0.60 | 0.30 | 0 | 26.1 |
+| 数据库（关键词） | 0.80 | 0.75 | 0 | 0 | 13.0 |
+| 数据库（混合检索） | 1.00 | 0.75 | 0 | 0 | 22.8 |
+
+用例见 `evals/memory_cases.jsonl`（单跳 / 精确标识符 / 时态 / 过期 / 冲突 /
+多跳 / 偏好 / 跨租户隔离 / 语义改写），阈值冻结在
+`evals/memory_eval_thresholds.json`，报告落在 `evals/memory_summary.md`。
+**混合检索的平均注入 token 只有 Markdown 全量的 0.87 倍，而过期误召回与跨租户
+泄漏都是 0** —— 这两条正是 cutover 的硬性完成标准。
+
 ## 更新：记忆模块的设计
+
+> **以下是最早的 Markdown 方案，现为 legacy 路径**（`KLONET_AGENT_MEMORY_AUTHORITY=legacy`
+> 时才生效，且 `MEMORY.md`/`USER.md` 只作为迁移与导出来源）。当前生效的设计见上一节。
+
 现在简单的把history数组无线增长显示是不可以的，不仅会忘记之前的目标，还会导致记忆窗口经常溢出
 
 人的记忆分为三种：

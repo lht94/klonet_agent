@@ -180,7 +180,7 @@ Prompt 不应该写成一个巨大的字符串，而应该分层。
 5. RAG 检索证据。
 6. 最近对话。
 7. 项目日志摘要。
-8. 长期记忆。
+8. 长期记忆（按需召回，不成段常驻；见 `memory/pack.py`）。
 9. 工具说明。
 
 上下文优化策略：
@@ -189,6 +189,35 @@ Prompt 不应该写成一个巨大的字符串，而应该分层。
 - 工具结果过长时截断或落盘。
 - 历史对话压缩成情景记忆。
 - 项目日志按章节读取，不一定每次全量注入。
+
+## 记忆系统（长期记忆）
+
+长期记忆已经从"Markdown 文件 + 模型自由覆写"升级为 PostgreSQL + pgvector
+子系统。分四层，每层只回答一个问题，各有唯一出口：
+
+| 层 | 文件 | 回答的问题 |
+| :--- | :--- | :--- |
+| 领域 | `memory/domain.py` | 什么叫一条合法的记忆（类型/作用域/subject 自洽） |
+| 契约 | `memory/repository.py` | 仓库必须提供哪些能力（Protocol，含 embedding 维度常量） |
+| 存储 | `memory/postgres.py` + `memory/database.py` + `migrations/` | 怎么安全地落库（连接池、租户事务、RLS、不可变触发器） |
+| 决策 | `memory/versioning.py` | 新来的候选**怎么写**（ADD/UPDATE/SUPERSEDE/NOOP/REJECT） |
+
+外围三条链路：
+
+- **写入**：`candidate_extractor.py`（模型说了什么）→ `write_policy.py`
+  （能不能写）→ `versioning.py`（怎么写）→ `write_pipeline.py`（串联 + 幂等 + 审计）。
+- **召回**：`retriever.py`（查询向量 + 错误分类 + rerank 回退 + 冲突标注）→
+  `pack.py`（按类型与 token 构包）→ `context/compiler.py` 的
+  `memory_pack_message`（独立预算位，剩余空间 15%，先于普通证据）。
+- **后台**：`embedding_worker.py` 消费 `memory_versions` 的 outbox 补算向量，
+  正文先提交、向量异步补，崩溃靠租约回收。
+- **迁移与生命周期**：`migration.py`（Markdown → 库，四态状态机）、
+  `admin.py`（查看 / 删除 / 归档 / 物理清理）。
+
+关键不变量（细节见 README 的"记忆系统"一节与
+[`17_memory_lifecycle_operations.md`](17_memory_lifecycle_operations.md)）：
+正文不可变、模型不能自由覆盖、模型不能编造证据、租户隔离双层强制、
+注入有 token 硬预算、删除必须同时清向量。
 
 ## Harness 工程
 

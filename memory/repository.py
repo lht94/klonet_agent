@@ -444,6 +444,51 @@ class MemoryRepository(Protocol):
 
         ...
 
+    # --- 删除权与生命周期（阶段 7）---
+
+    def delete_memory(
+        self,
+        memory_id: str,
+        *,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """逻辑删除一条记忆，并**同步清除它的向量**。
+
+        三件事必须一起做，缺一条就会出现"删了但还能召回"：
+
+        1. 记录状态转 ``deleted``（当前视图立刻不再返回它）；
+        2. 当前版本结束有效期（``as_of`` 视图也不再把它当成"当时有效"）；
+        3. **清掉向量与 outbox 任务**——否则语义通道还会命中它，而接口上
+           看起来已经删了。这是"删除权"最容易漏掉的一条。
+        """
+
+        ...
+
+    def purge_deleted(
+        self, *, older_than: datetime, limit: int = 1000
+    ) -> int:
+        """物理清理已逻辑删除且超过保留期的记录，返回删除条数。
+
+        只删 ``status='deleted'`` 且 ``updated_at <= older_than`` 的记录；
+        版本、来源、关系随外键级联删除。**不可逆**，所以门槛（保留期）由调用方
+        显式给出，不在这里给默认值。
+        """
+
+        ...
+
+    def list_records(
+        self,
+        *,
+        limit: int = 100,
+        memory_type: MemoryType | None = None,
+        scope: Scope | None = None,
+        status: str | None = None,
+    ) -> list[MemoryRecord]:
+        """管理视图：列出当前租户的记忆（含已失效/已删除的，供审计与删除用）。"""
+
+        ...
+
     # --- 读取 ---
 
     def get_record(self, memory_id: str) -> MemoryRecord | None:

@@ -1,0 +1,46 @@
+{
+  "frozen_at": "2026-10-08",
+  "frozen_by": "02-记忆系统升级计划 · 阶段 7",
+  "note": "这些阈值是 cutover 的前置条件：任何一项不达标都不允许把 Markdown 降级为迁移/导出来源。修改本文件等同于重新冻结基线，必须在 evals/memory_summary.md 里留下新的一次实测。",
+  "measurement": {
+    "cases": "evals/memory_cases.jsonl",
+    "runner": "python -m evals.run_memory_eval",
+    "summary": "evals/memory_summary.md",
+    "embedding": "确定性哈希词袋嵌入（离线可重放），只量管线不量供应商向量质量",
+    "token_scope": "被注入上下文的正文字符 token 估算（context/tokens.estimate_tokens）"
+  },
+  "measured": {
+    "markdown": {
+      "recall_at_k": 1.0,
+      "precision_at_k": 0.6,
+      "expired_false_recall_rate": 0.3,
+      "leakage_rate": 0.0,
+      "mean_tokens": 26.1
+    },
+    "db_keyword": {
+      "recall_at_k": 0.8,
+      "precision_at_k": 0.75,
+      "expired_false_recall_rate": 0.0,
+      "leakage_rate": 0.0,
+      "mean_tokens": 13.0
+    },
+    "db_hybrid": {
+      "recall_at_k": 1.0,
+      "precision_at_k": 0.75,
+      "expired_false_recall_rate": 0.0,
+      "leakage_rate": 0.0,
+      "mean_tokens": 22.8,
+      "conflict_flag_rate": 1.0,
+      "token_ratio_vs_markdown": 0.8736
+    }
+  },
+  "thresholds": {
+    "hybrid_recall_at_k_min": 0.9,
+    "hybrid_precision_at_k_min": 0.6,
+    "keyword_recall_at_k_min": 0.6,
+    "expired_false_recall_max": 0.0,
+    "cross_tenant_leakage_max": 0.0,
+    "conflict_flag_rate_min": 1.0,
+    "hybrid_token_ratio_vs_markdown_max": 1.0
+  }
+}
