@@ -45,6 +45,8 @@ class ContextBudget:
 
 # 已知模型 profile。窗口与输出上限按各供应商公开发布的规格保守填写；
 # 供应商调整规格时可通过环境变量覆盖，不必改代码。
+# 国产模型统一按 128K 窗口保守取值（实际规格不低于该值），避免掉进 fallback
+# 的 65536 兜底而过早触发压缩。
 _KNOWN_PROFILES: dict[str, ModelContextProfile] = {
     "gemini-3.7-flash": ModelContextProfile(
         context_window=1_000_000,
@@ -52,6 +54,36 @@ _KNOWN_PROFILES: dict[str, ModelContextProfile] = {
         safety_margin_tokens=8_192,
     ),
     "glm-5.2": ModelContextProfile(
+        context_window=128_000,
+        max_output_tokens=16_384,
+        safety_margin_tokens=8_192,
+    ),
+    "glm-5.3": ModelContextProfile(
+        context_window=128_000,
+        max_output_tokens=16_384,
+        safety_margin_tokens=8_192,
+    ),
+    "glm-5.3-flash": ModelContextProfile(
+        context_window=128_000,
+        max_output_tokens=16_384,
+        safety_margin_tokens=8_192,
+    ),
+    "deepseek-v4-flash": ModelContextProfile(
+        context_window=128_000,
+        max_output_tokens=16_384,
+        safety_margin_tokens=8_192,
+    ),
+    "deepseek-v4.1-flash": ModelContextProfile(
+        context_window=128_000,
+        max_output_tokens=16_384,
+        safety_margin_tokens=8_192,
+    ),
+    "deepseek-v4-pro": ModelContextProfile(
+        context_window=128_000,
+        max_output_tokens=16_384,
+        safety_margin_tokens=8_192,
+    ),
+    "qwen3.8-flash": ModelContextProfile(
         context_window=128_000,
         max_output_tokens=16_384,
         safety_margin_tokens=8_192,

@@ -29,6 +29,20 @@ def test_known_models_get_deterministic_limits():
     assert gemini.hard_input_limit > glm.hard_input_limit
 
 
+def test_domestic_models_are_not_shadowed_by_fallback():
+    """生产在用的国产模型必须是已知 profile，而不是 65536 保守兜底。"""
+
+    for model in (
+        "deepseek-v4-flash",
+        "glm-5.3-flash",
+        "qwen3.8-flash",
+    ):
+        budget = _budget(model)
+        assert budget.profile_source == "builtin", f"{model} 掉进了 fallback"
+        # 128K 窗口扣除预留后应明显高于 fallback 的约 47k。
+        assert budget.hard_input_limit > 90_000, f"{model} 的输入预算过小"
+
+
 def test_unknown_model_uses_conservative_fallback():
     """未知模型必须回退到保守默认，而不是旧的全局 500000。"""
 

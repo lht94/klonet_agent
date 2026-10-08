@@ -17,19 +17,31 @@
     → 超过硬阈值时本地拒绝发送，不再请求失败后补救
 ```
 
-- **动态预算**：按模型解析窗口/输出预留/安全余量（`ModelContextProfile`），
-  已知 `gemini-3.7-flash`、`GLM-5.2`；未知模型回退保守默认，
-  可用 `KLONET_AGENT_CONTEXT_WINDOW`、`KLONET_AGENT_MAX_OUTPUT_TOKENS`、
-  `KLONET_AGENT_SAFETY_MARGIN_TOKENS`、`KLONET_AGENT_SOFT_LIMIT_RATIO` 覆盖。
+- **动态预算**：按模型解析窗口/输出预留/安全余量（`ModelContextProfile`）。
+  已知模型包括 `gemini-3.7-flash`（1M）、`glm-5.2`/`glm-5.3`/`glm-5.3-flash`、
+  `deepseek-v4-flash`/`deepseek-v4.1-flash`/`deepseek-v4-pro`、`qwen3.8-flash`
+  （128K）；未知模型回退 65536 保守默认，可用 `KLONET_AGENT_CONTEXT_WINDOW`、
+  `KLONET_AGENT_MAX_OUTPUT_TOKENS`、`KLONET_AGENT_SAFETY_MARGIN_TOKENS`、
+  `KLONET_AGENT_SOFT_LIMIT_RATIO` 覆盖。
 - **完整消息组**：裁剪单位是语义完整的回合/工具交换，而不是"最近 20 条"，
   tool call 与 tool result 整组保留或整组淘汰。
 - **结构化 TaskCheckpoint**：压缩结果为固定 schema（目标/约束/已完成/
   失败尝试/下一步等），版本化原子写入 `memory/checkpoints/`，损坏自动
-  回退上一版本；重启后从 checkpoint 覆盖范围之后的事件恢复。
-- **可审计**：每次编译的估算 token、各区域占用、淘汰数量写入
-  `trace.jsonl`（event=`context_compile`）。
+  回退上一版本；重启后从 checkpoint 覆盖范围（`rows-N`）之后的事件恢复。
+- **可审计**：每次编译的估算 token、各区域占用（system/checkpoint/evidence/
+  recent_history/tools）、淘汰组数写入 `trace.jsonl`（event=`context_compile`）。
 
-临时回退旧路径：设置 `KLONET_AGENT_DISABLE_CONTEXT_COMPILER=1`。
+常用配置：
+
+```bash
+KLONET_AGENT_DISABLE_CONTEXT_COMPILER=1   # 一键回退旧压缩路径
+KLONET_AGENT_CONTEXT_WINDOW=131072        # 覆盖窗口
+KLONET_AGENT_REASONING_EFFORT=off         # 不发送 reasoning_effort（部分中转站 Gemini 上游会 500）
+KLONET_DEBUG_DUMP_REQUEST=/tmp/req.json   # 导出最终请求体，便于离线重放定位供应商问题
+```
+
+完整设计、部署记录与验证数据见
+[`doc/16_context_management_upgrade.md`](doc/16_context_management_upgrade.md)。
 
 ## 聊天模型供应商
 
@@ -37,6 +49,22 @@
 
 - 每日 21:00（含）至次日 09:00（不含）：并行科技 `GLM-5.2`；
 - 其余时段：OpenAI 兼容接口 `https://api.yyds168.net/v1` 的 `gemini-3.7-flash`。
+
+生产部署（vemu25_test3）已把两个分支统一指向中转站，绕开官方额度限制：
+
+```dotenv
+CHAT_LLM_BASE_URL=https://api.yyds168.net/v1
+CHAT_LLM_MODEL=deepseek-v4-flash
+PARATERA_BASE_URL=https://api.yyds168.net/v1
+PARATERA_MODEL=deepseek-v4-flash
+PARATERA_API_KEY_1=<复用 CHAT_LLM_API_KEY>
+KLONET_AGENT_REASONING_EFFORT=off
+```
+
+两个分支保持一致后，无论夜间窗口是否命中，`ProviderRouter.resolve()` 只会解析出
+一种 `(model, base_url)` 组合。中转站可用的国产模型实测（stream + tools 均兼容）：
+`deepseek-v4-flash`（约 5s，当前选用）、`glm-5.3-flash`（约 11s）、
+`qwen3.8-flash`（约 19s）。
 
 本地 `.env` 可配置：
 
