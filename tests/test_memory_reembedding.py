@@ -617,8 +617,10 @@ def test_validate_gate_and_atomic_promote_rollback(db: MemoryDatabase) -> None:
     assert manager.get(migration.migration_id).status == "validating"
 
     # 把缺口补上 → 通过 → ready → promote 原子切换。
-    # coverage 是全库全局的：用 Job 本身排空所有租户的积压（真实路径），
-    # 只补本租户永远凑不齐门槛。
+    # coverage 是全库全局的：用 Job 本身排空所有租户的积压（真实路径）。
+    # validate 不通过后迁移停在 validating，先显式回炉（状态机
+    # validating → backfilling 这条边），Job 只在 backfilling 干活。
+    manager.continue_backfill(migration.migration_id)
     job.run(_context(), None)
     report = manager.validate(
         migration.migration_id, search_fn=_search_all, probes=["Python", "React"]

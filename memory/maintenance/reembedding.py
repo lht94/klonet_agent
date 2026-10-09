@@ -297,6 +297,15 @@ class EmbeddingMigrationManager:
 
         return self._transition(migration_id, "validating", allowed_from=("backfilling",))
 
+    def continue_backfill(self, migration_id: str) -> EmbeddingMigration:
+        """validating → backfilling（validation 发现覆盖不达标，回炉继续补）。
+
+        这是 validating → backfilling 这条边的唯一入口——门禁没过就回来
+        继续回填，而不是停在 validating 等一个永远等不来的奇迹。
+        """
+
+        return self._transition(migration_id, "backfilling", allowed_from=("validating",))
+
     def retry(self, migration_id: str) -> EmbeddingMigration:
         """failed → backfilling（失败重启从 outbox/cursor 续跑，不重复已成功条目）。"""
 
