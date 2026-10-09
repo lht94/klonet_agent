@@ -35,7 +35,10 @@ class HealthReportJob:
         self._database = database
         self._governance_enabled = governance_enabled
 
-    def run(self, context: JobContext) -> JobResult:
+    def run(self, context: JobContext, cursor: str | None = None) -> JobResult:
+        """签名与 ``MaintenanceJob`` 协议一致（``context, cursor``）——
+        service 主循环按两参调用；health 不用 cursor 但必须接住它。"""
+
         snapshot = collect_snapshot(database=self._database, now=context.started_at)
         healthy = bool(snapshot.get("healthy"))
 
