@@ -183,6 +183,51 @@ class TestEventAndProjection:
         assert "sk-abcdefghijklmnop1234" not in failure.message
 
 
+class TestEvidenceAndRouting:
+    def test_record_evidence_persists_with_hash(self, alice_gov):
+        evidence, claim = alice_gov.record_evidence(
+            source_type="tool",
+            subject="run_command",
+            observation="port 8080 free",
+            raw_content="port 8080 free",
+        )
+        assert claim is None
+        stored = alice_gov.repository.get_evidence(evidence.evidence_id)
+        assert stored is not None
+        assert stored.source_type == "tool"
+        assert stored.artifact_hash is not None
+        assert "evidence.recorded" in {
+            e.event_type for e in alice_gov.repository.list_events(alice_gov.run_id)
+        }
+
+    def test_conflict_creates_contradicted_claim(self, alice_gov):
+        ev1, _ = alice_gov.record_evidence(
+            source_type="tool", subject="probe_x", observation="port 8080 free"
+        )
+        ev2, claim = alice_gov.record_evidence(
+            source_type="tool", subject="probe_x", observation="port 8080 occupied"
+        )
+        assert claim is not None
+        links = alice_gov.repository.list_claim_links(claim.claim_id)
+        assert {l.evidence_id for l in links} == {ev1.evidence_id, ev2.evidence_id}
+
+    def test_claim_gate_and_route_decision(self, alice_gov):
+        ev, _ = alice_gov.record_evidence(
+            source_type="tool", subject="probe_y", observation="ok"
+        )
+        claim = alice_gov.create_claim(
+            subject="probe_y", statement="端口空闲", evidence_ids=[ev.evidence_id]
+        )
+        assert alice_gov.evidence_sufficient(claim.claim_id)
+
+        decision = alice_gov.record_route_decision(actual_model="test-model")
+        assert decision is not None and decision.shadow is True
+        assert any(
+            e.event_type == "route.decided"
+            for e in alice_gov.repository.list_events(alice_gov.run_id)
+        )
+
+
 class TestIsolation:
     def test_rls_blocks_cross_tenant_read(self, db, alice_gov):
         """另一个 user 绑定租户后必须读不到 alice 的治理数据。

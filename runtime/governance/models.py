@@ -396,3 +396,43 @@ class RedactionRecord:
     content_hash: str
     privacy_class: PrivacyClass | str = PrivacyClass.SENSITIVE
     created_at: datetime = field(default_factory=utcnow)
+
+def event_row(event: "RuntimeEvent") -> dict[str, Any]:
+    """把 ``RuntimeEvent`` 压平成 PostgreSQL 行参数（所有仓储实现共用）。
+
+    注意：这是纯函数，放在 models 是为了让 postgres 与 evidence mixin
+    共享同一份行映射，避免 mixin 拿不到模块级私有函数。
+    ``event_id`` / ``parent_event_id`` 是 uuid 列，这里显式转成 UUID 对象，
+    不依赖 text→uuid 的赋值隐式转换。
+    """
+
+    import json
+    import uuid as uuid_module
+
+    def _coerce_uuid(value):
+        if value is None:
+            return None
+        try:
+            return uuid_module.UUID(str(value))
+        except ValueError:
+            return value
+
+    return {
+        "event_id": _coerce_uuid(event.event_id),
+        "event_type": event.event_type,
+        "schema_version": event.schema_version,
+        "user_id": event.tenant_user_id,
+        "project_id": event.project_id,
+        "session_id": event.session_id,
+        "run_id": event.run_id,
+        "turn_id": event.turn_id,
+        "task_id": event.task_id,
+        "step_id": event.step_id,
+        "parent_event_id": _coerce_uuid(event.parent_event_id),
+        "idempotency_key": event.idempotency_key,
+        "actor_type": enum_text(event.actor_type),
+        "actor_id": event.actor_id,
+        "payload": json.dumps(event.payload, ensure_ascii=False, default=str),
+        "privacy_class": enum_text(event.privacy_class),
+        "occurred_at": event.occurred_at,
+    }

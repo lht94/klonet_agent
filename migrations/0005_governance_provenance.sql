@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS governance.claims (
                                 DEFERRABLE INITIALLY DEFERRED,
     turn_id         text        REFERENCES governance.turns (turn_id)
                                 DEFERRABLE INITIALLY DEFERRED,
+    idempotency_key text        UNIQUE,
     created_at      timestamptz NOT NULL DEFAULT now(),
     updated_at      timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT claims_project_id_not_empty

@@ -17,6 +17,7 @@ from uuid import UUID
 from klonet_agent.memory.database import MemoryDatabase
 from klonet_agent.memory.domain import Tenant
 from klonet_agent.runtime.governance.models import (
+    event_row as _event_row,
     enum_text,
     FailureRecord,
     ModelCallRecord,
@@ -49,28 +50,6 @@ def _uuid(value: str | None) -> UUID | None:
 
 def _jsonb(value: Any) -> Any:
     return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def _event_row(event: RuntimeEvent) -> dict[str, Any]:
-    return {
-        "event_id": _uuid(event.event_id),
-        "event_type": event.event_type,
-        "schema_version": event.schema_version,
-        "user_id": event.tenant_user_id,
-        "project_id": event.project_id,
-        "session_id": event.session_id,
-        "run_id": event.run_id,
-        "turn_id": event.turn_id,
-        "task_id": event.task_id,
-        "step_id": event.step_id,
-        "parent_event_id": _uuid(event.parent_event_id),
-        "idempotency_key": event.idempotency_key,
-        "actor_type": enum_text(event.actor_type),
-        "actor_id": event.actor_id,
-        "payload": _jsonb(event.payload),
-        "privacy_class": enum_text(event.privacy_class),
-        "occurred_at": event.occurred_at,
-    }
 
 
 class PostgresGovernanceRepository(GovernanceEvidenceMixin):

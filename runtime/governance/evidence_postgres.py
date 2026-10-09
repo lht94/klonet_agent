@@ -12,6 +12,7 @@ from typing import Any
 
 from klonet_agent.runtime.governance.models import (
     enum_text,
+    event_row as _event_row,
     RuntimeEvent,
 )
 from klonet_agent.runtime.governance.provenance import (
@@ -31,7 +32,7 @@ class GovernanceEvidenceMixin:
     """混入 PostgresGovernanceRepository 的证据/主张/路由写入。"""
 
     def add_evidence(self, evidence: EvidenceRecord, event: RuntimeEvent) -> bool:
-        row = self._event_row(event)
+        row = _event_row(event)
         with self.database.tenant_session(self.tenant) as conn:
             self._ensure_turn_row(conn, event)
             inserted = conn.execute(
@@ -111,7 +112,7 @@ class GovernanceEvidenceMixin:
         return [self._evidence_from_row(row) for row in rows]
 
     def mark_evidence_stale(self, evidence_id: str, event: RuntimeEvent) -> None:
-        row = self._event_row(event)
+        row = _event_row(event)
         with self.database.tenant_session(self.tenant) as conn:
             self._ensure_turn_row(conn, event)
             conn.execute(
@@ -139,7 +140,7 @@ class GovernanceEvidenceMixin:
             )
 
     def add_claim(self, claim: ClaimRecord, event: RuntimeEvent) -> bool:
-        row = self._event_row(event)
+        row = _event_row(event)
         with self.database.tenant_session(self.tenant) as conn:
             self._ensure_turn_row(conn, event)
             inserted = conn.execute(
@@ -188,7 +189,7 @@ class GovernanceEvidenceMixin:
         return True
 
     def link_claim_evidence(self, link: ClaimEvidenceLink, event: RuntimeEvent) -> bool:
-        row = self._event_row(event)
+        row = _event_row(event)
         with self.database.tenant_session(self.tenant) as conn:
             self._ensure_turn_row(conn, event)
             inserted = conn.execute(
@@ -256,7 +257,7 @@ class GovernanceEvidenceMixin:
         return [self._claim_from_row(row) for row in rows]
 
     def record_route_decision(self, decision: RouteDecision, event: RuntimeEvent) -> bool:
-        row = self._event_row(event)
+        row = _event_row(event)
         with self.database.tenant_session(self.tenant) as conn:
             self._ensure_turn_row(conn, event)
             inserted = conn.execute(
