@@ -279,13 +279,10 @@ def test_rerunning_maintenance_migration_is_noop(db: MemoryDatabase) -> None:
         before = conn.execute(
             "SELECT COUNT(*) AS n FROM memory_maintenance.memory_maintenance_jobs"
         ).fetchone()["n"]
-    # 走迁移执行器的"再跑一次"路径。
-    with db.diagnostic_session() as conn:
-        # 重复执行 0006 文件本身——load_migration_files 不重跑，但 schema_migrations
-        # 的 checksum 校验在 run_migrations 顶部进行；这里只直接验证 schema
-        # 是幂等的即可。
-        applied = db.run_migrations()
-    assert "0006_memory_maintenance" in applied
+    # 走迁移执行器的"再跑一次"路径——0006 已经在 schema_migrations 里，
+    # 所以这次不会被执行；``applied`` 返回空列表是正确的。
+    applied = db.run_migrations()
+    assert applied == []
     with db.diagnostic_session() as conn:
         after = conn.execute(
             "SELECT COUNT(*) AS n FROM memory_maintenance.memory_maintenance_jobs"
