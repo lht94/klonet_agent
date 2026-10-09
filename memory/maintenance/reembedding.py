@@ -361,19 +361,20 @@ class EmbeddingMigrationManager:
 
         migration = self._require(migration_id)
         pool = self._database._require_pool()
+        # 注意：CTE 用 f-string 内联（常量、不含占位符），参数只有 profile 一个。
+        # 不要用 "% body" 的写法——它会把 CTE 的占位符一起吞掉（真踩过：
+        # "query has 1 placeholders but 2 parameters were passed"）。
+        sql = f"""
+        WITH eligible AS ({_ELIGIBLE_CTE_SQL_BODY})
+        SELECT
+            (SELECT count(*) FROM eligible) AS eligible,
+            (SELECT count(*) FROM memory_embedding_outbox o
+               JOIN eligible e ON e.memory_version_id = o.memory_version_id
+              WHERE o.embedding_profile_id = %s
+                AND o.status = 'completed') AS completed
+        """
         with pool.connection() as conn:
-            row = conn.execute(
-                """
-                WITH eligible AS (%s)
-                SELECT
-                    (SELECT count(*) FROM eligible) AS eligible,
-                    (SELECT count(*) FROM memory_embedding_outbox o
-                       JOIN eligible e ON e.memory_version_id = o.memory_version_id
-                      WHERE o.embedding_profile_id = %%s
-                        AND o.status = 'completed') AS completed
-                """ % _ELIGIBLE_CTE_SQL_BODY,
-                [migration.target_profile_id, migration.target_profile_id],
-            ).fetchone()
+            row = conn.execute(sql, [migration.target_profile_id]).fetchone()
         if row is None:  # pragma: no cover
             return (0, 0)
         return (int(row["completed"]), int(row["eligible"]))

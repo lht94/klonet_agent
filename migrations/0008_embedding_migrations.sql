@@ -50,6 +50,24 @@ CREATE TABLE IF NOT EXISTS public.memory_embeddings (
 CREATE INDEX IF NOT EXISTS memory_embeddings_profile_idx
     ON public.memory_embeddings (embedding_profile_id);
 
+-- RLS 沿外键回溯（与 memory_sources 的 policy 同一写法）：向量是租户数据，
+-- 与 memory_* 六表同一条纪律——应用层过滤之外，RLS 是第二道闸。
+ALTER TABLE public.memory_embeddings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.memory_embeddings FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS memory_embeddings_tenant ON public.memory_embeddings;
+CREATE POLICY memory_embeddings_tenant ON public.memory_embeddings
+    FOR ALL
+    USING (EXISTS (
+        SELECT 1 FROM memory_versions v
+        JOIN memory_records r ON r.id = v.memory_id
+        WHERE v.id = memory_embeddings.memory_version_id
+    ))
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM memory_versions v
+        JOIN memory_records r ON r.id = v.memory_id
+        WHERE v.id = memory_embeddings.memory_version_id
+    ));
+
 -- 同一 profile 下同一模型重复写入 = 覆盖（幂等），但**换模型**写同一 profile
 -- 是事故（向量与身份不一致会造成召回污染）。模型身份对 (version, profile)
 -- 不可变，换模型必须走新 profile + 新迁移。
