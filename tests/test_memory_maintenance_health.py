@@ -187,11 +187,9 @@ def test_real_numbers_flow_into_snapshot(db: MemoryDatabase) -> None:
 
     snapshot = collect_snapshot(database=db)
 
-    # embedding outbox：写入记忆会自动排队 default profile。
-    assert snapshot["memory_embedding_pending_total"].get("default", 0) >= 2
-    total = 0
-    for profile in snapshot["memory_embedding_pending_total"]:
-        pass  # coverage 断言在下面统一做
+    # embedding outbox：写入记忆会自动排队 default profile；被删除的那条
+    # outbox 行随"删除三件套"一起清掉（删除不复活），所以 pending = 1。
+    assert snapshot["memory_embedding_pending_total"].get("default", 0) == 1
     cov = snapshot["memory_embedding_coverage_ratio"]
     if "default" in cov:
         assert 0.0 <= cov["default"] <= 1.0
@@ -250,14 +248,15 @@ def test_record_run_metric_writes_runtime_events(db: MemoryDatabase) -> None:
     )
     with db.diagnostic_session() as conn:
         event = conn.execute(
-            "SELECT event_type, payload, user_id FROM governance.runtime_events e "
+            "SELECT e.event_type AS event_type, e.payload AS payload, "
+            "       r.user_id AS run_user FROM governance.runtime_events e "
             " JOIN governance.runs r ON r.run_id = e.run_id WHERE r.run_id = %s "
             " ORDER BY e.occurred_at DESC LIMIT 1",
             (rid,),
         ).fetchone()
     assert event is not None
     assert event["event_type"] == "run_metric"
-    assert event["user_id"] == "system"
+    assert event["run_user"] == "system"
     metrics = event["payload"]["metrics"]
     assert metrics["memory_expired_active_total"] == 1
     assert metrics["memory_embedding_pending_total{profile=\"default\"}"] == 2
