@@ -1,9 +1,10 @@
-# 18 — Agent 运行治理层（03 计划阶段 0–3 实施记录）
+# 18 — Agent 运行治理层（03 计划阶段 0–5 实施记录）
 
 > 对应计划：[`通用功能升级计划/03-Agent运行治理升级计划.md`](../通用功能升级计划/03-Agent运行治理升级计划.md)
-> 本文记录 2026-10-09 落地的 P0 部分：阶段 0（基线与契约）、阶段 1（运行标识与事件底座 +
-> 最小隐私网关）、阶段 2（持久化任务状态）、阶段 3（通用失败协议）。
-> 阶段 4–8（证据链、能力路由、完整隐私、统一评估、切换清理）为后续迭代。
+> 本文记录 2026-10-09 落地部分：阶段 0（基线与契约）、阶段 1（运行标识与事件底座 +
+> 最小隐私网关）、阶段 2（持久化任务状态）、阶段 3（通用失败协议）、
+> 阶段 4（证据与 provenance）、阶段 5 的确定性路由核心（shadow-only）。
+> 阶段 6–8（完整隐私、统一评估、切换清理）为后续迭代。
 
 ## 1. 模块布局
 
@@ -82,10 +83,38 @@ KLONET_AGENT_MEMORY_DSN=postgresql://...   # 治理层共用
 首次启用前执行迁移：
 `python -c "from klonet_agent.memory.database import MemoryDatabase; MemoryDatabase.from_env().open().run_migrations()"`
 
-## 6. 后续（未在本轮范围）
+## 6. 阶段 4：证据与 provenance（2026-10-09 第二批）
 
-- 阶段 4：通用 EvidenceRecord / ClaimRecord / provenance（source adapter、哈希、freshness）；
-- 阶段 5：ModelCapabilityRegistry + RoutingPolicy（shadow 先行）；
+- 新增 `runtime/governance/provenance.py`：`EvidenceRecord`（观察）/ `ClaimRecord`（主张）
+  严格分离，`claim_evidence` 多对多（supports/contradicts/uncertain）；
+  `content_hash` 内容寻址、`refresh_freshness`（源哈希变化或超 TTL → stale）、
+  `detect_conflict`（同主体同类型 fresh 观察不同 → `EvidenceConflict`）；
+  `claim_evidence_gate` 是记忆候选的最小证据门槛（≥1 条 supports）；
+  `ops_evidence_to_governance` 兼容 adapter（Ops 权威不动，只映射）。
+- 新增迁移 `0005_governance_provenance.sql`：`governance.evidence / claims /
+  claim_evidence / route_decisions`，RLS 与延迟外键同 0004 约定。
+- `evidence_postgres.py` 以 mixin 挂进 `PostgresGovernanceRepository`；事件与
+  投影仍同事务，幂等命中不重复应用投影。
+- 服务层：`record_evidence`（冲突自动转 `claims.status='contradicted'` 并挂双证据）、
+  `create_claim`、`mark_evidence_stale`、`evidence_sufficient`。
+- orchestrator：`_execute_tool` 成功结果登记为 evidence（哈希 + 观察预览）。
+
+## 7. 阶段 5：能力注册与确定性路由（shadow-only）
+
+- `capabilities.py`：`ModelCapability`（固定版本声明：窗口/能力/价格/延迟/健康度/
+  数据驻留上限）、`ModelCapabilityRegistry`、`default_registry()`（来自部署配置，
+  去重同模型多入口）。
+- `routing_policy.py`：`TaskRequirements` 硬约束过滤（capability/context/cost/
+  latency/privacy 各有 reason code）→ 确定性评分 quality 0.40 + health 0.25 +
+  cost 0.20 + latency 0.15（quality 用"有无冻结 eval 基线"作保守代理：有 1.0 / 无 0.5）。
+- **只做 shadow**：`chat_with_llm` 记录「策略选择 vs 实际模型」到
+  `governance.route_decisions`，不控制生产流量；学习型路由器暂不实现。
+- 隐私约束进入硬过滤：`privacy_max_class` 超出模型 `max_privacy_class` 的直接剔除；
+  secret 永远不进模型（隐私网关拒绝）。
+
+## 8. 后续（未在本轮范围）
+
+- 阶段 5 收尾：shadow 对比报告与 canary、eval 基线回填注册表；
 - 阶段 6：完整隐私（保留期、删除与派生清理、访问审计）；
 - 阶段 7：统一 EvaluationRecord 与发布门禁；
 - 阶段 8：checkpoint 改从任务投影生成、JSONL 读取路径删除、旧链路清理。

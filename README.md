@@ -470,6 +470,12 @@ run.py ->
   不会被修改），模型/工具调用的 telemetry 事件进缓冲按幂等键补投；
 - secret 级数据（API key、密码、私钥）被最小隐私网关拒绝持久化，事件降级为
   不含原文的 tombstone；`tracing/governance.jsonl` 只是导出，不是权威。
+- 证据与主张分离（阶段 4）：工具成功结果自动登记为 `governance.evidence`
+  （内容寻址哈希，源变化 → stale）；同主体矛盾观察自动生成 `contradicted`
+  主张；记忆候选的最小证据门槛是 `claim_evidence_gate`（≥1 条 supports）。
+- 确定性路由（阶段 5，shadow-only）：`ModelCapabilityRegistry` + 硬约束过滤 +
+  可解释评分，每次调用把「策略选择 vs 实际模型」写进 `governance.route_decisions`，
+  不控制生产流量。
 
 ## 记忆系统（PostgreSQL + pgvector）
 

@@ -514,12 +514,18 @@ class AgentOrchestrator:
         # 治理层模型调用记录（telemetry 级：不可用时进缓冲，不阻断主链路）。
         governance = self._governance
         if governance is not None:
+            actual_model = getattr(self.llm, "model", None) or "unknown"
             governance.record_model_call(
-                model=getattr(self.llm, "model", None) or "unknown",
+                model=actual_model,
                 total_tokens=getattr(getattr(response, "usage", None), "total_tokens", 0) or 0,
                 duration_ms=duration_ms,
                 succeeded=True,
             )
+            # 阶段 5：影子路由——策略选择 vs 实际模型，只记录不控制流量。
+            try:
+                governance.record_route_decision(actual_model=actual_model, shadow=True)
+            except Exception:
+                pass  # 影子路由失败绝不影响主链路。
         return response
 
     def _complete_llm(self, history: list[dict], *, stream: bool):
@@ -990,6 +996,19 @@ class AgentOrchestrator:
                 outcome="succeeded",
                 args_preview=self._safe_tool_args_preview(tool_args),
             )
+            # 阶段 4：成功的工具结果登记为证据（内容寻址哈希，观察只存预览）。
+            # evidence 是观察记录，冲突检测走服务层（同主体矛盾 → contradicted 主张）。
+            try:
+                governance.record_evidence(
+                    source_type="tool",
+                    subject=tool_name,
+                    observation=str(result),
+                    source_uri=tool_name,
+                    raw_content=str(result),
+                    confidence=0.6,
+                )
+            except Exception:
+                pass  # 证据登记失败不阻断工具结果返回（telemetry 级）。
         return result
 
     @staticmethod

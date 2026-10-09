@@ -62,7 +62,8 @@ def db(admin_dsn: str) -> Any:
         database.open()
         try:
             applied = database.run_migrations()
-            assert applied[-1] == "0004_governance"
+            assert "0004_governance" in applied
+            assert applied[-1] == "0005_governance_provenance"
             yield database
         finally:
             database.close()
@@ -91,6 +92,7 @@ class TestGovernanceSchema:
         for table in (
             "runs", "turns", "tasks", "steps", "runtime_events",
             "failures", "model_calls", "tool_calls", "redactions",
+            "evidence", "claims", "claim_evidence", "route_decisions",
         ):
             assert _to_regclass(db, f"governance.{table}"), f"缺表 governance.{table}"
 

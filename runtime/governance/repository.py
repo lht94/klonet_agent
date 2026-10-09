@@ -19,6 +19,12 @@ from klonet_agent.runtime.governance.models import (
     TaskRecord,
     ToolCallRecord,
 )
+from klonet_agent.runtime.governance.provenance import (
+    ClaimEvidenceLink,
+    ClaimRecord,
+    EvidenceRecord,
+)
+from klonet_agent.runtime.governance.routing_policy import RouteDecision
 
 
 class GovernanceRepositoryError(RuntimeError):
@@ -90,6 +96,28 @@ class GovernanceRepository(Protocol):
 
     def count_events(self, run_id: str) -> int: ...
 
+    # -------------------------------------------------- 阶段 4/5：证据与路由 --
+    def add_evidence(self, evidence: EvidenceRecord, event: RuntimeEvent) -> bool: ...
+
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None: ...
+
+    def find_evidence_by_subject(self, subject: str) -> list[EvidenceRecord]: ...
+
+    def mark_evidence_stale(self, evidence_id: str, event: RuntimeEvent) -> None: ...
+
+    def add_claim(self, claim: ClaimRecord, event: RuntimeEvent) -> bool: ...
+
+    def link_claim_evidence(
+        self, link: ClaimEvidenceLink, event: RuntimeEvent
+    ) -> bool: ...
+
+    def list_claim_links(self, claim_id: str) -> list[ClaimEvidenceLink]: ...
+
+    def list_claims(self, run_id: str) -> list[ClaimRecord]: ...
+
+    def record_route_decision(self, decision: RouteDecision, event: RuntimeEvent) -> bool: ...
+
+
 
 class InMemoryGovernanceRepository:
     """线程不安全的内存实现：单元测试与降级缓冲用。
@@ -109,6 +137,10 @@ class InMemoryGovernanceRepository:
         self.model_calls: list[ModelCallRecord] = []
         self.tool_calls: list[ToolCallRecord] = []
         self.redactions: dict[str, list] = {}
+        self.evidence: dict[str, EvidenceRecord] = {}
+        self.claims: dict[str, ClaimRecord] = {}
+        self.claim_links: list[ClaimEvidenceLink] = []
+        self.route_decisions: list[RouteDecision] = []
 
     # ---------------------------------------------------------------- 写入 --
     def begin_run(self, run: RunRecord) -> None:
@@ -213,6 +245,64 @@ class InMemoryGovernanceRepository:
 
     def count_events(self, run_id: str) -> int:
         return sum(1 for e in self._events.values() if e.run_id == run_id)
+
+    # ------------------------------------------------- 阶段 4/5：证据与路由 --
+    def add_evidence(self, evidence: EvidenceRecord, event: RuntimeEvent) -> bool:
+        if self._event_slot(event) is not None:
+            return False
+        self._events[event.event_id] = event
+        if event.idempotency_key:
+            self._idempotency[event.idempotency_key] = event.event_id
+        self.evidence[evidence.evidence_id] = evidence
+        return True
+
+    def get_evidence(self, evidence_id: str) -> EvidenceRecord | None:
+        return self.evidence.get(evidence_id)
+
+    def find_evidence_by_subject(self, subject: str) -> list[EvidenceRecord]:
+        return [e for e in self.evidence.values() if e.subject == subject]
+
+    def mark_evidence_stale(self, evidence_id: str, event: RuntimeEvent) -> None:
+        item = self.evidence.get(evidence_id)
+        if item is not None:
+            item.freshness = "stale"
+        if self._event_slot(event) is None:
+            self._events[event.event_id] = event
+            if event.idempotency_key:
+                self._idempotency[event.idempotency_key] = event.event_id
+
+    def add_claim(self, claim: ClaimRecord, event: RuntimeEvent) -> bool:
+        if self._event_slot(event) is not None:
+            return False
+        self._events[event.event_id] = event
+        if event.idempotency_key:
+            self._idempotency[event.idempotency_key] = event.event_id
+        self.claims[claim.claim_id] = claim
+        return True
+
+    def link_claim_evidence(self, link: ClaimEvidenceLink, event: RuntimeEvent) -> bool:
+        if self._event_slot(event) is not None:
+            return False
+        self._events[event.event_id] = event
+        if event.idempotency_key:
+            self._idempotency[event.idempotency_key] = event.event_id
+        self.claim_links.append(link)
+        return True
+
+    def list_claim_links(self, claim_id: str) -> list[ClaimEvidenceLink]:
+        return [l for l in self.claim_links if l.claim_id == claim_id]
+
+    def list_claims(self, run_id: str) -> list[ClaimRecord]:
+        return [c for c in self.claims.values() if c.run_id == run_id]
+
+    def record_route_decision(self, decision: RouteDecision, event: RuntimeEvent) -> bool:
+        if self._event_slot(event) is not None:
+            return False
+        self._events[event.event_id] = event
+        if event.idempotency_key:
+            self._idempotency[event.idempotency_key] = event.event_id
+        self.route_decisions.append(decision)
+        return True
 
     # ---------------------------------------------------------- 测试辅助 --
     def all_events(self) -> list[RuntimeEvent]:

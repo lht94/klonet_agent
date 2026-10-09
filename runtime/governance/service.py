@@ -16,7 +16,29 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from klonet_agent.memory.domain import Tenant
+from klonet_agent.runtime.governance.provenance import (
+    ClaimEvidenceLink,
+    ClaimEvidenceRelation,
+    ClaimRecord,
+    ClaimStatus,
+    EvidenceConflict,
+    SourceType,
+    claim_evidence_gate,
+    detect_conflict,
+    make_evidence,
+)
+from klonet_agent.runtime.governance.capabilities import default_registry
+from klonet_agent.runtime.governance.routing_policy import (
+    POLICY_VERSION,
+    TaskRequirements,
+    decide_route,
+)
 from klonet_agent.runtime.governance.models import (
+    REASON_CLAIM_CREATED,
+    REASON_CLAIM_LINKED,
+    REASON_EVIDENCE_RECORDED,
+    REASON_EVIDENCE_STALE,
+    REASON_ROUTE_DECIDED,
     enum_text,
     ActorType,
     FailureLessonCandidate,
@@ -547,6 +569,202 @@ class RuntimeGovernance:
             f"根因假设：{failure.root_cause_hypothesis or '未记录'}。"
         )
 
+    # ------------------------------------------------- 阶段 4/5：证据与路由 --
+    def record_evidence(
+        self,
+        *,
+        source_type: SourceType | str,
+        subject: str,
+        observation: str = "",
+        source_uri: str | None = None,
+        raw_content=None,
+        confidence: float = 0.5,
+        ttl_seconds: float | None = None,
+        idempotency_key: str | None = None,
+    ):
+        """登记一条证据（telemetry 级，冲突自动转 contradicted 主张）。"""
+
+        if self._run is None:
+            return None
+        evidence = make_evidence(
+            source_type,
+            run_id=self._run.run_id,
+            user_id=self.tenant.user_id,
+            project_id=self.tenant.project_id,
+            subject=str(subject)[:200],
+            observation=str(observation or "")[:2000],
+            source_uri=source_uri,
+            raw_content=raw_content,
+            confidence=confidence,
+            ttl_seconds=ttl_seconds,
+            idempotency_key=idempotency_key,
+        )
+        event = self._event(
+            event_type="evidence.recorded",
+            reason_code=REASON_EVIDENCE_RECORDED,
+            payload={
+                "source_type": enum_text(source_type),
+                "subject": evidence.subject,
+                "artifact_hash": evidence.artifact_hash,
+                "confidence": evidence.confidence,
+            },
+            turn_id=self._turn_id,
+            idempotency_key=idempotency_key or f"evidence:{evidence.evidence_id}",
+        )
+        self._persist_telemetry(
+            event, lambda: self.repository.add_evidence(evidence, event)
+        )
+
+        # 冲突检测：同主体同类型、双方 fresh、观察不同 → contradicted 主张。
+        try:
+            existing = self.repository.find_evidence_by_subject(evidence.subject)
+        except Exception:
+            existing = []
+        conflict = detect_conflict(evidence, existing)
+        if conflict is not None:
+            claim = self.create_claim(
+                subject=evidence.subject,
+                statement=(
+                    f"主体 {evidence.subject} 存在相互矛盾的观察："
+                    f"{conflict.existing_id} 与 {conflict.incoming_id}"
+                ),
+                evidence_ids=[conflict.existing_id, conflict.incoming_id],
+                status=ClaimStatus.CONTRADICTED,
+                confidence=0.0,
+                idempotency_key=f"conflict:{conflict.existing_id}:{conflict.incoming_id}",
+            )
+            return evidence, claim
+        return evidence, None
+
+    def create_claim(
+        self,
+        *,
+        subject: str,
+        statement: str,
+        evidence_ids: list[str] | None = None,
+        status: ClaimStatus | str = ClaimStatus.SUPPORTED,
+        confidence: float = 0.8,
+        task_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> ClaimRecord:
+        """登记一条主张并挂上证据关联（多对多）。"""
+
+        if self._run is None:
+            raise GovernanceUnavailableError("治理层尚未开始运行（start_run）")
+        claim = ClaimRecord(
+            claim_id=new_id(),
+            run_id=self._run.run_id,
+            user_id=self.tenant.user_id,
+            project_id=self.tenant.project_id,
+            subject=str(subject)[:200],
+            statement=str(statement)[:1000],
+            status=status,
+            confidence=max(0.0, min(1.0, float(confidence))),
+            task_id=task_id,
+            turn_id=self._turn_id,
+            idempotency_key=idempotency_key,
+        )
+        event = self._event(
+            event_type="claim.created",
+            reason_code=REASON_CLAIM_CREATED,
+            payload={
+                "subject": claim.subject,
+                "statement": claim.statement[:300],
+                "status": enum_text(status),
+                "evidence_count": len(evidence_ids or []),
+            },
+            turn_id=self._turn_id,
+            task_id=task_id,
+            idempotency_key=idempotency_key or f"claim:{claim.claim_id}",
+        )
+        self._persist_telemetry(
+            event, lambda: self.repository.add_claim(claim, event)
+        )
+        for evidence_id in evidence_ids or []:
+            link = ClaimEvidenceLink(
+                claim_id=claim.claim_id, evidence_id=evidence_id
+            )
+            link_event = self._event(
+                event_type="claim.linked",
+                reason_code=REASON_CLAIM_LINKED,
+                payload={"claim_id": claim.claim_id, "evidence_id": evidence_id},
+                turn_id=self._turn_id,
+                idempotency_key=f"link:{claim.claim_id}:{evidence_id}:supports",
+            )
+            self._persist_telemetry(
+                link_event,
+                lambda link=link, ev=link_event: self.repository.link_claim_evidence(link, ev),
+            )
+        return claim
+
+    def mark_evidence_stale(self, evidence_id: str, *, current_source_hash: str | None = None) -> None:
+        """来源已变化时把证据标记为 stale（事件 + 投影同事务，telemetry 级）。"""
+
+        from klonet_agent.runtime.governance.provenance import refresh_freshness
+
+        evidence = self._get_evidence(evidence_id)
+        if evidence is None:
+            raise GovernanceRepositoryError(f"证据不存在: {evidence_id}")
+        refresh_freshness(evidence, current_source_hash=current_source_hash)
+        event = self._event(
+            event_type="evidence.stale",
+            reason_code=REASON_EVIDENCE_STALE,
+            payload={"evidence_id": evidence_id, "freshness": evidence.freshness},
+            turn_id=self._turn_id,
+            idempotency_key=f"stale:{evidence_id}",
+        )
+        self._persist_telemetry(
+            event, lambda: self.repository.mark_evidence_stale(evidence_id, event)
+        )
+
+    def evidence_sufficient(self, claim_id: str, *, min_supports: int = 1) -> bool:
+        """记忆候选的证据门槛：主张是否具备足够的 supports 关联。"""
+
+        links = self.repository.list_claim_links(claim_id)
+        return claim_evidence_gate(links, min_supports=min_supports)
+
+    def record_route_decision(
+        self,
+        requirements: TaskRequirements | None = None,
+        *,
+        actual_model: str | None = None,
+        shadow: bool = True,
+    ):
+        """记录一次路由决策（阶段 5：shadow 模式，不控制生产流量）。"""
+
+        if self._run is None:
+            return None
+        decision = decide_route(
+            default_registry(),
+            requirements or TaskRequirements(),
+            run_id=self._run.run_id,
+            user_id=self.tenant.user_id,
+            project_id=self.tenant.project_id,
+            actual_model=actual_model,
+            shadow=shadow,
+        )
+        if decision is None:
+            return None
+        event = self._event(
+            event_type="route.decided",
+            reason_code=REASON_ROUTE_DECIDED,
+            payload={
+                "task_level": decision.task_level,
+                "selected": decision.selected,
+                "actual_model": decision.actual_model,
+                "shadow": decision.shadow,
+                "reason_codes": decision.reason_codes,
+                "policy_version": decision.policy_version,
+            },
+            turn_id=self._turn_id,
+            idempotency_key=f"route:{decision.decision_id}",
+        )
+        self._persist_telemetry(
+            event,
+            lambda: self.repository.record_route_decision(decision, event),
+        )
+        return decision
+
     # ---------------------------------------------------------------- 内部 --
     def _event(
         self,
@@ -680,6 +898,12 @@ class RuntimeGovernance:
     def _get_failure(self, failure_id: str) -> FailureRecord | None:
         try:
             return self.repository.get_failure(failure_id)
+        except Exception as exc:
+            raise GovernanceUnavailableError(f"治理存储读取失败: {exc}") from exc
+
+    def _get_evidence(self, evidence_id: str) -> Any:
+        try:
+            return self.repository.get_evidence(evidence_id)
         except Exception as exc:
             raise GovernanceUnavailableError(f"治理存储读取失败: {exc}") from exc
 

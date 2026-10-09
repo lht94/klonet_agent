@@ -27,6 +27,9 @@ from klonet_agent.runtime.governance.models import (
     ToolCallRecord,
     utcnow,
 )
+from klonet_agent.runtime.governance.evidence_postgres import (
+    GovernanceEvidenceMixin,
+)
 from klonet_agent.runtime.governance.repository import (
     ConcurrentProjectionError,
     GovernanceRepositoryError,
@@ -70,7 +73,7 @@ def _event_row(event: RuntimeEvent) -> dict[str, Any]:
     }
 
 
-class PostgresGovernanceRepository:
+class PostgresGovernanceRepository(GovernanceEvidenceMixin):
     """governance schema 的 PostgreSQL 仓储。
 
     复用 ``MemoryDatabase`` 的连接池与租户绑定：治理与记忆共享一个数据库

@@ -225,6 +225,11 @@ REASON_TOOL_CALL_COMPLETED = "tool_call.completed"
 REASON_TOOL_CALL_FAILED = "tool_call.failed"
 REASON_TURN_STARTED = "turn.started"
 REASON_RUN_STARTED = "run.started"
+REASON_EVIDENCE_RECORDED = "evidence.recorded"
+REASON_EVIDENCE_STALE = "evidence.stale"
+REASON_CLAIM_CREATED = "claim.created"
+REASON_CLAIM_LINKED = "claim.linked"
+REASON_ROUTE_DECIDED = "route.decided"
 
 
 # --------------------------------------------------------------------------- #
