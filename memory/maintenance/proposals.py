@@ -575,7 +575,13 @@ def build_merge_candidate(repository: Any, proposal: Proposal) -> Any:
     sources: list[Any] = []
     for record in records:
         version = record.active_version
-        for source in (version.sources if version is not None else ()) or ():
+        if version is None or not getattr(version, "id", None):
+            continue
+        # ``get_record`` 不会顺带把来源查出来（``MemoryVersion`` 上的
+        # ``sources`` 在按行构造时是空的）。必须显式走 ``list_sources``，
+        # 否则候选会因为"没有任何来源"被 ``plan_consolidation`` 的 R1 直接
+        # REJECT——这正是真库测试第一次跑出来的现象。
+        for source in repository.list_sources(str(version.id)) or ():
             key = (source.source_type.value, source.source_id)
             if key in seen:
                 continue
