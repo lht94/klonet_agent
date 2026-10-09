@@ -427,22 +427,23 @@ def test_build_jobs_skips_embedding_job_without_credentials(monkeypatch) -> None
 def test_build_jobs_skips_unimplemented_jobs(monkeypatch) -> None:
     """只有已实现的 Job 会被发现；其余名字安静跳过，不报错。
 
-    阶段 3 实现了 ``embedding_outbox``，阶段 4 实现了 ``expiration`` /
-    ``purge``，阶段 5 实现了 ``consolidation``。断言"集合包含"而不是"集合
-    等于"，这样后续阶段新增 Job 时这条测试不会变成假失败——真正要守住的是
-    "未实现的不会被凭空注册"。
+    阶段 3–7 之后全部六个 KNOWN_JOB_NAMES 都有实现。断言"集合包含"而不是
+    "集合等于"——真正要守住的是"没实现/没凭据的不会被凭空注册"。
     """
 
     import klonet_agent.llm.embeddings as embeddings
 
     monkeypatch.setattr(embeddings, "build_default_embedding_provider", lambda: None)
     names = {job.name for job in cli._build_jobs(database=None, config=MaintenanceConfig())}
-    assert {"expiration", "purge", "consolidation"}.issubset(names)
-    # 没有嵌入凭据时 embedding_outbox 不注册（否则是一个永远跑不动的 Job）。
+    assert {"expiration", "purge", "consolidation", "health_report"}.issubset(names)
+    # 没有嵌入凭据时 embedding_outbox / reembedding 不注册
+    #（否则是永远跑不动的 Job）。
     assert "embedding_outbox" not in names
-    # 尚未实现的阶段 6–7 绝不能凭空出现。
     assert "reembedding" not in names
-    assert "health_report" not in names
+    # KNOWN_JOB_NAMES 之外的名字绝不能凭空出现。
+    from klonet_agent.memory.maintenance.service import KNOWN_JOB_NAMES
+
+    assert not (names - set(KNOWN_JOB_NAMES))
 
 
 # --------------------------------------------------------------------------- #

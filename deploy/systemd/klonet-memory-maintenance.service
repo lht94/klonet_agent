@@ -1,0 +1,40 @@
+# klone 记忆生命周期 Worker 的 systemd 单元（04 计划阶段 7）。
+#
+# 安装：
+#   sudo cp deploy/systemd/klonet-memory-maintenance.service /etc/systemd/system/
+#   sudo cp deploy/systemd/klonet-memory-maintenance.env.example /etc/klonet/memory-maintenance.env
+#   sudo chmod 600 /etc/klonet/memory-maintenance.env   # 里面有连接密码
+#   sudo systemctl daemon-reload && sudo systemctl enable --now klonet-memory-maintenance
+#
+# 安全纪律：
+#   * Worker 用专有最小权限角色 klonet_maint（0006/0007/0008 授权），
+#     绝不用应用角色或超级用户跑；
+#   * 连接密码只经 EnvironmentFile 注入，**不进单元正文**；
+#   * 停止语义 = SIGTERM → Worker 只置停止事件、当前 Job 跑完才退出
+#     （TimeoutStopSec 要大于最大 Job 周期）。
+
+[Unit]
+Description=klonet memory lifecycle maintenance worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=klonet
+Group=klonet
+WorkingDirectory=/opt/klonet_agent
+# 环境文件由运维手工放置，权限 600；单元正文里没有机密。
+EnvironmentFile=/etc/klonet/memory-maintenance.env
+ExecStart=/opt/klonet_agent/.venv/bin/python -m klonet_agent.memory.maintenance run
+# SIGTERM 优雅停止：只置事件，等当前 Job 完成。给足宽限。
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=10
+# 加固：文件系统只读，只留必要的日志目录。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

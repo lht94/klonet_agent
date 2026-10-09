@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from klonet_agent.memory.domain import Tenant
 from klonet_agent.runtime.governance.provenance import (
@@ -929,3 +929,69 @@ class RuntimeGovernance:
             return self.repository.find_task_by_idempotency_key(key)
         except Exception as exc:
             raise GovernanceUnavailableError(f"治理存储读取失败: {exc}") from exc
+
+
+# --------------------------------------------------------------------------- #
+# 运行指标（04 计划 §6.6 / 阶段 7）
+# --------------------------------------------------------------------------- #
+
+
+def record_run_metric(
+    database: Any,
+    *,
+    metrics: Mapping[str, Any],
+    run_id: str | None = None,
+    actor_id: str = "memory_maintenance_worker",
+) -> str:
+    """把一批运行指标追加进 ``governance.runtime_events``。
+
+    04 计划 §6.6 的硬约束：健康指标**只有这一条权威通道**——不另开
+    ``memory_maintenance_health_metrics`` 表（03 阶段 7 的"单一权威"约束
+    已经禁止 Worker 自己再开表）。``runtime_events`` 是追加写的事实账本，
+    指标就是"某一时刻 Worker 报了一组数"这个事实。
+
+    跨租户（Worker 无租户上下文）：runs 行落 ``user_id='system'``，
+    走 ``diagnostic_session``——治理 schema 没有行级安全，写入口只有这里。
+
+    返回本次落账的 ``run_id``（按天聚合：同一天的所有 Worker tick 共享一条
+    runs 行，事件各自独立追加）。
+
+    ``metrics`` 的键必须是 §6.6 的最终 Prometheus 名（带标签的花括号形态，
+    如 ``memory_maintenance_consecutive_failures{job="purge"}``）；值是数字
+    或 ISO 时间戳字符串。**只放聚合值**——正文 / token / 连接密码永远不进
+    指标。
+    """
+
+    import json
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+    from uuid import uuid4 as _uuid4
+
+    if not metrics:
+        raise ValueError("record_run_metric 需要至少一个指标")
+
+    rid = run_id or (
+        f"memory-maintenance-{_dt.now(_tz.utc):%Y%m%d}"
+    )
+    payload = {"metrics": dict(metrics)}
+    pool = database._require_pool()
+    with pool.connection() as conn:
+        with conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO governance.runs (run_id, user_id, mode)
+                VALUES (%s, 'system', 'maintenance')
+                ON CONFLICT (run_id) DO NOTHING
+                """,
+                (rid,),
+            )
+            conn.execute(
+                """
+                INSERT INTO governance.runtime_events
+                       (event_id, event_type, run_id, actor_type, actor_id,
+                        payload, occurred_at)
+                VALUES (%s, 'run_metric', %s, 'system', %s, %s, now())
+                """,
+                (str(_uuid4()), rid, actor_id, json.dumps(payload, ensure_ascii=False)),
+            )
+    return rid

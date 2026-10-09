@@ -94,8 +94,10 @@ def evaluate_worker_health() -> tuple[bool, str]:
         # 模块不存在/导入失败/采集失败：阶段 0–6 期间都是合法的过渡态。
         return True, "Worker 模块尚未就绪（视为过渡态，不阻断 cutover）"
     if snapshot.get("healthy") is True:
-        return True, "Worker 健康"
-    return False, f"Worker 不健康：{snapshot}"
+        # 透传快照 reason（如"未配置——过渡语义"），运维不用猜是哪种放行。
+        reason = str(snapshot.get("reason") or "Worker 健康")
+        return True, reason
+    return False, f"Worker 不健康：{snapshot.get('reason') or snapshot}"
 
 
 def evaluate_memory_eval() -> tuple[bool, str]:

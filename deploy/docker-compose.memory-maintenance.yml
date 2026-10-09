@@ -1,0 +1,28 @@
+# klone 记忆生命周期 Worker 的 Docker Compose 示例（04 计划阶段 7）。
+#
+# **仅作部署示例**——本机实跑测试仍按既有本机 PG 路径（Docker Desktop 沙箱
+# 不能由 Agent 拉起，这一点与用户级约定一致）。生产上 systemd 与 compose 二选一。
+#
+#   docker compose -f deploy/docker-compose.memory-maintenance.yml up -d
+#
+# 机密经 env_file 注入，不写进本文件。
+
+services:
+  memory-maintenance:
+    image: python:3.11-slim
+    working_dir: /app
+    command: python -m klonet_agent.memory.maintenance run
+    env_file:
+      - ./systemd/klonet-memory-maintenance.env.example
+    volumes:
+      - ./:/app:ro
+    stop_grace_period: 90s   # SIGTERM 优雅停止：等当前 Job 完成
+    restart: on-failure
+    depends_on:
+      - postgres
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_PASSWORD: CHANGE_ME
+    ports:
+      - "15432:5432"

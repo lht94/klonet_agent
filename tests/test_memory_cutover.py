@@ -125,7 +125,9 @@ def test_worker_module_missing_is_treated_as_healthy(monkeypatch) -> None:
     对齐——这两点是阶段 7 真实接入前的契约保证。
     """
 
-    monkeypatch.setenv(_TEST_DSN_ENV, "postgresql://placeholder:5432/postgres")
+    # 阶段 7 起 collect_snapshot 是真实现：无 MEMORY_DSN → 过渡语义 True；
+    # （DSN 在但库打不开 → False，由 test_memory_maintenance_health.py 覆盖。）
+    monkeypatch.delenv("KLONET_AGENT_MEMORY_DSN", raising=False)
     healthy, detail = cli.evaluate_worker_health()
     assert healthy is True
     # §6.6 指标字段名集合

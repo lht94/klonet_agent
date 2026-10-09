@@ -486,6 +486,15 @@ run.py ->
 （安装）与 [`doc/17_memory_lifecycle_operations.md`](doc/17_memory_lifecycle_operations.md)
 （评测门槛、cutover、备份恢复、删除权）。
 
+**生命周期 Worker**（04 计划，阶段 0–7 已落地）：六个维护 Job
+（embedding 回填 / 过期归档 / 删除清理 / 整理提案 / 模型迁移回填 / 健康报告）
+由 `python -m klonet_agent.memory.maintenance run` 常驻驱动；生产入口与
+暂停/恢复/dry-run/回滚手册见
+[`doc/18_memory_lifecycle_worker_runbook.md`](doc/18_memory_lifecycle_worker_runbook.md)，
+systemd / compose 部署样例在 `deploy/`。健康指标唯一权威通道是
+`governance.runtime_events`（`record_run_metric`），健康门禁已接入
+`scripts/memory_cutover.py --check`。
+
 七条不变量，出问题先看这几条：
 
 1. **正文不可变**：版本表上的触发器冻结正文/哈希/时间/分词结果，只放行
