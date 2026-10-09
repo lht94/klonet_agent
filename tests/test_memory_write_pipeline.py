@@ -1265,6 +1265,7 @@ def db(admin_dsn: str):
                 "0003_immutable_versions",
                 "0004_governance",
                 "0005_governance_provenance",
+                "0006_memory_maintenance",
             ]
             yield database
         finally:

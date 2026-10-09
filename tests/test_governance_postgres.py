@@ -63,7 +63,7 @@ def db(admin_dsn: str) -> Any:
         try:
             applied = database.run_migrations()
             assert "0004_governance" in applied
-            assert applied[-1] == "0005_governance_provenance"
+            assert "0006_memory_maintenance" in applied
             yield database
         finally:
             database.close()

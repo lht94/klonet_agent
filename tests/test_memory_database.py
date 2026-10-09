@@ -148,7 +148,8 @@ def test_migration_files_are_discovered_in_order() -> None:
         "0002_roles_and_grants",
         "0003_immutable_versions",
         "0004_governance",
-                "0005_governance_provenance",
+        "0005_governance_provenance",
+        "0006_memory_maintenance",
     ]
     for item in migrations:
         assert item.sql.strip()

@@ -45,6 +45,7 @@ CURRENT_APPLIED_MIGRATIONS: tuple[str, ...] = (
     "0003_immutable_versions",
     "0004_governance",
     "0005_governance_provenance",
+    "0006_memory_maintenance",
 )
 
 BASELINE_REPORT_FILE = (
