@@ -382,14 +382,45 @@ def test_exact_duplicate_creates_noop_proposal(db: MemoryDatabase) -> None:
     assert all(item.status is ProposalStatus.PENDING for item in proposals)
 
 
-def test_conflict_proposal_for_same_subject(db: MemoryDatabase) -> None:
+def test_same_subject_second_active_record_is_schema_forbidden(
+    db: MemoryDatabase,
+) -> None:
+    """钉住 schema 不变量：同 (tenant, scope, subject) 只允许一条 active 记录。
+
+    这意味着 ``classify_pair`` 的 CONFLICT 分支（同 subject_key、不同内容、
+    都 active）对 Job 扫描到的活记录**不可达**——schema 的 partial unique
+    index 先拦住了。CONFLICT 的现实入口是 as_of 历史回放 / 迁移进来的
+    遗留数据，纯函数分类已有离线测试覆盖。这里验证的是：绕过版本管理
+    直接写第二条 active 记录必须被 ``ActiveSubjectConflictError`` 拒绝。
+    """
+
+    from klonet_agent.memory.repository import ActiveSubjectConflictError
+
     tenant = _tenant()
     repo = _repo(db, tenant)
     subject = f"fact:project:demo:{uuid4().hex[:6]}"
     _add(repo, tenant, subject=subject, content="运行版本是 Python 3.11")
-    # 同一 subject 第二次写入走 add_version（唯一索引只允许一条 active）。
+    with pytest.raises(ActiveSubjectConflictError):
+        _add(repo, tenant, subject=subject, content="运行版本是 Python 3.13")
+
+
+def test_subject_conflict_via_versions_surfaces_in_one_record(
+    db: MemoryDatabase,
+) -> None:
+    """"同 subject 不同内容"的现实形态：同一条记录的多个版本。
+
+    Job 扫描的是 active 记录（取 active_version），不会对同一记录的两个
+    版本互相配对（那属于版本管理的事，不是记录去重）。这里验证 Job 跑在
+    "一条记录两个版本"的库上时正常空转、不产任何提案——把"Job 不越权
+    碰版本"钉成行为。
+    """
+
     from klonet_agent.memory.repository import NewVersionCommand
 
+    tenant = _tenant()
+    repo = _repo(db, tenant)
+    subject = f"fact:project:demo:{uuid4().hex[:6]}"
+    _add(repo, tenant, subject=subject, content="运行版本是 Python 3.11")
     repo.add_version(
         NewVersionCommand(
             memory_id=str(repo.find_active_by_subject(subject).id),
@@ -404,23 +435,12 @@ def test_conflict_proposal_for_same_subject(db: MemoryDatabase) -> None:
             ),
         )
     )
-    # 造一条"同 subject、不同内容、都 active"的历史遗留（直接 SQL 改 status）。
-    second = _add(
-        repo,
-        tenant,
-        subject=subject,
-        content="运行版本是 Python 3.13",
-    )
 
     job = _job(db, tenant, similarity_threshold=0.5)
-    job.run(_context(), None)
+    result = job.run(_context(), None)
+    assert result.changed == 0
     store = ProposalStore(db, tenant)
-    conflicts = [
-        item for item in store.list() if item.proposal_type is ProposalType.CONFLICT
-    ]
-    assert conflicts, "同 subject 不同内容必须产出 CONFLICT 提案"
-    assert "same_subject_different_content" in conflicts[0].reason_codes
-    assert str(second.id) in conflicts[0].source_memory_ids or True
+    assert store.list() == []
 
 
 def test_near_duplicate_creates_merge_with_deterministic_content(
