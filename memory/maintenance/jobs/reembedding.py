@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Sequence
 
 from klonet_agent.config import MaintenanceConfig
@@ -181,7 +181,7 @@ class ReembeddingJob:
 
         remaining = (context.deadline - self._clock()).total_seconds()
         budget = min(max(1.0, remaining * 0.8), 600.0)
-        return self._clock() + budget
+        return self._clock() + timedelta(seconds=budget)
 
     def _list_tenants(self) -> list[Tenant]:
         if self._tenants_provider is not None:

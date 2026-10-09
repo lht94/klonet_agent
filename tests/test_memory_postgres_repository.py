@@ -254,6 +254,7 @@ def test_migration_creates_extension_tables_indexes_and_policies(db: MemoryDatab
             "memory_relations",
             "memory_write_candidates",
             "memory_embedding_outbox",
+            "memory_embeddings",
         }
 
         indexes = {
@@ -293,6 +294,7 @@ def test_migration_creates_extension_tables_indexes_and_policies(db: MemoryDatab
             "memory_relations",
             "memory_write_candidates",
             "memory_embedding_outbox",
+            "memory_embeddings",
         } <= forced
 
 
