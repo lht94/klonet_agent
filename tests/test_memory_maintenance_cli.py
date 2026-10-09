@@ -97,9 +97,49 @@ def test_no_command_prints_help_and_returns_usage(capsys) -> None:
     assert cli.main([]) == cli.EXIT_USAGE
 
 
-def test_proposals_is_usage_error(capsys) -> None:
-    assert cli.main(["proposals", "list"]) == cli.EXIT_USAGE
-    assert "阶段 5" in capsys.readouterr().err
+def test_proposals_without_dsn_is_config_error(monkeypatch, capsys) -> None:
+    """阶段 5 起 proposals 已实现：没有 DSN 时是配置错误，不再是 usage。"""
+
+    for key in ("KLONET_AGENT_MEMORY_DSN", "MEMORY_DATABASE_URL", "DATABASE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    assert cli.main(["proposals", "list"]) == cli.EXIT_CONFIG
+    assert "数据库不可用" in capsys.readouterr().err
+
+
+def test_proposals_approve_without_id_is_usage_error(monkeypatch, capsys) -> None:
+    """有 DSN 但没给 proposal_id → usage（不需要真连库）。"""
+
+    import klonet_agent.memory.database as database_module
+
+    class _FakeDb:
+        is_open = True
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(database_module, "MemoryDatabase", _FakeDatabaseStub)
+    assert cli.main(["proposals", "approve"]) == cli.EXIT_USAGE
+    assert "proposal_id" in capsys.readouterr().err
+
+
+class _FakeDatabaseStub:
+    """只够 ``proposals`` 分支构造 store 用的替身（不连库）。"""
+
+    def __init__(self, *args, **kwargs):
+        self.is_open = True
+
+    @classmethod
+    def from_env(cls, **kwargs):
+        return cls()
+
+    def open(self):
+        return self
+
+    def close(self):
+        pass
+
+    def diagnostic_session(self):
+        raise AssertionError("不该真的查询数据库")
 
 
 def test_run_without_enabled_is_config_error(monkeypatch, capsys) -> None:

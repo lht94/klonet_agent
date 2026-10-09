@@ -1266,6 +1266,7 @@ def db(admin_dsn: str):
                 "0004_governance",
                 "0005_governance_provenance",
                 "0006_memory_maintenance",
+        "0007_memory_maintenance_proposals",
             ]
             yield database
         finally:

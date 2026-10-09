@@ -220,11 +220,84 @@ def _cmd_status(args: argparse.Namespace, config: MaintenanceConfig) -> int:
 
 
 def _cmd_proposals(args: argparse.Namespace) -> int:
-    print(
-        "proposals 子命令属于 04 计划阶段 5（整理提案系统），尚未实现。",
-        file=sys.stderr,
+    """``proposals list|approve|reject``（04 计划阶段 5）。
+
+    租户从 ``--user-id`` / ``--project-id`` 取（缺省读 ``DEFAULT_USER_ID`` /
+    ``DEFAULT_PROJECT_ID``）：提案表没有 RLS，租户过滤靠这里显式绑定。
+    **approve 走 ``apply_proposal``**，它内部只经 ``versioning.apply_plan``
+    写正式记忆——CLI 不提供任何"直接改记忆"的旁路。
+    """
+
+    from klonet_agent.config import DEFAULT_PROJECT_ID, DEFAULT_USER_ID
+    from klonet_agent.memory.domain import Tenant
+    from klonet_agent.memory.maintenance.proposals import (
+        ProposalInvalidError,
+        ProposalStateError,
+        ProposalStatus,
+        ProposalStore,
+        ProposalStaleError,
+        apply_proposal,
     )
-    return EXIT_USAGE
+    from klonet_agent.memory.postgres import PostgresMemoryRepository
+
+    action = args.action or "list"
+    user_id = str(args.user_id or DEFAULT_USER_ID)
+    project_id = args.project_id if args.project_id is not None else DEFAULT_PROJECT_ID
+    tenant = Tenant(user_id=user_id, project_id=(project_id or None))
+
+    database = _build_database()
+    try:
+        store = ProposalStore(database, tenant)
+        repository = PostgresMemoryRepository(database, tenant)
+
+        if action == "list":
+            status = args.status or None
+            proposals = store.list(status=status, limit=args.limit)
+            if args.json:
+                print(
+                    json.dumps(
+                        [item.as_dict() for item in proposals],
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            elif not proposals:
+                print("没有符合条件的提案。")
+            else:
+                for item in proposals:
+                    print(
+                        f"{item.proposal_id}  {item.status.value:<9} "
+                        f"{item.proposal_type.value:<9} "
+                        f"sources={len(item.source_memory_ids)} "
+                        f"reasons={','.join(item.reason_codes) or '-'}"
+                    )
+            return EXIT_OK
+
+        if not args.proposal_id:
+            print("approve/reject 需要给出 proposal_id。", file=sys.stderr)
+            return EXIT_USAGE
+
+        if action == "reject":
+            store.transition(args.proposal_id, ProposalStatus.REJECTED)
+            print(f"已驳回：{args.proposal_id}")
+            return EXIT_OK
+
+        # approve
+        try:
+            outcome = apply_proposal(store, repository, args.proposal_id)
+        except ProposalStaleError as exc:
+            print(f"提案已过期（来源已变化）：{exc}", file=sys.stderr)
+            return EXIT_RUNTIME
+        except (ProposalStateError, ProposalInvalidError) as exc:
+            print(str(exc), file=sys.stderr)
+            return EXIT_USAGE
+        print(
+            f"已应用：{args.proposal_id} decision={outcome.decision or '-'} "
+            f"versions={len(outcome.applied_version_ids)}"
+        )
+        return EXIT_OK
+    finally:
+        database.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -262,11 +335,21 @@ def build_parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="打印 Worker 状态")
     status.add_argument("--json", action="store_true", help="JSON 输出")
 
-    proposals = sub.add_parser("proposals", help="整理提案（阶段 5，占位）")
+    proposals = sub.add_parser("proposals", help="整理提案的查看与审批（阶段 5）")
     proposals.add_argument(
         "action", nargs="?", choices=["list", "approve", "reject"], default="list"
     )
     proposals.add_argument("proposal_id", nargs="?")
+    proposals.add_argument("--user-id", default=None, help="租户 user_id（缺省取配置默认值）")
+    proposals.add_argument("--project-id", default=None, help="租户 project_id（缺省取配置默认值）")
+    proposals.add_argument(
+        "--status",
+        default=None,
+        choices=["pending", "approved", "rejected", "applied", "expired"],
+        help="按状态过滤（仅 list）",
+    )
+    proposals.add_argument("--limit", type=int, default=50, help="最多列出多少条")
+    proposals.add_argument("--json", action="store_true", help="JSON 输出")
 
     return parser
 
@@ -281,8 +364,17 @@ def main(argv: list[str] | None = None) -> int:
 
     _configure_logging(getattr(args, "verbose", False))
 
+    from klonet_agent.memory.database import MemoryDatabaseError
+
     if args.command == "proposals":
-        return _cmd_proposals(args)
+        try:
+            return _cmd_proposals(args)
+        except MemoryDatabaseError as exc:
+            print(f"数据库不可用：{exc}", file=sys.stderr)
+            return EXIT_CONFIG
+        except Exception as exc:  # noqa: BLE001 - 顶层兜底换成稳定退出码
+            print(f"运行故障：{type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_RUNTIME
 
     try:
         config = load_maintenance_config()
@@ -294,8 +386,6 @@ def main(argv: list[str] | None = None) -> int:
         # 旧类的实例，`except` 匹配不到。捕获稳定的内建基类即可跨 reload 生效。
         print(f"配置错误：{exc}", file=sys.stderr)
         return EXIT_CONFIG
-
-    from klonet_agent.memory.database import MemoryDatabaseError
 
     handlers = {
         "run": _cmd_run,
