@@ -498,8 +498,6 @@ def test_backfill_writes_profile_table_and_search_routes(db: MemoryDatabase) -> 
     )
     started = manager.start(migration.migration_id)
     assert started.status == "backfilling"
-    started = manager.start(migration.migration_id)
-    assert started.status == "backfilling"
     job = _job(db, manager=manager)
     result = job.run(_context(), None)
     # coverage/eligible 是**全库全局**的（迁移语义如此），module 级共享库里
@@ -598,8 +596,9 @@ def test_validate_gate_and_atomic_promote_rollback(db: MemoryDatabase) -> None:
     job.run(_context(), None)
     assert manager.get(migration.migration_id).status == "validating"
 
-    # 未 validate 就 promote → 门禁拒绝。
-    with pytest.raises(EmbeddingMigrationGateError):
+    # 未 validate 就 promote → 拒绝（validating 状态先撞 StateError；
+    # ready 但 stats.passed=False 时是 GateError——两条都是"过不了门禁"）。
+    with pytest.raises(EmbeddingMigrationError):
         manager.promote(migration.migration_id)
 
     # coverage 不足（eligible 里故意再补一个未完成的）→ 不通过。
