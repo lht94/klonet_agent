@@ -16,11 +16,20 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from klonet_agent.memory.domain import MemoryQuery, MemoryRecord, MemoryType, Scope
+from klonet_agent.memory.domain import (
+    MemoryDomainError,
+    MemoryQuery,
+    MemoryRecord,
+    MemoryType,
+    Scope,
+)
+from klonet_agent.memory.repository import DeletedBacklog
 
 __all__ = [
+    "ExpiredArchiveReport",
     "ForgetOutcome",
     "MemoryAdmin",
+    "PurgeReport",
     "RetentionPolicy",
 ]
 
@@ -41,10 +50,47 @@ class RetentionPolicy:
     soft_delete_retention_days: int = 30
     # 单次清理的上限，避免一个定时任务把整张表锁住。
     purge_batch_limit: int = 1000
+    # 部署合规下限（天）。**这是本文件唯一一处"钳制"**，而且方向是保守的：
+    # 配置把保留期写短了（例如 1 天）时，实际按这个下限执行。
+    # 与 ``MaintenanceConfig`` 的"非法即拒绝启动"不矛盾——那里防的是"启动一个
+    # 参数错的服务"，这里防的是"一次错误的配置把还没到期的数据删掉"，后者
+    # 不可逆，宁可静默保守。
+    compliance_floor_days: int = 0
 
     def purge_cutoff(self, *, now: datetime | None = None) -> datetime:
         moment = now or _now()
-        return moment - timedelta(days=max(0, int(self.soft_delete_retention_days)))
+        days = max(
+            max(0, int(self.compliance_floor_days)),
+            max(0, int(self.soft_delete_retention_days)),
+        )
+        return moment - timedelta(days=days)
+
+
+@dataclass(frozen=True)
+class ExpiredArchiveReport:
+    """一次过期归档的明细。
+
+    ``cursor`` 是**下一批的起点**；调用方（ExpirationJob）把它写进
+    ``memory_maintenance_jobs.cursor``，下一个 tick 从断点继续。
+    """
+
+    archived: int = 0
+    outbox_deferred: int = 0
+    batches: int = 0
+    cursor: str | None = None
+    exhausted: bool = False
+
+
+@dataclass(frozen=True)
+class PurgeReport:
+    """一次物理清理的明细。"""
+
+    dry_run: bool = False
+    removed: int = 0
+    batches: int = 0
+    backlog: "DeletedBacklog | None" = None
+    recall_leaks: tuple[str, ...] = ()
+    stopped_early: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,39 +185,242 @@ class MemoryAdmin:
         return ForgetOutcome(memory_id=memory_id, deleted=True, reason=reason)
 
     def purge(
-        self, *, policy: RetentionPolicy | None = None, now: datetime | None = None
+        self,
+        *,
+        policy: RetentionPolicy | None = None,
+        now: datetime | None = None,
+        dry_run: bool = False,
+        batch_size: int | None = None,
+        max_batches: int | None = None,
+        recall_sample: int = 3,
     ) -> int:
-        """物理清理已过保留期的逻辑删除记录。返回删除条数。"""
+        """物理清理已过保留期的逻辑删除记录。返回删除条数。
+
+        保留旧签名（返回 ``int``）不变；需要明细（backlog 规模、抽查结果、
+        是否提前停止）的调用方用 :meth:`purge_report`。
+        """
+
+        return self.purge_report(
+            policy=policy,
+            now=now,
+            dry_run=dry_run,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            recall_sample=recall_sample,
+        ).removed
+
+    def purge_report(
+        self,
+        *,
+        policy: RetentionPolicy | None = None,
+        now: datetime | None = None,
+        dry_run: bool = False,
+        batch_size: int | None = None,
+        max_batches: int | None = None,
+        recall_sample: int = 3,
+    ) -> PurgeReport:
+        """物理清理的完整实现（04 计划 §6.3）。
+
+        四件事，缺一不可：
+
+        1. **只处理显式 ``deleted``**——``purge_deleted`` 的谓词里写死了
+           ``status='deleted'``；expired / superseded 永远不会被这里碰到。
+        2. **tombstone 先写**——每批删除**之前**落一条不含正文的审计事件
+           （数量、最老删除时间、这批的 id）。审计写在删除后，一旦事务崩了
+           就既没删掉、也没有记录，看不出"当时打算删什么"。
+        3. **多批次循环**——单次 1000 条的上限不该等于"一天只清 1000 条"。
+        4. **删完抽查召回**——抽样 ``recall_check``，只要还有一条能被检索到
+           就立刻停下并留痕。"删除完成"的判定标准是"检索不到"，不是"状态字段
+           变了"。
+        """
 
         active_policy = policy or RetentionPolicy()
-        removed = self._repository.purge_deleted(
-            older_than=active_policy.purge_cutoff(now=now),
-            limit=active_policy.purge_batch_limit,
-        )
+        cutoff = active_policy.purge_cutoff(now=now)
+        limit = int(batch_size or active_policy.purge_batch_limit)
+        if limit <= 0:
+            raise MemoryDomainError("purge 的 batch_size 必须为正整数")
+
+        if dry_run:
+            backlog = self._repository.inspect_deleted_backlog(
+                older_than=cutoff, limit=limit
+            )
+            self._trace(
+                "memory_purge_dry_run",
+                {
+                    "would_remove": backlog.count,
+                    "oldest_deleted_at": (
+                        backlog.oldest_deleted_at.isoformat()
+                        if backlog.oldest_deleted_at
+                        else None
+                    ),
+                    "estimated_bytes": backlog.estimated_bytes,
+                    "retention_floor_days": max(
+                        int(active_policy.compliance_floor_days),
+                        int(active_policy.soft_delete_retention_days),
+                    ),
+                },
+            )
+            return PurgeReport(dry_run=True, removed=backlog.count, backlog=backlog)
+
+        removed = 0
+        batches = 0
+        leaks: list[str] = []
+        stopped_early = False
+        while max_batches is None or batches < max_batches:
+            backlog = self._repository.inspect_deleted_backlog(
+                older_than=cutoff, limit=limit
+            )
+            if backlog.count == 0:
+                break
+            # tombstone：先记后删。payload 只放数量/时间/id，绝不放正文。
+            self._trace(
+                "memory_purge_tombstone",
+                {
+                    "count": backlog.count,
+                    "oldest_deleted_at": (
+                        backlog.oldest_deleted_at.isoformat()
+                        if backlog.oldest_deleted_at
+                        else None
+                    ),
+                    "estimated_bytes": backlog.estimated_bytes,
+                    "batch": batches,
+                },
+            )
+            deleted = self._repository.purge_deleted(older_than=cutoff, limit=limit)
+            removed += deleted
+            batches += 1
+
+            if recall_sample > 0 and backlog.memory_ids:
+                leaks = [
+                    memory_id
+                    for memory_id in backlog.memory_ids[:recall_sample]
+                    if self.recall_check(memory_id)
+                ]
+                if leaks:
+                    # 还能召回说明级联没删干净（或检索走了别的通道）。
+                    # 继续下一批只会扩大污染面，立刻停。
+                    self._trace("memory_purge_recall_leak", {"memory_ids": leaks})
+                    stopped_early = True
+                    break
+
+            if deleted == 0:
+                # 谓词匹配得到但一条没删掉：说明有并发把它改回去了，避免空转。
+                break
+
         if removed:
-            self._trace("memory_purged", {"removed": removed})
-        return removed
+            self._trace("memory_purged", {"removed": removed, "batches": batches})
+        return PurgeReport(
+            removed=removed,
+            batches=batches,
+            recall_leaks=tuple(leaks),
+            stopped_early=stopped_early,
+        )
 
-    def archive_expired(self, *, now: datetime | None = None) -> int:
-        """把"有效期已过但状态还是 active"的记录归档成 expired。
+    def expired_preview(self, *, now: datetime | None = None, batch_size: int = 500) -> int:
+        """dry-run：本租户当前有多少条"``valid_to`` 已过但仍 active"。
 
-        正常情况下 ``mark_expired`` 会同时改状态与 ``valid_to``，不该出现这种分歧；
-        这里是**防御性清理**：万一有历史遗留（直接改过 ``valid_to`` 的写入路径），
-        它们会一直占着"active"的名字，让审计数字对不上。
+        与 :meth:`archive_expired_report` 走**同一个** repository 谓词，所以
+        这个数字就是"真跑一批会归档多少"。
         """
 
         moment = now or _now()
+        page = self._repository.list_expired_candidates(
+            cutoff=moment, cursor=None, batch_size=max(1, int(batch_size))
+        )
+        return len(page.items)
+
+    def archive_expired(
+        self,
+        *,
+        now: datetime | None = None,
+        batch_size: int | None = None,
+        max_batches: int | None = None,
+        outbox_defer_seconds: int = 3600,
+    ) -> int:
+        """把"有效期已过但状态还是 active"的记录归档成 expired。返回条数。
+
+        保留旧签名（返回 ``int``）；需要 cursor 的调用方用
+        :meth:`archive_expired_report`。
+        """
+
+        return self.archive_expired_report(
+            now=now,
+            batch_size=batch_size,
+            max_batches=max_batches,
+            outbox_defer_seconds=outbox_defer_seconds,
+        ).archived
+
+    def archive_expired_report(
+        self,
+        *,
+        now: datetime | None = None,
+        batch_size: int | None = None,
+        max_batches: int | None = None,
+        outbox_defer_seconds: int = 3600,
+        cursor: str | None = None,
+    ) -> ExpiredArchiveReport:
+        """过期归档的完整实现（04 计划 §6.2）。
+
+        正常情况下 ``mark_expired`` 会同时改状态与 ``valid_to``，不该出现
+        "``valid_to`` 已过但状态还是 active"；这里是**防御性清理**：历史遗留
+        会一直占着 "active" 的名字，让审计数字对不上。
+
+        与旧实现的区别（旧版 ``list_records(limit=1000)`` 全量拉取 +
+        单条 ``mark_expired``）：
+
+        * **keyset 分页**而不是 offset——归档会把行移出结果集，offset 必然漏行；
+        * **条件更新**（``archive_expired_batch`` 里带 ``status='active'
+          AND valid_to <= cutoff``），并发下最多各改一半，不会覆盖写；
+        * **同事务联动 outbox**：归档后把这些记录未闭环的 embedding 任务
+          推到 ``outbox_defer_seconds`` 之后，避免把算力花在刚失效的内容上。
+        """
+
+        moment = now or _now()
+        size = int(batch_size or 500)
+        if size <= 0:
+            raise MemoryDomainError("archive_expired 的 batch_size 必须为正整数")
+        defer_until = moment + timedelta(seconds=max(0, int(outbox_defer_seconds)))
+
         archived = 0
-        for record in self._repository.list_records(limit=1000, status="active"):
-            version = record.active_version
-            if version is None or version.valid_to is None:
-                continue
-            if version.valid_to <= moment:
-                self._repository.mark_expired(record.id, version.valid_to)
-                archived += 1
+        deferred = 0
+        batches = 0
+        current = cursor
+        while max_batches is None or batches < max_batches:
+            page = self._repository.list_expired_candidates(
+                cutoff=moment, cursor=current, batch_size=size
+            )
+            if not page.items:
+                return ExpiredArchiveReport(
+                    archived=archived,
+                    outbox_deferred=deferred,
+                    batches=batches,
+                    cursor=None,
+                    exhausted=True,
+                )
+            result = self._repository.archive_expired_batch(
+                memory_ids=[item.memory_id for item in page.items],
+                cutoff=moment,
+                outbox_retry_after=defer_until,
+            )
+            archived += result.archived
+            deferred += result.outbox_deferred
+            batches += 1
+            current = page.next_cursor
+            if current is None:
+                break
+
         if archived:
-            self._trace("memory_archived", {"archived": archived})
-        return archived
+            self._trace(
+                "memory_archived",
+                {"archived": archived, "batches": batches, "outbox_deferred": deferred},
+            )
+        return ExpiredArchiveReport(
+            archived=archived,
+            outbox_deferred=deferred,
+            batches=batches,
+            cursor=current,
+            exhausted=current is None,
+        )
 
     # ------------------------------------------------------------- 召回校验 --
 

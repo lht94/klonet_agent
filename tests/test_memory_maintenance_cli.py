@@ -310,13 +310,25 @@ def test_build_jobs_skips_embedding_job_without_credentials(monkeypatch) -> None
     assert "embedding_outbox" not in {job.name for job in jobs}
 
 
-def test_build_jobs_is_empty_for_unimplemented_jobs(monkeypatch) -> None:
-    """只有 embedding 一个 Job 实现了；其余名字应被安静跳过，不报错。"""
+def test_build_jobs_skips_unimplemented_jobs(monkeypatch) -> None:
+    """只有已实现的 Job 会被发现；其余名字安静跳过，不报错。
+
+    阶段 3 实现了 ``embedding_outbox``，阶段 4 实现了 ``expiration`` /
+    ``purge``。断言"集合包含"而不是"集合等于"，这样后续阶段新增 Job 时
+    这条测试不会变成假失败——真正要守住的是"未实现的不会被凭空注册"。
+    """
 
     import klonet_agent.llm.embeddings as embeddings
 
     monkeypatch.setattr(embeddings, "build_default_embedding_provider", lambda: None)
-    assert cli._build_jobs(database=None, config=MaintenanceConfig()) == []
+    names = {job.name for job in cli._build_jobs(database=None, config=MaintenanceConfig())}
+    assert {"expiration", "purge"}.issubset(names)
+    # 没有嵌入凭据时 embedding_outbox 不注册（否则是一个永远跑不动的 Job）。
+    assert "embedding_outbox" not in names
+    # 尚未实现的阶段 5–7 绝不能凭空出现。
+    assert "consolidation" not in names
+    assert "reembedding" not in names
+    assert not (names - {"embedding_outbox", "expiration", "purge"})
 
 
 # --------------------------------------------------------------------------- #

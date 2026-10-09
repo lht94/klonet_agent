@@ -21,7 +21,6 @@ cursor 的语义：按 ``(user_id, project_id)`` 稳定排序后，cursor 记录
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -30,6 +29,13 @@ from klonet_agent.memory.database import MemoryDatabase
 from klonet_agent.memory.domain import Tenant
 from klonet_agent.memory.embedding_worker import EmbeddingWorker
 from klonet_agent.memory.maintenance.base import JobContext, JobResult
+from klonet_agent.memory.maintenance.tenants import (
+    decode_tenant_cursor,
+    encode_tenant_cursor,
+    normalise_tenants,
+    tenant_key,
+    tenants_after_cursor,
+)
 from klonet_agent.memory.repository import (
     DEFAULT_EMBEDDING_PROFILE_ID,
     EMBEDDING_DIMENSIONS,
@@ -45,37 +51,9 @@ __all__ = [
 
 
 def _tenant_key(tenant: Tenant) -> tuple[str, str]:
-    """稳定排序键。``project_id`` 为 None 的记忆排在同一个 user 的最前面。"""
+    """稳定排序键（与 ``maintenance/tenants.tenant_key`` 同一口径）。"""
 
-    return (str(tenant.user_id), str(tenant.project_id or ""))
-
-
-def encode_tenant_cursor(tenant: Tenant) -> str:
-    """把一个租户编码成 cursor 字符串（JSON 数组，便于人工阅读与排查）。"""
-
-    return json.dumps([str(tenant.user_id), tenant.project_id], ensure_ascii=False)
-
-
-def decode_tenant_cursor(cursor: str | None) -> tuple[str, str | None] | None:
-    """解析 cursor；无法解析时返回 ``None``（从头上重扫，绝不"猜一个位置"）。
-
-    宁可多扫一遍也不要因为 cursor 形态不认识而跳过一批租户——后者会让
-    coverage 指标看起来正常，实际却有租户永远补不上向量。
-    """
-
-    if not cursor:
-        return None
-    try:
-        payload = json.loads(cursor)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, (list, tuple)) or len(payload) != 2:
-        return None
-    user_id = str(payload[0] or "").strip()
-    if not user_id:
-        return None
-    project_id = payload[1]
-    return (user_id, str(project_id) if project_id else None)
+    return tenant_key(tenant)
 
 
 class EmbeddingOutboxJob:
@@ -136,10 +114,7 @@ class EmbeddingOutboxJob:
 
             tenants = list_active_tenants(self._database, limit=self._max_tenants * 4)
         # 去重 + 稳定排序：cursor 的正确性依赖顺序稳定。
-        unique: dict[tuple[str, str], Tenant] = {}
-        for tenant in tenants:
-            unique.setdefault(_tenant_key(tenant), tenant)
-        return [unique[key] for key in sorted(unique)]
+        return normalise_tenants(tenants)[: self._max_tenants]
 
     def _repository_for(self, tenant: Tenant) -> Any:
         if self._repository_factory is not None:
@@ -184,12 +159,7 @@ class EmbeddingOutboxJob:
         if not tenants:
             return JobResult(details=("no_tenants：没有可调度的租户",))
 
-        start = decode_tenant_cursor(cursor)
-        if start is not None:
-            start_key = (start[0], str(start[1] or ""))
-            tenants = [t for t in tenants if _tenant_key(t) > start_key]
-        tenants = tenants[: self._max_tenants]
-
+        tenants = tenants_after_cursor(self._list_tenants(), cursor)
         if not tenants:
             # cursor 已经走到底：下一轮从头来。
             return JobResult(details=("cursor_exhausted：本轮无剩余租户",))

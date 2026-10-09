@@ -55,10 +55,14 @@ from klonet_agent.memory.repository import (
     DEFAULT_EMBEDDING_PROFILE_ID,
     EMBEDDING_DIMENSIONS,
     ActiveSubjectConflictError,
+    ArchivedExpiredBatch,
     CandidateNotFoundError,
     CandidateRecord,
+    DeletedBacklog,
     DuplicateVersionError,
     EmbeddingOutboxStats,
+    ExpiredCandidate,
+    ExpiredCandidatePage,
     MemoryRepositoryError,
     NewRecordCommand,
     NewVersionCommand,
@@ -66,6 +70,8 @@ from klonet_agent.memory.repository import (
     RecordNotFoundError,
     RecordNotActiveError,
     ScopeViolationError,
+    decode_expired_cursor,
+    encode_expired_cursor,
 )
 
 __all__ = [
@@ -1445,6 +1451,215 @@ class PostgresMemoryRepository:
                 [MemoryStatus.DELETED.value, older_than, *scope_params, int(limit)],
             ).fetchall()
         return len(rows)
+
+    # ------------------------------------------------- 过期归档与清理（阶段 4） --
+
+    def list_expired_candidates(
+        self,
+        *,
+        cutoff: datetime,
+        cursor: str | None = None,
+        batch_size: int = 500,
+    ) -> ExpiredCandidatePage:
+        """keyset 分页列出"``valid_to`` 已过但仍为 active"的记忆。
+
+        条件与 :meth:`archive_expired_batch` **逐字一致**（``status='active'``
+        + ``active_version.valid_to <= cutoff``），避免出现"列出的是 A、改的是
+        B"这类只有生产上才看得见的偏差。
+
+        keyset 用 ``(v.valid_to, r.id)`` 行比较：归档会把行移出结果集，
+        offset 分页在"边读边改"时必然漏行。多取一条（``batch_size + 1``）
+        只为了判断"还有没有下一页"，返回给调用方的仍是 ``batch_size`` 条。
+        """
+
+        if cutoff is None:
+            raise MemoryDomainError("list_expired_candidates 必须给出 cutoff")
+        if batch_size <= 0:
+            return ExpiredCandidatePage()
+        scope, scope_params = self._record_scope("r")
+        clauses = [
+            "r.status = %s",
+            "v.valid_to IS NOT NULL",
+            "v.valid_to <= %s",
+            scope,
+        ]
+        params: list[Any] = [MemoryStatus.ACTIVE.value, cutoff, *scope_params]
+        decoded = decode_expired_cursor(cursor)
+        if decoded is not None:
+            cursor_valid_to, cursor_memory_id = decoded
+            clauses.append("(v.valid_to, r.id) > (%s, %s)")
+            params.extend([cursor_valid_to, _as_uuid(cursor_memory_id, "cursor")])
+        where = " AND ".join(clauses)
+        params.append(int(batch_size) + 1)
+
+        with self._session(readonly=True) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT r.id AS memory_id, r.user_id, r.project_id, r.scope,
+                       v.valid_to AS valid_to
+                  FROM memory_records r
+                  JOIN memory_versions v ON v.id = r.active_version_id
+                 WHERE {where}
+                 ORDER BY v.valid_to, r.id
+                 LIMIT %s
+                """,
+                params,
+            ).fetchall()
+
+        has_more = len(rows) > int(batch_size)
+        visible = rows[: int(batch_size)]
+        items = tuple(
+            ExpiredCandidate(
+                memory_id=str(row["memory_id"]),
+                user_id=str(row["user_id"]),
+                project_id=(str(row["project_id"]) if row["project_id"] else None),
+                scope=Scope(str(row["scope"])),
+                valid_to=row["valid_to"],
+            )
+            for row in visible
+        )
+        next_cursor = None
+        if has_more and visible:
+            last = visible[-1]
+            next_cursor = encode_expired_cursor(last["valid_to"], str(last["memory_id"]))
+        return ExpiredCandidatePage(items=items, next_cursor=next_cursor)
+
+    def archive_expired_batch(
+        self,
+        *,
+        memory_ids: Sequence[str],
+        cutoff: datetime,
+        outbox_retry_after: datetime | None = None,
+    ) -> ArchivedExpiredBatch:
+        """条件更新：把给定的一批记忆归档为 expired（同一事务内联动 outbox）。
+
+        与计划 §6.2 的签名（``archive_expired_batch(cutoff, limit, tenant)``）
+        略有出入，理由有两条：
+
+        * ``tenant`` 在租户绑定的 repository 上是**隐式**的（``_record_scope``
+          + RLS），显式再传一遍反而给了"传错租户"的机会；
+        * 收窄成显式 ``memory_ids``，让"列出候选 → 条件归档"两步在同一批 id 上
+          闭环——调用方能精确说出这一批改了哪些，审计与 outbox 联动都靠它。
+
+        **条件更新没有省掉**：SQL 里仍带 ``status='active' AND valid_to <= cutoff``，
+        所以并发/时序导致的状态变化只会让这一条不被归档，不会被覆盖写。
+
+        所有语句在同一个事务里：记录状态、outbox 推后要么一起生效、要么一起回滚，
+        不会留下"记录已 expired 但 outbox 还在空转"的半套状态。
+        """
+
+        if cutoff is None:
+            raise MemoryDomainError("archive_expired_batch 必须给出 cutoff")
+        if outbox_retry_after is not None and outbox_retry_after < cutoff:
+            # 推到 cutoff 之前等于没推——下一条 claim 立刻又会命中它。
+            raise MemoryDomainError(
+                "outbox_retry_after 必须不早于 cutoff，否则推后没有意义"
+            )
+        ids: list[Any] = []
+        for raw in memory_ids:
+            parsed = _as_uuid(raw, "memory_id")
+            if parsed is not None:
+                ids.append(parsed)
+        if not ids:
+            return ArchivedExpiredBatch()
+
+        scope, scope_params = self._record_scope("r")
+        with self._session() as conn:
+            archived_rows = conn.execute(
+                f"""
+                UPDATE memory_records r
+                   SET status = %s, updated_at = now()
+                  FROM memory_versions v
+                 WHERE r.id = ANY(%s)
+                   AND v.id = r.active_version_id
+                   AND r.status = %s
+                   AND v.valid_to IS NOT NULL
+                   AND v.valid_to <= %s
+                   AND {scope}
+                RETURNING r.id AS memory_id
+                """,
+                [
+                    MemoryStatus.EXPIRED.value,
+                    ids,
+                    MemoryStatus.ACTIVE.value,
+                    cutoff,
+                    *scope_params,
+                ],
+            ).fetchall()
+            archived_ids = [row["memory_id"] for row in archived_rows]
+            if not archived_ids:
+                return ArchivedExpiredBatch()
+
+            deferred = 0
+            if outbox_retry_after is not None:
+                deferred_rows = conn.execute(
+                    """
+                    UPDATE memory_embedding_outbox o
+                       SET next_attempt_at = %s, updated_at = now()
+                      FROM memory_versions v
+                     WHERE v.id = o.memory_version_id
+                       AND v.memory_id = ANY(%s)
+                       AND o.status IN ('pending', 'processing')
+                    RETURNING o.memory_version_id
+                    """,
+                    (outbox_retry_after, archived_ids),
+                ).fetchall()
+                deferred = len(deferred_rows)
+        return ArchivedExpiredBatch(
+            archived=len(archived_ids),
+            memory_ids=tuple(str(item) for item in archived_ids),
+            outbox_deferred=deferred,
+        )
+
+    def inspect_deleted_backlog(
+        self, *, older_than: datetime, limit: int = 1000
+    ) -> DeletedBacklog:
+        """与 :meth:`purge_deleted` 同一谓词的规模统计（dry-run 用）。
+
+        ``limit`` 与 ``purge_deleted`` 的语义相同：只统计**一批**要删的量。
+        想估全量就传一个大 limit；默认值与 purge 的批大小一致，于是
+        "dry-run 报的数字"和"真跑一批删的数字"是同一个口径。
+        """
+
+        if older_than is None:
+            raise MemoryDomainError("inspect_deleted_backlog 必须给出保留期门槛")
+        if limit <= 0:
+            return DeletedBacklog()
+        scope, scope_params = self._record_scope("r")
+        with self._session(readonly=True) as conn:
+            row = conn.execute(
+                f"""
+                WITH target AS (
+                    SELECT r.id, r.updated_at
+                      FROM memory_records r
+                     WHERE r.status = %s
+                       AND r.updated_at <= %s
+                       AND {scope}
+                     ORDER BY r.updated_at
+                     LIMIT %s
+                )
+                SELECT (SELECT count(*) FROM target) AS n,
+                       (SELECT min(updated_at) FROM target) AS oldest,
+                       (SELECT coalesce(sum(length(v.content)), 0)
+                          FROM memory_versions v
+                         WHERE v.memory_id IN (SELECT id FROM target)) AS bytes,
+                       (SELECT array_agg(id) FROM target) AS ids
+                """,
+                [
+                    MemoryStatus.DELETED.value,
+                    older_than,
+                    *scope_params,
+                    int(limit),
+                ],
+            ).fetchone()
+        oldest = row["oldest"] if row is not None else None
+        raw_ids = row["ids"] if row is not None else None
+        return DeletedBacklog(
+            count=int(row["n"] or 0) if row is not None else 0,
+            oldest_deleted_at=oldest if isinstance(oldest, datetime) else None,
+            estimated_bytes=int(row["bytes"] or 0) if row is not None else 0,
+            memory_ids=tuple(str(item) for item in (raw_ids or ())),
+        )
 
     def list_records(
         self,

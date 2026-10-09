@@ -230,6 +230,101 @@ class EmbeddingOutboxStats:
         return max(0.0, float(delta.total_seconds()))
 
 
+@dataclass(frozen=True)
+class ExpiredCandidate:
+    """一条"``valid_to`` 已过、但状态仍是 active"的记忆。
+
+    正常情况下 ``mark_expired`` 会同时改状态与 ``valid_to``；出现这种分歧意味着
+    有历史遗留（直接改过 ``valid_to`` 的写入路径），它们会一直占着 "active" 的
+    名字，让审计数字对不上。
+    """
+
+    memory_id: str
+    user_id: str
+    project_id: str | None
+    scope: Scope
+    valid_to: datetime
+
+
+@dataclass(frozen=True)
+class ExpiredCandidatePage:
+    """keyset 分页的一页。
+
+    ``next_cursor`` 为 ``None`` 表示已到末页。cursor 由
+    :func:`encode_expired_cursor` 生成，形态是稳定的 ``(valid_to, memory_id)``。
+    """
+
+    items: tuple[ExpiredCandidate, ...] = ()
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class ArchivedExpiredBatch:
+    """一次 :meth:`MemoryRepository.archive_expired_batch` 的结果。"""
+
+    archived: int = 0
+    memory_ids: tuple[str, ...] = ()
+    outbox_deferred: int = 0
+
+
+@dataclass(frozen=True)
+class DeletedBacklog:
+    """待物理清理的规模（purge dry-run）。"""
+
+    count: int = 0
+    oldest_deleted_at: datetime | None = None
+    estimated_bytes: int = 0
+    # 这一批具体是哪些（上限 = 查询时给的 ``limit``）。purge 用它做"删完抽查
+    # 还能不能被召回"——只知道数量就无从抽查。
+    memory_ids: tuple[str, ...] = ()
+
+
+_EXPIRED_CURSOR_SEPARATOR = "|"
+
+
+def encode_expired_cursor(valid_to: datetime, memory_id: str) -> str:
+    """把 keyset 位置编码成 cursor。
+
+    形态刻意做得**可读**（``<ISO8601>|<uuid>`` 而不是 base64）：分页出错时
+    运维能一眼看出"停在哪条、哪个时间点"，而不是先写一段解码脚本。
+    ``valid_to`` 统一转成 UTC ISO8601——不同时区表示同一个瞬间必须产生
+    同一个 cursor，否则断点会错位。
+    """
+
+    if valid_to is None:
+        raise ValueError("cursor 的 valid_to 不能为空")
+    if not str(memory_id or "").strip():
+        raise ValueError("cursor 的 memory_id 不能为空")
+    moment = valid_to.astimezone(timezone.utc) if valid_to.tzinfo else valid_to.replace(
+        tzinfo=timezone.utc
+    )
+    return f"{moment.isoformat()}{_EXPIRED_CURSOR_SEPARATOR}{memory_id}"
+
+
+def decode_expired_cursor(cursor: str | None) -> tuple[datetime, str] | None:
+    """解析 cursor；无法解析时返回 ``None``（从头开始，绝不"猜一个位置"）。
+
+    与阶段 3 的租户 cursor 同一取舍：宁可多扫一页，也不要因为 cursor 不认识
+    而跳过一批过期记忆——后者会让"过期记录 2 小时内归档"的 SLO 静默失守。
+    """
+
+    if not cursor:
+        return None
+    if _EXPIRED_CURSOR_SEPARATOR not in cursor:
+        return None
+    raw_moment, _, raw_id = cursor.partition(_EXPIRED_CURSOR_SEPARATOR)
+    memory_id = raw_id.strip()
+    if not memory_id:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw_moment.strip())
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc), memory_id
+
+
 class MemoryRepository(Protocol):
     """记忆存储契约。
 
@@ -496,6 +591,66 @@ class MemoryRepository(Protocol):
         只删 ``status='deleted'`` 且 ``updated_at <= older_than`` 的记录；
         版本、来源、关系随外键级联删除。**不可逆**，所以门槛（保留期）由调用方
         显式给出，不在这里给默认值。
+        """
+
+        ...
+
+    # --- 过期归档与物理清理（04 计划阶段 4）--------------------------------- #
+
+    def list_expired_candidates(
+        self,
+        *,
+        cutoff: datetime,
+        cursor: str | None = None,
+        batch_size: int = 500,
+    ) -> "ExpiredCandidatePage":
+        """列出"``valid_to`` 已过但仍为 active"的记忆，**keyset 分页**。
+
+        只读，不改变任何状态——dry-run、运维巡检和 ExpirationJob 的"取一批"
+        都走这里。
+
+        * ``cutoff``：判定门槛（通常是 ``now``）。条件与
+          :meth:`archive_expired_batch` 完全一致，避免"列出的是 A、改的是 B"。
+        * ``cursor``：上一页返回的 ``next_cursor``。keyset 字段是稳定的
+          ``(valid_to, memory_id)``，**不能用 offset**——归档会把行移出结果集，
+          offset 分页必然漏行。
+        * 跨租户硬过滤由实现层的 ``_record_scope()`` + RLS 保证；调用方拿到的
+          永远是当前绑定租户的行。
+        """
+
+        ...
+
+    def archive_expired_batch(
+        self,
+        *,
+        memory_ids: Sequence[str],
+        cutoff: datetime,
+        outbox_retry_after: datetime | None = None,
+    ) -> "ArchivedExpiredBatch":
+        """把给定的一批记忆从 active 归档成 expired（**条件更新**）。
+
+        SQL 里带上 ``status='active' AND valid_to <= cutoff``：即便传进来的 id
+        在这一瞬间已经过期/被删/状态已变，也不会被"再归档一次"。所以这个方法是
+        幂等且并发安全的——两个 worker 同时跑最多各改一半，不会互相覆盖。
+
+        ``outbox_retry_after`` 非空时，**同一个事务**里把这些记录的
+        ``embedding_outbox`` 未闭环条目推到该时刻：归档后它们的向量没有意义，
+        但立刻删除 outbox 行会掩盖"曾经欠过一次"的事实。推后而不是删除，
+        配合阶段 3 的 ``claim_pending_embeddings`` 的 ``r.status <> 'deleted'``
+        谓词（expired 仍会被领到，所以推后是为了让它们排在 deleted 之前不被
+        无谓计算）。
+        """
+
+        ...
+
+    def inspect_deleted_backlog(
+        self, *, older_than: datetime, limit: int = 1000
+    ) -> "DeletedBacklog":
+        """查"已过保留期、待物理清理"的规模（purge dry-run 用）。
+
+        与 :meth:`purge_deleted` 用**同一个谓词**，所以 dry-run 报的数字就是
+        真跑会删的量。``estimated_bytes`` 用正文长度估算（不落盘、不精确），
+        只用来判断"这次要不要在低峰期跑"。
         """
 
         ...
