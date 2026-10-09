@@ -267,7 +267,7 @@ def _add(repo: PostgresMemoryRepository, tenant: Tenant, content: str, **kwargs:
             project_id=tenant.project_id,
             memory_type=MemoryType.FACT,
             scope=Scope.SHARED_OPS if tenant is SHARED_OPS_TENANT else Scope.PROJECT,
-            subject_key=f"fact:exp:{uuid4().hex[:8]}",
+            subject_key=f"fact:project:exp:{uuid4().hex[:8]}",
             content=content,
             sources=(
                 MemorySource(

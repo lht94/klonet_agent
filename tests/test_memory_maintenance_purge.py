@@ -191,7 +191,7 @@ def _add(repo: PostgresMemoryRepository, tenant: Tenant, content: str):
             project_id=tenant.project_id,
             memory_type=MemoryType.FACT,
             scope=Scope.PROJECT,
-            subject_key=f"fact:purge:{uuid4().hex[:8]}",
+            subject_key=f"fact:project:purge:{uuid4().hex[:8]}",
             content=content,
             sources=(
                 MemorySource(
