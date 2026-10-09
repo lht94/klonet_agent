@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from klonet_agent.memory.domain import (
@@ -185,12 +185,17 @@ class EmbeddingOutboxStats:
 
     ``coverage`` 是"已算出向量的版本占比"，也是判断能否依赖向量通道、以及
     要不要建 HNSW 的依据（计划 §12：先测量再决定）。
+
+    ``oldest_pending_at`` 是**尚未闭环的最老任务**的创建时间（04 计划 §6.1
+    "最老 pending" 指标）。只看 ``outstanding`` 数量无法区分"队列在动但积压
+    很久"和"队列刚有活"——前者才是要告警的。
     """
 
     pending: int = 0
     processing: int = 0
     completed: int = 0
     failed: int = 0
+    oldest_pending_at: datetime | None = None
 
     @property
     def outstanding(self) -> int:
@@ -209,6 +214,20 @@ class EmbeddingOutboxStats:
         if self.total == 0:
             return 1.0
         return self.completed / self.total
+
+    def oldest_pending_age_seconds(self, *, now: datetime | None = None) -> float | None:
+        """最老未闭环任务的年龄（秒）；队列为空时返回 ``None``。
+
+        ``None`` 与 ``0.0`` 语义不同：``None`` 表示"没有积压"，``0.0`` 表示
+        "刚进来一条"。健康判定必须区分这两者，否则空队列会被算成"存在 0 秒
+        的积压"。
+        """
+
+        if self.oldest_pending_at is None:
+            return None
+        moment = now or datetime.now(timezone.utc)
+        delta = moment - self.oldest_pending_at
+        return max(0.0, float(delta.total_seconds()))
 
 
 class MemoryRepository(Protocol):
@@ -388,8 +407,12 @@ class MemoryRepository(Protocol):
         *,
         embedding_model: str,
         embedding_version: str,
-    ) -> None:
+    ) -> bool:
         """写入向量并闭环 outbox 状态。
+
+        返回 ``True`` 表示已写入；``False`` 表示跳过——记录已被删除（04 计划
+        §6.1"删除记忆不会复活"）。把删除当成"跳过"而不是"失败"，是为了不让
+        正常的删除在 worker 日志里留下假失败。
 
         这是 embedding worker（阶段 4）的写入口；正文事务自己不调用它，
         以保持"正文先提交、向量异步补算"的解耦。模型与版本必须一起给，

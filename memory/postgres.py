@@ -73,6 +73,7 @@ __all__ = [
     "EMBEDDING_DIMENSIONS",
     "PostgresMemoryRepository",
     "default_lexical_text",
+    "list_active_tenants",
 ]
 
 
@@ -183,6 +184,57 @@ def default_lexical_text(content: str) -> str:
     return " ".join(
         token for token in DEFAULT_TOKENIZER.tokenize(str(content)) if token.strip()
     )
+
+
+def list_active_tenants(
+    database: MemoryDatabase,
+    *,
+    limit: int = 1000,
+    include_shared_ops: bool = False,
+) -> list[Tenant]:
+    """列出库里有未删除记忆的租户，按 ``(user_id, project_id)`` 稳定排序。
+
+    04 计划 §6.1：`EmbeddingOutboxJob` 必须"按租户调度"——``EmbeddingWorker``
+    与 ``MemoryRepository`` 都是**租户作用域**的（RLS 沿
+    ``memory_versions → memory_records`` 回溯），所以 Worker 需要一个明确的
+    租户清单才能开始工作。
+
+    **这是一个跨租户的只读查询**，用 ``diagnostic_session()``（不绑定
+    ``app.user_id``）。这意味着：
+
+    * 在超级用户/``BYPASSRLS`` 角色下能看到全部租户——测试与运维场景；
+    * 在受 RLS 约束的角色（``klonet_app``）下**什么都看不到**，返回空列表。
+      这种部署必须显式传入租户清单（见 ``EmbeddingOutboxJob`` 的
+      ``tenants_provider`` 参数），而不是指望这个函数凭空发现租户。
+
+    宁可返回空列表（Worker 空转，运维能立刻从 health 的 jobs=[] 看出来）
+    也不要静默地只处理一部分租户——后者会让 coverage 指标看起来正常，
+    实际却有租户永远补不上向量。
+
+    ``include_shared_ops``：``shared_ops`` 记忆的 ``project_id`` 是 NULL 且
+    ``scope='shared_ops'``；默认不返回（普通租户上下文读不到它们，
+    强行调度只会得到权限错误）。
+    """
+
+    if limit <= 0:
+        return []
+    conditions = ["status <> 'deleted'", "user_id <> ''"]
+    if not include_shared_ops:
+        conditions.append("scope <> 'shared_ops'")
+    sql = (
+        "SELECT DISTINCT user_id, project_id FROM memory_records "
+        "WHERE " + " AND ".join(conditions) + " "
+        "ORDER BY user_id, project_id NULLS FIRST LIMIT %s"
+    )
+    with database.diagnostic_session() as conn:
+        rows = conn.execute(sql, (int(limit),)).fetchall()
+    tenants: list[Tenant] = []
+    for row in rows:
+        project_id = row["project_id"]
+        tenants.append(
+            Tenant(user_id=str(row["user_id"]), project_id=(str(project_id) if project_id else None))
+        )
+    return tenants
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -1090,7 +1142,22 @@ class PostgresMemoryRepository:
         *,
         embedding_model: str,
         embedding_version: str,
-    ) -> None:
+    ) -> bool:
+        """给一个版本写回向量。
+
+        返回 ``True`` 表示已写入；``False`` 表示**跳过**——记录已被删除，或者
+        对应的 outbox 行已经不在了（04 计划 §6.1"写回前再次验证版本未删除"）。
+
+        为什么返回布尔值而不是抛异常：被删除的记录不是"失败"。如果把它
+        当成可重试错误，worker 会白白重试到 ``max_attempts`` 才 abandoned，
+        日志里出现一堆假失败；如果当成永久失败，又会把一次正常的删除
+        记成 embedding 故障。跳过是唯一准确的语义。
+
+        竞态窗口：worker 领取任务（status='processing'）之后、写回之前，用户
+        删除了这条记忆。``delete_memory`` 会清掉向量**并删掉 outbox 行**，但
+        那时代码已经拿着 ``version_id`` 在写回了——所以必须在这里再查一次。
+        """
+
         values = tuple(float(item) for item in embedding)
         if len(values) != EMBEDDING_DIMENSIONS:
             raise MemoryDomainError(
@@ -1103,9 +1170,37 @@ class PostgresMemoryRepository:
             )
 
         vid = _as_uuid(version_id, "version_id")
+        scope, scope_params = self._record_scope("r")
         with self._session() as conn:
-            if self._select_version(conn, vid) is None:
+            # 一次查出"版本是否可见"和"记录是否已删除"，避免两次往返之间
+            # 状态又变了。
+            target = conn.execute(
+                f"""
+                SELECT v.id AS version_id, r.status AS record_status
+                  FROM memory_versions v
+                  JOIN memory_records r ON r.id = v.memory_id
+                 WHERE v.id = %s AND {scope}
+                """,
+                [vid, *scope_params],
+            ).fetchone()
+            if target is None:
                 raise RecordNotFoundError(f"版本 {version_id} 不存在或不属于当前租户")
+            if str(target["record_status"]) == MemoryStatus.DELETED.value:
+                # 删除后不复活：把该版本的向量与 outbox 一起清掉，再返回跳过。
+                conn.execute(
+                    """
+                    UPDATE memory_versions
+                       SET embedding = NULL, embedding_model = NULL, embedding_version = NULL
+                     WHERE id = %s
+                    """,
+                    (vid,),
+                )
+                conn.execute(
+                    "DELETE FROM memory_embedding_outbox WHERE memory_version_id = %s",
+                    (vid,),
+                )
+                return False
+
             updated = conn.execute(
                 """
                 UPDATE memory_versions
@@ -1128,6 +1223,7 @@ class PostgresMemoryRepository:
                 """,
                 (vid, DEFAULT_EMBEDDING_PROFILE_ID),
             )
+        return True
 
     # --------------------------------------------------------- embedding 队列 --
 
@@ -1153,6 +1249,10 @@ class PostgresMemoryRepository:
         #   pending + next_attempt_at <= now()  → 失败退避到点了
         #   processing + 租约过期               → 上一个 worker 崩了
         # 于是"崩溃恢复"不需要额外的清理进程，一个越界的租约就是它的全部机制。
+        #
+        # 04 计划 §6.1：``r.status <> 'deleted'`` —— 已删除的记录绝不重新嵌入。
+        # `delete_memory` 会删掉 outbox 行，但"领取后、写回前被删除"的竞态仍然存在，
+        # 所以**读取侧和写入侧都要挡**（写入侧见 ``set_embedding``）。
         sql = f"""
         WITH claimed AS (
             SELECT o.memory_version_id, o.embedding_profile_id
@@ -1162,6 +1262,7 @@ class PostgresMemoryRepository:
              WHERE o.embedding_profile_id = %s
                AND o.status IN ('pending', 'processing')
                AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= %s)
+               AND r.status <> 'deleted'
                AND {scope}
              ORDER BY o.created_at, o.memory_version_id
              LIMIT %s
@@ -1242,12 +1343,28 @@ class PostgresMemoryRepository:
                 """,
                 [profile, *scope_params],
             ).fetchall()
+            # 最老"未闭环"任务（pending 或 processing）的创建时间。
+            # 04 计划 §6.1 的"最老 pending"指标：数量之外还要有滞留时长。
+            oldest_row = conn.execute(
+                f"""
+                SELECT min(o.created_at) AS oldest
+                  FROM memory_embedding_outbox o
+                  JOIN memory_versions v ON v.id = o.memory_version_id
+                  JOIN memory_records r ON r.id = v.memory_id
+                 WHERE o.embedding_profile_id = %s
+                   AND o.status IN ('pending', 'processing')
+                   AND {scope}
+                """,
+                [profile, *scope_params],
+            ).fetchone()
         counts = {str(row["status"]): int(row["n"]) for row in rows}
+        oldest = oldest_row["oldest"] if oldest_row is not None else None
         return EmbeddingOutboxStats(
             pending=counts.get("pending", 0),
             processing=counts.get("processing", 0),
             completed=counts.get("completed", 0),
             failed=counts.get("failed", 0),
+            oldest_pending_at=oldest if isinstance(oldest, datetime) else None,
         )
 
     # -------------------------------------------------- 删除权与生命周期 --

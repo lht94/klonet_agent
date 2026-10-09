@@ -53,12 +53,17 @@ class EmbeddingRunStats:
 
     ``errors`` 只放异常的"类型 + 消息"，不放正文——向量生成失败经常发生在
     含敏感内容的记忆上，日志不该成为绕过脱敏的旁路。
+
+    ``skipped``（04 计划阶段 3）是"领取之后发现目标已经不该写"的条数：记录被
+    删除、outbox 行已被删除。它不是失败——把它记成 failed 会让正常的删除
+    在监控里显示成 embedding 故障。
     """
 
     claimed: int = 0
     embedded: int = 0
     retried: int = 0
     abandoned: int = 0
+    skipped: int = 0
     errors: tuple[str, ...] = ()
 
     @property
@@ -152,17 +157,39 @@ class EmbeddingWorker:
 
     # ------------------------------------------------------------- 运行 --
 
-    def run(self, *, limit: int | None = None) -> EmbeddingRunStats:
+    def run(
+        self,
+        *,
+        limit: int | None = None,
+        deadline: datetime | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> EmbeddingRunStats:
         """处理至多 ``limit`` 条待办任务（默认一批）。
 
         不抛异常：这是后台任务，任何一条失败都只影响它自己。调用方从返回的
         统计与 ``stats()`` 观察结果。
+
+        ``deadline`` / ``should_stop``（04 计划阶段 3）：本方法是"批内循环"，
+        一批 20 条、每条可能打一次网络。没有这两个闸门，一个慢供应商会把
+        Worker 的单次 tick 拖过 lease 甚至拖过整个 grace period。检查点放在
+        **每个批次的边界**和**每条任务之前**——前者避免无谓地再领一批，
+        后者避免已经超时还继续跑完手里的一整批。
         """
 
         budget = self._batch_size if limit is None else max(0, int(limit))
-        claimed_total = embedded = retried = abandoned = 0
+        claimed_total = embedded = retried = abandoned = skipped = 0
         errors: list[str] = []
+
+        def _stopping() -> bool:
+            if should_stop is not None and should_stop():
+                return True
+            if deadline is not None and self._clock() >= deadline:
+                return True
+            return False
+
         while budget > 0:
+            if _stopping():
+                break
             batch = self._repository.claim_pending_embeddings(
                 limit=min(self._batch_size, budget),
                 lease_seconds=self._lease_seconds,
@@ -175,9 +202,14 @@ class EmbeddingWorker:
             budget -= len(batch)
             claimed_total += len(batch)
             for item in batch:
+                if _stopping():
+                    # 手里这条不跑了：它仍是 processing，租约到期后会被重领。
+                    break
                 outcome, message = self._process(item)
                 if outcome == "embedded":
                     embedded += 1
+                elif outcome == "skipped":
+                    skipped += 1
                 elif outcome == "retried":
                     retried += 1
                     errors.append(message)
@@ -189,6 +221,7 @@ class EmbeddingWorker:
             embedded=embedded,
             retried=retried,
             abandoned=abandoned,
+            skipped=skipped,
             errors=tuple(errors),
         )
 
@@ -200,7 +233,7 @@ class EmbeddingWorker:
         except Exception as exc:  # noqa: BLE001 - 单条失败不应中断整批
             return self._record_failure(item, exc)
         try:
-            self._repository.set_embedding(
+            written = self._repository.set_embedding(
                 item.version_id,
                 vector,
                 embedding_model=self._model,
@@ -208,6 +241,9 @@ class EmbeddingWorker:
             )
         except Exception as exc:  # noqa: BLE001 - 同上；写回失败与生成失败分开归因
             return self._record_failure(item, exc)
+        if written is False:
+            # 记录已被删除（或 outbox 行已不在）：跳过，不算失败。
+            return ("skipped", "")
         return ("embedded", "")
 
     def _embed(self, content: str) -> tuple[float, ...]:

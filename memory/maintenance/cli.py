@@ -63,23 +63,37 @@ def _build_database() -> Any:
     return database
 
 
-def _build_jobs() -> list[Any]:
+def _build_jobs(database: Any, config: MaintenanceConfig) -> list[Any]:
     """加载已经实现好的 Job。
 
     阶段 2 时 ``memory/maintenance/jobs/`` 还没有任何 Job 实现，返回空列表是
-    预期行为（Worker 起来后只空转）。阶段 3–7 每加一个 Job 模块，这里自动
-    发现它——**不写死名字**，避免"实现了但忘记注册"的静默缺失。
+    预期行为（Worker 起来后只空转）。阶段 3 起每加一个 Job 模块自动被发现——
+    **不写死名字**，避免"实现了但忘记注册"的静默缺失。
 
-    模块约定：``memory.maintenance.jobs.<canonical_name>`` 暴露
-    ``JOB`` 对象（实现了 ``MaintenanceJob``）。
+    模块约定（两种任选其一）：
+
+    * ``memory.maintenance.jobs.<canonical_name>`` 暴露 ``JOB`` 对象
+      （无依赖的 Job）；
+    * 或者暴露 ``build_job(*, database, config)`` 工厂，返回 Job 或 ``None``
+      （需要数据库/凭据的 Job；返回 None 表示"这个部署不具备运行条件"，
+      例如没有嵌入凭据）。
+
+    ``build_job`` 优先。工厂返回 ``None`` 时**不注册**，这样 ``status`` 的
+    ``jobs`` 列表就能如实反映"哪些 Job 真的可用"。
     """
 
     jobs: list[Any] = []
     for name in service_module.KNOWN_JOB_NAMES:
         module_name = f"klonet_agent.memory.maintenance.jobs.{name}"
         try:
-            module = __import__(module_name, fromlist=["JOB"])
+            module = __import__(module_name, fromlist=["JOB", "build_job"])
         except ImportError:
+            continue
+        builder = getattr(module, "build_job", None)
+        if callable(builder):
+            job = builder(database=database, config=config)
+            if job is not None:
+                jobs.append(job)
             continue
         job = getattr(module, "JOB", None)
         if job is not None:
@@ -92,7 +106,7 @@ def _build_service(config: MaintenanceConfig) -> tuple[MaintenanceService, Any]:
     from klonet_agent.memory.maintenance.repository import MaintenanceRepository
 
     repository = MaintenanceRepository(database)
-    service = MaintenanceService(repository, config, jobs=_build_jobs())
+    service = MaintenanceService(repository, config, jobs=_build_jobs(database, config))
     return service, database
 
 
