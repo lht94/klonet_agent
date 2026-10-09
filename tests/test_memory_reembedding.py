@@ -496,6 +496,8 @@ def test_backfill_writes_profile_table_and_search_routes(db: MemoryDatabase) -> 
         target_model="test-model",
         target_model_version="1",
     )
+    started = manager.start(migration.migration_id)
+    assert started.status == "backfilling"
     job = _job(db, manager=manager)
     result = job.run(_context(), None)
     assert result.changed == 2
@@ -586,6 +588,7 @@ def test_validate_gate_and_atomic_promote_rollback(db: MemoryDatabase) -> None:
         target_model="test-model",
         target_model_version="1",
     )
+    manager.start(migration.migration_id)
     job = _job(db, manager=manager)
     job.run(_context(), None)
     assert manager.get(migration.migration_id).status == "validating"
