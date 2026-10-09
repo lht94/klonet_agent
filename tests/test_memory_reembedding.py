@@ -498,16 +498,21 @@ def test_backfill_writes_profile_table_and_search_routes(db: MemoryDatabase) -> 
     )
     started = manager.start(migration.migration_id)
     assert started.status == "backfilling"
+    started = manager.start(migration.migration_id)
+    assert started.status == "backfilling"
     job = _job(db, manager=manager)
     result = job.run(_context(), None)
-    assert result.changed == 2
+    # coverage/eligible 是**全库全局**的（迁移语义如此），module 级共享库里
+    # 先前用例的租户也会被播种+回填，所以断言"至少包含本租户的 2 条"。
+    assert result.changed >= 2
     assert result.failed == 0
 
     # 向量落在多 profile 表，default 单列不被触碰。
     with db.diagnostic_session() as conn:
         profile_rows = conn.execute(
-            "SELECT embedding_model FROM memory_embeddings WHERE embedding_profile_id = %s",
-            (target,),
+            "SELECT embedding_model FROM memory_embeddings "
+            " WHERE embedding_profile_id = %s AND memory_version_id = ANY(%s)",
+            (target, [a.active_version.id, b.active_version.id]),
         ).fetchall()
         legacy = conn.execute(
             "SELECT embedding IS NULL AS empty FROM memory_versions WHERE id = ANY(%s)",
@@ -613,8 +618,9 @@ def test_validate_gate_and_atomic_promote_rollback(db: MemoryDatabase) -> None:
     assert manager.get(migration.migration_id).status == "validating"
 
     # 把缺口补上 → 通过 → ready → promote 原子切换。
-    worker = job._default_worker(tenant=tenant, profile_id=target)  # noqa: SLF001
-    worker.run(limit=10)
+    # coverage 是全库全局的：用 Job 本身排空所有租户的积压（真实路径），
+    # 只补本租户永远凑不齐门槛。
+    job.run(_context(), None)
     report = manager.validate(
         migration.migration_id, search_fn=_search_all, probes=["Python", "React"]
     )
