@@ -21,6 +21,7 @@ import pytest
 
 from klonet_agent.memory.database import MemoryDatabase, temporary_database
 from klonet_agent.memory.domain import (
+    WriteDecision,
     MemorySource,
     MemoryStatus,
     MemoryType,
@@ -627,3 +628,54 @@ def test_merge_apply_writes_through_versioning(db: MemoryDatabase) -> None:
     assert written is not None
     assert "合并后正文" in (written.active_version.content if written.active_version else "")
     assert outcome.applied_version_ids
+
+
+def test_merge_into_existing_subject_appends_version_and_keeps_old(
+    db: MemoryDatabase,
+) -> None:
+    """MERGE 语义 = UPDATE（含义未变、只是描述合并），旧值必须保留。
+
+    这是 R8 那条规则的可执行形式：同一个 subject 内容不同、又没声明决策时
+    ``plan_consolidation`` 会 REJECT。提案类型给出了这个声明——
+    MERGE → UPDATE（追加版本），SUPERSEDE → 替换。
+    """
+
+    tenant = _tenant()
+    repo, first, second = _seed_pair(db, tenant)
+    store = ProposalStore(db, tenant)
+    ids = [str(first.id), str(second.id)]
+    old_version_id = first.active_version_id
+
+    created = store.create(
+        proposal_type=ProposalType.MERGE,
+        source_memory_ids=ids,
+        scope=Scope.PROJECT,
+        # 刻意不给 subject_key：落到 primary 的 subject 上，即"与已有记忆合并"。
+        suggested_action={"merged_content": "后端运行时要求 Python 3.11（合并后正文）"},
+        source_fingerprints=capture_source_fingerprints(repo, ids),
+    )
+    candidate = build_merge_candidate(repo, created.proposal)
+    assert candidate.proposed_decision is WriteDecision.UPDATE
+
+    store.transition(created.proposal.proposal_id, ProposalStatus.APPROVED)
+    outcome = apply_proposal(store, repo, created.proposal.proposal_id)
+
+    assert outcome.decision == "update"
+    assert outcome.record_id == str(first.id)
+    assert outcome.applied_version_ids
+    # 旧版本仍在：MERGE 不丢历史。
+    assert repo.get_version(str(old_version_id)) is not None
+
+
+def test_supersede_proposal_asks_for_supersede(db: MemoryDatabase) -> None:
+    tenant = _tenant()
+    repo, first, second = _seed_pair(db, tenant)
+    store = ProposalStore(db, tenant)
+    created = store.create(
+        proposal_type=ProposalType.SUPERSEDE,
+        source_memory_ids=[str(first.id), str(second.id)],
+        scope=Scope.PROJECT,
+        suggested_action={"merged_content": "替换后的正文"},
+    )
+    candidate = build_merge_candidate(repo, created.proposal)
+    assert candidate.proposed_decision is WriteDecision.SUPERSEDE

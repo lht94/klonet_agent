@@ -551,7 +551,7 @@ def build_merge_candidate(repository: Any, proposal: Proposal) -> Any:
     也不存在表达它的字段——不是"我们检查后拒绝"，而是"压根没法写出来"。
     """
 
-    from klonet_agent.memory.domain import MemoryCandidate
+    from klonet_agent.memory.domain import MemoryCandidate, WriteDecision
 
     payload = dict(proposal.suggested_action or {})
     content = str(payload.get("merged_content") or "").strip()
@@ -589,6 +589,17 @@ def build_merge_candidate(repository: Any, proposal: Proposal) -> Any:
             sources.append(source)
 
     subject_key = str(payload.get("subject_key") or "").strip() or primary.subject_key
+    # ``proposed_decision`` 由**提案类型**决定，而不是从载荷里读——载荷是模型
+    # 产出的，让它自己声明"我这是 SUPERSEDE"等于把最后一次判断也交出去。
+    #   MERGE     → UPDATE：含义未变、只是描述/来源合并，追加新版本，旧值不丢；
+    #   SUPERSEDE → SUPERSEDE：明确替换旧值（这是两个不同的提案类型，
+    #               审批时运维看到的就是它）；
+    #   CONFLICT  → 不设：矛盾不入 apply 路径（要写的是关系不是正文）。
+    proposed = {
+        ProposalType.MERGE: WriteDecision.UPDATE,
+        ProposalType.SUPERSEDE: WriteDecision.SUPERSEDE,
+    }.get(proposal.proposal_type)
+
     return MemoryCandidate(
         memory_type=primary.memory_type,
         scope=primary.scope,
@@ -597,6 +608,7 @@ def build_merge_candidate(repository: Any, proposal: Proposal) -> Any:
         subject_key=subject_key,
         content=content,
         confidence=max(record.confidence for record in records),
+        proposed_decision=proposed,
         sources=tuple(sources),
     )
 
