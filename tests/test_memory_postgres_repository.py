@@ -232,10 +232,14 @@ def test_migration_creates_extension_tables_indexes_and_policies(db: MemoryDatab
     assert ":klonet@" not in info["dsn"]
 
     with db.diagnostic_session() as conn:
+        # 只查 public schema（业务记忆六张表）。``memory_maintenance_*`` 维护
+        # 表在 0006 落地的 memory_maintenance schema，**不**在 public。
+        # ``pg_class.relnamespace = 'public'::regnamespace`` 把范围锁在 public。
         tables = {
             row["relname"]
             for row in conn.execute(
                 "SELECT relname FROM pg_class WHERE relkind = 'r' "
+                "AND relnamespace = 'public'::regnamespace "
                 "AND relname LIKE 'memory\\_%'"
             ).fetchall()
         }
