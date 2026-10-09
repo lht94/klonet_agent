@@ -73,34 +73,6 @@ class JobClaim:
     config: Mapping[str, Any]
     batch_limit: int
 
-    def to_job_context(
-        self,
-        *,
-        run_id: str,
-        worker_id: str,
-        deadline_seconds: float,
-    ) -> "JobContext":  # type: ignore[name-defined]  # noqa: F821
-        """转成 ``MaintenanceJob.run`` 接受的 ``JobContext``。
-
-        ``batch_limit`` 从 ``config["batch_limit"]`` 读（默认 100），死线
-        由 caller 决定（典型为 ``lease_seconds``，保证 lease 过期前
-        必须交回）。
-        """
-
-        # 避免循环 import：JobContext 在 maintenance.base 里。
-        from klonet_agent.memory.maintenance.base import JobContext
-
-        batch_limit = int(self.config.get("batch_limit", 100))
-        return JobContext(
-            job_name=self.job_name,
-            run_id=run_id,
-            worker_id=worker_id,
-            started_at=self.started_at,
-            deadline=self.deadline,
-            batch_limit=batch_limit,
-            dry_run=bool(self.config.get("dry_run", False)),
-        )
-
 
 class MaintenanceRepository:
     """维护调度与 run 账本的事务化访问入口。"""
@@ -115,6 +87,8 @@ class MaintenanceRepository:
         *,
         worker_id: str,
         lease_seconds: float,
+        job_name: str | None = None,
+        force: bool = False,
     ) -> JobClaim | None:
         """原子领取一个到期 Job；无 due job 返回 ``None``。
 
@@ -130,6 +104,11 @@ class MaintenanceRepository:
         4. INSERT 一行 ``runs`` 状态为 ``running`` 的账本；如果该 job 已有
            一个未结束的 running，partial unique index 抛 UniqueViolationError，
            repository 转成 :class:`ClaimRace`。
+
+        ``job_name`` 限定只领某个 Job（``once --job X`` 用）。
+        ``force=True`` 跳过 ``enabled`` 与 ``next_run_at`` 判定，只用于运维
+        手工触发（``once --job X --force``）；**仍**尊重 lease——别的 worker
+        正在跑时依旧抢不到。
         """
 
         if not worker_id:
@@ -140,21 +119,30 @@ class MaintenanceRepository:
         lease_seconds_int = int(lease_seconds)
         run_id = str(uuid.uuid4())
 
+        conditions = ["(lease_expires_at IS NULL OR lease_expires_at <= now())"]
+        params: list[Any] = []
+        if job_name is not None:
+            conditions.append("job_name = %s")
+            params.append(job_name)
+        if not force:
+            conditions.append("enabled")
+            conditions.append("next_run_at <= now()")
+        where_clause = " AND ".join(conditions)
+
         pool = self._database._require_pool()
         with pool.connection() as conn:
             with conn.transaction():
                 # 1) 选到期行。
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT job_name, cursor, config, last_started_at
                     FROM memory_maintenance.memory_maintenance_jobs
-                    WHERE enabled
-                      AND next_run_at <= now()
-                      AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+                    WHERE {where_clause}
                     ORDER BY next_run_at ASC
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                     """,
+                    tuple(params),
                 ).fetchone()
                 if row is None:
                     return None

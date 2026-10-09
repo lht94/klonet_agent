@@ -4,7 +4,9 @@
 不要在业务模块里散落硬编码配置，后续部署到服务器时也更方便从环境变量或配置文件读取。
 """
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 import os
 
 
@@ -186,6 +188,203 @@ def memory_cutover_enabled() -> bool:
 # 也可以单独用各自的变量灰度（例如只开写入管线跑 shadow 阶段）。
 MEMORY_WRITE_PIPELINE_ENABLED = MEMORY_WRITE_PIPELINE_ENABLED or memory_cutover_enabled()
 MEMORY_PACK_ENABLED = MEMORY_PACK_ENABLED or memory_cutover_enabled()
+
+
+# --- 记忆生命周期维护 Worker（04 计划 §7）-------------------------------- #
+#
+# Worker 是**独立进程**（不随 Agent 主链路启动），默认关闭。所有值走环境变量，
+# 但**不做静默修正**：非法周期/批量/租约会让 ``load_maintenance_config()`` 抛
+# ``MaintenanceConfigError``，让进程以明确的配置错误退出码结束——一个把
+# lease 配成 0 的部署如果被"悄悄改成默认值"，会以最难排查的方式出问题
+# （两个 worker 抢同一 job、或租约永不过期）。
+#
+# 完整取值见 ``doc/`` 的运维 runbook；这里只固化契约。
+
+class MaintenanceConfigError(ValueError):
+    """维护 Worker 配置非法。启动必须拒绝，不静默修正。"""
+
+
+@dataclass(frozen=True)
+class MaintenanceConfig:
+    """Worker 全部可调参数。默认值即 04 计划 §7 表格。"""
+
+    enabled: bool = False
+    poll_seconds: float = 5.0
+    shutdown_grace_seconds: float = 30.0
+    lease_seconds: float = 120.0
+    embedding_batch_size: int = 20
+    embedding_interval_seconds: int = 10
+    expiration_interval_seconds: int = 3600
+    expiration_batch_size: int = 500
+    purge_interval_seconds: int = 86400
+    purge_batch_size: int = 1000
+    consolidation_interval_seconds: int = 86400
+    consolidation_batch_size: int = 100
+    dry_run: bool = False
+
+    def __post_init__(self) -> None:
+        """严格校验：任何非法值都让构造失败。
+
+        刻意**不 clamp**——``min 1`` / ``max 0`` 这类修正会让一个配错的部署
+        看起来正常启动，然后在生产上以"任务永远跑不起来"或"租约永不过期"
+        的形式失败。
+        """
+
+        problems: list[str] = []
+        if self.poll_seconds <= 0:
+            problems.append(f"poll_seconds 必须 > 0，实际 {self.poll_seconds}")
+        if self.shutdown_grace_seconds <= 0:
+            problems.append(
+                f"shutdown_grace_seconds 必须 > 0，实际 {self.shutdown_grace_seconds}"
+            )
+        if self.lease_seconds <= 0:
+            problems.append(f"lease_seconds 必须 > 0，实际 {self.lease_seconds}")
+        if self.lease_seconds < self.poll_seconds:
+            problems.append(
+                f"lease_seconds({self.lease_seconds}) 不能小于 poll_seconds({self.poll_seconds})"
+            )
+        if self.shutdown_grace_seconds > self.lease_seconds:
+            # grace 比 lease 还长：收到 SIGTERM 后想在 grace 内跑完，但 lease
+            # 早就过期、别的 worker 已经把同一 job 领走了。
+            problems.append(
+                f"shutdown_grace_seconds({self.shutdown_grace_seconds}) 不能大于 "
+                f"lease_seconds({self.lease_seconds})"
+            )
+        for name, value in (
+            ("embedding_batch_size", self.embedding_batch_size),
+            ("expiration_batch_size", self.expiration_batch_size),
+            ("purge_batch_size", self.purge_batch_size),
+            ("consolidation_batch_size", self.consolidation_batch_size),
+        ):
+            if value <= 0:
+                problems.append(f"{name} 必须 > 0，实际 {value}")
+        for name, value in (
+            ("embedding_interval_seconds", self.embedding_interval_seconds),
+            ("expiration_interval_seconds", self.expiration_interval_seconds),
+            ("purge_interval_seconds", self.purge_interval_seconds),
+            ("consolidation_interval_seconds", self.consolidation_interval_seconds),
+        ):
+            if value <= 0:
+                problems.append(f"{name} 必须 > 0，实际 {value}")
+        if problems:
+            raise MaintenanceConfigError(
+                "MaintenanceConfig 非法：" + "；".join(problems)
+            )
+
+    def job_interval_seconds(self, job_name: str) -> int:
+        """某 Job 的默认调度周期（秒）。
+
+        未登记的 job 名返回 ``poll_seconds``——调用方（service.py 的 registry）
+        会在注册阶段先拒掉未知名字，这里只兜底不抛。
+        """
+
+        return {
+            "embedding_outbox": self.embedding_interval_seconds,
+            "expiration": self.expiration_interval_seconds,
+            "purge": self.purge_interval_seconds,
+            "consolidation": self.consolidation_interval_seconds,
+        }.get(job_name, max(1, int(self.poll_seconds)))
+
+    def job_batch_size(self, job_name: str) -> int:
+        return {
+            "embedding_outbox": self.embedding_batch_size,
+            "expiration": self.expiration_batch_size,
+            "purge": self.purge_batch_size,
+            "consolidation": self.consolidation_batch_size,
+        }.get(job_name, 100)
+
+
+_MAINTENANCE_ENV_PREFIX = "KLONET_AGENT_MAINTENANCE_"
+
+
+def _maintenance_env_bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise MaintenanceConfigError(
+        f"{name} 取值非法：{raw!r}（应为 1/0/true/false/yes/no/on/off）"
+    )
+
+
+def _maintenance_env_value(
+    env: Mapping[str, str], name: str, default: str, kind: str
+) -> str:
+    raw = env.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    text = str(raw).strip()
+    try:
+        if kind == "int":
+            int(text)
+        elif kind == "float":
+            float(text)
+        else:  # pragma: no cover - 防御性分支
+            raise ValueError(kind)
+    except ValueError as exc:
+        raise MaintenanceConfigError(
+            f"{name} 取值非法：{raw!r}（应为 {kind}）"
+        ) from exc
+    return text
+
+
+def load_maintenance_config(env: Mapping[str, str] | None = None) -> MaintenanceConfig:
+    """从环境变量构造 ``MaintenanceConfig``。
+
+    与 ``config.py`` 顶层常量不同，**不提供模块级默认实例**：这个配置一旦读错
+    就直接拒绝启动，所以必须由 Worker 启动路径显式调用、显式处理异常。
+    """
+
+    source: Mapping[str, str] = os.environ if env is None else env
+
+    def _int(name: str, default: int) -> int:
+        return int(_maintenance_env_value(source, name, str(default), "int"))
+
+    def _float(name: str, default: float) -> float:
+        return float(_maintenance_env_value(source, name, str(default), "float"))
+
+    config = MaintenanceConfig(
+        enabled=_maintenance_env_bool(
+            source, f"{_MAINTENANCE_ENV_PREFIX}ENABLED", False
+        ),
+        poll_seconds=_float(f"{_MAINTENANCE_ENV_PREFIX}POLL_SECONDS", 5.0),
+        shutdown_grace_seconds=_float(
+            f"{_MAINTENANCE_ENV_PREFIX}SHUTDOWN_GRACE_SECONDS", 30.0
+        ),
+        lease_seconds=_float(f"{_MAINTENANCE_ENV_PREFIX}LEASE_SECONDS", 120.0),
+        embedding_batch_size=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}EMBEDDING_BATCH_SIZE", 20
+        ),
+        embedding_interval_seconds=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}EMBEDDING_INTERVAL_SECONDS", 10
+        ),
+        expiration_interval_seconds=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}EXPIRATION_INTERVAL_SECONDS", 3600
+        ),
+        expiration_batch_size=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}EXPIRATION_BATCH_SIZE", 500
+        ),
+        purge_interval_seconds=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}PURGE_INTERVAL_SECONDS", 86400
+        ),
+        purge_batch_size=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}PURGE_BATCH_SIZE", 1000
+        ),
+        consolidation_interval_seconds=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}CONSOLIDATION_INTERVAL_SECONDS", 86400
+        ),
+        consolidation_batch_size=_int(
+            f"{_MAINTENANCE_ENV_PREFIX}CONSOLIDATION_BATCH_SIZE", 100
+        ),
+        dry_run=_maintenance_env_bool(
+            source, f"{_MAINTENANCE_ENV_PREFIX}DRY_RUN", False
+        ),
+    )
+    return config
 # 软阈值触发压缩时，待覆盖历史低于该 token 数就跳过压缩：收益不足以抵掉
 # 一次额外的压缩模型调用（软阈值也可能由系统规则/证据区单独造成）。
 CONTEXT_COMPACTION_MIN_TOKENS = max(
