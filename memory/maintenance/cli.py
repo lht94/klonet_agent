@@ -278,11 +278,37 @@ def _cmd_proposals(args: argparse.Namespace) -> int:
             return EXIT_USAGE
 
         if action == "reject":
+            current = store.get(args.proposal_id)
+            if current is None:
+                print(f"提案不存在或不属于当前租户：{args.proposal_id}", file=sys.stderr)
+                return EXIT_USAGE
+            if current.status.value != "pending":
+                print(
+                    f"只有 pending 提案可以驳回，当前为 {current.status.value}",
+                    file=sys.stderr,
+                )
+                return EXIT_USAGE
             store.transition(args.proposal_id, ProposalStatus.REJECTED)
             print(f"已驳回：{args.proposal_id}")
             return EXIT_OK
 
-        # approve
+        # approve：运维语义是"批准并落地"，所以这里是两步
+        #   pending --(approve)--> approved --(apply)--> applied
+        # 状态机不允许 pending 直接跳到 applied（那是"未批准就改正式记忆"），
+        # 所以 CLI 必须显式走完中间那步，而不是一步到位。
+        current = store.get(args.proposal_id)
+        if current is None:
+            print(f"提案不存在或不属于当前租户：{args.proposal_id}", file=sys.stderr)
+            return EXIT_USAGE
+        if current.status is ProposalStatus.PENDING:
+            store.transition(args.proposal_id, ProposalStatus.APPROVED)
+        elif current.status is not ProposalStatus.APPROVED:
+            print(
+                f"提案状态为 {current.status.value}，只有 pending 或 approved 才能落地",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+
         try:
             outcome = apply_proposal(store, repository, args.proposal_id)
         except ProposalStaleError as exc:

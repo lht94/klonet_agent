@@ -142,6 +142,80 @@ class _FakeDatabaseStub:
         raise AssertionError("不该真的查询数据库")
 
 
+# --------------------------------------------------------------------------- #
+# proposals（阶段 5）
+# --------------------------------------------------------------------------- #
+
+
+def test_proposals_approve_walks_pending_then_applied(monkeypatch, capsys) -> None:
+    """``approve`` 必须显式走 pending -> approved -> applied 两步。
+
+    状态机不允许 pending 直接跳 applied（那是"未批准就改正式记忆"），
+    所以 CLI 不能只调 ``apply_proposal``。这条测试钉住那个两步。
+    """
+
+    from klonet_agent.memory.maintenance import cli as cli_module
+    from klonet_agent.memory.maintenance import proposals as proposals_module
+    from klonet_agent.memory.maintenance.proposals import (
+        ApplyOutcome,
+        Proposal,
+        ProposalStatus,
+        ProposalType,
+    )
+    from klonet_agent.memory.domain import Scope
+
+    transitions: list[str] = []
+
+    class _Store:
+        def __init__(self, database, tenant):
+            self._status = ProposalStatus.PENDING
+
+        def get(self, proposal_id):
+            return Proposal(
+                proposal_id=proposal_id,
+                job_name="consolidation",
+                user_id="u",
+                project_id="p",
+                scope=Scope.PROJECT,
+                proposal_type=ProposalType.NOOP,
+                source_memory_ids=("a", "b"),
+                suggested_action={},
+                reason_codes=(),
+                evidence_refs=(),
+                fingerprint="f",
+                policy_version="v1",
+                model_version=None,
+                status=self._status,
+                created_at=None,
+                reviewed_at=None,
+                applied_version_ids=(),
+                source_fingerprints={},
+            )
+
+        def transition(self, proposal_id, status, **kwargs):
+            transitions.append(getattr(status, "value", str(status)))
+            self._status = (
+                status if isinstance(status, ProposalStatus) else ProposalStatus(str(status))
+            )
+            return self.get(proposal_id)
+
+    def _fake_apply(store, repository, proposal_id):
+        transitions.append("apply")
+        store._status = ProposalStatus.APPLIED
+        return ApplyOutcome(proposal=store.get(proposal_id), decision="noop")
+
+    monkeypatch.setattr(proposals_module, "ProposalStore", _Store)
+    monkeypatch.setattr(proposals_module, "apply_proposal", _fake_apply)
+    monkeypatch.setattr(cli_module, "_build_database", lambda: _FakeDatabaseStub())
+    monkeypatch.setattr(
+        "klonet_agent.memory.postgres.PostgresMemoryRepository",
+        lambda database, tenant: object(),
+    )
+
+    assert cli.main(["proposals", "approve", "p-1"]) == cli.EXIT_OK
+    assert transitions == ["approved", "apply"]
+
+
 def test_run_without_enabled_is_config_error(monkeypatch, capsys) -> None:
     monkeypatch.delenv("KLONET_AGENT_MAINTENANCE_ENABLED", raising=False)
     assert cli.main(["run"]) == cli.EXIT_CONFIG
