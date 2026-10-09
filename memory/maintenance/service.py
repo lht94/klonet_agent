@@ -312,10 +312,16 @@ class MaintenanceService:
         if canonical is not None:
             self._require_registered(canonical)
         limit = max_runs if canonical is None else 1
-        while len(results) < limit:
+        attempts = 0
+        # 上限必须数**领取次数**而不是成功数：持续失败的 Job 永远凑不满
+        # "1 个成功"，``while len(results) < limit`` 会变成无限热循环
+        # （阶段 7 真库实测：签名不匹配的 Job 以 ~60 次/秒的速度刷
+        # claim/fail，consecutive_failures 冲到 7 万+）。
+        while attempts < limit:
             claim = self._claim(canonical, force=force)
             if claim is None:
                 break
+            attempts += 1
             result = self._execute(claim)
             if result is not None:
                 results.append(result)
