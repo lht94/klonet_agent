@@ -201,6 +201,7 @@ def _add(repo: PostgresMemoryRepository, tenant: Tenant, content: str, **kwargs:
                     source_excerpt="测试证据",
                 ),
             ),
+            **kwargs,
         )
     )
 
