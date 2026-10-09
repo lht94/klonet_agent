@@ -198,9 +198,17 @@ def admin_dsn() -> str:
     return _admin_dsn_or_skip()
 
 
+#: 当前模块临时库的 DSN（``db`` fixture 写入；离线时为空）。
+#: 清场 fixture **不能**直接依赖 ``db``——autouse 会把 skip 传染给全部
+#: 离线用例（真踩过：18 项全 skip）。
+_CURRENT_DSN: list[str] = []
+
+
 @pytest.fixture(scope="module")
 def db(admin_dsn: str):
     with temporary_database(admin_dsn) as dsn:
+        _CURRENT_DSN.clear()
+        _CURRENT_DSN.append(dsn)
         database = MemoryDatabase(dsn, min_size=1, max_size=6)
         database.open()
         try:
@@ -208,6 +216,33 @@ def db(admin_dsn: str):
             yield database
         finally:
             database.close()
+        _CURRENT_DSN.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_leftover_live_migrations():
+    """任何一条测试失败都不能把活迁移留给后面的用例。
+
+    账本的 partial unique index 同时只允许一个非终态迁移——这是产品约束，
+    代价是测试之间的级联：第一个失败会挡住后面所有 create。这里在每个
+    用例结束后强制清场（retired 的不动，只清活的）。
+    """
+
+    yield
+    if not _CURRENT_DSN:
+        return
+    database = MemoryDatabase(_CURRENT_DSN[0], min_size=1, max_size=2)
+    database.open()
+    try:
+        manager = EmbeddingMigrationManager(database)
+        for migration in manager.list():
+            if migration.live:
+                try:
+                    manager.cancel(migration.migration_id)
+                except Exception:  # noqa: BLE001 - 清场失败让下个用例暴露
+                    pass
+    finally:
+        database.close()
 
 
 def _tenant() -> Tenant:
@@ -293,6 +328,10 @@ def test_migration_tables_and_singleton_seeded(db: MemoryDatabase) -> None:
 def test_illegal_state_transition_rejected_by_trigger(db: MemoryDatabase) -> None:
     import psycopg
 
+    # 触发器用 ERRCODE '2F002'（与 0003/0007 同一语义）；psycopg 按 SQLSTATE
+    # 映射异常类（ModifyingSqlDataNotPermitted），所以按码查而不是猜类名。
+    guard_error = psycopg.errors.lookup("2F002")
+
     manager = EmbeddingMigrationManager(db)
     manager.create(
         migration_id=f"m-{uuid4().hex[:8]}",
@@ -302,7 +341,7 @@ def test_illegal_state_transition_rejected_by_trigger(db: MemoryDatabase) -> Non
     )
     live = manager.get_live()
     assert live is not None
-    with pytest.raises(psycopg.errors.RaiseException):
+    with pytest.raises(guard_error):
         with db.diagnostic_session() as conn:
             conn.execute(
                 "UPDATE memory_maintenance.embedding_migrations "
