@@ -28,11 +28,15 @@
 
 CREATE SCHEMA IF NOT EXISTS memory_maintenance;
 
+-- 把本事务的 search_path 优先指向 memory_maintenance；以后 CREATE TABLE /
+-- INDEX / FUNCTION 不必再写完整 schema 名。事务结束自动恢复（用 SET LOCAL）。
+SET LOCAL search_path TO memory_maintenance, public;
+
 -- --------------------------------------------------------------------------- --
 -- memory_maintenance_jobs：调度真相
 -- --------------------------------------------------------------------------- --
 
-CREATE TABLE IF NOT EXISTS memory_maintenance_jobs (
+CREATE TABLE IF NOT EXISTS memory_maintenance.memory_maintenance_jobs (
     job_name              text        PRIMARY KEY
                                       CHECK (job_name <> ''),
     enabled               boolean     NOT NULL DEFAULT true,
@@ -76,7 +80,7 @@ CREATE INDEX IF NOT EXISTS memory_maintenance_jobs_lease_idx
 -- memory_maintenance_runs：单次执行的账本
 -- --------------------------------------------------------------------------- --
 
-CREATE TABLE IF NOT EXISTS memory_maintenance_runs (
+CREATE TABLE IF NOT EXISTS memory_maintenance.memory_maintenance_runs (
     run_id            uuid        PRIMARY KEY,
     job_name          text        NOT NULL
                                   REFERENCES memory_maintenance.memory_maintenance_jobs (job_name)
