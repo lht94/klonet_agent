@@ -605,9 +605,11 @@ def _render(
     dsn_available: bool,
 ) -> str:
     aggregates = {arm: _aggregate(outcomes, arm) for arm in ARMS}
+    mode = "cutover_passed" if dsn_available else "baseline_generated"
     lines = [
         "# Klonet 记忆系统专项评测",
         "",
+        f"- mode: {mode}",
         f"- cases: {len(outcomes)}",
         f"- 真库：{'可用' if dsn_available else '不可用（只跑了 Markdown baseline）'}",
         f"- 阈值冻结时间：{thresholds.get('frozen_at') or '未冻结'}",
@@ -727,9 +729,11 @@ def main() -> int:
         )
         print(
             f"memory eval: 未设置 {_TEST_DSN_ENV}，只生成了 Markdown baseline；"
-            f"summary: {_OUTPUT_FILE}"
+            f"summary: {_OUTPUT_FILE}\n"
+            f"退出码 2：baseline_generated（不是 cutover_passed，"
+            "CI 不得把本次运行记作评测通过）"
         )
-        return 0
+        return 2
 
     from klonet_agent.memory.database import MemoryDatabase, temporary_database
     from klonet_agent.memory.repository import EMBEDDING_DIMENSIONS

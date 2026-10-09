@@ -1,0 +1,21 @@
+{
+  "frozen_at": null,
+  "frozen_by": "04-自动化记忆生命周期管理升级计划 · 阶段 0 前置",
+  "note": "占位文件：阶段 0 创建以提前锁定结构与字段名，阶段 5 实施时填充 ≥50 条跨 user/project/shared 三种 scope、跨 episode/fact/preference 三种 memory_type 的人工标注样本，并冻结 precision/recall 下限与跨租户泄漏上限。当前 measurement 与 thresholds 为空，cutover 门禁不会因本文件未冻结而放松；memory_cutover.py 的 --check 仍然只看 run_memory_eval 的 9 项核心阈值。",
+  "measurement": {
+    "cases": "evals/consolidation_cases.jsonl",
+    "runner": "python -m evals.run_consolidation_eval",
+    "summary": "evals/consolidation_summary.md",
+    "embedding": "确定性哈希词袋嵌入（与 run_memory_eval 一致），只量管线不量供应商向量质量",
+    "tenant_isolation": "按用例隔离租户（-c<N> 后缀，避免共用租户撞 uq_memory_records_active_subject 并让语义通道把别的用例召回来；嵌入走 blake2b 确定性哈希，不依赖 hash() 内置盐）"
+  },
+  "measured": {},
+  "thresholds": {
+    "exact_duplicate_precision_min": null,
+    "near_duplicate_precision_min": null,
+    "conflict_precision_min": null,
+    "cross_tenant_leakage_max": null,
+    "merge_recall_min": null,
+    "merge_token_ratio_max": null
+  }
+}
