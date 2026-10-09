@@ -83,8 +83,10 @@ def _build_jobs(database: Any, config: MaintenanceConfig) -> list[Any]:
     """
 
     jobs: list[Any] = []
+    module_map = _job_module_map()
     for name in service_module.KNOWN_JOB_NAMES:
-        module_name = f"klonet_agent.memory.maintenance.jobs.{name}"
+        basename = module_map.get(name, name)
+        module_name = f"klonet_agent.memory.maintenance.jobs.{basename}"
         try:
             module = __import__(module_name, fromlist=["JOB", "build_job"])
         except ImportError:
@@ -99,6 +101,22 @@ def _build_jobs(database: Any, config: MaintenanceConfig) -> list[Any]:
         if job is not None:
             jobs.append(job)
     return jobs
+
+
+def _job_module_map() -> dict[str, str]:
+    """规范 Job 名 → 模块文件 basename 的映射（见 ``jobs/__init__.py``）。
+
+    规范名是写进数据库的外部契约，模块名是内部实现细节，两者**不必**相同
+    （``embedding_outbox`` → ``jobs/embedding.py``）。这里显式取映射，
+    取不到才退回"模块名 == 规范名"。
+    """
+
+    try:
+        from klonet_agent.memory.maintenance.jobs import JOB_MODULES
+
+        return dict(JOB_MODULES)
+    except ImportError:  # pragma: no cover - 包结构被破坏时
+        return {}
 
 
 def _build_service(config: MaintenanceConfig) -> tuple[MaintenanceService, Any]:

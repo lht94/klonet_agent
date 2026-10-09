@@ -266,6 +266,60 @@ def test_unexpected_error_returns_runtime_code(monkeypatch, capsys) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Job 发现（_build_jobs）
+# --------------------------------------------------------------------------- #
+
+
+def test_job_module_map_covers_every_known_job() -> None:
+    """每个规范 Job 名都必须在 ``JOB_MODULES`` 里有映射。
+
+    回归保护：``embedding_outbox`` 的模块文件叫 ``embedding.py``。如果把
+    "模块名 = 规范名"当成约定，Job 会被静默地不注册——单测全绿、``status``
+    里少一项。这条断言把"映射必须显式"钉死。
+    """
+
+    from klonet_agent.memory.maintenance.jobs import JOB_MODULES
+    from klonet_agent.memory.maintenance.service import KNOWN_JOB_NAMES
+
+    missing = [name for name in KNOWN_JOB_NAMES if name not in JOB_MODULES]
+    assert missing == [], f"JOB_MODULES 缺少映射：{missing}"
+
+
+def test_build_jobs_discovers_the_embedding_job(monkeypatch) -> None:
+    """有嵌入凭据时，``embedding_outbox`` 必须被发现并注册。"""
+
+    import klonet_agent.llm.embeddings as embeddings
+
+    monkeypatch.setattr(
+        embeddings,
+        "build_default_embedding_provider",
+        lambda: (lambda text: (0.0,) * 1024),
+    )
+    jobs = cli._build_jobs(database=None, config=MaintenanceConfig())
+    names = {job.name for job in jobs}
+    assert "embedding_outbox" in names, f"未发现 embedding_outbox：{names}"
+
+
+def test_build_jobs_skips_embedding_job_without_credentials(monkeypatch) -> None:
+    """没有嵌入凭据时不该注册一个"永远跑不动"的 Job。"""
+
+    import klonet_agent.llm.embeddings as embeddings
+
+    monkeypatch.setattr(embeddings, "build_default_embedding_provider", lambda: None)
+    jobs = cli._build_jobs(database=None, config=MaintenanceConfig())
+    assert "embedding_outbox" not in {job.name for job in jobs}
+
+
+def test_build_jobs_is_empty_for_unimplemented_jobs(monkeypatch) -> None:
+    """只有 embedding 一个 Job 实现了；其余名字应被安静跳过，不报错。"""
+
+    import klonet_agent.llm.embeddings as embeddings
+
+    monkeypatch.setattr(embeddings, "build_default_embedding_provider", lambda: None)
+    assert cli._build_jobs(database=None, config=MaintenanceConfig()) == []
+
+
+# --------------------------------------------------------------------------- #
 # 与 config 的契约
 # --------------------------------------------------------------------------- #
 
