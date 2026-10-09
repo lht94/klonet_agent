@@ -20,13 +20,19 @@
 - **正文超长时截断并显式标注，结构永不截断。** 丢弃整条会损失最相关的记忆，
   保留完整正文又会让一条记忆吃掉整个预算。所以只有正文被截，且条目里
   ``正文已截断`` 是模型看得见的。
+- **淘汰组合分 = 融合分 × 时间权重。** 同类型内竞争时，旧观察被打折：
+  fact 半衰期 90 天、episode 180 天，preference 不衰减（偏好没有"变旧"的
+  语义，衰减会误伤最有复用价值的记忆）。时间是折扣不是加分——"新"不能让
+  不相关的记忆入选（score=0 乘任何权重仍是 0）。缺 observed_at 的条目按
+  1.0 处理，不因数据缺失受罚。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from klonet_agent.context.tokens import estimate_tokens
 from klonet_agent.memory.domain import MemoryHit, MemoryType
@@ -40,6 +46,7 @@ __all__ = [
     "MemoryPackBuilder",
     "MemoryPackDrop",
     "MemoryPackEntry",
+    "_recency_weight_for",
 ]
 
 
@@ -74,6 +81,13 @@ _SECTION_TITLES: Mapping[str, str] = {
 # Ops 模式的记忆里会有端口、进程、服务这类会变的东西，必须强制模型先用工具确认。
 _RUNTIME_MODES = frozenset({"ops", "ops-privilege"})
 
+# 时间衰减半衰期（天）：按类型区分。不在表里的类型（preference）不衰减。
+# fact 会过时（版本号、IP、配置），episode 是经历衰减得慢，preference 稳定。
+_RECENCY_HALF_LIFE_DAYS: Mapping[str, float] = {
+    MemoryType.FACT.value: 90.0,
+    MemoryType.EPISODE.value: 180.0,
+}
+
 _HEADER = (
     "【按问题检索到的相关记忆】\n"
     "以下是与当前问题相关的历史记忆，属于参考线索而非本轮事实；"
@@ -96,15 +110,24 @@ class MemoryPackEntry:
     sources: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     content_truncated: bool = False
+    observed_at: datetime | None = None
 
 
 @dataclass(frozen=True)
 class MemoryPackDrop:
-    """一条没能进包的记忆及其原因（供观测，不渲染给模型）。"""
+    """一条没能进包的记忆及其原因（供观测，不渲染给模型）。
+
+    ``score`` / ``recency_weight`` / ``final_score`` 只在"预算/条数竞争"类
+    淘汰里填写，用于归因：分数低是 rerank 判它不相关，还是时间把它衰减死了——
+    两者的修法完全不同。结构性淘汰（类型不可打包）不需要归因。
+    """
 
     memory_id: str
     memory_type: str
     reason: str
+    score: float | None = None
+    recency_weight: float | None = None
+    final_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +184,7 @@ class MemoryPackBuilder:
         type_limits: Mapping[str, int] | None = None,
         max_content_chars: int = 400,
         max_sources: int = 3,
+        clock: Callable[[], datetime] | None = None,
     ):
         if token_budget <= 0:
             raise ValueError("token_budget 必须为正整数")
@@ -168,6 +192,7 @@ class MemoryPackBuilder:
         self._type_limits = dict(type_limits or DEFAULT_TYPE_LIMITS)
         self._max_content_chars = max(40, int(max_content_chars))
         self._max_sources = max(1, int(max_sources))
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     @property
     def token_budget(self) -> int:
@@ -203,12 +228,20 @@ class MemoryPackBuilder:
 
         # token 是最终硬约束：整条淘汰，绝不截断单条结构。
         while entries and tokens > self._token_budget:
-            victim = self._pick_victim(entries)
+            victim, attribution = self._pick_victim(entries)
             if victim is None:  # pragma: no cover - entries 非空时必然选得出
                 break
             entries.remove(victim)
+            score, weight, final_score = attribution
             dropped.append(
-                MemoryPackDrop(victim.memory_id, victim.memory_type, "over_token_budget")
+                MemoryPackDrop(
+                    victim.memory_id,
+                    victim.memory_type,
+                    "over_token_budget",
+                    score=score,
+                    recency_weight=weight,
+                    final_score=final_score,
+                )
             )
             text = self._render(entries, conflict_ids, mode, warnings)
             tokens = estimate_tokens(text)
@@ -240,10 +273,12 @@ class MemoryPackBuilder:
     ) -> tuple[list[MemoryHit], list[MemoryPackDrop]]:
         """按类型分桶并施加条数上限，再按渲染顺序展开。
 
-        召回结果本身已按融合分数降序，所以"取前 N 条"就是"取分数最高的 N 条"，
-        不需要在这里再排一次（再排一次还会破坏同分时的稳定顺序）。
+        召回结果本身已按融合分数降序，但条数上限的竞争用**组合分**
+        （融合分 × 时间权重）裁决：同类型内旧观察给新观察让位。
+        同分且同权重时保持召回顺序，不引入额外的不稳定排序。
         """
 
+        now = self._clock()
         buckets: dict[str, list[MemoryHit]] = {key: [] for key in _SECTION_ORDER}
         dropped: list[MemoryPackDrop] = []
         for hit in hits:
@@ -254,23 +289,66 @@ class MemoryPackBuilder:
                     MemoryPackDrop(hit.record.id, memory_type, "type_not_packable")
                 )
                 continue
-            if len(buckets[memory_type]) >= limit:
-                dropped.append(
-                    MemoryPackDrop(hit.record.id, memory_type, "over_type_limit")
-                )
+            bucket = buckets[memory_type]
+            if len(bucket) < limit:
+                bucket.append(hit)
                 continue
-            buckets[memory_type].append(hit)
+            # 满桶：来者与桶内组合分最低者竞争，输的一方带归因出局。
+            challenger_score = self._combined_score_of_hit(hit, now)
+            incumbent = min(
+                bucket, key=lambda item: self._combined_score_of_hit(item, now)
+            )
+            incumbent_score = self._combined_score_of_hit(incumbent, now)
+            loser = hit if challenger_score <= incumbent_score else incumbent
+            loser_score = min(challenger_score, incumbent_score)
+            loser_weight = _recency_weight_for(
+                memory_type, loser.version.observed_at, now
+            )
+            dropped.append(
+                MemoryPackDrop(
+                    loser.record.id,
+                    memory_type,
+                    "over_type_limit",
+                    score=float(loser.score),
+                    recency_weight=loser_weight,
+                    final_score=loser_score,
+                )
+            )
+            if loser is incumbent:
+                bucket.remove(incumbent)
+                bucket.append(hit)
         selected = [hit for key in _SECTION_ORDER for hit in buckets[key]]
         return selected, dropped
 
-    def _pick_victim(self, entries: list[MemoryPackEntry]) -> MemoryPackEntry | None:
+    def _combined_score_of_hit(self, hit: MemoryHit, now: datetime) -> float:
+        """融合分 × 时间权重：同类型内竞争淘汰的裁决分。"""
+
+        return float(hit.score) * _recency_weight_for(
+            _type_of(hit), hit.version.observed_at, now
+        )
+
+    def _pick_victim(
+        self, entries: list[MemoryPackEntry]
+    ) -> tuple[MemoryPackEntry | None, tuple[float, float, float]]:
+        """按类型顺序找第一个非空桶，桶内组合分最低者出局，附归因。"""
+
+        now = self._clock()
         for memory_type in _EVICTION_ORDER:
             candidates = [
                 entry for entry in entries if entry.memory_type == memory_type
             ]
-            if candidates:
-                return min(candidates, key=lambda entry: entry.score)
-        return None
+            if not candidates:
+                continue
+
+            def combined(item: MemoryPackEntry) -> float:
+                return item.score * _recency_weight_for(
+                    item.memory_type, item.observed_at, now
+                )
+
+            victim = min(candidates, key=combined)
+            weight = _recency_weight_for(victim.memory_type, victim.observed_at, now)
+            return victim, (victim.score, weight, victim.score * weight)
+        return None, (0.0, 1.0, 0.0)
 
     # ------------------------------------------------------------- 渲染 --
 
@@ -299,6 +377,7 @@ class MemoryPackBuilder:
             sources=sources,
             reasons=tuple(hit.reasons),
             content_truncated=truncated,
+            observed_at=version.observed_at,
         )
 
     def _render(
@@ -359,6 +438,30 @@ class MemoryPackBuilder:
 def _type_of(hit: MemoryHit) -> str:
     memory_type = hit.record.memory_type
     return memory_type.value if isinstance(memory_type, MemoryType) else str(memory_type)
+
+
+def _as_aware(moment: datetime) -> datetime:
+    """naive datetime 按 UTC 处理（DB 返回 aware，测试/旧数据可能给 naive）。"""
+
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+def _recency_weight_for(
+    memory_type: str, observed_at: datetime | None, now: datetime
+) -> float:
+    """时间权重 ∈ (0, 1]：越新越接近 1。
+
+    - 不在半衰期表里的类型（preference）恒为 1.0：偏好没有"变旧"的语义；
+    - 缺 observed_at 按 1.0 处理：数据缺失不惩罚，交给融合分裁决；
+    - 未来时间戳（时钟偏斜）按 0 天龄处理，权重 1.0，不给负龄加成。
+    """
+
+    half_life = _RECENCY_HALF_LIFE_DAYS.get(memory_type)
+    if half_life is None or observed_at is None:
+        return 1.0
+    age_seconds = (now - _as_aware(observed_at)).total_seconds()
+    age_days = max(0.0, age_seconds / 86400.0)
+    return math.exp(-age_days / half_life)
 
 
 def _short_id(memory_id: str) -> str:

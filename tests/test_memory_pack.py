@@ -75,6 +75,7 @@ def _hit(
     ),
     valid_from: datetime | None = None,
     valid_to: datetime | None = None,
+    observed_at: datetime | None = None,
     reasons: tuple[str, ...] = ("lexical",),
 ) -> MemoryHit:
     memory_id = str(uuid4())
@@ -93,7 +94,7 @@ def _hit(
         memory_id=memory_id,
         version=1,
         content=content,
-        observed_at=_now(),
+        observed_at=observed_at or _now(),
         valid_from=valid_from or _now(),
         valid_to=valid_to,
         content_hash=content_hash(content),
@@ -299,6 +300,135 @@ def test_tokens_never_exceed_the_budget() -> None:
     for budget in range(120, 1200, 20):
         pack = _builder(token_budget=budget).build(report)
         assert pack.tokens <= budget
+
+
+# --------------------------------------------------------------------------- #
+# 时间衰减 × 融合分：同类型内竞争用组合分裁决
+# --------------------------------------------------------------------------- #
+
+
+def test_recency_weight_by_type_and_age() -> None:
+    """权重按类型区分：preference 恒 1.0，fact/episode 按半衰期指数衰减。"""
+
+    from klonet_agent.memory.pack import MemoryPackEntry, _recency_weight_for
+
+    now = _now()
+
+    def entry(memory_type: str, age_days: float) -> MemoryPackEntry:
+        return MemoryPackEntry(
+            memory_id="m",
+            memory_type=memory_type,
+            scope="user",
+            content="c",
+            confidence=0.9,
+            score=1.0,
+            observed_at=now - timedelta(days=age_days),
+        )
+
+    # preference 不衰减：一年前的偏好权重仍是 1.0。
+    assert _recency_weight_for("preference", now - timedelta(days=365), now) == 1.0
+    # 刚观察到的条目权重 1.0；一个半衰期后衰减到 1/e。
+    assert _recency_weight_for("fact", now, now) == 1.0
+    assert _recency_weight_for("fact", now - timedelta(days=90), now) == pytest.approx(
+        math.exp(-1.0)
+    )
+    assert _recency_weight_for(
+        "episode", now - timedelta(days=180), now
+    ) == pytest.approx(math.exp(-1.0))
+    # 同龄时 fact 衰得比 episode 快（半衰期更短）。
+    assert _recency_weight_for(
+        "fact", now - timedelta(days=90), now
+    ) < _recency_weight_for("episode", now - timedelta(days=90), now)
+    # 缺 observed_at 不惩罚；未来时间戳（时钟偏斜）按 0 天龄处理。
+    assert _recency_weight_for("fact", None, now) == 1.0
+    assert _recency_weight_for(
+        "fact", now + timedelta(days=3), now
+    ) == pytest.approx(1.0)
+
+
+def test_token_budget_eviction_prefers_newer_fact_on_score_tie() -> None:
+    """同类型同分时旧观察先出局：组合分 = 融合分 × 时间权重，归因随 drop 记录。"""
+
+    old = _hit(
+        MemoryType.FACT,
+        "旧事实：运行时是 Python 3.9",
+        score=2.0,
+        observed_at=_now() - timedelta(days=360),
+    )
+    new = _hit(MemoryType.FACT, "新事实：运行时是 Python 3.11", score=2.0)
+    report = MemoryRetrievalReport(query="运行时", hits=(old, new))
+
+    for budget in range(400, 20, -5):
+        pack = _builder(token_budget=budget).build(report)
+        if len(pack.entries) == 1:
+            assert pack.entries[0].content == "新事实：运行时是 Python 3.11"
+            drop = next(
+                d for d in pack.dropped if d.reason == "over_token_budget"
+            )
+            assert drop.memory_id == old.record.id
+            assert drop.score == pytest.approx(2.0)
+            assert drop.recency_weight is not None and drop.recency_weight < 0.1
+            assert drop.final_score is not None
+            assert drop.final_score < drop.score
+            return
+    pytest.fail("没有找到恰好保留一条的预算档位")
+
+
+def test_over_type_limit_uses_combined_score_and_attributes_the_loser() -> None:
+    """条数上限竞争同样走组合分：旧同分条目让位，淘汰归因记录在 drop 上。"""
+
+    old = _hit(
+        MemoryType.FACT,
+        "旧事实：端口是 8080",
+        score=2.0,
+        observed_at=_now() - timedelta(days=360),
+    )
+    new = _hit(MemoryType.FACT, "新事实：端口是 9090", score=2.0)
+    fillers = tuple(
+        _hit(MemoryType.FACT, f"高分事实 {index}", score=5.0) for index in range(3)
+    )
+    # fact 上限 4：三条高分 + 满桶后，旧同分条目必须给后来者让位。
+    pack = _builder(token_budget=8000).build(
+        MemoryRetrievalReport(query="端口", hits=(old, new, *fillers))
+    )
+
+    kept_contents = [entry.content for entry in pack.entries]
+    assert "旧事实：端口是 8080" not in kept_contents
+    assert "新事实：端口是 9090" in kept_contents
+    assert len(kept_contents) == 4
+    assert sum(1 for d in pack.dropped if d.reason == "over_type_limit") == 1
+
+    drop = next(d for d in pack.dropped if d.reason == "over_type_limit")
+    assert drop.memory_id == old.record.id
+    assert drop.recency_weight is not None and drop.recency_weight < 0.1
+    assert drop.final_score is not None and drop.final_score < drop.score
+
+
+def test_preference_is_never_decayed_by_age() -> None:
+    """偏好没有"变旧"的语义：300 天前的偏好组合分不打折，不会因年龄被挤出。"""
+
+    old_pref = _hit(
+        MemoryType.PREFERENCE,
+        "偏好：回答一律使用简体中文",
+        score=3.0,
+        observed_at=_now() - timedelta(days=300),
+    )
+    new_pref = _hit(MemoryType.PREFERENCE, "偏好：先列方案再动手", score=2.8)
+    report = MemoryRetrievalReport(query="偏好", hits=(old_pref, new_pref))
+
+    for budget in range(400, 20, -5):
+        pack = _builder(token_budget=budget).build(report)
+        if len(pack.entries) == 1:
+            # 若衰减误伤偏好，old 的组合分会掉到 new 之下，被挤出的会是 old。
+            assert pack.entries[0].content == "偏好：回答一律使用简体中文"
+            drop = next(
+                d for d in pack.dropped if d.reason == "over_token_budget"
+            )
+            assert drop.memory_id == new_pref.record.id
+            assert drop.recency_weight == pytest.approx(1.0)
+            assert drop.final_score == pytest.approx(drop.score)
+            return
+    pytest.fail("没有找到恰好保留一条的预算档位")
 
 
 def test_pack_is_empty_rather_than_a_bare_header() -> None:
