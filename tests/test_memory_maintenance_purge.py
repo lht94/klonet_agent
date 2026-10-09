@@ -184,7 +184,7 @@ def _repo(database: MemoryDatabase, tenant: Tenant) -> PostgresMemoryRepository:
     return PostgresMemoryRepository(database, tenant)
 
 
-def _add(repo: PostgresMemoryRepository, tenant: Tenant, content: str):
+def _add(repo: PostgresMemoryRepository, tenant: Tenant, content: str, **kwargs: Any):
     return repo.add_record(
         NewRecordCommand(
             user_id=tenant.user_id,
@@ -261,8 +261,12 @@ def test_expired_and_superseded_are_not_purged(db: MemoryDatabase) -> None:
     repo = _repo(db, tenant)
     base = datetime.now(timezone.utc)
 
-    expired_record = _add(repo, tenant, "过期记录不应被 purge")
+    expired_record = _add(
+        repo, tenant, "过期记录不应被 purge", valid_from=base - timedelta(days=2)
+    )
     with db.diagnostic_session() as conn:
+        # valid_to 必须严格晚于 valid_from（CHECK 会拦），所以先把种子记录的
+        # valid_from 拉早，再写一个仍然早于 now 的 valid_to。
         conn.execute(
             "UPDATE memory_versions SET valid_to = %s WHERE memory_id = %s",
             (base - timedelta(hours=1), UUID(str(expired_record.id))),
@@ -306,7 +310,7 @@ def test_beyond_retention_is_purged_and_leaves_no_trace(db: MemoryDatabase) -> N
     _age_deleted(db, str(record.id), days=90)
 
     # 删除时 outbox 与向量就该清了；这里确认一下前置状态。
-    assert repo.recall_check(str(record.id), text="Python 部署端口") is False
+    assert MemoryAdmin(repo).recall_check(str(record.id), text="Python 部署端口") is False
 
     removed = MemoryAdmin(repo).purge(
         policy=RetentionPolicy(soft_delete_retention_days=30)
@@ -320,7 +324,7 @@ def test_beyond_retention_is_purged_and_leaves_no_trace(db: MemoryDatabase) -> N
             (UUID(version_id),),
         ).fetchone()["n"]
     assert int(orphan_sources) == 0, "不能留下孤立来源"
-    assert repo.recall_check(str(record.id), text="Python 部署端口") is False
+    assert MemoryAdmin(repo).recall_check(str(record.id), text="Python 部署端口") is False
 
 
 def test_dry_run_reports_without_deleting(db: MemoryDatabase) -> None:

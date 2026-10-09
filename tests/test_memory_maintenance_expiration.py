@@ -261,13 +261,17 @@ def _repo(database: MemoryDatabase, tenant: Tenant) -> PostgresMemoryRepository:
 
 
 def _add(repo: PostgresMemoryRepository, tenant: Tenant, content: str, **kwargs: Any):
+    is_shared = tenant is SHARED_OPS_TENANT
+    scope = Scope.SHARED_OPS if is_shared else Scope.PROJECT
+    # subject_key 的 scope 段必须与记录作用域一致，否则记录本身就不合法。
+    scope_segment = scope.value
     return repo.add_record(
         NewRecordCommand(
             user_id=tenant.user_id,
             project_id=tenant.project_id,
             memory_type=MemoryType.FACT,
-            scope=Scope.SHARED_OPS if tenant is SHARED_OPS_TENANT else Scope.PROJECT,
-            subject_key=f"fact:project:exp:{uuid4().hex[:8]}",
+            scope=scope,
+            subject_key=f"fact:{scope_segment}:exp:{uuid4().hex[:8]}",
             content=content,
             sources=(
                 MemorySource(
