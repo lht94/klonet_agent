@@ -93,6 +93,42 @@ def _content_hash(record: MemoryRecord) -> str | None:
     return getattr(version, "content_hash", None) if version is not None else None
 
 
+def _record_time(
+    record: MemoryRecord, source_lookup: "SourceLookup | None" = None
+) -> datetime | None:
+    """记录的"观察时间"：优先来源的 ``observed_at``，退化到版本时间。
+
+    **``MemoryRecord`` 上没有 ``observed_at``**——那个字段长在 ``MemorySource``
+    上，而 ``MemoryVersion`` 不 hydrate 来源。想拿真实观察时间就必须显式查
+    来源（与 ``_source_keys`` 同一个坑）；查不到时退化 ``valid_from``，再退化
+    记录的 ``created_at``。三条路都拿不到才返回 ``None``。
+    """
+
+    version = record.active_version
+    if version is None:
+        return None
+    if source_lookup is not None:
+        version_id = getattr(version, "id", None)
+        if version_id:
+            try:
+                sources = source_lookup(str(version_id)) or ()
+            except Exception:  # noqa: BLE001 - 来源查不到不该让分类失败
+                sources = ()
+            stamps = [
+                source.observed_at
+                for source in sources
+                if getattr(source, "observed_at", None) is not None
+            ]
+            if stamps:
+                return min(stamps)
+    for attr in ("valid_from", "created_at"):
+        value = getattr(version, attr, None)
+        if isinstance(value, datetime):
+            return value
+    value = getattr(record, "created_at", None)
+    return value if isinstance(value, datetime) else None
+
+
 #: ``(version_id) -> Sequence[MemorySource]``。
 #:
 #: **必须显式注入**：``list_records`` / ``get_record`` 都不会 hydrate
@@ -193,7 +229,8 @@ def classify_pair(
     shared = _source_keys(left, source_lookup) & _source_keys(right, source_lookup)
     if shared:
         reasons.append("shared_source_evidence")
-    left_at, right_at = left.observed_at, right.observed_at
+    left_at = _record_time(left, source_lookup)
+    right_at = _record_time(right, source_lookup)
     if left_at is not None and right_at is not None:
         if abs((left_at - right_at).total_seconds()) <= 3600:
             reasons.append("observed_close_in_time")
@@ -301,7 +338,9 @@ class SuggestionRequest:
 SuggestionProvider = Callable[[SuggestionRequest], Mapping[str, Any] | None]
 
 
-def _fallback_merge_content(pair: CandidatePair) -> str:
+def _fallback_merge_content(
+    pair: CandidatePair, source_lookup: "SourceLookup | None" = None
+) -> str:
     """没有模型时的确定性合并：置信度高者优先，其次更长，其次更早。
 
     这三条排序都是刻意的：置信度高说明证据更足；等置信度下更长的描述通常
@@ -311,8 +350,8 @@ def _fallback_merge_content(pair: CandidatePair) -> str:
     def _rank(record: MemoryRecord) -> tuple[float, int, float, str]:
         version = record.active_version
         length = len(str(version.content or "")) if version is not None else 0
-        observed = record.observed_at
-        # 越早的 observed_at 排越前 → 取负的时间戳。
+        observed = _record_time(record, source_lookup)
+        # 越早的观察时间排越前 → 取负的时间戳。
         stamp = -observed.timestamp() if observed is not None else 0.0
         return (-float(record.confidence), -length, stamp, str(record.id))
 
@@ -520,7 +559,9 @@ class ConsolidationJob:
                 reasons.append("model_suggestion")
             if not str(suggested.get("merged_content") or "").strip():
                 # 没有模型也必须给出一个能落地的正文，否则这条提案永远批不动。
-                suggested["merged_content"] = _fallback_merge_content(pair)
+                suggested["merged_content"] = _fallback_merge_content(
+                    pair, source_lookup=getattr(repository, "list_sources", None)
+                )
                 reasons.append("deterministic_merge")
         return store.create(
             proposal_type=pair.proposal_type,
