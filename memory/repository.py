@@ -516,6 +516,36 @@ class MemoryRepository(Protocol):
 
         ...
 
+    def set_profile_embedding(
+        self,
+        version_id: str,
+        embedding: Sequence[float],
+        *,
+        embedding_profile_id: str,
+        embedding_model: str,
+        embedding_version: str,
+    ) -> bool:
+        """写入**非 default** profile 的向量并闭环对应 outbox 行。
+
+        存储落在 ``public.memory_embeddings``（0008 迁移），与 default 的
+        ``memory_versions.embedding`` 并存——这是"重嵌入期间在线召回无中断"
+        的存储基础。语义与 :meth:`set_embedding` 一致：记录已删除 → 清理后
+        返回 ``False``（跳过，不是失败）。``default`` 刻意拒绝：两条写路径
+        混用会让"哪条向量是权威"变成考古问题。
+        """
+
+        ...
+
+    def active_embedding_profile(self) -> str:
+        """当前生效的 embedding profile（检索向量路由的权威来源）。
+
+        读 ``memory_maintenance.embedding_active_profile`` 单例行；迁移
+        promote/rollback 用一条 UPDATE 原子改写它。0008 未应用时退回
+        ``default``（老库兼容）。
+        """
+
+        ...
+
     # --- embedding outbox（阶段 4）---
 
     def claim_pending_embeddings(

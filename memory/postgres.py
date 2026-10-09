@@ -1231,6 +1231,109 @@ class PostgresMemoryRepository:
             )
         return True
 
+    def set_profile_embedding(
+        self,
+        version_id: str,
+        embedding: Sequence[float],
+        *,
+        embedding_profile_id: str,
+        embedding_model: str,
+        embedding_version: str,
+    ) -> bool:
+        profile = str(embedding_profile_id or "").strip()
+        if not profile:
+            raise MemoryDomainError("embedding_profile_id 不能为空")
+        if profile == DEFAULT_EMBEDDING_PROFILE_ID:
+            raise MemoryDomainError(
+                "default profile 的向量必须走 set_embedding（memory_versions.embedding），"
+                "多 profile 表不接受 default——两条写路径混用会让权威向量变成考古问题"
+            )
+        values = tuple(float(item) for item in embedding)
+        if len(values) != EMBEDDING_DIMENSIONS:
+            raise MemoryDomainError(
+                f"向量维度 {len(values)} 与 schema 的 vector({EMBEDDING_DIMENSIONS}) 不一致。"
+                "换维度需要新建 profile + 新表（0008 头部注释），不能原地改"
+            )
+        if not embedding_model or not embedding_version:
+            raise MemoryDomainError(
+                "写入向量必须同时给出 embedding_model 与 embedding_version"
+            )
+
+        vid = _as_uuid(version_id, "version_id")
+        scope, scope_params = self._record_scope("r")
+        with self._session() as conn:
+            # 与 set_embedding 相同的写回前再验证：竞态窗口 = 领取后、写回前被删除。
+            target = conn.execute(
+                f"""
+                SELECT v.id AS version_id, r.status AS record_status
+                  FROM memory_versions v
+                  JOIN memory_records r ON r.id = v.memory_id
+                 WHERE v.id = %s AND {scope}
+                """,
+                [vid, *scope_params],
+            ).fetchone()
+            if target is None:
+                raise RecordNotFoundError(f"版本 {version_id} 不存在或不属于当前租户")
+            if str(target["record_status"]) == MemoryStatus.DELETED.value:
+                # 删除不复活：这个 profile 的队列行与向量一起清掉，返回跳过。
+                conn.execute(
+                    """
+                    DELETE FROM memory_embedding_outbox
+                     WHERE memory_version_id = %s AND embedding_profile_id = %s
+                    """,
+                    (vid, profile),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM memory_embeddings
+                     WHERE memory_version_id = %s AND embedding_profile_id = %s
+                    """,
+                    (vid, profile),
+                )
+                return False
+
+            conn.execute(
+                """
+                INSERT INTO memory_embeddings
+                       (memory_version_id, embedding_profile_id,
+                        embedding, embedding_model, embedding_version)
+                VALUES (%s, %s, %s::vector, %s, %s)
+                ON CONFLICT (memory_version_id, embedding_profile_id) DO UPDATE
+                   SET embedding = EXCLUDED.embedding,
+                       embedding_model = EXCLUDED.embedding_model,
+                       embedding_version = EXCLUDED.embedding_version
+                """,
+                (vid, profile, _vector_literal(values), embedding_model, embedding_version),
+            )
+            conn.execute(
+                """
+                UPDATE memory_embedding_outbox
+                   SET status = 'completed', last_error = NULL,
+                       next_attempt_at = NULL, updated_at = now()
+                 WHERE memory_version_id = %s AND embedding_profile_id = %s
+                """,
+                (vid, profile),
+            )
+        return True
+
+    def active_embedding_profile(self) -> str:
+        pool = self._database._require_pool()
+        try:
+            with pool.connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT profile_id
+                      FROM memory_maintenance.embedding_active_profile
+                     WHERE id = 1
+                    """
+                ).fetchone()
+        except MemoryRepositoryError:
+            # 0008 未应用的老库：检索退回 default（legacy 单列），不阻塞在线。
+            return DEFAULT_EMBEDDING_PROFILE_ID
+        if row is None:  # pragma: no cover - 0008 已播种
+            return DEFAULT_EMBEDDING_PROFILE_ID
+        return str(row["profile_id"])
+
     # --------------------------------------------------------- embedding 队列 --
 
     def claim_pending_embeddings(
@@ -1872,12 +1975,23 @@ class PostgresMemoryRepository:
         query: MemoryQuery,
         *,
         query_embedding: Sequence[float] | None = None,
+        embedding_profile_id: str | None = None,
     ) -> list[MemoryHit]:
         """三通道（全文 / 向量 / 精确标识符）召回 + RRF 融合。
 
         向量缺失时**只退化为全文与精确通道**，不伪造语义结果；调用方可以从
         ``reasons`` 看出每条命中实际来自哪些通道。
+
+        ``embedding_profile_id``：None → 读单例 active profile（迁移门禁
+        promote/rollback 原子改写它）；显式给出则用指定 profile——shadow
+        对比（04 计划 §6.5）靠这个参数同时跑新旧两套向量。
         """
+
+        profile = (
+            str(embedding_profile_id).strip()
+            if embedding_profile_id is not None
+            else self.active_embedding_profile()
+        )
 
         if query_embedding is not None:
             values = tuple(float(item) for item in query_embedding)
@@ -1898,7 +2012,7 @@ class PostgresMemoryRepository:
                 channels["lexical"] = lexical
             if values:
                 semantic = _semantic_candidates(
-                    conn, _vector_literal(values), filters, params, pool
+                    conn, _vector_literal(values), filters, params, pool, profile_id=profile
                 )
                 if semantic:
                     channels["semantic"] = semantic
@@ -2190,17 +2304,41 @@ def _semantic_candidates(
     filters: str,
     params: Sequence[Any],
     pool: int,
+    *,
+    profile_id: str = DEFAULT_EMBEDDING_PROFILE_ID,
 ) -> list[UUID]:
+    """语义通道。profile 路由（04 计划 §6.5 双 profile）：
+
+    - ``default``：读 ``memory_versions.embedding``（02 的单列路径，零改动）；
+    - 其它 profile：JOIN ``memory_embeddings``（0008 的多 profile 表）。
+    同一时刻只有一张表参与排序——迁移回填期间新 profile 的向量在那张表里
+    逐步齐全，default 的召回**完全不受影响**。
+    """
+
+    if profile_id == DEFAULT_EMBEDDING_PROFILE_ID:
+        sql = f"""
+        SELECT v.id AS id
+          FROM memory_versions v
+          JOIN memory_records r ON r.id = v.memory_id
+         WHERE {filters}
+           AND v.embedding IS NOT NULL
+         ORDER BY v.embedding <=> %s::vector, v.id
+         LIMIT %s
+        """
+        rows = conn.execute(sql, [*params, vector_literal, pool]).fetchall()
+        return [row["id"] for row in rows]
+
     sql = f"""
     SELECT v.id AS id
       FROM memory_versions v
       JOIN memory_records r ON r.id = v.memory_id
+      JOIN memory_embeddings e ON e.memory_version_id = v.id
      WHERE {filters}
-       AND v.embedding IS NOT NULL
-     ORDER BY v.embedding <=> %s::vector, v.id
+       AND e.embedding_profile_id = %s
+     ORDER BY e.embedding <=> %s::vector, v.id
      LIMIT %s
     """
-    rows = conn.execute(sql, [*params, vector_literal, pool]).fetchall()
+    rows = conn.execute(sql, [*params, profile_id, vector_literal, pool]).fetchall()
     return [row["id"] for row in rows]
 
 

@@ -233,18 +233,24 @@ class EmbeddingWorker:
         except Exception as exc:  # noqa: BLE001 - 单条失败不应中断整批
             return self._record_failure(item, exc)
         try:
-            written = self._repository.set_embedding(
-                item.version_id,
-                vector,
-                embedding_model=self._model,
-                embedding_version=self._model_version,
-            )
+            written = self._write_back(item, vector)
         except Exception as exc:  # noqa: BLE001 - 同上；写回失败与生成失败分开归因
             return self._record_failure(item, exc)
         if written is False:
             # 记录已被删除（或 outbox 行已不在）：跳过，不算失败。
             return ("skipped", "")
         return ("embedded", "")
+
+    def _write_back(self, item: PendingEmbedding, vector: tuple[float, ...]) -> bool:
+        """把向量写回存储。default 走 ``set_embedding``（memory_versions 单列）；
+        非 default profile 由 :class:`ReembeddingWorker` 覆盖，写多 profile 表
+        （04 计划 §6.5 双 profile）。"""
+        return self._repository.set_embedding(
+            item.version_id,
+            vector,
+            embedding_model=self._model,
+            embedding_version=self._model_version,
+        )
 
     def _embed(self, content: str) -> tuple[float, ...]:
         raw = self._embedder(str(content or ""))

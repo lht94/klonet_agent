@@ -47,6 +47,7 @@ CURRENT_APPLIED_MIGRATIONS: tuple[str, ...] = (
     "0005_governance_provenance",
     "0006_memory_maintenance",
         "0007_memory_maintenance_proposals",
+        "0008_embedding_migrations",
 )
 
 BASELINE_REPORT_FILE = (
