@@ -118,8 +118,11 @@ def select_recent_groups(
     返回 (included, omitted)。保证：
     - 组的相对顺序不变；
     - 任何组都不会被部分纳入；
-    - 最新组即使单独超过预算，也会降级保留其首尾消息，
-      避免出现"一条巨大工具输出让最近历史完全为空"的情况。
+    - **整组放不下就整组 omit，绝不拆链**（阶段 7）。旧实现曾在"最新组
+      过大"时降级保留其中的 user/assistant 文本、丢弃中间工具交换，
+      那会产生"有 tool_call 没有 tool result"的协议残片；宁可让这一轮
+      历史区为空，也不能发送残缺的工具链。若确实需要一个巨大的历史
+      工具交换，应由调用方先行注入结构化工具摘要，而不是在这里拆。
 
     ``tokenizer`` 为 None 时按启发式 token 数选（与 MessageGroup 初始化时
     的估算口径一致）；非 None 时按真路径 BPE 重新估算每组 token，
@@ -149,29 +152,4 @@ def select_recent_groups(
 
     included.reverse()
     omitted.reverse()
-
-    # 兜底：一条消息都没装下时（最新组本身超预算），降级保留该组中
-    # 的 user 消息与最后一条 assistant 文本消息，丢弃中间工具交换。
-    if not included and non_system:
-        newest = non_system[-1]
-        fallback = [
-            message
-            for message in newest.messages
-            if message.get("role") in {"user", "assistant"}
-            and not message.get("tool_calls")
-        ]
-        if fallback:
-            kept_ids = tuple(
-                event_id
-                for event_id, message in zip(newest.event_ids, newest.messages)
-                if message in fallback
-            )
-            degraded = MessageGroup(
-                event_ids=kept_ids,
-                messages=tuple(fallback),
-                group_type="orphan",
-            )
-            included = [degraded]
-            omitted = non_system[:-1]
-
     return included, omitted

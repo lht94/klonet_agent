@@ -136,6 +136,9 @@ class MemoryPack:
 
     ``text`` 为空表示这一轮没有可注入的记忆——调用方必须把它当成"不注入"，
     而不是渲染一个空标题（那会白占 token 并暗示"查过了但没有"）。
+
+    ``mode`` 保存下来是为了让 ``to_messages()`` 能重建"运行态约束"提示段，
+    从而支持按条目拆分（阶段 7）。
     """
 
     text: str = ""
@@ -144,6 +147,7 @@ class MemoryPack:
     tokens: int = 0
     conflict_ids: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    mode: str = "mentor"
 
     @property
     def empty(self) -> bool:
@@ -172,6 +176,74 @@ class MemoryPack:
             # 完整 id 只在本地记账字段里，供 trace 与审计；发送前一并剥离。
             "_memory_pack_ids": list(self.memory_ids),
         }
+
+    def to_messages(self) -> list[dict[str, Any]]:
+        """把包拆成**按条目**的多条消息（阶段 7）。
+
+        旧实现只提供 ``to_message()``（整包一条），compiler 因此只能
+        "整包进或整包丢"——一条超大记忆就能让整个 MemoryPack 消失。
+        拆条之后，compiler 在 hard eviction 阶段可以逐条移除最低优先级的
+        内容，而不是一刀切。
+
+        布局：
+        - 每条记忆一条消息，按 ``entries`` 现有顺序（preference → fact →
+          episode，即复用价值从高到低）；
+        - header 与"冲突 / 运行态约束"等全局提示挂在**第一条**（最高优先级
+          的那条）上，避免出现"只剩一个孤立 header"的消息。
+
+        返回空列表表示这一轮不注入记忆。
+        """
+
+        if not self.text.strip() or not self.entries:
+            return []
+
+        global_notes = self._global_notes()
+        messages: list[dict[str, Any]] = []
+        last_index = len(self.entries) - 1
+        for index, entry in enumerate(self.entries):
+            body = (
+                f"### {_SECTION_TITLES[entry.memory_type]}\n"
+                f"- {entry.content}\n"
+                f"  - {_metadata_line(entry)}"
+            )
+            content = (_HEADER + "\n\n" + body) if index == 0 else body
+            if index == last_index and global_notes:
+                content = content + "\n\n" + "\n".join(global_notes)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": content,
+                    "_memory_pack": True,
+                    "_memory_pack_ids": [entry.memory_id],
+                }
+            )
+        return messages
+
+    def _global_notes(self) -> list[str]:
+        """冲突提示与运行态约束——整包渲染与拆条渲染共用同一段文本。"""
+
+        lines: list[str] = []
+        if self.conflict_ids:
+            lines.append("")
+            lines.append("### 需要确认的冲突")
+            lines.append(
+                "- 这些记忆之间存在 contradicts 关系，不得静默合并："
+                + "、".join(_short_id(memory_id) for memory_id in self.conflict_ids)
+                + "。请在回答里说明不确定之处，或向用户确认。"
+            )
+        if _needs_runtime_constraint(self.mode):
+            lines.append("")
+            lines.append("### 运行态约束")
+            lines.append(
+                "- 以上记忆若涉及端口、进程、服务、容器等运行态信息，"
+                "必须先由本轮工具结果确认后才能采用；记忆只是历史线索。"
+            )
+        if self.warnings:
+            lines.append("")
+            lines.append("### 召回状态")
+            for warning in self.warnings:
+                lines.append(f"- {warning}")
+        return lines
 
 
 class MemoryPackBuilder:
@@ -264,6 +336,7 @@ class MemoryPackBuilder:
                 memory_id for memory_id in conflict_ids if memory_id in kept
             ),
             warnings=tuple(warnings),
+            mode=mode,
         )
 
     # ------------------------------------------------------------- 选择 --

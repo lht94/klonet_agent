@@ -13,6 +13,7 @@ compression_required 请求压缩，而不是请求失败后补救。
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -32,6 +33,23 @@ class ContextOverflowError(Exception):
     def __init__(self, message: str, areas: dict[str, int] | None = None):
         super().__init__(message)
         self.areas = areas or {}
+
+
+def _legacy_compression_order() -> bool:
+    """阶段 7 顺序开关（默认关闭）。
+
+    - 关闭（默认）= 新顺序：用**完整候选**（``inventory.candidate_tokens``）
+      判断是否超过 soft limit —— 这样"原始候选已超线但被裁剪后低于线"的场景
+      也能触发压缩。
+    - 开启 = 旧顺序：用**裁剪后**的 ``estimated`` 判断。
+
+    刻意直接读环境变量而不是 import config：``context`` 包保持自包含，
+    不被配置层反向依赖。保留一个版本周期后再连同这个函数一起删除。
+    """
+
+    return os.getenv(
+        "KLONET_AGENT_LEGACY_COMPRESSION_ORDER", "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
 
 
 # 只剥离本地记账字段，其余字段原样保留：部分供应商（如 DeepSeek 推理模型）
@@ -103,10 +121,56 @@ class ContextRequest:
     tool_definitions: list[dict] | None = None
     # evidence_messages：RAG/日志/工具摘要等证据消息，独立预算。
     evidence_messages: list[dict] = field(default_factory=list)
-    # memory_pack_message：按问题检索到的记忆包，**独立**预算且先于普通证据。
-    # 它必须留在证据区：检索到的记忆是与当前任务相关的历史信息，
+    # memory_pack_message：按问题检索到的记忆包（单条渲染），**独立**预算且
+    # 先于普通证据。它必须留在证据区：检索到的记忆是与当前任务相关的历史信息，
     # 不具备系统规则的优先级，不能伪装成 system policy（计划 §6.7）。
     memory_pack_message: dict | None = None
+    # memory_pack_messages：记忆包的**按条目拆分**版本（阶段 7）。非空时优先于
+    # ``memory_pack_message``——它让 compiler 可以逐条降级，避免"一条超大记忆
+    # 让整包消失"。列表顺序即优先级顺序（高 → 低），装载时从前往后装。
+    memory_pack_messages: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ContextInventory:
+    """完整候选上下文的**只读**计量结果（阶段 7）。
+
+    与 ``compile()`` 的关键区别：inventory 阶段**不做任何裁剪**——
+    不省略消息、不截断 MemoryPack、不选择 recent groups。它只回答
+    "如果把手上这些材料全发出去，一共要多少 token"。
+
+    为什么需要它：``compression_required`` 若基于裁剪后的 ``estimated``
+    判断，语义就变成"淘汰后仍超过 70%"，导致**原始候选已经远超 soft、
+    却因为裁剪后低于 soft 而不产生 checkpoint**。所以压缩判断必须看
+    ``candidate_tokens``（完整候选），而不是看裁剪结果。
+
+    ``candidate_tokens`` 与 hard/soft limit 使用同一 tokenizer 和同一
+    tool/output/safety 预算口径，因此可以直接比较。
+    """
+
+    required_tokens: int
+    memory_pack_tokens: int
+    evidence_tokens: int
+    history_tokens: int
+    tool_tokens: int
+    candidate_tokens: int
+    hard_input_limit: int
+    soft_input_limit: int
+    model: str
+    profile_source: str = "builtin"
+    tokenizer_id: str | None = None
+
+    @property
+    def exceeds_soft_limit(self) -> bool:
+        """完整候选是否超过软阈值——压缩的唯一触发条件。"""
+
+        return self.candidate_tokens > self.soft_input_limit
+
+    @property
+    def exceeds_hard_limit(self) -> bool:
+        """完整候选是否超过硬限——压缩后仍需淘汰的信号。"""
+
+        return self.candidate_tokens > self.hard_input_limit
 
 
 @dataclass(frozen=True)
@@ -126,10 +190,83 @@ class CompiledContext:
     # 实际进入上下文的记忆 id（来自 MemoryPack 的本地记账字段），供 trace 断言
     # "相关记忆确实进了证据区、无关记忆一条都没进"。
     memory_pack_ids: tuple[str, ...] = ()
+    # ---- 阶段 7：三段式 token 计量，避免把三个阶段的数字混成一个 ----
+    # candidate_tokens：本次编译**之前**的完整候选总量（裁剪前）。
+    candidate_tokens: int = 0
+    # post_compaction_tokens：压缩后的完整候选总量；未压缩时等于 candidate_tokens。
+    post_compaction_tokens: int = 0
+    # final_tokens：实际发送的 token（= estimated_input_tokens 的别名，便于对齐口径）。
+    final_tokens: int = 0
+    # 被淘汰对象的归因（事件 id / 区域 + 原因码），比只记 id 列表更可审计。
+    eviction_reasons: tuple[str, ...] = ()
 
 
 class ContextCompiler:
     """把多路上下文材料编译为一次 LLM 请求的消息列表。"""
+
+    def inventory(self, request: ContextRequest) -> ContextInventory:
+        """只读计量完整候选上下文（阶段 7 的入口）。
+
+        不省略任何消息、不选组、不截断——只算总量。调用方先用它判断
+        "完整候选是否超过 soft limit"，再决定是否压缩。
+        """
+
+        budget = build_context_budget(request.model, request.tool_definitions)
+        return self._inventory_with(budget, request)
+
+    def _inventory_with(
+        self, budget: ContextBudget, request: ContextRequest
+    ) -> ContextInventory:
+        """用已解析的预算做完整候选计量（避免重复 build_context_budget）。"""
+
+        tokenizer = _tokens_module.get_tokenizer(budget.tokenizer_id)
+
+        required_tokens = _tokens_module.estimate_messages_tokens(
+            list(request.system_messages), tokenizer=tokenizer
+        )
+        if request.checkpoint_message is not None:
+            required_tokens += _tokens_module.estimate_messages_tokens(
+                [request.checkpoint_message], tokenizer=tokenizer
+            )
+        required_tokens += _tokens_module.estimate_messages_tokens(
+            list(request.transient_messages), tokenizer=tokenizer
+        )
+        if request.current_user_message is not None:
+            required_tokens += _tokens_module.estimate_messages_tokens(
+                [request.current_user_message], tokenizer=tokenizer
+            )
+
+        pack_tokens = 0
+        if request.memory_pack_messages:
+            pack_tokens = _tokens_module.estimate_messages_tokens(
+                list(request.memory_pack_messages), tokenizer=tokenizer
+            )
+        elif request.memory_pack_message is not None:
+            pack_tokens = _tokens_module.estimate_messages_tokens(
+                [request.memory_pack_message], tokenizer=tokenizer
+            )
+        evidence_tokens = _tokens_module.estimate_messages_tokens(
+            list(request.evidence_messages), tokenizer=tokenizer
+        )
+        history_tokens = _tokens_module.estimate_messages_tokens(
+            list(request.history_messages), tokenizer=tokenizer
+        )
+
+        return ContextInventory(
+            required_tokens=required_tokens,
+            memory_pack_tokens=pack_tokens,
+            evidence_tokens=evidence_tokens,
+            history_tokens=history_tokens,
+            tool_tokens=budget.reserved_tool_tokens,
+            candidate_tokens=(
+                required_tokens + pack_tokens + evidence_tokens + history_tokens
+            ),
+            hard_input_limit=budget.hard_input_limit,
+            soft_input_limit=budget.soft_input_limit,
+            model=request.model,
+            profile_source=budget.profile_source,
+            tokenizer_id=budget.tokenizer_id,
+        )
 
     def compile(self, request: ContextRequest) -> CompiledContext:
         """按预算组装最终消息列表。"""
@@ -198,12 +335,16 @@ class ContextCompiler:
         # 所以不会把一条记忆切成半条——残缺条目比少一条更糟。
         memory_pack: list[dict] = []
         pack_omitted: list[dict] = []
+        pack_messages = _pack_messages_of(request)
         remaining = budget.hard_input_limit - required_tokens
-        if request.memory_pack_message is not None:
+        if pack_messages:
+            # 阶段 7：记忆包按**条目**装载，且正向装（列表顺序即优先级，
+            # 高优先级先装）。整条放不下只丢那一条，不再让整包消失。
             memory_pack, pack_omitted = _fit_messages(
-                [request.memory_pack_message],
+                pack_messages,
                 int(remaining * 0.15),
                 tokenizer=tokenizer,
+                reverse=False,
             )
             areas["memory_pack"] = _tokens_module.estimate_messages_tokens(
                 memory_pack, tokenizer=tokenizer
@@ -261,12 +402,24 @@ class ContextCompiler:
             final_messages.append(current_user)
 
         estimated = required_tokens + areas["recent_history"]
-        compression_required = estimated > budget.soft_input_limit
+        # 阶段 7：压缩判断必须基于**完整候选**（inventory），而不是裁剪后的
+        # estimated——否则会出现"原始候选已远超 soft、却因裁剪后低于 soft
+        # 而不产生 checkpoint"，被淘汰内容既没进上下文也没进摘要。
+        # KLONET_AGENT_LEGACY_COMPRESSION_ORDER=1 可回退到旧口径一个版本周期。
+        inventory = self._inventory_with(budget, request)
+        if _legacy_compression_order():
+            compression_required = estimated > budget.soft_input_limit
+        else:
+            compression_required = inventory.exceeds_soft_limit
 
         memory_pack_ids: tuple[str, ...] = ()
         if memory_pack:
-            raw_ids = memory_pack[0].get("_memory_pack_ids") or ()
-            memory_pack_ids = tuple(str(item) for item in raw_ids)
+            # 阶段 7：记忆包可能是多条消息，逐条汇拢才拿得到完整 id 列表。
+            collected: list[str] = []
+            for message in memory_pack:
+                for item in message.get("_memory_pack_ids") or ():
+                    collected.append(str(item))
+            memory_pack_ids = tuple(collected)
 
         return CompiledContext(
             messages=final_messages,
@@ -280,6 +433,19 @@ class ContextCompiler:
             areas=areas,
             profile_source=budget.profile_source,
             memory_pack_ids=memory_pack_ids,
+            candidate_tokens=inventory.candidate_tokens,
+            # 本函数不含压缩，故 post_compaction 与 candidate 同值；
+            # orchestrator 在真正压缩后会重编译，那时 candidate 即压缩后的量。
+            post_compaction_tokens=inventory.candidate_tokens,
+            final_tokens=estimated,
+            eviction_reasons=tuple(
+                f"history:{event_id}" for event_id in omitted_ids
+            )
+            + (("memory_pack:over_zone_budget",) if pack_omitted else ())
+            + tuple(
+                f"evidence:over_zone_budget-{index}"
+                for index in range(len(evidence_omitted))
+            ),
         )
 
     def compile_history(
@@ -290,6 +456,7 @@ class ContextCompiler:
         checkpoint_message: dict | None = None,
         evidence_messages: list[dict] | None = None,
         memory_pack_message: dict | None = None,
+        memory_pack_messages: list[dict] | None = None,
     ) -> CompiledContext:
         """从扁平 history 编译（编排器当前主路径的便捷入口）。
 
@@ -318,8 +485,23 @@ class ContextCompiler:
             tool_definitions=tool_definitions,
             evidence_messages=evidence_messages or [],
             memory_pack_message=memory_pack_message,
+            memory_pack_messages=list(memory_pack_messages or []),
         )
         return self.compile(request)
+
+
+def _pack_messages_of(request: ContextRequest) -> list[dict]:
+    """取出这一轮要装载的记忆包消息列表。
+
+    优先用按条目拆分的 ``memory_pack_messages``（阶段 7），它让 compiler
+    能逐条降级；回退到单条渲染的 ``memory_pack_message``（旧调用方）。
+    """
+
+    if request.memory_pack_messages:
+        return list(request.memory_pack_messages)
+    if request.memory_pack_message is not None:
+        return [request.memory_pack_message]
+    return []
 
 
 def _fit_messages(
@@ -327,8 +509,14 @@ def _fit_messages(
     token_budget: int,
     *,
     tokenizer: SupportsEncode | None = None,
+    reverse: bool = True,
 ) -> tuple[list[dict], list[dict]]:
-    """按预算从新到旧保留证据消息，返回 (included, omitted)。
+    """按预算保留消息，返回 (included, omitted)。
+
+    ``reverse=True``（默认）：从**新到旧**装——用于历史/证据区，最近的内容
+    最重要，先保住。
+    ``reverse=False``：从**前往后**装——用于已按优先级排好序的记忆包条目
+    （高优先级在前），保住高优先级的那些。
 
     ``tokenizer`` 透传到 ``estimate_messages_tokens``，与 compile() 主体
     的口径保持一致。
@@ -337,11 +525,15 @@ def _fit_messages(
     included: list[dict] = []
     omitted: list[dict] = []
     used = 0
-    for message in reversed(messages):
+    sequence = reversed(messages) if reverse else messages
+    for message in sequence:
         cost = _tokens_module.estimate_messages_tokens([message], tokenizer=tokenizer)
         if used + cost <= token_budget:
-            included.insert(0, message)
+            included.append(message)
             used += cost
         else:
-            omitted.insert(0, message)
+            omitted.append(message)
+    if reverse:
+        included.reverse()
+        omitted.reverse()
     return included, omitted

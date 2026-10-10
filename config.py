@@ -392,6 +392,10 @@ def load_maintenance_config(env: Mapping[str, str] | None = None) -> Maintenance
 CONTEXT_COMPACTION_MIN_TOKENS = max(
     0, int(os.getenv("KLONET_AGENT_COMPACTION_MIN_TOKENS", "512")),
 )
+
+# 阶段 7 顺序开关 KLONET_AGENT_LEGACY_COMPRESSION_ORDER 定义在
+# context/compiler.py 与 orchestrator.py 各自的 _legacy_compression_order()
+# 里 —— 刻意让 context 包保持自包含，不由配置层反向注入。
 MAX_TOOL_ROUNDS = 8
 OPS_MAX_TOOL_ROUNDS = 16
 SHARED_OPS_MEMORY_RECENT_DAYS = 3

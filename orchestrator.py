@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from time import perf_counter
@@ -381,7 +382,7 @@ class AgentOrchestrator:
 
         # 把记忆设定加入到系统提示词中。
         # 打开 MemoryPack 开关后，这里不再常驻 MEMORY.md / USER.md 全文：正文改由
-        # 每轮按问题召回的证据块承担（见 _memory_pack_message）。
+        # 每轮按问题召回的证据块承担（见 _memory_pack_messages）。
         memory_prompt = self.memory_store.memory_prompt(
             mode=self.profile.name,
             include_long_term=self._markdown_memory_is_injected(),
@@ -578,13 +579,13 @@ class AgentOrchestrator:
         model = getattr(self.llm, "model", None) or "unknown"
         # 记忆包在同一回合里只构造一次：压缩后重编译时复用同一份，
         # 不为同一句用户输入跑两遍召回与嵌入。
-        memory_pack_message = self._memory_pack_message(history)
+        memory_pack_messages = self._memory_pack_messages(history)
         try:
             compiled = self.context_compiler.compile_history(
                 history,
                 model=model,
                 tool_definitions=tools,
-                memory_pack_message=memory_pack_message,
+                memory_pack_messages=memory_pack_messages,
             )
         except ContextOverflowError as exc:
             self.trace_logger.record_privileged_event(
@@ -597,9 +598,15 @@ class AgentOrchestrator:
             raise
 
         if compiled.compression_required:
-            covered_prefix = self._covered_prefix_length(
-                history, compiled.omitted_event_ids
-            )
+            # 阶段 7：压缩范围取"当前输入之前的全部未覆盖历史"，
+            # 不再依赖第一次编译产生的 omitted（那是裁剪后的产物）；
+            # 开关打开时回退旧范围（一个版本周期后删除）。
+            if self._legacy_compression_order():
+                covered_prefix = self._covered_prefix_length_legacy(
+                    history, compiled.omitted_event_ids
+                )
+            else:
+                covered_prefix = self._coverable_prefix_length(history)
             coverable = self._non_system_messages(history)[:covered_prefix]
             coverable_tokens = estimate_messages_tokens(coverable)
             checkpoint_message = None
@@ -634,9 +641,11 @@ class AgentOrchestrator:
                     model=model,
                     tool_definitions=tools,
                     checkpoint_message=checkpoint_message,
-                    memory_pack_message=memory_pack_message,
+                    memory_pack_messages=memory_pack_messages,
                 )
                 if compiled.compression_required:
+                    # 阶段 7：压缩后重新计量——candidate 是压缩后的完整候选。
+                    # 只有它仍超过 hard 时才会在本次编译里发生淘汰。
                     self.trace_logger.record_privileged_event(
                         user_id=self.session.user_id,
                         project_id=self.session.project_id,
@@ -645,6 +654,11 @@ class AgentOrchestrator:
                         payload={
                             "estimated_input_tokens": compiled.estimated_input_tokens,
                             "areas": compiled.areas,
+                            "candidate_tokens": compiled.candidate_tokens,
+                            "hard_input_limit": compiled.hard_input_limit,
+                            "post_compaction_evictions": list(
+                                compiled.eviction_reasons
+                            ),
                         },
                     )
 
@@ -661,6 +675,10 @@ class AgentOrchestrator:
             omitted_event_ids=len(compiled.omitted_event_ids),
             areas=compiled.areas,
             profile_source=compiled.profile_source,
+            candidate_tokens=compiled.candidate_tokens,
+            post_compaction_tokens=compiled.post_compaction_tokens,
+            final_tokens=compiled.final_tokens,
+            eviction_reasons=compiled.eviction_reasons,
         )
         return compiled
 
@@ -681,22 +699,57 @@ class AgentOrchestrator:
         return [message for message in history if message.get("role") != "system"]
 
     @classmethod
-    def _covered_prefix_length(
+    def _coverable_prefix_length(
+        cls,
+        history: list[dict],
+    ) -> int:
+        """可压缩前缀长度：当前用户输入之前的全部非 system 消息条数。
+
+        **阶段 7 的关键改动**：压缩范围不再依赖第一次 hard-budget 选择产生的
+        ``omitted_event_ids``。那个 omitted 本身就是"已经裁剪过"的产物，用它
+        反推压缩范围会把顺序绑死成"先淘汰、后压缩"，从而出现
+        "原始候选已远超 soft、却因裁剪后低于 soft 而不压缩"的漏洞。
+
+        现在直接取"完整历史里、当前输入以前"的全部事件：
+
+        - 当前用户输入永远不计入——本轮输入不可被压缩；
+        - 已被上一版 checkpoint 覆盖的部分由 ``previous`` 作为增量基础承载，
+          因此这里不需要、也无从区分"哪些已被覆盖"。
+
+        返回非 system 消息条数，供 ``_compact_context_once`` 切前缀。
+        """
+
+        non_system = cls._non_system_messages(history)
+        if not non_system:
+            return 0
+        newest_is_user = non_system[-1].get("role") == "user"
+        return max(0, len(non_system) - (1 if newest_is_user else 0))
+
+    @staticmethod
+    def _legacy_compression_order() -> bool:
+        """阶段 7 顺序开关（默认关闭；与 context.compiler 同源同值）。"""
+
+        return os.getenv(
+            "KLONET_AGENT_LEGACY_COMPRESSION_ORDER", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def _covered_prefix_length_legacy(
         cls,
         history: list[dict],
         omitted_event_ids: tuple[str, ...],
     ) -> int:
-        """把编译器的 omitted 事件 id 映射成“需要被 checkpoint 覆盖的前缀长度”。
+        """**旧顺序**的压缩范围：把编译器的 omitted 映射成前缀长度。
+
+        仅当 ``KLONET_AGENT_LEGACY_COMPRESSION_ORDER=1`` 时使用。
+        保留一个版本周期以便一键回退，之后连同开关一起物理删除。
 
         omitted 事件 id 有两种来源：
-        - "rows-<n>"：已持久化事件，用行号定位；
-        - "msg-<index>"：旧格式/未持久化事件，用它在非 system 消息序列中的位置定位。
+        - ``"rows-<n>"``：已持久化事件，用行号定位；
+        - ``"msg-<index>"``：旧格式/未持久化事件，用它在非 system 消息序列中的
+          位置定位。
 
-        返回覆盖前缀的非 system 消息条数；当前用户输入永远不计入，避免把本轮
-        输入压缩掉。编译器没有报告被淘汰事件时，退化为覆盖当前用户输入之前的
-        全部事件 —— 历史整体超过软阈值时，正需要把整段历史折叠成 checkpoint。
-        出现无法映射的 id 时同样保守地整体覆盖：宁可多覆盖，也不能把未总结的
-        事件当成已覆盖。
+        无法映射时保守地整体覆盖：宁可多覆盖，也不能把未总结的事件当成已覆盖。
         """
 
         non_system = cls._non_system_messages(history)
@@ -1172,21 +1225,21 @@ class AgentOrchestrator:
 
     # ------------------------------------------------------- 记忆召回（阶段 5） --
 
-    def _memory_pack_message(self, history: list[dict]) -> dict | None:
-        """按当前问题构建记忆包消息；不可用时返回 None。
+    def _memory_pack_messages(self, history: list[dict]) -> list[dict]:
+        """按当前问题构建记忆包消息列表（阶段 7：按条目拆分）；不可用时返回空列表。
 
         失败一律降级为"这轮不注入记忆"：记忆是增强项，不该成为回答的阻塞点，
         更不该在用户请求路径上抛异常。
         """
 
         if not MEMORY_PACK_ENABLED:
-            return None
+            return []
         query_text = self._memory_query_text(history)
         if not query_text.strip():
-            return None
+            return []
         retriever = self._memory_retriever()
         if retriever is None:
-            return None
+            return []
         try:
             from klonet_agent.memory.domain import MemoryQuery
 
@@ -1197,7 +1250,7 @@ class AgentOrchestrator:
             self._trace_memory_pack(
                 "recall_failed", {"error": type(exc).__name__}
             )
-            return None
+            return []
 
         pack = self._memory_pack_builder().build(report, mode=self.profile.name)
         if pack.empty:
@@ -1209,7 +1262,7 @@ class AgentOrchestrator:
                     "dropped": len(pack.dropped),
                 },
             )
-            return None
+            return []
         self._trace_memory_pack(
             "injected",
             {
@@ -1224,7 +1277,7 @@ class AgentOrchestrator:
                 "conflicts": list(pack.conflict_ids),
             },
         )
-        return pack.to_message()
+        return pack.to_messages()
 
     def _memory_query_text(self, history: list[dict]) -> str:
         """召回用的查询文本：本轮用户输入。

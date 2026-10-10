@@ -77,8 +77,13 @@ def test_interrupted_chain_is_one_droppable_group():
     assert len(omitted) == 1
 
 
-def test_single_group_over_budget_degrades_without_broken_chains():
-    """单个组超过整个预算时降级保留首尾，不产生残缺工具链。"""
+def test_single_group_over_budget_is_omitted_whole_not_split():
+    """单个组超过整个预算时整组 omit，绝不拆链（阶段 7）。
+
+    旧实现在这种情况下会"降级保留首尾"——丢掉中间的工具交换、只留
+    user/assistant 文本，那会产生"有 tool_call 没有 tool result"的协议残片。
+    现在宁可让这一轮历史区为空，也不发送残缺的工具链。
+    """
 
     from klonet_agent.context.message_groups import select_recent_groups
 
@@ -86,12 +91,12 @@ def test_single_group_over_budget_degrades_without_broken_chains():
     groups = [g for g in _groups(messages) if g.group_type != "system"]
     included, omitted = select_recent_groups(groups, token_budget=10)
 
-    assert len(included) == 1
-    roles = [m["role"] for m in included[0].messages]
-    assert "tool" not in roles
-    assert roles[0] == "user" and roles[-1] == "assistant"
-    assert not any(m.get("tool_calls") for m in included[0].messages)
-    del omitted
+    assert included == [], "整组放不下时必须整组淘汰，不得拆链"
+    assert len(omitted) == 1
+    # 被淘汰的组本身保持完整：tool_calls 与 tool result 都还在。
+    roles = [m["role"] for m in omitted[0].messages]
+    assert "tool" in roles
+    assert any(m.get("tool_calls") for m in omitted[0].messages)
 
 
 def test_older_complete_groups_dropped_first():

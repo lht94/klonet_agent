@@ -84,8 +84,22 @@ class TraceLogger:
         omitted_event_ids: int,
         areas: dict | None = None,
         profile_source: str = "builtin",
+        candidate_tokens: int = 0,
+        post_compaction_tokens: int = 0,
+        final_tokens: int = 0,
+        eviction_reasons=None,
     ):
-        """记录一次上下文编译结果，用于回答 token 消耗分布与预算命中率。"""
+        """记录一次上下文编译结果，用于回答 token 消耗分布与预算命中率。
+
+        阶段 7 起额外记录**三段式 token 计量**：
+        - ``candidate_tokens``：裁剪前的完整候选总量（压缩判断依据）；
+        - ``post_compaction_tokens``：压缩后的候选总量；
+        - ``final_tokens``：实际发送的 token。
+
+        三者满足 ``candidate >= post_compaction >= final``，混为一个指标会
+        让"到底是候选超线还是裁剪后超线"无法区分。``eviction_reasons`` 记录
+        每个被淘汰对象的区域与原因码，而不只是一个 id 列表。
+        """
 
         self._append(
             {
@@ -103,6 +117,10 @@ class TraceLogger:
                 "omitted_event_ids": omitted_event_ids,
                 "areas": areas or {},
                 "profile_source": profile_source,
+                "candidate_tokens": candidate_tokens,
+                "post_compaction_tokens": post_compaction_tokens,
+                "final_tokens": final_tokens,
+                "eviction_reasons": list(eviction_reasons or ()),
             }
         )
 

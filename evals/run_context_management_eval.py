@@ -250,6 +250,9 @@ def _run_case(case: dict) -> dict:
             )
             pre_required = pre_compiled.compression_required
             result["areas"] = pre_compiled.areas
+            # 阶段 7：压缩判断的依据是**完整候选**，把它记下来才能区分
+            # "候选超线"与"裁剪后超线"。
+            result["candidate_tokens"] = pre_compiled.candidate_tokens
         except ContextOverflowError as exc:
             pre_required = True
             result["areas"] = exc.areas
