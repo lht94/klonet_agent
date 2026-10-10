@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import paramiko
 
@@ -13,7 +14,8 @@ PORT = 1012
 USER = "lzl"
 PASSWORD = "123"
 REPO = "klonet_agent"
-BUNDLE = "/home/klonet-agent/klonet-tokenizer-upgrade.bundle"
+# 远端 bundle 路径。可用 KLONET_VM_BUNDLE 覆盖（每次推送换名避免撞旧文件）。
+BUNDLE = os.environ.get("KLONET_VM_BUNDLE", "/home/klonet-agent/klonet-push.bundle")
 
 
 def run(client, cmd, timeout=30):
