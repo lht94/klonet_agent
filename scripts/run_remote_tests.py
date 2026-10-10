@@ -37,10 +37,10 @@ def main() -> int:
         print(f"ssh 连接失败: {exc}", file=sys.stderr)
         return 2
 
-    # 0) 确认远端 HEAD 是 0768561
+    # 0) 打印远端 HEAD 供核对（每次推送 sha 不同，不做硬编码比对）
     code, out, _ = run(client, f"cd ~/{REPO} && git rev-parse HEAD")
-    if code != 0 or "0768561" not in out:
-        print(f"远端 HEAD 不匹配：{out}", file=sys.stderr)
+    if code != 0:
+        print(f"无法读取远端 HEAD：{out}", file=sys.stderr)
         return 4
 
     # 1) 跑 context 测试。
@@ -54,7 +54,7 @@ def main() -> int:
             "export PYTHONPATH=$HOME && "
             "cd ~/{0} && "
             "~/miniconda3/envs/klonet_agent/bin/python -m pytest "
-            "{0}/tests/test_context_*.py "
+            "tests/test_context_*.py "
             "--no-header --tb=short --basetemp=/tmp/remote_ctx "
             "-p no:cacheprovider 2>&1 | tail -40"
         ).format(REPO),
