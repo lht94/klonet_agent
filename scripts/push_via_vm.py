@@ -60,10 +60,6 @@ def main() -> int:
     if code != 0:
         print("bundle verify 失败", file=sys.stderr)
         return 5
-    # bundle verify 输出 commits 行包含 commit sha
-    if "0768561" not in out:
-        print(f"bundle 不含目标提交 0768561，verify 输出:\n{out}", file=sys.stderr)
-        return 6
 
     # 3) fetch from bundle：bundle 只暴露 HEAD 一个 ref，所以 refspec 写成
     #    HEAD:refs/remotes/bundle/master（不能写 refs/heads/* 因为 bundle 里
