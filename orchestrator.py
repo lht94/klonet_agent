@@ -214,6 +214,8 @@ class AgentOrchestrator:
         self._memory_read_error: str | None = None
         self._memory_retriever_cache = None
         self._memory_retriever_error: str | None = None
+        # cutover（默认）下"库不可用 → 降级 Markdown"只告警一次的标记。
+        self._markdown_fallback_notified = False
         self._memory_pack_builder_cache = None
         # 本轮 history 列表的引用。工具循环里的记忆工具需要通过它拿到本轮事件，
         # 而 single_chat 只在开始时把引用放进来（列表本身是就地修改的）。
@@ -1119,15 +1121,54 @@ class AgentOrchestrator:
 
         return history, token
 
+    def _memory_recall_available(self) -> bool:
+        """数据库召回链路是否可用（cutover 下决定要不要降级回 Markdown）。
+
+        "不可用"指**链路坏了**：没配 DSN、连不上库。召回结果为空不算——
+        那只是"这条问题没有相关记忆"，数据库仍然是权威，不该因此把
+        Markdown 全文请回来。失败会被读路径缓存（每进程只试一次），
+        所以这里的降级不会在每个回合反复撞库。
+        """
+
+        if not MEMORY_PACK_ENABLED:
+            return False
+        return self._memory_repository() is not None
+
     def _markdown_memory_is_injected(self) -> bool:
         """Markdown 记忆是否仍常驻注入系统提示词。
 
-        两个条件同时成立才注入：Markdown 还是权威（未 cutover），且按需召回没有
-        接管常驻注入（MemoryPack 开关没开）。任一条件成立就不再注入——
-        "新路径已接管"与"旧权威已下线"是两个独立的理由，都足以撤掉常驻文本。
+        三种情况注入：
+
+        1. Markdown 还是权威（legacy / shadow / compare）且按需召回没接管
+           （MemoryPack 开关没开）——旧行为；
+        2. **cutover（默认）但数据库召回链路不可用**——"数据库优先、没有
+           数据库再降级 Markdown"的可用性兜底。降级只发生一次并留痕
+           （trace ``memory_markdown_fallback``），避免每轮重复告警。
+
+        "召回结果为空"不属于降级：那只说明这条问题没有相关记忆，不说明
+        数据库坏了。
         """
 
-        return markdown_memory_is_authoritative() and not MEMORY_PACK_ENABLED
+        if markdown_memory_is_authoritative():
+            return not MEMORY_PACK_ENABLED
+
+        available = self._memory_recall_available()
+        if available:
+            return False
+        if not self._markdown_fallback_notified:
+            self._markdown_fallback_notified = True
+            reason = (
+                self._memory_read_error
+                or self._memory_pipeline_error
+                or "未知原因"
+            )
+            print(f"Klonet Agent：（记忆库不可用，本轮起降级为 Markdown 记忆：{reason}）")
+            # 事件名：memory_pack_markdown_fallback（沿用 _trace_memory_pack 的前缀）。
+            self._trace_memory_pack(
+                "markdown_fallback",
+                {"reason": reason[:200], "authority": MEMORY_AUTHORITY},
+            )
+        return True
 
     # ------------------------------------------------------- 记忆召回（阶段 5） --
 

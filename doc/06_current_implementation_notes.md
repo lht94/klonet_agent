@@ -393,8 +393,10 @@ python -m pytest -q
 - ~~向量数据库~~ → **已完成**：记忆库选型定为 PostgreSQL + pgvector（02 计划阶段 1–7）。
 - ~~SQLite 多用户元数据~~ → **不再做**：只维护一套 PostgreSQL 语义，避免两套
   SQL/全文检索/向量实现长期漂移（计划 §12）。
-- cutover 尚未切到默认：代码默认仍是 `legacy`，需要部署侧执行
-  `scripts/memory_cutover.py --apply` 才算完成切换。
+- ~~cutover 尚未切到默认~~ → **已完成**（2026-10-10）：`MEMORY_AUTHORITY` 默认
+  `cutover`，数据库优先；库不可用（未配 DSN / 连不上）时自动降级回 Markdown 注入
+  与文件写入，trace 记 `memory_pack_markdown_fallback`。`scripts/memory_cutover.py`
+  保留为显式切换/回滚工具。
 - 独立 ReviewAgent。
 - Web/API 服务。
 - LangGraph 状态图。

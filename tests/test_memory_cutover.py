@@ -296,3 +296,101 @@ def test_a_misspelled_authority_falls_back_to_legacy(monkeypatch, config) -> Non
     assert reloaded.MEMORY_AUTHORITY == "legacy"
     assert reloaded.memory_cutover_enabled() is False
     assert reloaded.markdown_memory_is_authoritative() is True
+
+
+# --------------------------------------------------------------------------- #
+# 默认值（2026-10-10 起：数据库优先，库不可用降级 Markdown）
+# --------------------------------------------------------------------------- #
+
+
+def test_default_authority_is_cutover(config) -> None:
+    """不设任何环境变量时，新部署直接走数据库优先。"""
+
+    import importlib
+
+    reloaded = importlib.reload(config)
+    assert reloaded.MEMORY_AUTHORITY == "cutover"
+    assert reloaded.memory_cutover_enabled() is True
+    assert reloaded.MEMORY_PACK_ENABLED is True
+    assert reloaded.MEMORY_WRITE_PIPELINE_ENABLED is True
+    assert reloaded.markdown_memory_is_authoritative() is False
+
+
+# --------------------------------------------------------------------------- #
+# orchestrator 的可用性降级（数据库优先，没有数据库再降级 Markdown）
+# --------------------------------------------------------------------------- #
+
+
+class _FakeSession:
+    user_id = "u"
+    project_id = "p"
+    mode = "mentor"
+
+
+class _FakeTrace:
+    def __init__(self):
+        self.events = []
+
+    def record_privileged_event(self, **kwargs):
+        self.events.append(kwargs)
+
+
+def _bare_orchestrator(
+    monkeypatch, *, authoritative: bool, db_available: bool, pack_enabled: bool = True
+):
+    """构造一个只填了记忆判定所需字段的最小 orchestrator。
+
+    不走真实构造器：这条测试只锁 `_markdown_memory_is_injected` 的判定表，
+    与数据库、profile、工具表都无关。
+    """
+
+    import klonet_agent.orchestrator as orch_mod
+
+    monkeypatch.setattr(
+        orch_mod, "markdown_memory_is_authoritative", lambda: authoritative
+    )
+    monkeypatch.setattr(orch_mod, "MEMORY_PACK_ENABLED", pack_enabled)
+    obj = orch_mod.AgentOrchestrator.__new__(orch_mod.AgentOrchestrator)
+    obj._memory_pipeline = None
+    # 预置"管线不可用"的原因，避免测试真的去连库。
+    obj._memory_pipeline_error = "未配置记忆库 DSN" if not db_available else None
+    obj._memory_read_repository = object() if db_available else None
+    obj._memory_read_error = None if db_available else None
+    obj._markdown_fallback_notified = False
+    obj.session = _FakeSession()
+    obj.trace_logger = _FakeTrace()
+    return obj
+
+
+def test_cutover_falls_back_to_markdown_when_db_unavailable(monkeypatch) -> None:
+    obj = _bare_orchestrator(monkeypatch, authoritative=False, db_available=False)
+    assert obj._markdown_memory_is_injected() is True, "库不可用必须降级回 Markdown"
+
+
+def test_cutover_keeps_markdown_out_when_db_available(monkeypatch) -> None:
+    obj = _bare_orchestrator(monkeypatch, authoritative=False, db_available=True)
+    assert obj._markdown_memory_is_injected() is False, "库可用就不该注入 Markdown 全文"
+
+
+def test_cutover_fallback_warns_and_traces_only_once(monkeypatch, capsys) -> None:
+    obj = _bare_orchestrator(monkeypatch, authoritative=False, db_available=False)
+    first = obj._markdown_memory_is_injected()
+    second = obj._markdown_memory_is_injected()
+    assert first is True and second is True
+    out = capsys.readouterr().out
+    assert out.count("降级为 Markdown") == 1, "告警只该出现一次"
+    assert len(obj.trace_logger.events) == 1
+    assert obj.trace_logger.events[0]["event"] == "memory_pack_markdown_fallback"
+
+
+def test_legacy_state_keeps_the_old_semantics(monkeypatch) -> None:
+    """legacy 且没开按需召回 → 仍然常驻注入 Markdown（旧行为不变）。"""
+
+    import klonet_agent.orchestrator as orch_mod
+
+    monkeypatch.setattr(orch_mod, "markdown_memory_is_authoritative", lambda: True)
+    obj = _bare_orchestrator(
+        monkeypatch, authoritative=True, db_available=False, pack_enabled=False
+    )
+    assert obj._markdown_memory_is_injected() is True
+    assert obj._markdown_fallback_notified is False, "legacy 态不走降级告警"

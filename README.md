@@ -521,7 +521,7 @@ systemd / compose 部署样例在 `deploy/`。健康指标唯一权威通道是
 
 | 环境变量 | 默认 | 作用 |
 | :--- | :--- | :--- |
-| `KLONET_AGENT_MEMORY_AUTHORITY` | `legacy` | `legacy`/`shadow`/`compare`/`cutover` 四态。设成 `cutover` 会一次性打开下面两个开关，Markdown 降级为迁移/导出源 |
+| `KLONET_AGENT_MEMORY_AUTHORITY` | `cutover` | `legacy`/`shadow`/`compare`/`cutover` 四态。默认 `cutover`：**数据库优先**——配了 DSN 就走受控写入与按需召回，Markdown 退出常驻注入；**库不可用（未配 DSN / 连不上）时自动降级回 Markdown**（trace 记 `memory_pack_markdown_fallback`，只告警一次）。设成 `legacy` 可回到旧行为 |
 | `KLONET_AGENT_MEMORY_WRITE_PIPELINE` | `0` | 受控写入管线（候选提取 + 策略过滤 + consolidation） |
 | `KLONET_AGENT_MEMORY_PACK` | `0` | 不再常驻注入 `MEMORY.md`/`USER.md`，改为每轮按问题召回 |
 | `KLONET_AGENT_MEMORY_PACK_TOKEN_BUDGET` | `900` | 记忆包 token 硬上限 |

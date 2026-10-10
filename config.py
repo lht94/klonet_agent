@@ -138,11 +138,14 @@ MEMORY_PACK_RECALL_LIMIT = max(
     10, int(os.getenv("KLONET_AGENT_MEMORY_PACK_RECALL_LIMIT", "40")),
 )
 # 记忆权威归属：与阶段 6 的四态状态机同名（legacy / shadow / compare / cutover）。
-# 只有 cutover 会让 Markdown 退出回答路径（不再常驻注入 MEMORY.md / USER.md）。
-# 取值非法时退回 legacy —— 迁移阶段是"生产开关"，读到一个拼错的字就切换到新权威
-# 是最糟的失败方向。
+# 默认 **cutover**（2026-10-10 起）：数据库优先——配了记忆库 DSN 就走受控写入与
+# 按需召回，Markdown 退出常驻注入；**库不可用（未配 DSN / 连不上）时自动降级回
+# Markdown 注入与文件写入**，降级会在 trace 留痕（memory_markdown_fallback）。
+# 想回到旧行为可显式设 KLONET_AGENT_MEMORY_AUTHORITY=legacy。
+# 取值非法时退回 legacy —— 读到一个拼错的字就切换权威仍是最糟的失败方向，
+# 而 legacy 是上一代已验证的稳定行为。
 MEMORY_AUTHORITY = os.getenv(
-    "KLONET_AGENT_MEMORY_AUTHORITY", "legacy",
+    "KLONET_AGENT_MEMORY_AUTHORITY", "cutover",
 ).strip().lower()
 if MEMORY_AUTHORITY not in {"legacy", "shadow", "compare", "cutover"}:
     MEMORY_AUTHORITY = "legacy"
@@ -168,17 +171,16 @@ def markdown_memory_is_authoritative() -> bool:
 
 
 def memory_cutover_enabled() -> bool:
-    """是否已经切换到"数据库是唯一记忆权威"。
+    """是否处于"数据库优先"。
 
     这是阶段 7 的**单一切换点**：``KLONET_AGENT_MEMORY_AUTHORITY=cutover``
     一次把三件事同时打开——数据库读取管线、受控写入管线、按需召回注入，
     Markdown 降级为迁移/导出来源。
 
-    为什么默认值仍是 ``legacy`` 而不是直接默认 cutover：记忆库是**可选部署件**
-    （见 ``doc/15``），没有 DSN 的环境里默认打开新路径只会让每次对话都多一次
-    失败的连接尝试。所以"默认启用"落在一个部署变量上，而不是落在代码常量上；
-    代码默认保持可用的旧行为，切换前的门槛是 ``evals/memory_eval_thresholds.json``
-    里冻结的验收阈值（用 ``scripts/memory_cutover.py`` 执行）。
+    注意 cutover ≠ "Markdown 永久退场"：这是**默认值**（2026-10-10 起），
+    但运行时若召回链路不可用（未配 DSN、连不上库），orchestrator 会自动
+    降级回 Markdown 注入与文件写入，并在 trace 留痕。降级是**可用性**手段，
+    不改变权威归属（那由迁移状态机管）。
     """
 
     return MEMORY_AUTHORITY == "cutover"

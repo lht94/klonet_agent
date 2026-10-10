@@ -13,8 +13,15 @@
 | :--- | :--- | :--- |
 | `KLONET_AGENT_MEMORY_DSN` | 应用进程 | 业务侧连接串，用 `klonet_app` 角色（读写） |
 | `KLONET_AGENT_TEST_PG_DSN` | 运维/CI | **仅评测与测试用**，会建/删临时库，必须指向可随意破坏的库 |
-| `KLONET_AGENT_MEMORY_AUTHORITY` | 应用进程 | 见第 3 节，默认 `legacy` |
-| `KLONET_AGENT_MEMORY_WRITE_PIPELINE` / `..._MEMORY_PACK` | 应用进程 | 默认关闭；`cutover` 会自动打开 |
+| `KLONET_AGENT_MEMORY_AUTHORITY` | 应用进程 | 见第 3 节。默认 `cutover`（2026-10-10 起）：数据库优先，库不可用自动降级 Markdown |
+| `KLONET_AGENT_MEMORY_WRITE_PIPELINE` / `..._MEMORY_PACK` | 应用进程 | 默认随 `cutover` 打开；也可单独设值灰度 |
+
+> **降级语义（cutover 默认值）**：`KLONET_AGENT_MEMORY_AUTHORITY=cutover` 下，
+> 数据库召回链路不可用（未配 DSN / 连不上库）时，orchestrator 自动降级回
+> Markdown 注入与文件写入，打印一次告警并在 trace 记
+> `memory_pack_markdown_fallback`。**"召回结果为空"不触发降级**——那只是
+> 这条问题没有相关记忆，不代表库坏了。降级是可用性手段，不改变权威归属；
+> 降级期间写入走旧文件工具，库恢复后（重启进程）自动回到数据库路径。
 
 > **两个 DSN 刻意不共用。** 测试/评测会 `CREATE DATABASE`、`DROP DATABASE`，
 > 复用业务 DSN 等于给一次误配留了一颗能删库的雷。
@@ -112,6 +119,11 @@ python scripts/memory_cutover.py --rollback /etc/klonet-agent/klonet-agent.env
 `--apply` 会先跑一遍评测，**不达标直接拒绝**——判定门槛不能被绕过（没有
 `--skip-eval` 这类开关）。切到 `cutover` 时，`KLONET_AGENT_MEMORY_AUTHORITY`
 一次打开写入管线与记忆包注入，`MEMORY.md` / `USER.md` 不再常驻注入。
+
+> **2026-10-10 起 `cutover` 已是默认值**，`--apply` 主要用于把部署环境文件显式
+> 固化（以及从 `legacy` 显式迁移的老部署）；`--rollback` 仍用于显式回退到
+> `legacy`。运行期的可用性降级（库不可用退回 Markdown）与这里的**权威回滚**
+> 是两回事：前者自动发生、库恢复即回；后者是迁移语义，回到最近一次只读快照。
 
 **回滚语义**：回滚 = 回到最近一次只读快照，**不恢复双写**（计划 §8 第 8 条）。
 快照文件路径记在迁移状态文件里。
