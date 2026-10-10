@@ -319,3 +319,113 @@ def test_context_request_without_memory_pack_is_unchanged():
     assert compiled.areas["memory_pack"] == 0
     assert compiled.memory_pack_ids == ()
     assert compiled.omitted_event_ids == ()
+
+
+# --------------------------------------------------------------------------- #
+# 真路径 tokenizer：profile 带 tokenizer_id 时，编译器必须走 BPE 精确计数
+# --------------------------------------------------------------------------- #
+
+
+class _ExactTokenizer:
+    """每个 char 1 token 的极简 tokenizer；用来证明 compile 走了真路径。"""
+
+    def encode(self, text: str) -> list[int]:
+        if not text:
+            return []
+        return [0] * len(text)
+
+
+def test_compile_uses_real_tokenizer_when_profile_has_tokenizer_id(monkeypatch):
+    """profile 绑了 tokenizer_id 时，编译应按 BPE 重算所有区的 token。"""
+
+    from klonet_agent.context import tokens as tokens_module
+    from klonet_agent.context.budget import build_context_budget
+    from klonet_agent.context.compiler import ContextCompiler
+
+    # 1. 让 get_tokenizer 返回 fake（模拟真路径生效）。
+    fake = _ExactTokenizer()
+    monkeypatch.setattr(tokens_module, "get_tokenizer", lambda _id: fake)
+    # 2. profile 选 deepseek-v4-flash（带 tokenizer_id）。
+    budget = build_context_budget("deepseek-v4-flash")
+    assert budget.tokenizer_id == "deepseek-ai/DeepSeek-V3"
+
+    compiled = ContextCompiler().compile(_request(model="deepseek-v4-flash"))
+    # fake 是每字符 1 token；areas 应当比启发式结果大（中文密度低于启发式）。
+    # 验证：启发式对 system 两句中文各 8 字会算 8/1.5≈5+5=10，
+    # 真路径算 8+8=16，应当高于启发式。
+    assert compiled.areas["system"] > 10
+
+
+def test_compile_falls_back_to_heuristic_when_tokenizer_unavailable(monkeypatch):
+    """tokenizer 不可用（None）时，compile 必须降级到启发式，且不能崩溃。"""
+
+    from klonet_agent.context import tokens as tokens_module
+
+    monkeypatch.setattr(tokens_module, "get_tokenizer", lambda _id: None)
+    compiled = _compiler().compile(_request(model="deepseek-v4-flash"))
+    # 启发式下"当前问题" 4 字中文 → 4/1.5 ≈ 2.67 → ceil 3
+    assert compiled.areas["current_input"] >= 2
+
+
+def test_assert_within_hard_limit_uses_real_tokenizer(monkeypatch):
+    """发送前最后一道闸（assert_within_hard_limit）必须用真路径算 token。"""
+
+    from klonet_agent.context import tokens as tokens_module
+    from klonet_agent.context.compiler import assert_within_hard_limit
+
+    fake = _ExactTokenizer()
+    monkeypatch.setattr(tokens_module, "get_tokenizer", lambda _id: fake)
+    messages = [{"role": "user", "content": "12345678"}]  # 8 字符
+    # fake 每个字符 1 token = 8；加上 role 启发式 1 + 结构开销 4 = 13
+    estimated = assert_within_hard_limit(messages, "deepseek-v4-flash")
+    assert estimated == 13
+
+
+def test_select_recent_groups_uses_passed_tokenizer(monkeypatch):
+    """select_recent_groups 必须按传入的 tokenizer 重算每组 token。"""
+
+    from klonet_agent.context import tokens as tokens_module
+    from klonet_agent.context.message_groups import (
+        parse_message_groups,
+        select_recent_groups,
+    )
+
+    fake = _ExactTokenizer()
+
+    # spy：验证 tokenizer 真的被传给 estimate_messages_tokens。
+    captured: list = []
+    real_estimate = tokens_module.estimate_messages_tokens
+
+    def spy(messages, *, tokenizer=None):
+        captured.append(("fake" if tokenizer is fake else "heuristic"))
+        return real_estimate(messages, tokenizer=tokenizer)
+
+    monkeypatch.setattr(tokens_module, "estimate_messages_tokens", spy)
+
+    messages = [
+        {"role": "user", "content": "abcd"},
+        {"role": "assistant", "content": "wxyz"},
+    ]
+    groups = parse_message_groups(messages)
+    select_recent_groups(groups, 1024, tokenizer=fake)
+    # MessageGroup 构造时也会调一次（启发式），select 时至少调一次（真路径）。
+    assert "fake" in captured, f"select_recent_groups 没有用 fake tokenizer，spy 记录={captured}"
+
+
+def test_select_recent_groups_unchanged_when_tokenizer_omitted():
+    """select_recent_groups 不传 tokenizer 时，行为与旧实现等价（启发式）。"""
+
+    from klonet_agent.context.message_groups import (
+        parse_message_groups,
+        select_recent_groups,
+    )
+
+    messages = [
+        {"role": "user", "content": "abcd"},
+        {"role": "assistant", "content": "wxyz"},
+    ]
+    groups = parse_message_groups(messages)
+    # 启发式：8 字符 ASCII → 8/4 = 2 token
+    # 默认 budget 给大一些，确保至少一个组能进。
+    included, _ = select_recent_groups(groups, 1024)
+    assert len(included) == 1

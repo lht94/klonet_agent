@@ -34,5 +34,11 @@ pgvector>=0.3
 # Parser-backed review for one-time privileged shell artifacts
 bashlex>=0.18
 
+# Optional: 真路径 tokenizer，让 context/tokens.py 走 BPE 精确计数。
+# 不装本包也能工作：context/tokens.get_tokenizer() 会返回 None 并降级到
+# 字符启发式。装上后，deepseek-v4-flash / glm-* / qwen3.8-flash 等
+# 已知模型 profile 会自动按 HuggingFace 上的公开 tokenizer 算 token。
+tokenizers>=0.15
+
 # Tests
 pytest>=8.0.0

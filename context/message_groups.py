@@ -14,7 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from klonet_agent.context.tokens import estimate_messages_tokens
+from klonet_agent.context import tokens as _tokens_module
+from klonet_agent.context.tokens import SupportsEncode
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,9 @@ class MessageGroup:
     def __post_init__(self):
         if self.estimated_tokens == 0:
             object.__setattr__(
-                self, "estimated_tokens", estimate_messages_tokens(list(self.messages))
+                self,
+                "estimated_tokens",
+                _tokens_module.estimate_messages_tokens(list(self.messages)),
             )
 
 
@@ -107,6 +110,8 @@ def parse_message_groups(messages: list[dict[str, Any]]) -> list[MessageGroup]:
 def select_recent_groups(
     groups: list[MessageGroup],
     token_budget: int,
+    *,
+    tokenizer: SupportsEncode | None = None,
 ) -> tuple[list[MessageGroup], list[MessageGroup]]:
     """从新到旧选择完整组，直到预算用尽。
 
@@ -115,6 +120,10 @@ def select_recent_groups(
     - 任何组都不会被部分纳入；
     - 最新组即使单独超过预算，也会降级保留其首尾消息，
       避免出现"一条巨大工具输出让最近历史完全为空"的情况。
+
+    ``tokenizer`` 为 None 时按启发式 token 数选（与 MessageGroup 初始化时
+    的估算口径一致）；非 None 时按真路径 BPE 重新估算每组 token，
+    保证预算精度与上游 compile() 内的 estimate_messages_tokens 对齐。
     """
 
     if token_budget <= 0:
@@ -126,9 +135,15 @@ def select_recent_groups(
     used = 0
 
     for group in reversed(non_system):
-        if group.estimated_tokens <= token_budget - used:
+        # select 阶段重新按 tokenizer 算 token，避免 group.estimated_tokens
+        # （构造时启发式）与当前调用方选择的 tokenizer 口径不一致。
+        # 模块属性查找而非 import 绑定，是为了 monkeypatch 能在测试里 spy。
+        cost = _tokens_module.estimate_messages_tokens(
+            list(group.messages), tokenizer=tokenizer
+        )
+        if cost <= token_budget - used:
             included.append(group)
-            used += group.estimated_tokens
+            used += cost
             continue
         omitted.append(group)
 

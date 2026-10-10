@@ -147,3 +147,61 @@ def test_soft_limit_ratio_defaults_to_seventy_percent():
 
     budget = _budget("glm-5.2")
     assert budget.soft_input_limit == int(budget.hard_input_limit * 0.70)
+
+
+def test_known_models_propagate_tokenizer_id():
+    """公开 tokenizer 的模型 profile 必须把 tokenizer_id 串到 ContextBudget。"""
+
+    from klonet_agent.context.budget import build_context_budget, get_model_profile
+
+    # 国产主流模型：公开 tokenizer。
+    for model, expected_id in (
+        ("deepseek-v4-flash", "deepseek-ai/DeepSeek-V3"),
+        ("deepseek-v4.1-flash", "deepseek-ai/DeepSeek-V3"),
+        ("deepseek-v4-pro", "deepseek-ai/DeepSeek-V3"),
+        ("qwen3.8-flash", "Qwen/Qwen2.5-7B-Instruct"),
+        ("glm-5.2", "THUDM/glm-4-9b-chat"),
+        ("glm-5.3", "THUDM/glm-4-9b-chat"),
+        ("glm-5.3-flash", "THUDM/glm-4-9b-chat"),
+    ):
+        profile = get_model_profile(model)
+        budget = build_context_budget(model)
+        assert profile.tokenizer_id == expected_id, f"{model} profile 缺 tokenizer_id"
+        assert budget.tokenizer_id == expected_id, f"{model} budget 未透传 tokenizer_id"
+
+
+def test_closed_source_model_has_no_tokenizer_id():
+    """闭源模型（gemini）必须保持 tokenizer_id=None，走启发式。"""
+
+    from klonet_agent.context.budget import build_context_budget, get_model_profile
+
+    profile = get_model_profile("gemini-3.7-flash")
+    budget = build_context_budget("gemini-3.7-flash")
+    assert profile.tokenizer_id is None
+    assert budget.tokenizer_id is None
+
+
+def test_env_can_override_tokenizer_id(monkeypatch):
+    """KLONET_AGENT_TOKENIZER_ID 环境变量覆盖 profile 的 tokenizer_id。"""
+
+    from klonet_agent.context.budget import build_context_budget, get_model_profile
+
+    monkeypatch.setenv("KLONET_AGENT_TOKENIZER_ID", "custom/tokenizer")
+    profile = get_model_profile("glm-5.2")
+    budget = build_context_budget("glm-5.2")
+    assert profile.source == "env"
+    assert profile.tokenizer_id == "custom/tokenizer"
+    assert budget.tokenizer_id == "custom/tokenizer"
+
+
+def test_tokenizer_id_works_for_unknown_model_with_env(monkeypatch):
+    """未知模型配合 env 指定的 tokenizer_id 也能透传。"""
+
+    from klonet_agent.context.budget import build_context_budget, get_model_profile
+
+    monkeypatch.setenv("KLONET_AGENT_TOKENIZER_ID", "x/y")
+    profile = get_model_profile("totally-unknown-model")
+    budget = build_context_budget("totally-unknown-model")
+    assert profile.source == "env"
+    assert profile.tokenizer_id == "x/y"
+    assert budget.tokenizer_id == "x/y"

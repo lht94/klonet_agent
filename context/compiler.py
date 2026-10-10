@@ -22,7 +22,8 @@ from klonet_agent.context.message_groups import (
     parse_message_groups,
     select_recent_groups,
 )
-from klonet_agent.context.tokens import estimate_messages_tokens
+from klonet_agent.context import tokens as _tokens_module
+from klonet_agent.context.tokens import SupportsEncode
 
 
 class ContextOverflowError(Exception):
@@ -68,10 +69,14 @@ def assert_within_hard_limit(
 
     注意 hard_input_limit 已经扣掉了输出预留、tool schema 和安全余量，
     因此这里只比较消息本身的 token，不重复计入 tool schema。
+
+    真路径：profile 绑了 tokenizer_id 时按 BPE 精确算 token；
+    降级：profile 未绑或 tokenizer 加载失败时按字符启发式算。
     """
 
     budget = build_context_budget(model, tool_definitions)
-    estimated = estimate_messages_tokens(messages)
+    tokenizer = _tokens_module.get_tokenizer(budget.tokenizer_id)
+    estimated = _tokens_module.estimate_messages_tokens(messages, tokenizer=tokenizer)
     if estimated > budget.hard_input_limit:
         raise ContextOverflowError(
             "发送前硬预算断言失败：估算输入 token 超过模型 hard limit，拒绝请求供应商。",
@@ -130,6 +135,12 @@ class ContextCompiler:
         """按预算组装最终消息列表。"""
 
         budget = build_context_budget(request.model, request.tool_definitions)
+        # 一次预算解析 → 一份 tokenizer；tokenizer 加载失败时为 None，
+        # 所有 estimate_messages_tokens 调用自动降级到字符启发式。
+        # 用模块属性查找而非 ``from ... import get_tokenizer``，是为了让测试
+        # 里 ``monkeypatch.setattr(tokens_module, "get_tokenizer", ...)``
+        # 在本模块也能生效——import 绑定会冻结引用。
+        tokenizer = _tokens_module.get_tokenizer(budget.tokenizer_id)
         areas: dict[str, int] = {
             "system": 0,
             "checkpoint": 0,
@@ -145,21 +156,25 @@ class ContextCompiler:
         # 顺序：system -> checkpoint -> transient -> [evidence] -> [recent] -> current
         # 当前用户输入始终排在最后，最近历史插入在其之前。
         system_messages = list(request.system_messages)
-        areas["system"] = estimate_messages_tokens(system_messages)
+        areas["system"] = _tokens_module.estimate_messages_tokens(system_messages, tokenizer=tokenizer)
 
         checkpoint_messages: list[dict] = []
         checkpoint_id = None
         if request.checkpoint_message is not None:
             checkpoint_messages = [request.checkpoint_message]
             checkpoint_id = str(request.checkpoint_message.get("checkpoint_id") or "")
-        areas["checkpoint"] = estimate_messages_tokens(checkpoint_messages)
+        areas["checkpoint"] = _tokens_module.estimate_messages_tokens(
+            checkpoint_messages, tokenizer=tokenizer
+        )
 
         transient = list(request.transient_messages)
-        areas["transient"] = estimate_messages_tokens(transient)
+        areas["transient"] = _tokens_module.estimate_messages_tokens(transient, tokenizer=tokenizer)
 
         current_user = request.current_user_message
         areas["current_input"] = (
-            estimate_messages_tokens([current_user]) if current_user is not None else 0
+            _tokens_module.estimate_messages_tokens([current_user], tokenizer=tokenizer)
+            if current_user is not None
+            else 0
         )
 
         required_tokens = (
@@ -186,18 +201,24 @@ class ContextCompiler:
         remaining = budget.hard_input_limit - required_tokens
         if request.memory_pack_message is not None:
             memory_pack, pack_omitted = _fit_messages(
-                [request.memory_pack_message], int(remaining * 0.15)
+                [request.memory_pack_message],
+                int(remaining * 0.15),
+                tokenizer=tokenizer,
             )
-            areas["memory_pack"] = estimate_messages_tokens(memory_pack)
+            areas["memory_pack"] = _tokens_module.estimate_messages_tokens(
+                memory_pack, tokenizer=tokenizer
+            )
             required_tokens += areas["memory_pack"]
 
         # ---- 证据区：独立预算（可用空间的一部分） ----
         remaining = budget.hard_input_limit - required_tokens
         evidence_budget = int(remaining * 0.25)
         evidence_messages, evidence_omitted = _fit_messages(
-            request.evidence_messages, evidence_budget
+            request.evidence_messages, evidence_budget, tokenizer=tokenizer
         )
-        areas["evidence"] = estimate_messages_tokens(evidence_messages)
+        areas["evidence"] = _tokens_module.estimate_messages_tokens(
+            evidence_messages, tokenizer=tokenizer
+        )
         required_tokens += areas["evidence"]
 
         # ---- 最近历史区：剩余预算内从新到旧选择完整组 ----
@@ -208,9 +229,13 @@ class ContextCompiler:
         recent: list[dict] = []
         if history_messages:
             groups = parse_message_groups(history_messages)
-            included, omitted = select_recent_groups(groups, history_budget)
+            included, omitted = select_recent_groups(
+                groups, history_budget, tokenizer=tokenizer
+            )
             recent = [dict(message) for group in included for message in group.messages]
-            areas["recent_history"] = estimate_messages_tokens(recent)
+            areas["recent_history"] = _tokens_module.estimate_messages_tokens(
+                recent, tokenizer=tokenizer
+            )
 
         included_ids = tuple(
             event_id for group in included for event_id in group.event_ids
@@ -300,14 +325,20 @@ class ContextCompiler:
 def _fit_messages(
     messages: list[dict],
     token_budget: int,
+    *,
+    tokenizer: SupportsEncode | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """按预算从新到旧保留证据消息，返回 (included, omitted)。"""
+    """按预算从新到旧保留证据消息，返回 (included, omitted)。
+
+    ``tokenizer`` 透传到 ``estimate_messages_tokens``，与 compile() 主体
+    的口径保持一致。
+    """
 
     included: list[dict] = []
     omitted: list[dict] = []
     used = 0
     for message in reversed(messages):
-        cost = estimate_messages_tokens([message])
+        cost = _tokens_module.estimate_messages_tokens([message], tokenizer=tokenizer)
         if used + cost <= token_budget:
             included.insert(0, message)
             used += cost
