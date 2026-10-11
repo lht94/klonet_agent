@@ -88,19 +88,11 @@ def _clamp_unit(value, default):
         return default
 
 
-def _clamp_percent(value, default):
-    try:
-        return max(0, min(int(value), 100))
-    except (TypeError, ValueError):
-        return default
-
-
 # Jev knowledge-store routing (plan 05).  ``JEV_ROUTING_MODE`` is the single
 # shadow switch; the historical ``JEV_SHADOW_COMPARE`` is kept only as a
 # compatibility alias instead of a second, competing mechanism.
 JEV_ROUTING_MODES = ("off", "shadow", "canary", "enforced")
 _jev_routing_mode_env = os.getenv("JEV_ROUTING_MODE", "").strip().lower()
-JEV_ROUTING_MODE_EXPLICIT = bool(_jev_routing_mode_env)
 JEV_ROUTING_MODE = (
     _jev_routing_mode_env
     if _jev_routing_mode_env
@@ -115,28 +107,34 @@ if JEV_ROUTING_MODE not in JEV_ROUTING_MODES:
         % JEV_ROUTING_MODE
     )
     JEV_ROUTING_MODE = "off"
-JEV_STORE_ROUTING_ENABLED = os.getenv(
-    "JEV_STORE_ROUTING_ENABLED", "false",
-).strip().lower() in {"1", "true", "yes", "on"}
 JEV_MIN_MARGIN = _clamp_unit(os.getenv("JEV_MIN_MARGIN", "0.10"), 0.10)
+# Turn-path defaults re-based on the 2026-10-11 real sweep over 120 cases
+# (docs/evals/jev_v05_summary_remote_20261011.md).  The old values were
+# unreachable for some fields — e.g. ``clarification_required`` observed
+# max=0.81 against a 0.85 threshold, so it could never pass.  Only scope /
+# requires_retrieval / requires_public_docs / requires_source_code gate the
+# route; the other two are informational (see decision_policy).
 JEV_THRESHOLD_SCOPE = _clamp_unit(
     os.getenv("JEV_THRESHOLD_SCOPE", "0.75"), 0.75,
 )
 JEV_THRESHOLD_RETRIEVAL = _clamp_unit(
-    os.getenv("JEV_THRESHOLD_RETRIEVAL", "0.80"), 0.80,
+    os.getenv("JEV_THRESHOLD_RETRIEVAL", "0.70"), 0.70,
 )
 JEV_THRESHOLD_PUBLIC_DOCS = _clamp_unit(
-    os.getenv("JEV_THRESHOLD_PUBLIC_DOCS", "0.78"), 0.78,
+    os.getenv("JEV_THRESHOLD_PUBLIC_DOCS", "0.75"), 0.75,
 )
 JEV_THRESHOLD_SOURCE_CODE = _clamp_unit(
-    os.getenv("JEV_THRESHOLD_SOURCE_CODE", "0.82"), 0.82,
+    os.getenv("JEV_THRESHOLD_SOURCE_CODE", "0.75"), 0.75,
 )
 JEV_THRESHOLD_ENV_DIAGNOSIS = _clamp_unit(
-    os.getenv("JEV_THRESHOLD_ENV_DIAGNOSIS", "0.88"), 0.88,
+    os.getenv("JEV_THRESHOLD_ENV_DIAGNOSIS", "0.80"), 0.80,
 )
 JEV_THRESHOLD_CLARIFICATION = _clamp_unit(
-    os.getenv("JEV_THRESHOLD_CLARIFICATION", "0.85"), 0.85,
+    os.getenv("JEV_THRESHOLD_CLARIFICATION", "0.70"), 0.70,
 )
+# Privileged thresholds are deliberately left conservative: only 10 safety
+# samples have been observed so far, and lowering a safety gate on that basis
+# would be exactly the "intuition-based tuning" the plan forbids.
 JEV_THRESHOLD_PRIVILEGED_INTENT = _clamp_unit(
     os.getenv("JEV_THRESHOLD_PRIVILEGED_INTENT", "0.90"), 0.90,
 )
@@ -146,9 +144,6 @@ JEV_THRESHOLD_PRIVILEGED_EXECUTION = _clamp_unit(
 JEV_TRACE_FILE = os.getenv(
     "JEV_TRACE_FILE", str(PROJECT_ROOT / "tracing" / "jev_decisions.jsonl"),
 ).strip()
-JEV_SHADOW_SAMPLE_PERCENT = _clamp_percent(
-    os.getenv("JEV_SHADOW_SAMPLE_PERCENT", "100"), 100,
-)
 PARATERA_BASE_URL = os.getenv(
     "PARATERA_BASE_URL", "https://llmapi.paratera.com/v1",
 ).strip()

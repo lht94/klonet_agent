@@ -1,108 +1,1071 @@
 {
-  "schema_version": 1,
-  "captured": false,
-  "captured_at": null,
-  "status": "synthetic_pending_real_capture",
-  "note": "阶段 0.5 Step 1 需要在有真实 TYPESAFE_API_KEY 的机器上重新采样并置 captured=true；在真实样本落盘前，JEV_MIN_MARGIN 的可用性只能按本文件的 contract 结论处理，且不得据此宣称 margin 门禁已生效。",
+  "captured": true,
+  "captured_at": "2026-10-11T12:21:32+00:00",
+  "contract": {
+    "answers_cover_all_questions": true,
+    "boolean_probability_field": "noul",
+    "choice_confidence_field": "confidence",
+    "choice_returns_distribution": true,
+    "choice_value_field": "choice",
+    "model_version": "jev-1.13.0"
+  },
   "contract_questions": [
-    "Choice 是否返回完整 probabilities 分布（还是只有 top1 probability）？",
+    "Choice 是否返回完整 probabilities 分布？",
     "布尔 Noul 是否稳定返回 noul 概率？",
-    "noul 概率与 1-noul 是否互补？",
     "answers 是否覆盖全部提问？",
-    "缺失字段的实际形态是什么？"
+    "字段名分别是什么？"
   ],
+  "note": "真实采样自 https://api.typesafe.ai/v1/systemone（model=jev-1.13.0）。结论：Choice 返回完整 probabilities（可算 margin）；布尔以 noul 概率返回，confidence 取 max(p,1-p)。服务器需经 127.0.0.1:7891 海外代理访问，直连返回 HTTP 451 地区封锁。",
+  "observed": {
+    "turn_both": {
+      "latency_s": 0.57,
+      "requires_public_docs": 0.73,
+      "requires_retrieval": 0.34,
+      "requires_source_code": 0.8,
+      "scope_choice": "klonet",
+      "scope_probabilities_count": 3
+    },
+    "turn_docs_topology": {
+      "latency_s": 0.6,
+      "requires_public_docs": 0.91,
+      "requires_retrieval": 0.66,
+      "requires_source_code": 0.55,
+      "scope_choice": "klonet",
+      "scope_probabilities_count": 3
+    },
+    "turn_general": {
+      "latency_s": 0.59,
+      "requires_public_docs": 0.06,
+      "requires_retrieval": 0.08,
+      "requires_source_code": 0.04,
+      "scope_choice": "general",
+      "scope_probabilities_count": 3
+    },
+    "turn_source_port": {
+      "latency_s": 0.64,
+      "requires_public_docs": 0.39,
+      "requires_retrieval": 0.56,
+      "requires_source_code": 0.84,
+      "scope_choice": "klonet",
+      "scope_probabilities_count": 3
+    }
+  },
+  "questions_schema_hash": "sha256:1937c3383cb4a211e2256908d3636428362f076a4f0735773f5bff7d444297ce",
   "samples": [
     {
-      "name": "turn_choice_with_distribution",
-      "state": {
-        "current_request": "Klonet 的拓扑部署流程是什么？",
-        "recent_user_turns": [],
-        "last_assistant_intent_summary": "",
-        "mode": "mentor"
-      },
+      "name": "turn_docs_topology",
+      "prompt": "Klonet 的拓扑部署流程是什么？",
       "questions": {
-        "scope": {
-          "type": "choice",
-          "options": ["klonet", "general", "mixed"]
+        "action_goal": {
+          "criteria": {
+            "deploy_topology": "deploy_topology",
+            "explain_concept": "explain_concept",
+            "inspect_error": "inspect_error",
+            "install_dependencies": "install_dependencies",
+            "prepare_tools": "prepare_tools",
+            "restart_services": "restart_services",
+            "start_services": "start_services",
+            "stop_services": "stop_services",
+            "unknown": "unknown",
+            "use_feature": "use_feature"
+          },
+          "instructions": "Classify the user's current goal.",
+          "type": "choice"
+        },
+        "clarification_required": {
+          "instructions": "Is a material user choice missing and undiscoverable?",
+          "type": "noul"
+        },
+        "deployment_phase": {
+          "criteria": {
+            "environment_setup": "environment_setup",
+            "local_tool_preparation": "local_tool_preparation",
+            "platform_restart": "platform_restart",
+            "platform_shutdown": "platform_shutdown",
+            "platform_startup": "platform_startup",
+            "platform_usage": "platform_usage",
+            "topology_deploy": "topology_deploy",
+            "troubleshooting": "troubleshooting",
+            "unknown": "unknown"
+          },
+          "instructions": "Classify the current deployment or usage phase.",
+          "type": "choice"
+        },
+        "is_correction": {
+          "instructions": "Is the user correcting the previous interpretation?",
+          "type": "noul"
+        },
+        "operation": {
+          "criteria": {
+            "acceptance_check": "acceptance_check",
+            "dependency_install": "dependency_install",
+            "environment_setup": "environment_setup",
+            "platform_destroy": "platform_destroy",
+            "platform_restart": "platform_restart",
+            "platform_start": "platform_start",
+            "platform_stop": "platform_stop",
+            "unknown": "unknown"
+          },
+          "instructions": "Choose only the operation currently requested.",
+          "type": "choice"
+        },
+        "requires_environment_diagnosis": {
+          "instructions": "Must current machine state be inspected?",
+          "type": "noul"
+        },
+        "requires_public_docs": {
+          "instructions": "Does answering the current request require Klonet concepts, usage, deployment, operations, troubleshooting guidance or other public documentation evidence?",
+          "type": "noul"
         },
         "requires_retrieval": {
-          "type": "boolean"
+          "instructions": "Does the answer require Klonet evidence?",
+          "type": "noul"
+        },
+        "requires_source_code": {
+          "instructions": "Does answering the current request require Klonet/VEMU source implementation, symbols, APIs, configuration definitions or call-chain evidence?",
+          "type": "noul"
+        },
+        "scope": {
+          "criteria": {
+            "general": "No substantive Klonet-specific request",
+            "klonet": "Klonet platform, its deployment, source, configuration or operations",
+            "mixed": "Both Klonet-specific and unrelated requests"
+          },
+          "instructions": "Classify the request's knowledge scope.",
+          "type": "choice"
+        },
+        "task_type": {
+          "criteria": {
+            "code_lookup": "asks where or how code implements something",
+            "concept": "asks what a Klonet concept, component or term means",
+            "credential_boundary": "asks about credentials, permissions or secrets",
+            "deployment_guidance": "asks how to deploy or configure",
+            "deployment_preparation": "prepares prerequisites before deployment",
+            "development": "asks to change or develop code",
+            "general": "general conversation",
+            "operation_guide": "asks for operational steps",
+            "project_progress": "asks project status",
+            "troubleshooting": "reports a failure and asks diagnosis"
+          },
+          "instructions": "Classify the user's task, not quoted history.",
+          "type": "choice"
         }
       },
       "response": {
-        "model": "jev-latest",
-        "version": "1.13.0",
         "answers": {
-          "scope": {
-            "value": "klonet",
+          "action_goal": {
+            "choice": "deploy_topology",
+            "confidence": 0.67,
             "probabilities": {
-              "klonet": 0.93,
-              "general": 0.05,
-              "mixed": 0.02
-            }
+              "deploy_topology": 0.7,
+              "explain_concept": 0.3,
+              "inspect_error": 0.0,
+              "install_dependencies": 0.0,
+              "prepare_tools": 0.0,
+              "restart_services": 0.0,
+              "start_services": 0.0,
+              "stop_services": 0.0,
+              "unknown": 0.0,
+              "use_feature": 0.0
+            },
+            "type": "choice"
+          },
+          "clarification_required": {
+            "noul": 0.31,
+            "type": "noul"
+          },
+          "deployment_phase": {
+            "choice": "topology_deploy",
+            "confidence": 0.92,
+            "probabilities": {
+              "environment_setup": 0.01,
+              "local_tool_preparation": 0.0,
+              "platform_restart": 0.0,
+              "platform_shutdown": 0.0,
+              "platform_startup": 0.0,
+              "platform_usage": 0.0,
+              "topology_deploy": 0.93,
+              "troubleshooting": 0.0,
+              "unknown": 0.06
+            },
+            "type": "choice"
+          },
+          "is_correction": {
+            "noul": 0.03,
+            "type": "noul"
+          },
+          "operation": {
+            "choice": "unknown",
+            "confidence": 0.58,
+            "probabilities": {
+              "acceptance_check": 0.0,
+              "dependency_install": 0.0,
+              "environment_setup": 0.35,
+              "platform_destroy": 0.0,
+              "platform_restart": 0.0,
+              "platform_start": 0.02,
+              "platform_stop": 0.0,
+              "unknown": 0.63
+            },
+            "type": "choice"
+          },
+          "requires_environment_diagnosis": {
+            "noul": 0.14,
+            "type": "noul"
+          },
+          "requires_public_docs": {
+            "noul": 0.91,
+            "type": "noul"
           },
           "requires_retrieval": {
-            "type": "noul",
-            "noul": 0.96
+            "noul": 0.66,
+            "type": "noul"
+          },
+          "requires_source_code": {
+            "noul": 0.55,
+            "type": "noul"
+          },
+          "scope": {
+            "choice": "klonet",
+            "confidence": 1.0,
+            "probabilities": {
+              "general": 0.0,
+              "klonet": 1.0,
+              "mixed": 0.0
+            },
+            "type": "choice"
+          },
+          "task_type": {
+            "choice": "deployment_guidance",
+            "confidence": 0.99,
+            "probabilities": {
+              "code_lookup": 0.0,
+              "concept": 0.0,
+              "credential_boundary": 0.0,
+              "deployment_guidance": 0.99,
+              "deployment_preparation": 0.0,
+              "development": 0.0,
+              "general": 0.0,
+              "operation_guide": 0.01,
+              "project_progress": 0.0,
+              "troubleshooting": 0.0
+            },
+            "type": "choice"
           }
         },
+        "model": "jev-1.13.0",
         "usage": {
-          "input_tokens": 210
+          "input_tokens": 1208,
+          "output_tokens": 532
         }
+      },
+      "state": {
+        "current_request": "Klonet 的拓扑部署流程是什么？",
+        "last_assistant_intent_summary": "",
+        "mode": "mentor",
+        "recent_user_turns": []
       }
     },
     {
-      "name": "turn_choice_without_distribution",
+      "name": "turn_source_port",
+      "prompt": "web_terminal_main.py 里 web 终端绑定的监听端口读配置还是写死的？",
+      "questions": {
+        "action_goal": {
+          "criteria": {
+            "deploy_topology": "deploy_topology",
+            "explain_concept": "explain_concept",
+            "inspect_error": "inspect_error",
+            "install_dependencies": "install_dependencies",
+            "prepare_tools": "prepare_tools",
+            "restart_services": "restart_services",
+            "start_services": "start_services",
+            "stop_services": "stop_services",
+            "unknown": "unknown",
+            "use_feature": "use_feature"
+          },
+          "instructions": "Classify the user's current goal.",
+          "type": "choice"
+        },
+        "clarification_required": {
+          "instructions": "Is a material user choice missing and undiscoverable?",
+          "type": "noul"
+        },
+        "deployment_phase": {
+          "criteria": {
+            "environment_setup": "environment_setup",
+            "local_tool_preparation": "local_tool_preparation",
+            "platform_restart": "platform_restart",
+            "platform_shutdown": "platform_shutdown",
+            "platform_startup": "platform_startup",
+            "platform_usage": "platform_usage",
+            "topology_deploy": "topology_deploy",
+            "troubleshooting": "troubleshooting",
+            "unknown": "unknown"
+          },
+          "instructions": "Classify the current deployment or usage phase.",
+          "type": "choice"
+        },
+        "is_correction": {
+          "instructions": "Is the user correcting the previous interpretation?",
+          "type": "noul"
+        },
+        "operation": {
+          "criteria": {
+            "acceptance_check": "acceptance_check",
+            "dependency_install": "dependency_install",
+            "environment_setup": "environment_setup",
+            "platform_destroy": "platform_destroy",
+            "platform_restart": "platform_restart",
+            "platform_start": "platform_start",
+            "platform_stop": "platform_stop",
+            "unknown": "unknown"
+          },
+          "instructions": "Choose only the operation currently requested.",
+          "type": "choice"
+        },
+        "requires_environment_diagnosis": {
+          "instructions": "Must current machine state be inspected?",
+          "type": "noul"
+        },
+        "requires_public_docs": {
+          "instructions": "Does answering the current request require Klonet concepts, usage, deployment, operations, troubleshooting guidance or other public documentation evidence?",
+          "type": "noul"
+        },
+        "requires_retrieval": {
+          "instructions": "Does the answer require Klonet evidence?",
+          "type": "noul"
+        },
+        "requires_source_code": {
+          "instructions": "Does answering the current request require Klonet/VEMU source implementation, symbols, APIs, configuration definitions or call-chain evidence?",
+          "type": "noul"
+        },
+        "scope": {
+          "criteria": {
+            "general": "No substantive Klonet-specific request",
+            "klonet": "Klonet platform, its deployment, source, configuration or operations",
+            "mixed": "Both Klonet-specific and unrelated requests"
+          },
+          "instructions": "Classify the request's knowledge scope.",
+          "type": "choice"
+        },
+        "task_type": {
+          "criteria": {
+            "code_lookup": "asks where or how code implements something",
+            "concept": "asks what a Klonet concept, component or term means",
+            "credential_boundary": "asks about credentials, permissions or secrets",
+            "deployment_guidance": "asks how to deploy or configure",
+            "deployment_preparation": "prepares prerequisites before deployment",
+            "development": "asks to change or develop code",
+            "general": "general conversation",
+            "operation_guide": "asks for operational steps",
+            "project_progress": "asks project status",
+            "troubleshooting": "reports a failure and asks diagnosis"
+          },
+          "instructions": "Classify the user's task, not quoted history.",
+          "type": "choice"
+        }
+      },
+      "response": {
+        "answers": {
+          "action_goal": {
+            "choice": "unknown",
+            "confidence": 0.48,
+            "probabilities": {
+              "deploy_topology": 0.0,
+              "explain_concept": 0.32,
+              "inspect_error": 0.01,
+              "install_dependencies": 0.0,
+              "prepare_tools": 0.01,
+              "restart_services": 0.0,
+              "start_services": 0.0,
+              "stop_services": 0.0,
+              "unknown": 0.53,
+              "use_feature": 0.13
+            },
+            "type": "choice"
+          },
+          "clarification_required": {
+            "noul": 0.28,
+            "type": "noul"
+          },
+          "deployment_phase": {
+            "choice": "unknown",
+            "confidence": 0.45,
+            "probabilities": {
+              "environment_setup": 0.06,
+              "local_tool_preparation": 0.1,
+              "platform_restart": 0.0,
+              "platform_shutdown": 0.0,
+              "platform_startup": 0.0,
+              "platform_usage": 0.09,
+              "topology_deploy": 0.0,
+              "troubleshooting": 0.24,
+              "unknown": 0.51
+            },
+            "type": "choice"
+          },
+          "is_correction": {
+            "noul": 0.04,
+            "type": "noul"
+          },
+          "operation": {
+            "choice": "unknown",
+            "confidence": 0.98,
+            "probabilities": {
+              "acceptance_check": 0.02,
+              "dependency_install": 0.0,
+              "environment_setup": 0.0,
+              "platform_destroy": 0.0,
+              "platform_restart": 0.0,
+              "platform_start": 0.0,
+              "platform_stop": 0.0,
+              "unknown": 0.98
+            },
+            "type": "choice"
+          },
+          "requires_environment_diagnosis": {
+            "noul": 0.65,
+            "type": "noul"
+          },
+          "requires_public_docs": {
+            "noul": 0.39,
+            "type": "noul"
+          },
+          "requires_retrieval": {
+            "noul": 0.56,
+            "type": "noul"
+          },
+          "requires_source_code": {
+            "noul": 0.84,
+            "type": "noul"
+          },
+          "scope": {
+            "choice": "klonet",
+            "confidence": 0.88,
+            "probabilities": {
+              "general": 0.08,
+              "klonet": 0.92,
+              "mixed": 0.0
+            },
+            "type": "choice"
+          },
+          "task_type": {
+            "choice": "code_lookup",
+            "confidence": 1.0,
+            "probabilities": {
+              "code_lookup": 1.0,
+              "concept": 0.0,
+              "credential_boundary": 0.0,
+              "deployment_guidance": 0.0,
+              "deployment_preparation": 0.0,
+              "development": 0.0,
+              "general": 0.0,
+              "operation_guide": 0.0,
+              "project_progress": 0.0,
+              "troubleshooting": 0.0
+            },
+            "type": "choice"
+          }
+        },
+        "model": "jev-1.13.0",
+        "usage": {
+          "input_tokens": 1219,
+          "output_tokens": 525
+        }
+      },
+      "state": {
+        "current_request": "web_terminal_main.py 里 web 终端绑定的监听端口读配置还是写死的？",
+        "last_assistant_intent_summary": "",
+        "mode": "mentor",
+        "recent_user_turns": []
+      }
+    },
+    {
+      "name": "turn_general",
+      "prompt": "Python 的 GIL 是什么？",
+      "questions": {
+        "action_goal": {
+          "criteria": {
+            "deploy_topology": "deploy_topology",
+            "explain_concept": "explain_concept",
+            "inspect_error": "inspect_error",
+            "install_dependencies": "install_dependencies",
+            "prepare_tools": "prepare_tools",
+            "restart_services": "restart_services",
+            "start_services": "start_services",
+            "stop_services": "stop_services",
+            "unknown": "unknown",
+            "use_feature": "use_feature"
+          },
+          "instructions": "Classify the user's current goal.",
+          "type": "choice"
+        },
+        "clarification_required": {
+          "instructions": "Is a material user choice missing and undiscoverable?",
+          "type": "noul"
+        },
+        "deployment_phase": {
+          "criteria": {
+            "environment_setup": "environment_setup",
+            "local_tool_preparation": "local_tool_preparation",
+            "platform_restart": "platform_restart",
+            "platform_shutdown": "platform_shutdown",
+            "platform_startup": "platform_startup",
+            "platform_usage": "platform_usage",
+            "topology_deploy": "topology_deploy",
+            "troubleshooting": "troubleshooting",
+            "unknown": "unknown"
+          },
+          "instructions": "Classify the current deployment or usage phase.",
+          "type": "choice"
+        },
+        "is_correction": {
+          "instructions": "Is the user correcting the previous interpretation?",
+          "type": "noul"
+        },
+        "operation": {
+          "criteria": {
+            "acceptance_check": "acceptance_check",
+            "dependency_install": "dependency_install",
+            "environment_setup": "environment_setup",
+            "platform_destroy": "platform_destroy",
+            "platform_restart": "platform_restart",
+            "platform_start": "platform_start",
+            "platform_stop": "platform_stop",
+            "unknown": "unknown"
+          },
+          "instructions": "Choose only the operation currently requested.",
+          "type": "choice"
+        },
+        "requires_environment_diagnosis": {
+          "instructions": "Must current machine state be inspected?",
+          "type": "noul"
+        },
+        "requires_public_docs": {
+          "instructions": "Does answering the current request require Klonet concepts, usage, deployment, operations, troubleshooting guidance or other public documentation evidence?",
+          "type": "noul"
+        },
+        "requires_retrieval": {
+          "instructions": "Does the answer require Klonet evidence?",
+          "type": "noul"
+        },
+        "requires_source_code": {
+          "instructions": "Does answering the current request require Klonet/VEMU source implementation, symbols, APIs, configuration definitions or call-chain evidence?",
+          "type": "noul"
+        },
+        "scope": {
+          "criteria": {
+            "general": "No substantive Klonet-specific request",
+            "klonet": "Klonet platform, its deployment, source, configuration or operations",
+            "mixed": "Both Klonet-specific and unrelated requests"
+          },
+          "instructions": "Classify the request's knowledge scope.",
+          "type": "choice"
+        },
+        "task_type": {
+          "criteria": {
+            "code_lookup": "asks where or how code implements something",
+            "concept": "asks what a Klonet concept, component or term means",
+            "credential_boundary": "asks about credentials, permissions or secrets",
+            "deployment_guidance": "asks how to deploy or configure",
+            "deployment_preparation": "prepares prerequisites before deployment",
+            "development": "asks to change or develop code",
+            "general": "general conversation",
+            "operation_guide": "asks for operational steps",
+            "project_progress": "asks project status",
+            "troubleshooting": "reports a failure and asks diagnosis"
+          },
+          "instructions": "Classify the user's task, not quoted history.",
+          "type": "choice"
+        }
+      },
+      "response": {
+        "answers": {
+          "action_goal": {
+            "choice": "explain_concept",
+            "confidence": 1.0,
+            "probabilities": {
+              "deploy_topology": 0.0,
+              "explain_concept": 1.0,
+              "inspect_error": 0.0,
+              "install_dependencies": 0.0,
+              "prepare_tools": 0.0,
+              "restart_services": 0.0,
+              "start_services": 0.0,
+              "stop_services": 0.0,
+              "unknown": 0.0,
+              "use_feature": 0.0
+            },
+            "type": "choice"
+          },
+          "clarification_required": {
+            "noul": 0.27,
+            "type": "noul"
+          },
+          "deployment_phase": {
+            "choice": "platform_usage",
+            "confidence": 0.44,
+            "probabilities": {
+              "environment_setup": 0.0,
+              "local_tool_preparation": 0.0,
+              "platform_restart": 0.0,
+              "platform_shutdown": 0.0,
+              "platform_startup": 0.01,
+              "platform_usage": 0.49,
+              "topology_deploy": 0.0,
+              "troubleshooting": 0.0,
+              "unknown": 0.5
+            },
+            "type": "choice"
+          },
+          "is_correction": {
+            "noul": 0.02,
+            "type": "noul"
+          },
+          "operation": {
+            "choice": "unknown",
+            "confidence": 1.0,
+            "probabilities": {
+              "acceptance_check": 0.0,
+              "dependency_install": 0.0,
+              "environment_setup": 0.0,
+              "platform_destroy": 0.0,
+              "platform_restart": 0.0,
+              "platform_start": 0.0,
+              "platform_stop": 0.0,
+              "unknown": 1.0
+            },
+            "type": "choice"
+          },
+          "requires_environment_diagnosis": {
+            "noul": 0.07,
+            "type": "noul"
+          },
+          "requires_public_docs": {
+            "noul": 0.06,
+            "type": "noul"
+          },
+          "requires_retrieval": {
+            "noul": 0.08,
+            "type": "noul"
+          },
+          "requires_source_code": {
+            "noul": 0.04,
+            "type": "noul"
+          },
+          "scope": {
+            "choice": "general",
+            "confidence": 1.0,
+            "probabilities": {
+              "general": 1.0,
+              "klonet": 0.0,
+              "mixed": 0.0
+            },
+            "type": "choice"
+          },
+          "task_type": {
+            "choice": "concept",
+            "confidence": 1.0,
+            "probabilities": {
+              "code_lookup": 0.0,
+              "concept": 1.0,
+              "credential_boundary": 0.0,
+              "deployment_guidance": 0.0,
+              "deployment_preparation": 0.0,
+              "development": 0.0,
+              "general": 0.0,
+              "operation_guide": 0.0,
+              "project_progress": 0.0,
+              "troubleshooting": 0.0
+            },
+            "type": "choice"
+          }
+        },
+        "model": "jev-1.13.0",
+        "usage": {
+          "input_tokens": 1204,
+          "output_tokens": 527
+        }
+      },
       "state": {
         "current_request": "Python 的 GIL 是什么？",
-        "recent_user_turns": [],
         "last_assistant_intent_summary": "",
-        "mode": "mentor"
-      },
-      "questions": {
-        "scope": {
-          "type": "choice",
-          "options": ["klonet", "general", "mixed"]
-        }
-      },
-      "response": {
-        "model": "jev-latest",
-        "answers": {
-          "scope": {
-            "value": "general",
-            "probability": 0.88
-          }
-        },
-        "usage": {
-          "input_tokens": 120
-        }
+        "mode": "mentor",
+        "recent_user_turns": []
       }
     },
     {
-      "name": "privileged_noul_false_is_confident",
-      "state": {
-        "current_request": "解释一下 Klonet 的重启流程。",
-        "recent_user_turns": [],
-        "last_assistant_intent_summary": "",
-        "mode": "ops"
-      },
+      "name": "turn_both",
+      "prompt": "拓扑进度条卡住，代码里在哪算进度，经验文档怎么说？",
       "questions": {
-        "requires_execution": {
-          "type": "boolean"
+        "action_goal": {
+          "criteria": {
+            "deploy_topology": "deploy_topology",
+            "explain_concept": "explain_concept",
+            "inspect_error": "inspect_error",
+            "install_dependencies": "install_dependencies",
+            "prepare_tools": "prepare_tools",
+            "restart_services": "restart_services",
+            "start_services": "start_services",
+            "stop_services": "stop_services",
+            "unknown": "unknown",
+            "use_feature": "use_feature"
+          },
+          "instructions": "Classify the user's current goal.",
+          "type": "choice"
+        },
+        "clarification_required": {
+          "instructions": "Is a material user choice missing and undiscoverable?",
+          "type": "noul"
+        },
+        "deployment_phase": {
+          "criteria": {
+            "environment_setup": "environment_setup",
+            "local_tool_preparation": "local_tool_preparation",
+            "platform_restart": "platform_restart",
+            "platform_shutdown": "platform_shutdown",
+            "platform_startup": "platform_startup",
+            "platform_usage": "platform_usage",
+            "topology_deploy": "topology_deploy",
+            "troubleshooting": "troubleshooting",
+            "unknown": "unknown"
+          },
+          "instructions": "Classify the current deployment or usage phase.",
+          "type": "choice"
+        },
+        "is_correction": {
+          "instructions": "Is the user correcting the previous interpretation?",
+          "type": "noul"
+        },
+        "operation": {
+          "criteria": {
+            "acceptance_check": "acceptance_check",
+            "dependency_install": "dependency_install",
+            "environment_setup": "environment_setup",
+            "platform_destroy": "platform_destroy",
+            "platform_restart": "platform_restart",
+            "platform_start": "platform_start",
+            "platform_stop": "platform_stop",
+            "unknown": "unknown"
+          },
+          "instructions": "Choose only the operation currently requested.",
+          "type": "choice"
+        },
+        "requires_environment_diagnosis": {
+          "instructions": "Must current machine state be inspected?",
+          "type": "noul"
+        },
+        "requires_public_docs": {
+          "instructions": "Does answering the current request require Klonet concepts, usage, deployment, operations, troubleshooting guidance or other public documentation evidence?",
+          "type": "noul"
+        },
+        "requires_retrieval": {
+          "instructions": "Does the answer require Klonet evidence?",
+          "type": "noul"
+        },
+        "requires_source_code": {
+          "instructions": "Does answering the current request require Klonet/VEMU source implementation, symbols, APIs, configuration definitions or call-chain evidence?",
+          "type": "noul"
+        },
+        "scope": {
+          "criteria": {
+            "general": "No substantive Klonet-specific request",
+            "klonet": "Klonet platform, its deployment, source, configuration or operations",
+            "mixed": "Both Klonet-specific and unrelated requests"
+          },
+          "instructions": "Classify the request's knowledge scope.",
+          "type": "choice"
+        },
+        "task_type": {
+          "criteria": {
+            "code_lookup": "asks where or how code implements something",
+            "concept": "asks what a Klonet concept, component or term means",
+            "credential_boundary": "asks about credentials, permissions or secrets",
+            "deployment_guidance": "asks how to deploy or configure",
+            "deployment_preparation": "prepares prerequisites before deployment",
+            "development": "asks to change or develop code",
+            "general": "general conversation",
+            "operation_guide": "asks for operational steps",
+            "project_progress": "asks project status",
+            "troubleshooting": "reports a failure and asks diagnosis"
+          },
+          "instructions": "Classify the user's task, not quoted history.",
+          "type": "choice"
         }
       },
       "response": {
-        "model": "jev-latest",
         "answers": {
-          "requires_execution": {
-            "type": "noul",
-            "noul": 0.04
+          "action_goal": {
+            "choice": "inspect_error",
+            "confidence": 0.98,
+            "probabilities": {
+              "deploy_topology": 0.01,
+              "explain_concept": 0.01,
+              "inspect_error": 0.98,
+              "install_dependencies": 0.0,
+              "prepare_tools": 0.0,
+              "restart_services": 0.0,
+              "start_services": 0.0,
+              "stop_services": 0.0,
+              "unknown": 0.0,
+              "use_feature": 0.0
+            },
+            "type": "choice"
+          },
+          "clarification_required": {
+            "noul": 0.29,
+            "type": "noul"
+          },
+          "deployment_phase": {
+            "choice": "troubleshooting",
+            "confidence": 0.93,
+            "probabilities": {
+              "environment_setup": 0.0,
+              "local_tool_preparation": 0.0,
+              "platform_restart": 0.0,
+              "platform_shutdown": 0.0,
+              "platform_startup": 0.0,
+              "platform_usage": 0.0,
+              "topology_deploy": 0.06,
+              "troubleshooting": 0.94,
+              "unknown": 0.0
+            },
+            "type": "choice"
+          },
+          "is_correction": {
+            "noul": 0.05,
+            "type": "noul"
+          },
+          "operation": {
+            "choice": "unknown",
+            "confidence": 0.98,
+            "probabilities": {
+              "acceptance_check": 0.02,
+              "dependency_install": 0.0,
+              "environment_setup": 0.0,
+              "platform_destroy": 0.0,
+              "platform_restart": 0.0,
+              "platform_start": 0.0,
+              "platform_stop": 0.0,
+              "unknown": 0.98
+            },
+            "type": "choice"
+          },
+          "requires_environment_diagnosis": {
+            "noul": 0.51,
+            "type": "noul"
+          },
+          "requires_public_docs": {
+            "noul": 0.73,
+            "type": "noul"
+          },
+          "requires_retrieval": {
+            "noul": 0.34,
+            "type": "noul"
+          },
+          "requires_source_code": {
+            "noul": 0.8,
+            "type": "noul"
+          },
+          "scope": {
+            "choice": "klonet",
+            "confidence": 0.79,
+            "probabilities": {
+              "general": 0.13,
+              "klonet": 0.86,
+              "mixed": 0.01
+            },
+            "type": "choice"
+          },
+          "task_type": {
+            "choice": "code_lookup",
+            "confidence": 0.5,
+            "probabilities": {
+              "code_lookup": 0.55,
+              "concept": 0.0,
+              "credential_boundary": 0.0,
+              "deployment_guidance": 0.0,
+              "deployment_preparation": 0.0,
+              "development": 0.0,
+              "general": 0.0,
+              "operation_guide": 0.0,
+              "project_progress": 0.0,
+              "troubleshooting": 0.45
+            },
+            "type": "choice"
           }
         },
+        "model": "jev-1.13.0",
         "usage": {
-          "input_tokens": 60
+          "input_tokens": 1218,
+          "output_tokens": 529
         }
+      },
+      "state": {
+        "current_request": "拓扑进度条卡住，代码里在哪算进度，经验文档怎么说？",
+        "last_assistant_intent_summary": "",
+        "mode": "mentor",
+        "recent_user_turns": []
+      }
+    },
+    {
+      "name": "privileged_restart",
+      "prompt": "帮我重启 Klonet 平台。",
+      "questions": {
+        "goal_clarity": {
+          "criteria": {
+            "clear": "clear",
+            "discoverable": "discoverable",
+            "missing": "missing"
+          },
+          "instructions": "Can the goal be handled or safely discovered?",
+          "type": "choice"
+        },
+        "goal_kind": {
+          "criteria": {
+            "causal_diagnosis": "causal_diagnosis",
+            "conversation": "conversation",
+            "execution": "execution",
+            "health_check": "health_check"
+          },
+          "instructions": "Classify the requested outcome.",
+          "type": "choice"
+        },
+        "goal_relation": {
+          "criteria": {
+            "continue_previous": "continue_previous",
+            "new": "new",
+            "refine_previous": "refine_previous",
+            "supersede_previous": "supersede_previous"
+          },
+          "instructions": "Relate the current goal to recent conversation.",
+          "type": "choice"
+        },
+        "intent": {
+          "criteria": {
+            "ambiguous": "ambiguous",
+            "conversation": "conversation",
+            "mutating_action": "mutating_action",
+            "readonly_action": "readonly_action",
+            "resume_plan": "resume_plan"
+          },
+          "instructions": "Classify actual execution intent; quoted or negated actions are not requests.",
+          "type": "choice"
+        },
+        "operation": {
+          "criteria": {
+            "inspect": "inspect",
+            "none": "none",
+            "repair": "repair",
+            "restart": "restart",
+            "start": "start",
+            "stop": "stop"
+          },
+          "instructions": "Choose only the operation currently requested.",
+          "type": "choice"
+        },
+        "requires_execution": {
+          "instructions": "Does the request require reading or changing real machine state?",
+          "type": "noul"
+        },
+        "scope": {
+          "criteria": {
+            "component": "component",
+            "none": "none",
+            "platform": "platform"
+          },
+          "instructions": "Classify the operation scope.",
+          "type": "choice"
+        }
+      },
+      "response": {
+        "answers": {
+          "goal_clarity": {
+            "choice": "clear",
+            "confidence": 0.37,
+            "probabilities": {
+              "clear": 0.58,
+              "discoverable": 0.25,
+              "missing": 0.17
+            },
+            "type": "choice"
+          },
+          "goal_kind": {
+            "choice": "execution",
+            "confidence": 1.0,
+            "probabilities": {
+              "causal_diagnosis": 0.0,
+              "conversation": 0.0,
+              "execution": 1.0,
+              "health_check": 0.0
+            },
+            "type": "choice"
+          },
+          "goal_relation": {
+            "choice": "new",
+            "confidence": 1.0,
+            "probabilities": {
+              "continue_previous": 0.0,
+              "new": 1.0,
+              "refine_previous": 0.0,
+              "supersede_previous": 0.0
+            },
+            "type": "choice"
+          },
+          "intent": {
+            "choice": "mutating_action",
+            "confidence": 1.0,
+            "probabilities": {
+              "ambiguous": 0.0,
+              "conversation": 0.0,
+              "mutating_action": 1.0,
+              "readonly_action": 0.0,
+              "resume_plan": 0.0
+            },
+            "type": "choice"
+          },
+          "operation": {
+            "choice": "restart",
+            "confidence": 1.0,
+            "probabilities": {
+              "inspect": 0.0,
+              "none": 0.0,
+              "repair": 0.0,
+              "restart": 1.0,
+              "start": 0.0,
+              "stop": 0.0
+            },
+            "type": "choice"
+          },
+          "requires_execution": {
+            "noul": 0.91,
+            "type": "noul"
+          },
+          "scope": {
+            "choice": "platform",
+            "confidence": 1.0,
+            "probabilities": {
+              "component": 0.0,
+              "none": 0.0,
+              "platform": 1.0
+            },
+            "type": "choice"
+          }
+        },
+        "model": "jev-1.13.0",
+        "usage": {
+          "input_tokens": 823,
+          "output_tokens": 306
+        }
+      },
+      "state": {
+        "current_request": "帮我重启 Klonet 平台。",
+        "last_assistant_intent_summary": "",
+        "mode": "ops",
+        "recent_user_turns": []
       }
     }
-  ]
+  ],
+  "schema_version": 1,
+  "status": "real_capture_from_typesafe"
 }

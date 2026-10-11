@@ -91,6 +91,22 @@ def fallback_group(reason_code: str) -> str:
 
 _SCOPE_OPTIONS = ("klonet", "general", "mixed")
 
+# Only these fields actually decide the knowledge route, so only they may veto
+# it.  ``clarification_required`` and ``requires_environment_diagnosis`` are
+# *informational*: their low confidence must never block store routing — the
+# 2026-10-11 real sweep showed them rejecting 110/120 and 99/120 cases while
+# changing nothing about which store is right.
+ROUTE_GATING_FIELDS = (
+    "scope",
+    "requires_retrieval",
+    "requires_public_docs",
+    "requires_source_code",
+)
+INFORMATIONAL_FIELDS = (
+    "requires_environment_diagnosis",
+    "clarification_required",
+)
+
 # Deterministic overrides (plan §6.1 rules 7–8).  Kept deliberately narrow:
 # they can only *veto* a Jev answer, never create one.
 _SOURCE_CODE_REQUEST_RE = re.compile(
@@ -114,6 +130,7 @@ class FieldDecision:
     threshold: float
     accepted: bool
     reason_code: str
+    gating: bool = True
 
 
 @dataclass(frozen=True)
@@ -231,15 +248,17 @@ def decide_knowledge_route(
     decisions = []
     rejected = []
     for name in required:
+        gating = name in ROUTE_GATING_FIELDS
         decision = _decide_field(
             result, name, answers[name], limits.for_field(name),
             min_margin=limits.min_margin,
             check_margin=_is_choice_field(name),
+            gating=gating,
         )
         decisions.append(decision)
         if decision.reason_code == REASON_MARGIN_UNAVAILABLE:
             margin_available = False
-        if not decision.accepted:
+        if not decision.accepted and decision.gating:
             rejected.append(decision)
     if rejected:
         reasons = _unique_ordered(d.reason_code for d in rejected)
@@ -394,13 +413,14 @@ def _decide_field(
     *,
     min_margin: float,
     check_margin: bool,
+    gating: bool = True,
 ) -> FieldDecision:
     confidence = field_confidence(result, name, value)
     if confidence < threshold:
         return FieldDecision(
             name=name, value=value, confidence=confidence,
             threshold=threshold, accepted=False,
-            reason_code=REASON_BELOW_FIELD_THRESHOLD,
+            reason_code=REASON_BELOW_FIELD_THRESHOLD, gating=gating,
         )
     if check_margin:
         margin = choice_margin(result, name)
@@ -411,17 +431,17 @@ def _decide_field(
             return FieldDecision(
                 name=name, value=value, confidence=confidence,
                 threshold=threshold, accepted=True,
-                reason_code=REASON_MARGIN_UNAVAILABLE,
+                reason_code=REASON_MARGIN_UNAVAILABLE, gating=gating,
             )
         if margin < min_margin:
             return FieldDecision(
                 name=name, value=value, confidence=confidence,
                 threshold=threshold, accepted=False,
-                reason_code=REASON_MARGIN_TOO_SMALL,
+                reason_code=REASON_MARGIN_TOO_SMALL, gating=gating,
             )
     return FieldDecision(
         name=name, value=value, confidence=confidence, threshold=threshold,
-        accepted=True, reason_code=REASON_ACCEPTED,
+        accepted=True, reason_code=REASON_ACCEPTED, gating=gating,
     )
 
 

@@ -113,6 +113,37 @@ def test_below_field_threshold_falls_back_with_exact_reason_code():
     assert blocked == {"requires_source_code"}
 
 
+def test_informational_fields_never_veto_the_store_route():
+    """Real-sweep finding: clarification/env-diagnosis confidence must not gate.
+
+    On 2026-10-11 these two fields rejected 110/120 and 99/120 cases while
+    saying nothing about which store is correct.
+    """
+
+    from klonet_agent.llm.decision_policy import (
+        INFORMATIONAL_FIELDS,
+        ROUTE_GATING_FIELDS,
+    )
+
+    answers = _turn_answers(requires_public_docs=True, requires_source_code=False)
+    confidences = _confident(answers)
+    confidences["clarification_required"] = 0.01
+    confidences["requires_environment_diagnosis"] = 0.01
+    decision = _decide(_result(answers, confidences=confidences))
+
+    assert decision.disposition == "constrain"
+    assert decision.knowledge_route == "public_docs"
+    assert set(INFORMATIONAL_FIELDS) == {
+        "requires_environment_diagnosis", "clarification_required",
+    }
+    assert "clarification_required" not in ROUTE_GATING_FIELDS
+    assert "requires_environment_diagnosis" not in ROUTE_GATING_FIELDS
+    non_gating = [
+        item.name for item in decision.field_decisions if item.gating is False
+    ]
+    assert set(non_gating) == set(INFORMATIONAL_FIELDS)
+
+
 def test_choice_margin_too_small_rejects_the_field():
     answers = _turn_answers()
     confidences = _confident(answers)
