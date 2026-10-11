@@ -49,6 +49,33 @@ class RetrievalPlan:
 
 
 @dataclass(frozen=True)
+class RetrievalConstraints:
+    """供应商无关的知识库路由约束（由 Jev 决策产生）。
+
+    ``allowed_stores`` 为空元组表示"不限制"（legacy 路径）；要表达"不允许
+    检索"必须同时给出 ``requires_retrieval=False``。这里刻意不保存 Jev 的
+    原始响应：概率与 reason code 进 trace，RAG 数据模型只保留可执行约束。
+    """
+
+    allowed_stores: tuple[str, ...] = ()
+    requires_retrieval: bool | None = None
+    source: str = "legacy"
+    confidence: float = 0.0
+    reason_codes: tuple[str, ...] = ()
+
+    @property
+    def constrained(self) -> bool:
+        """Whether this constraint actually narrows the planner."""
+
+        return bool(self.allowed_stores) or self.requires_retrieval is False
+
+    def permits(self, store: str) -> bool:
+        if not self.allowed_stores:
+            return True
+        return str(store) in self.allowed_stores
+
+
+@dataclass(frozen=True)
 class QueryRoute:
     """问题范围、任务类型和路由置信度。"""
 

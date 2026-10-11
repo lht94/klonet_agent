@@ -196,6 +196,7 @@ def test_jev_decision_model_declares_bounded_turn_and_privileged_questions():
     assert set(calls[0][1]) == {
         "scope", "task_type", "operation", "deployment_phase",
         "action_goal", "requires_retrieval",
+        "requires_public_docs", "requires_source_code",
         "requires_environment_diagnosis", "clarification_required",
         "is_correction",
     }
@@ -223,6 +224,8 @@ def test_intent_analyzer_skips_llm_for_confident_non_retrieval_decision():
                 "deployment_phase": "unknown",
                 "action_goal": "explain_concept",
                 "requires_retrieval": False,
+                "requires_public_docs": False,
+                "requires_source_code": False,
                 "requires_environment_diagnosis": False,
                 "clarification_required": False,
                 "is_correction": False,
@@ -234,7 +237,10 @@ def test_intent_analyzer_skips_llm_for_confident_non_retrieval_decision():
             )
 
     analysis = IntentAnalyzer(
-        NeverLLM(), decision_model=Decisions(), min_decision_confidence=0.85,
+        NeverLLM(),
+        decision_model=Decisions(),
+        min_decision_confidence=0.85,
+        routing_mode="enforced",
     ).analyze("Python 的 GIL 是什么？")
 
     assert analysis.intent.scope == "general"
@@ -266,14 +272,29 @@ def test_intent_analyzer_falls_back_to_llm_on_low_jev_confidence():
 
     class Decisions:
         def classify_turn(self, _state):
-            return DecisionResult(
-                answers={"scope": "general"},
-                confidences={"scope": 0.4},
-            )
+            answers = {
+                "scope": "general",
+                "task_type": "general",
+                "operation": "unknown",
+                "deployment_phase": "unknown",
+                "action_goal": "explain_concept",
+                "requires_retrieval": False,
+                "requires_public_docs": False,
+                "requires_source_code": False,
+                "requires_environment_diagnosis": False,
+                "clarification_required": False,
+                "is_correction": False,
+            }
+            confidences = {key: 0.9 for key in answers}
+            confidences["scope"] = 0.4
+            return DecisionResult(answers=answers, confidences=confidences)
 
     llm = LLM()
     analysis = IntentAnalyzer(
-        llm, decision_model=Decisions(), min_decision_confidence=0.85,
+        llm,
+        decision_model=Decisions(),
+        min_decision_confidence=0.85,
+        routing_mode="enforced",
     ).analyze("Klonet 是什么？")
 
     assert llm.calls == 1
@@ -312,6 +333,8 @@ def test_intent_analyzer_keeps_jev_enums_when_llm_builds_retrieval_plan():
         "deployment_phase": "troubleshooting",
         "action_goal": "inspect_error",
         "requires_retrieval": True,
+        "requires_public_docs": True,
+        "requires_source_code": True,
         "requires_environment_diagnosis": True,
         "clarification_required": False,
         "is_correction": False,
@@ -325,7 +348,7 @@ def test_intent_analyzer_keeps_jev_enums_when_llm_builds_retrieval_plan():
             )
 
     analysis = IntentAnalyzer(
-        LLM(), decision_model=Decisions(),
+        LLM(), decision_model=Decisions(), routing_mode="enforced",
     ).analyze("Klonet web_terminal 端口冲突")
 
     assert analysis.intent.scope == "klonet"

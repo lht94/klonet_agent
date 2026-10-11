@@ -11,7 +11,11 @@ from klonet_agent.config import (
     RAG_QUERY_PLANNER_MODEL, RAG_QUERY_PLANNER_TIMEOUT_SECONDS,
 )
 from klonet_agent.knowledge.conversation_state import ConversationState
-from klonet_agent.knowledge.models import RetrievalPlan, RetrievalTask
+from klonet_agent.knowledge.models import (
+    RetrievalConstraints,
+    RetrievalPlan,
+    RetrievalTask,
+)
 from klonet_agent.llm.client import LLMClient
 
 
@@ -183,7 +187,12 @@ def validate_plan(
 
 
 def fallback_plan(query: str, *, detail: str) -> RetrievalPlan:
-    """Conservative fail-open plan: search both stores with the original query."""
+    """Conservative fail-open plan: search both stores with the original query.
+
+    ⚠️ This plan deliberately ignores store constraints, so it must **never** be
+    used when a Jev store route is in force — use
+    :func:`constrained_fallback_plan` instead (plan 05 §4.4).
+    """
 
     original = (query or "").strip()
     exact_terms = _protected_terms(original)
@@ -205,6 +214,118 @@ def fallback_plan(query: str, *, detail: str) -> RetrievalPlan:
     )
 
 
+def constrained_fallback_plan(
+    query: str,
+    *,
+    allowed_stores: tuple[str, ...],
+    detail: str,
+) -> RetrievalPlan:
+    """Constraint-respecting fallback: only kept stores, or no retrieval at all.
+
+    ``allowed_stores`` empty → no retrieval tasks (semantically ``no_retrieval``).
+    """
+
+    original = (query or "").strip()
+    exact_terms = _protected_terms(original)
+    tasks = tuple(
+        RetrievalTask(
+            store=store,  # type: ignore[arg-type]
+            purpose="Jev store 约束下的保守召回",
+            exact_terms=exact_terms,
+        )
+        for store in ("public_docs", "source_code")
+        if store in tuple(allowed_stores)
+    )
+    if not tasks:
+        return RetrievalPlan(
+            original_query=original,
+            standalone_query=original,
+            retrieval_tasks=(),
+            confidence=0.0,
+            status="constrained",
+            detail=detail,
+        )
+    return RetrievalPlan(
+        original_query=original,
+        standalone_query=original,
+        retrieval_tasks=tasks,
+        confidence=0.0,
+        status="fallback",
+        detail=detail,
+    )
+
+
+def validate_plan_with_constraints(
+    original_query: str,
+    raw: Mapping[str, Any],
+    *,
+    constraints: "RetrievalConstraints | None" = None,
+    support_text: str = "",
+) -> RetrievalPlan:
+    """Validate untrusted planner JSON *and* enforce the Jev store route.
+
+    Invariant (must always hold)::
+
+        all(task.store in constraints.allowed_stores
+            for task in plan.retrieval_tasks)
+
+    The store constraint is enforced in code, never through the prompt.
+    """
+
+    original = (original_query or "").strip()
+    if constraints is not None and constraints.requires_retrieval is False:
+        return RetrievalPlan(
+            original_query=original,
+            standalone_query=original,
+            retrieval_tasks=(),
+            confidence=float(constraints.confidence or 0.0),
+            status="constrained",
+            detail="no_retrieval",
+        )
+
+    plan = validate_plan(
+        original, raw, support_text=support_text or original,
+    )
+    if constraints is None or not constraints.allowed_stores:
+        return plan
+    return _apply_store_constraints(plan, tuple(constraints.allowed_stores))
+
+
+def _apply_store_constraints(
+    plan: RetrievalPlan,
+    allowed_stores: tuple[str, ...],
+) -> RetrievalPlan:
+    if plan.status == "fallback":
+        # The planner itself failed; stay conservative *within* the constraint.
+        return constrained_fallback_plan(
+            plan.original_query or plan.standalone_query,
+            allowed_stores=allowed_stores,
+            detail=plan.detail or "planner_fallback",
+        )
+
+    kept = tuple(
+        task for task in plan.retrieval_tasks
+        if task.store in allowed_stores
+    )
+    if kept and len(kept) == len(plan.retrieval_tasks):
+        return plan
+    if kept:
+        return RetrievalPlan(
+            original_query=plan.original_query,
+            standalone_query=plan.standalone_query,
+            retrieval_tasks=kept,
+            excluded_terms=plan.excluded_terms,
+            confidence=plan.confidence,
+            status="constrained",
+            detail="planner_store_violation",
+        )
+    return constrained_fallback_plan(
+        plan.original_query or plan.standalone_query,
+        allowed_stores=allowed_stores,
+        detail="planner_store_violation",
+    )
+
+
 def plan_as_dict(plan: RetrievalPlan) -> dict[str, Any]:
     """Serializable representation for trace and tests."""
 
@@ -216,6 +337,7 @@ def plan_from_mapping(
     value: Any,
     *,
     support_text: str | None = None,
+    constraints: "RetrievalConstraints | None" = None,
 ) -> RetrievalPlan | None:
     """Deserialize an internally injected plan; return None when absent."""
 
@@ -225,11 +347,15 @@ def plan_from_mapping(
     # ``asdict`` includes transport-only fields not consumed by validate_plan.
     if "retrieval_tasks" not in payload:
         return None
-    plan = validate_plan(
+    plan = validate_plan_with_constraints(
         query,
         payload,
+        constraints=constraints,
         support_text=support_text or query,
     )
+    if constraints is not None and constraints.constrained:
+        # A store constraint was applied; the transported status would hide it.
+        return plan
     transported_status = str(value.get("status") or "").strip()
     transported_detail = str(value.get("detail") or "").strip()
     if transported_status in {"planned", "fallback"}:

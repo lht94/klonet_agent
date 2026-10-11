@@ -6,10 +6,13 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .test_tmp/
+.pytest-tmp-*/
 .mypy_cache/
 .ruff_cache/
 tracing/trace.jsonl
 tracing/trace-*.jsonl
+tracing/jev_decisions.jsonl
+tracing/jev_decisions*.jsonl
 
 # Local environment
 .env
@@ -38,6 +41,10 @@ evals/retrieval_summary.md
 # 对比测试的原始运行产物（草稿与冒烟输出）。
 # 正式实验的证据如需入库，应显式提交到单独目录，而不是让 runs/ 直接进版本库。
 evals/comparison/runs/
+
+# Jev 路由评测的原始运行产物（观测明细、含输入文本的报告）。
+# 正式证据如需入库，请显式提交到 evals/jev_v05_summary_*.md 这类单独文件。
+evals/results/
 
 # Local raw Klonet materials
 klonet_knowledge/

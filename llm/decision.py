@@ -12,12 +12,18 @@ from typing import Any, Callable, Dict, Mapping
 import urllib.request
 
 from klonet_agent.tools.environment import redact_sensitive_text
+from klonet_agent.llm.jev_questions import (
+    PRIVILEGED_QUESTIONS,
+    TURN_QUESTIONS,
+    questions_schema_hash,
+)
 from klonet_agent.config import (
     JEV_API_KEY_ENV,
     JEV_BASE_URL,
     JEV_ENABLED,
     JEV_GRAY_PERCENT,
     JEV_MODEL,
+    JEV_ROUTING_MODE,
     JEV_TIMEOUT_SECONDS,
 )
 
@@ -71,7 +77,7 @@ def configured_jev_decision_model(
     user_id: str,
     project_id: str,
 ) -> "JevDecisionModel | None":
-    if not JEV_ENABLED or not in_gray_rollout(
+    if not JEV_ENABLED or JEV_ROUTING_MODE == "off" or not in_gray_rollout(
         user_id, project_id, JEV_GRAY_PERCENT,
     ):
         return None
@@ -274,6 +280,10 @@ def _parse_result(
         confidence = metadata_confidence.get(name, inline_confidence)
         if confidence is None and probability is not None:
             confidence = probability
+        if confidence is None and isinstance(distribution, dict) and distribution:
+            # A Choice answer that only carries a distribution still needs a
+            # selected-answer confidence: use the distribution's maximum.
+            confidence = max(float(item) for item in distribution.values())
         if confidence is not None:
             confidences[name] = max(0.0, min(float(confidence), 1.0))
     usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
@@ -297,110 +307,10 @@ _SENSITIVE_KEYS = {
 }
 
 
-_TURN_QUESTIONS = {
-    "scope": {
-        "type": "choice",
-        "instructions": "Classify the request's knowledge scope.",
-        "options": ["klonet", "general", "mixed"],
-        "criteria": {"klonet": "Klonet platform, its deployment, source, configuration or operations", "general": "No substantive Klonet-specific request", "mixed": "Both Klonet-specific and unrelated requests"},
-    },
-    "task_type": {
-        "type": "choice",
-        "instructions": "Classify the user's task, not quoted history.",
-        "options": [
-            "concept", "deployment_preparation", "deployment_guidance",
-            "credential_boundary", "operation_guide", "troubleshooting",
-            "code_lookup", "development", "project_progress", "general",
-        ],
-        "criteria": {"concept": "asks what a Klonet concept, component or term means", "deployment_preparation": "prepares prerequisites before deployment", "deployment_guidance": "asks how to deploy or configure", "credential_boundary": "asks about credentials, permissions or secrets", "operation_guide": "asks for operational steps", "troubleshooting": "reports a failure and asks diagnosis", "code_lookup": "asks where or how code implements something", "development": "asks to change or develop code", "project_progress": "asks project status", "general": "general conversation"},
-    },
-    "operation": {
-        "type": "choice",
-        "instructions": "Choose only the operation currently requested.",
-        "options": [
-            "unknown", "environment_setup", "dependency_install",
-            "platform_start", "platform_stop", "platform_restart",
-            "platform_destroy", "acceptance_check",
-        ],
-    },
-    "deployment_phase": {
-        "type": "choice",
-        "instructions": "Classify the current deployment or usage phase.",
-        "options": [
-            "local_tool_preparation", "environment_setup", "platform_startup",
-            "platform_shutdown", "platform_restart", "topology_deploy",
-            "platform_usage", "troubleshooting", "unknown",
-        ],
-    },
-    "action_goal": {
-        "type": "choice",
-        "instructions": "Classify the user's current goal.",
-        "options": [
-            "prepare_tools", "install_dependencies", "start_services",
-            "stop_services", "restart_services", "deploy_topology",
-            "inspect_error", "use_feature", "explain_concept", "unknown",
-        ],
-    },
-    "requires_retrieval": {
-        "type": "boolean",
-        "instructions": "Does the answer require Klonet evidence?",
-    },
-    "requires_environment_diagnosis": {
-        "type": "boolean",
-        "instructions": "Must current machine state be inspected?",
-    },
-    "clarification_required": {
-        "type": "boolean",
-        "instructions": "Is a material user choice missing and undiscoverable?",
-    },
-    "is_correction": {
-        "type": "boolean",
-        "instructions": "Is the user correcting the previous interpretation?",
-    },
-}
-
-
-_PRIVILEGED_QUESTIONS = {
-    "intent": {
-        "type": "choice",
-        "instructions": "Classify actual execution intent; quoted or negated actions are not requests.",
-        "options": [
-            "conversation", "readonly_action", "mutating_action",
-            "resume_plan", "ambiguous",
-        ],
-    },
-    "goal_clarity": {
-        "type": "choice",
-        "instructions": "Can the goal be handled or safely discovered?",
-        "options": ["clear", "discoverable", "missing"],
-    },
-    "goal_relation": {
-        "type": "choice",
-        "instructions": "Relate the current goal to recent conversation.",
-        "options": [
-            "new", "continue_previous", "refine_previous", "supersede_previous",
-        ],
-    },
-    "goal_kind": {
-        "type": "choice",
-        "instructions": "Classify the requested outcome.",
-        "options": ["conversation", "execution", "health_check", "causal_diagnosis"],
-    },
-    "operation": {
-        "type": "choice",
-        "instructions": "Choose only the operation currently requested.",
-        "options": ["none", "restart", "repair", "start", "stop", "inspect"],
-    },
-    "scope": {
-        "type": "choice",
-        "instructions": "Classify the operation scope.",
-        "options": ["none", "platform", "component"],
-    },
-    "requires_execution": {
-        "type": "boolean",
-        "instructions": "Does the request require reading or changing real machine state?",
-    },
-}
+# The question sets live in ``llm/jev_questions.py`` (versioned, hashable).
+# These private aliases keep the historical import surface for tests/callers.
+_TURN_QUESTIONS = TURN_QUESTIONS
+_PRIVILEGED_QUESTIONS = PRIVILEGED_QUESTIONS
 
 
 def _redact_state(value: Any, key: str = "") -> Any:

@@ -77,6 +77,78 @@ JEV_MIN_CONFIDENCE = max(
 JEV_SHADOW_COMPARE = os.getenv("JEV_SHADOW_COMPARE", "true").strip().lower() in {
     "1", "true", "yes", "on",
 }
+
+
+def _clamp_unit(value, default):
+    """Clamp a probability-like configuration value into ``[0, 1]``."""
+
+    try:
+        return max(0.0, min(float(value), 1.0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp_percent(value, default):
+    try:
+        return max(0, min(int(value), 100))
+    except (TypeError, ValueError):
+        return default
+
+
+# Jev knowledge-store routing (plan 05).  ``JEV_ROUTING_MODE`` is the single
+# shadow switch; the historical ``JEV_SHADOW_COMPARE`` is kept only as a
+# compatibility alias instead of a second, competing mechanism.
+JEV_ROUTING_MODES = ("off", "shadow", "canary", "enforced")
+_jev_routing_mode_env = os.getenv("JEV_ROUTING_MODE", "").strip().lower()
+JEV_ROUTING_MODE_EXPLICIT = bool(_jev_routing_mode_env)
+JEV_ROUTING_MODE = (
+    _jev_routing_mode_env
+    if _jev_routing_mode_env
+    else ("shadow" if JEV_SHADOW_COMPARE else "off")
+)
+if JEV_ROUTING_MODE not in JEV_ROUTING_MODES:
+    # Never silently enter ``enforced`` because of a typo.
+    import sys as _sys
+
+    _sys.stderr.write(
+        "[klonet-agent] unknown JEV_ROUTING_MODE=%r, falling back to 'off'\n"
+        % JEV_ROUTING_MODE
+    )
+    JEV_ROUTING_MODE = "off"
+JEV_STORE_ROUTING_ENABLED = os.getenv(
+    "JEV_STORE_ROUTING_ENABLED", "false",
+).strip().lower() in {"1", "true", "yes", "on"}
+JEV_MIN_MARGIN = _clamp_unit(os.getenv("JEV_MIN_MARGIN", "0.10"), 0.10)
+JEV_THRESHOLD_SCOPE = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_SCOPE", "0.75"), 0.75,
+)
+JEV_THRESHOLD_RETRIEVAL = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_RETRIEVAL", "0.80"), 0.80,
+)
+JEV_THRESHOLD_PUBLIC_DOCS = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_PUBLIC_DOCS", "0.78"), 0.78,
+)
+JEV_THRESHOLD_SOURCE_CODE = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_SOURCE_CODE", "0.82"), 0.82,
+)
+JEV_THRESHOLD_ENV_DIAGNOSIS = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_ENV_DIAGNOSIS", "0.88"), 0.88,
+)
+JEV_THRESHOLD_CLARIFICATION = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_CLARIFICATION", "0.85"), 0.85,
+)
+JEV_THRESHOLD_PRIVILEGED_INTENT = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_PRIVILEGED_INTENT", "0.90"), 0.90,
+)
+JEV_THRESHOLD_PRIVILEGED_EXECUTION = _clamp_unit(
+    os.getenv("JEV_THRESHOLD_PRIVILEGED_EXECUTION", "0.92"), 0.92,
+)
+JEV_TRACE_FILE = os.getenv(
+    "JEV_TRACE_FILE", str(PROJECT_ROOT / "tracing" / "jev_decisions.jsonl"),
+).strip()
+JEV_SHADOW_SAMPLE_PERCENT = _clamp_percent(
+    os.getenv("JEV_SHADOW_SAMPLE_PERCENT", "100"), 100,
+)
 PARATERA_BASE_URL = os.getenv(
     "PARATERA_BASE_URL", "https://llmapi.paratera.com/v1",
 ).strip()

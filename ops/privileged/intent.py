@@ -7,6 +7,14 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from klonet_agent import config as _config
+from klonet_agent.llm.decision_policy import (
+    REASON_INVALID_ANSWER,
+    REASON_MISSING_ANSWER,
+    REASON_PROVIDER_ERROR,
+    decide_knowledge_route,
+)
+from klonet_agent.llm.jev_questions import build_privileged_state
 from klonet_agent.ops.privileged.action_contracts import _parse_json_object
 from klonet_agent.ops.privileged.context import klonet_domain_context
 from klonet_agent.tools.environment import redact_sensitive_text
@@ -195,6 +203,8 @@ class PrivilegedIntentDecision:
     used_decision_model: bool = False
     decision_latency_seconds: float = 0.0
     decision_fallback_reason: str = ""
+    # v0.5: shared policy vocabulary with the mentor path (trace/reason codes).
+    route_decision: Any = None
 
     @property
     def should_clarify(self) -> bool:
@@ -208,12 +218,37 @@ class PrivilegedIntentClassifier:
         *,
         decision_model: Any | None = None,
         min_decision_confidence: float = 0.85,
+        routing_mode: str | None = None,
+        trace_writer: Any | None = None,
     ) -> None:
         self.llm = llm
         self.decision_model = decision_model
         self.min_decision_confidence = max(
             0.0, min(float(min_decision_confidence), 1.0),
         )
+        self.routing_mode = routing_mode
+        self.trace_writer = trace_writer
+
+    def _mode(self) -> str:
+        if self.routing_mode:
+            return str(self.routing_mode)
+        return str(getattr(_config, "JEV_ROUTING_MODE", "off"))
+
+    def _write_trace(self, text: str, route_decision: Any, result: Any) -> None:
+        if self.trace_writer is None or route_decision is None:
+            return
+        try:
+            from klonet_agent.tracing.jev_trace import build_route_event
+
+            self.trace_writer.write(build_route_event(
+                request_text=text,
+                route_decision=route_decision,
+                result=result,
+                mode=self._mode(),
+                extra={"path": "privileged"},
+            ))
+        except Exception:
+            pass
 
     def classify(
         self,
@@ -222,21 +257,27 @@ class PrivilegedIntentClassifier:
         conversation_context: str = "",
     ) -> PrivilegedIntentDecision:
         decision_fallback_reason = ""
-        if self.decision_model is not None:
+        mode = self._mode()
+        if self.decision_model is not None and mode != "off":
             try:
                 result = self.decision_model.classify_privileged_intent(
-                    {
-                        "request": text,
-                        "recent_conversation": conversation_context,
-                        "safety_boundary": (
-                            "classification only; never authorize execution"
-                        ),
-                    }
+                    build_privileged_state(
+                        text,
+                        None,
+                        last_assistant_intent_summary=conversation_context,
+                        mode="ops",
+                    )
                 )
+                # v0.5 does not widen Jev's authority here: the policy result
+                # only provides reason codes/traces and a conservative gate.
+                route_decision = decide_knowledge_route(
+                    result, privileged=True, request_text=text, mode=mode,
+                )
+                self._write_trace(text, route_decision, result)
                 confidence = _decision_confidence(
                     result, ("intent", "requires_execution"),
                 )
-                if confidence >= self.min_decision_confidence:
+                if route_decision.adopted and confidence >= self.min_decision_confidence:
                     intent = str(result.answers.get("intent") or "")
                     requires_execution = bool(
                         result.answers.get("requires_execution", False)
@@ -274,9 +315,15 @@ class PrivilegedIntentClassifier:
                             **decision.__dict__,
                             "used_decision_model": True,
                             "decision_latency_seconds": result.latency_seconds,
+                            "route_decision": route_decision,
                         }
                     )
-                decision_fallback_reason = "low_confidence"
+                if not route_decision.adopted:
+                    decision_fallback_reason = _legacy_fallback_reason(
+                        route_decision.reason_codes
+                    )
+                else:
+                    decision_fallback_reason = "low_confidence"
             except _LowDecisionConfidence as exc:
                 decision_fallback_reason = str(exc)
             except Exception:
@@ -478,6 +525,18 @@ def _safe_classifier_error(exc: Exception) -> str:
 def _decision_confidence(result: Any, fields: tuple[str, ...] | None = None) -> float:
     values = [float(result.confidences[name]) for name in (fields or tuple(result.confidences)) if name in result.confidences]
     return min(values) if values else 0.0
+
+
+def _legacy_fallback_reason(reason_codes) -> str:
+    """Shared with the mentor path: same reason-code vocabulary (plan §6.3)."""
+
+    codes = tuple(reason_codes or ())
+    if any(
+        code in (REASON_PROVIDER_ERROR, REASON_MISSING_ANSWER, REASON_INVALID_ANSWER)
+        for code in codes
+    ):
+        return REASON_PROVIDER_ERROR
+    return "low_confidence"
 
 
 class _LowDecisionConfidence(Exception):

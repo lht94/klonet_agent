@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "captured": false,
+  "captured_at": null,
+  "status": "synthetic_pending_real_capture",
+  "note": "阶段 0.5 Step 1 需要在有真实 TYPESAFE_API_KEY 的机器上重新采样并置 captured=true；在真实样本落盘前，JEV_MIN_MARGIN 的可用性只能按本文件的 contract 结论处理，且不得据此宣称 margin 门禁已生效。",
+  "contract_questions": [
+    "Choice 是否返回完整 probabilities 分布（还是只有 top1 probability）？",
+    "布尔 Noul 是否稳定返回 noul 概率？",
+    "noul 概率与 1-noul 是否互补？",
+    "answers 是否覆盖全部提问？",
+    "缺失字段的实际形态是什么？"
+  ],
+  "samples": [
+    {
+      "name": "turn_choice_with_distribution",
+      "state": {
+        "current_request": "Klonet 的拓扑部署流程是什么？",
+        "recent_user_turns": [],
+        "last_assistant_intent_summary": "",
+        "mode": "mentor"
+      },
+      "questions": {
+        "scope": {
+          "type": "choice",
+          "options": ["klonet", "general", "mixed"]
+        },
+        "requires_retrieval": {
+          "type": "boolean"
+        }
+      },
+      "response": {
+        "model": "jev-latest",
+        "version": "1.13.0",
+        "answers": {
+          "scope": {
+            "value": "klonet",
+            "probabilities": {
+              "klonet": 0.93,
+              "general": 0.05,
+              "mixed": 0.02
+            }
+          },
+          "requires_retrieval": {
+            "type": "noul",
+            "noul": 0.96
+          }
+        },
+        "usage": {
+          "input_tokens": 210
+        }
+      }
+    },
+    {
+      "name": "turn_choice_without_distribution",
+      "state": {
+        "current_request": "Python 的 GIL 是什么？",
+        "recent_user_turns": [],
+        "last_assistant_intent_summary": "",
+        "mode": "mentor"
+      },
+      "questions": {
+        "scope": {
+          "type": "choice",
+          "options": ["klonet", "general", "mixed"]
+        }
+      },
+      "response": {
+        "model": "jev-latest",
+        "answers": {
+          "scope": {
+            "value": "general",
+            "probability": 0.88
+          }
+        },
+        "usage": {
+          "input_tokens": 120
+        }
+      }
+    },
+    {
+      "name": "privileged_noul_false_is_confident",
+      "state": {
+        "current_request": "解释一下 Klonet 的重启流程。",
+        "recent_user_turns": [],
+        "last_assistant_intent_summary": "",
+        "mode": "ops"
+      },
+      "questions": {
+        "requires_execution": {
+          "type": "boolean"
+        }
+      },
+      "response": {
+        "model": "jev-latest",
+        "answers": {
+          "requires_execution": {
+            "type": "noul",
+            "noul": 0.04
+          }
+        },
+        "usage": {
+          "input_tokens": 60
+        }
+      }
+    }
+  ]
+}

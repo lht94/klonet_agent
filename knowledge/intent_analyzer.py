@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any
 
+from klonet_agent import config as _config
 from klonet_agent.knowledge.intent_cases import (
     IntentCase,
     IntentCaseRetriever,
@@ -15,7 +16,7 @@ from klonet_agent.knowledge.intent_cases import (
 )
 from klonet_agent.knowledge.intent import QueryIntent
 from klonet_agent.knowledge.models import QueryRoute, RetrievalPlan
-from klonet_agent.knowledge.query_planner import validate_plan
+from klonet_agent.knowledge.query_planner import validate_plan_with_constraints
 from klonet_agent.knowledge.rag import route_query
 from klonet_agent.knowledge.semantic_understanding import (
     IntentDecision,
@@ -23,6 +24,13 @@ from klonet_agent.knowledge.semantic_understanding import (
     SemanticFrame,
     SemanticState,
 )
+from klonet_agent.llm.decision_policy import (
+    REASON_INVALID_ANSWER,
+    REASON_MISSING_ANSWER,
+    REASON_PROVIDER_ERROR,
+    decide_knowledge_route,
+)
+from klonet_agent.llm.jev_questions import build_turn_state
 
 
 INTENT_ANALYSIS_PROMPT = """
@@ -114,10 +122,19 @@ class IntentAnalysis:
     used_decision_model: bool = False
     decision_latency_seconds: float = 0.0
     decision_fallback_reason: str = ""
+    # v0.5: the full policy result and the effective knowledge route, for trace.
+    route_decision: Any = None
+    knowledge_route: str = "legacy"
 
 
 class IntentAnalyzer:
-    """Use an LLM to parse the user's request before retrieval/tool routing."""
+    """Use an LLM to parse the user's request before retrieval/tool routing.
+
+    v0.5 splits the decision in three states:
+    ``accept`` (Jev already decided: skip the generative intent call),
+    ``constrain`` (the LLM only fills open fields; Jev's store route is a hard
+    code-level constraint) and ``fallback`` (the legacy path runs unchanged).
+    """
 
     def __init__(
         self,
@@ -126,15 +143,46 @@ class IntentAnalyzer:
         *,
         decision_model=None,
         min_decision_confidence: float = 0.85,
+        routing_mode: str | None = None,
+        trace_writer: Any = None,
     ):
         self.llm = llm
         self.decision_model = decision_model
+        # Deprecated in v0.5: per-field thresholds in ``decision_policy`` now
+        # decide, and the store route is enforced by ``query_planner``.
         self.min_decision_confidence = max(
             0.0, min(float(min_decision_confidence), 1.0),
         )
+        # ``None`` → read ``JEV_ROUTING_MODE`` at call time (keeps monkeypatch
+        # and importlib.reload styles working).
+        self.routing_mode = routing_mode
+        # ``None`` → no tracing (tests stay hermetic).  The orchestrator injects
+        # a real writer so shadow runs actually produce evidence.
+        self.trace_writer = trace_writer
         self.intent_case_retriever = (
             intent_case_retriever or build_default_intent_case_retriever()
         )
+
+    def _mode(self) -> str:
+        if self.routing_mode:
+            return str(self.routing_mode)
+        return str(getattr(_config, "JEV_ROUTING_MODE", "off"))
+
+    def _write_trace(self, user_input: str, route_decision: Any, result: Any) -> None:
+        if self.trace_writer is None or route_decision is None:
+            return
+        try:
+            from klonet_agent.tracing.jev_trace import build_route_event
+
+            self.trace_writer.write(build_route_event(
+                request_text=user_input,
+                route_decision=route_decision,
+                result=result,
+                mode=self._mode(),
+            ))
+        except Exception:
+            # Observability must never break the conversation (plan §11).
+            pass
 
     def analyze(
         self,
@@ -143,46 +191,59 @@ class IntentAnalyzer:
         recent_history: list[dict] | None = None,
     ) -> IntentAnalysis:
         history = recent_history or []
-        decision_result = None
+        mode = self._mode()
+        route_decision = None
         trusted_decision_answers: dict[str, Any] = {}
         decision_fallback_reason = ""
-        if self.decision_model is not None:
+        decision_latency = 0.0
+        constraints = None
+
+        if self.decision_model is not None and mode != "off":
             try:
                 decision_result = self.decision_model.classify_turn(
-                    {
-                        "request": user_input,
-                        "recent_history": _bounded_history(history),
-                    }
+                    build_turn_state(user_input, history)
                 )
-                confidence = _decision_confidence(
-                    decision_result, ("scope", "requires_retrieval"),
+                decision_latency = float(
+                    getattr(decision_result, "latency_seconds", 0.0) or 0.0
                 )
-                # These fields were validated separately; task_type and
-                # correction remain LLM-owned and must not reject a safe gate.
-                if confidence < min(self.min_decision_confidence, 0.70):
-                    decision_fallback_reason = "low_confidence"
-                    decision_result = None
-                else:
-                    trusted_decision_answers = {
-                        name: decision_result.answers[name]
-                        for name in ("scope", "requires_retrieval")
-                        if name in decision_result.answers
-                    }
+                route_decision = decide_knowledge_route(
+                    decision_result,
+                    request_text=user_input,
+                    mode=mode,
+                )
+                self._write_trace(user_input, route_decision, decision_result)
             except Exception:
-                decision_fallback_reason = "provider_error"
-                decision_result = None
-        if decision_result is not None and (
-            trusted_decision_answers.get("scope") == "general"
-            and not bool(trusted_decision_answers.get("requires_retrieval", True))
-        ):
+                decision_fallback_reason = REASON_PROVIDER_ERROR
+                route_decision = None
+
+        # ``shadow`` computes but never controls: only ``canary``/``enforced``
+        # adopt Jev's route (and only then may the generative LLM be skipped).
+        enforced = mode in {"canary", "enforced"}
+        adopted = (
+            route_decision is not None
+            and route_decision.adopted
+            and enforced
+        )
+        if adopted:
+            trusted_decision_answers = dict(route_decision.accepted_answers)
+            constraints = route_decision.to_constraints()
+        elif route_decision is not None and not route_decision.adopted:
+            decision_fallback_reason = _legacy_fallback_reason(
+                route_decision.reason_codes
+            )
+
+        if adopted and route_decision.disposition == "accept":
             mapping = dict(trusted_decision_answers)
             mapping.update({"task_type": "general", "operation": "unknown"})
-            mapping["confidence"] = confidence
+            mapping["confidence"] = _min_field_confidence(route_decision)
             return IntentAnalysis(
                 intent=QueryIntent.from_mapping(mapping),
                 used_decision_model=True,
-                decision_latency_seconds=decision_result.latency_seconds,
+                decision_latency_seconds=decision_latency,
+                route_decision=route_decision,
+                knowledge_route=route_decision.knowledge_route,
             )
+
         user_message = _build_analysis_user_message(user_input, history)
         plan_support_text = user_message
         intent_cases = self.intent_case_retriever.search_for_prompt(
@@ -191,7 +252,7 @@ class IntentAnalyzer:
             min_score=0.1,
         )
         user_message = _append_intent_cases(user_message, intent_cases)
-        if decision_result is not None:
+        if adopted:
             user_message += (
                 "\n\nJev 已确定字段（这些值是约束，不得改写）：\n"
                 + json.dumps(
@@ -223,12 +284,13 @@ class IntentAnalyzer:
         content = response.choices[0].message.content or ""
         token_usage = getattr(getattr(response, "usage", None), "total_tokens", 0)
         raw = _parse_json_object(content)
-        if decision_result is not None:
+        if adopted:
             raw.update(trusted_decision_answers)
-            raw["confidence"] = confidence
-        retrieval_plan = validate_plan(
+            raw["confidence"] = _min_field_confidence(route_decision)
+        retrieval_plan = validate_plan_with_constraints(
             user_input,
             raw,
+            constraints=constraints,
             support_text=plan_support_text,
         )
         frame = _semantic_frame_from_mapping(raw)
@@ -238,7 +300,7 @@ class IntentAnalyzer:
                 frame,
                 SemanticState.from_history(recent_history or []),
             )
-            if decision_result is not None:
+            if adopted:
                 extracted_intent = QueryIntent.from_mapping(raw)
                 constrained = {
                     **decision.intent.__dict__,
@@ -248,7 +310,7 @@ class IntentAnalyzer:
                     "excluded_intents": extracted_intent.excluded_intents,
                     "prerequisites": extracted_intent.prerequisites,
                     **trusted_decision_answers,
-                    "confidence": confidence,
+                    "confidence": _min_field_confidence(route_decision),
                 }
                 decision = replace(
                     decision, intent=QueryIntent.from_mapping(constrained),
@@ -261,12 +323,13 @@ class IntentAnalyzer:
                 semantic_frame=frame,
                 decision=decision,
                 retrieval_plan=retrieval_plan,
-                used_decision_model=decision_result is not None,
-                decision_latency_seconds=(
-                    decision_result.latency_seconds
-                    if decision_result is not None else 0.0
-                ),
+                used_decision_model=adopted,
+                decision_latency_seconds=decision_latency,
                 decision_fallback_reason=decision_fallback_reason,
+                route_decision=route_decision,
+                knowledge_route=(
+                    route_decision.knowledge_route if adopted else "legacy"
+                ),
             )
         return IntentAnalysis(
             intent=QueryIntent.from_mapping(raw),
@@ -274,11 +337,13 @@ class IntentAnalyzer:
             used_model=True,
             raw_content=content,
             retrieval_plan=retrieval_plan,
-            used_decision_model=decision_result is not None,
-            decision_latency_seconds=(
-                decision_result.latency_seconds if decision_result is not None else 0.0
-            ),
+            used_decision_model=adopted,
+            decision_latency_seconds=decision_latency,
             decision_fallback_reason=decision_fallback_reason,
+            route_decision=route_decision,
+            knowledge_route=(
+                route_decision.knowledge_route if adopted else "legacy"
+            ),
         )
 
 
@@ -404,9 +469,28 @@ def _build_analysis_user_message(user_input: str, recent_history: list[dict]) ->
     )
 
 
-def _decision_confidence(result: Any, fields: tuple[str, ...] | None = None) -> float:
-    values = [float(result.confidences[name]) for name in (fields or tuple(result.confidences)) if name in result.confidences]
+def _min_field_confidence(route_decision: Any) -> float:
+    """Lowest accepted-field confidence, used as the decision confidence."""
+
+    decisions = getattr(route_decision, "field_decisions", ()) or ()
+    values = [float(item.confidence) for item in decisions]
     return min(values) if values else 0.0
+
+
+def _legacy_fallback_reason(reason_codes) -> str:
+    """Map v0.5 reason codes onto the two historical fallback strings.
+
+    Kept stable so existing dashboards/alerts keep working; the full reason
+    code set is available on ``IntentAnalysis.route_decision``.
+    """
+
+    codes = tuple(reason_codes or ())
+    if any(
+        code in (REASON_PROVIDER_ERROR, REASON_MISSING_ANSWER, REASON_INVALID_ANSWER)
+        for code in codes
+    ):
+        return REASON_PROVIDER_ERROR
+    return "low_confidence"
 
 
 def _bounded_history(history: list[dict]) -> list[dict[str, str]]:
