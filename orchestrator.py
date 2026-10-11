@@ -116,6 +116,7 @@ from klonet_agent.ops.routing import OpsRoute, route_ops_request
 from klonet_agent.prompts import build_system_prompts
 from klonet_agent.session import AgentSession, render_todos
 from klonet_agent.tools import TOOLS, ToolExecutor
+from klonet_agent.tracing.jev_trace import JevTraceWriter
 from klonet_agent.tracing.logger import TraceLogger
 
 
@@ -151,6 +152,9 @@ class AgentOrchestrator:
         )
         self._ops_semantic_routing = intent_analyzer is not None or supplied_llm is None
         self.answer_style = answer_style
+        # One shared, non-blocking Jev trace writer: shadow/canary runs must
+        # produce evidence without ever breaking the main path (plan 05 §11).
+        self._jev_trace_writer = JevTraceWriter()
         if intent_analyzer is not None:
             self.intent_analyzer = intent_analyzer
         elif supplied_llm is not None:
@@ -159,6 +163,7 @@ class AgentOrchestrator:
                 self.llm,
                 decision_model=self.decision_model,
                 min_decision_confidence=JEV_MIN_CONFIDENCE,
+                trace_writer=self._jev_trace_writer,
             )
         else:
             query_planner_llm = LLMClient(
@@ -170,6 +175,7 @@ class AgentOrchestrator:
                 query_planner_llm,
                 decision_model=self.decision_model,
                 min_decision_confidence=JEV_MIN_CONFIDENCE,
+                trace_writer=self._jev_trace_writer,
             )
         self.trace_logger = trace_logger or TraceLogger(TRACE_FILE)
         self.memory_store = memory_store or MemoryStore.for_session(
@@ -337,6 +343,7 @@ class AgentOrchestrator:
                     classifier_llm,
                     decision_model=self.decision_model,
                     min_decision_confidence=JEV_MIN_CONFIDENCE,
+                    trace_writer=self._jev_trace_writer,
                 ),
                 discovery=discovery,
                 synthesis=synthesis,
@@ -460,6 +467,24 @@ class AgentOrchestrator:
             self._covered_rows = covered or 0
         return self._covered_rows
 
+    def _latest_checkpoint_message(self) -> dict | None:
+        """最新 checkpoint 渲染成的 system 消息（无有效覆盖时返回 None）。
+
+        为什么必须**每轮无条件**注入：`init_history()` 只加载覆盖边界之后的原文，
+        边界之前的历史只存在于这份摘要里。若把注入绑在"本轮是否触发压缩"上，
+        重启后历史变小的一段时间内摘要会缺席，边界之前的内容对模型完全不可见。
+
+        覆盖区间为空（``rows-0``）或 checkpoint 缺失/损坏时返回 None——注入一份
+        "什么都没覆盖"的摘要只会白占预算，还会让模型误以为有更早的历史。
+        """
+
+        checkpoint = self.checkpoint_store.load_latest()
+        if checkpoint is None:
+            return None
+        if not _parse_covered_rows(checkpoint.source_event_end):
+            return None
+        return checkpoint.render_system_message()
+
     def _next_history_row(self) -> int:
         """分配下一个 history.jsonl 事件行号。"""
 
@@ -580,11 +605,16 @@ class AgentOrchestrator:
         # 记忆包在同一回合里只构造一次：压缩后重编译时复用同一份，
         # 不为同一句用户输入跑两遍召回与嵌入。
         memory_pack_messages = self._memory_pack_messages(history)
+        # 恢复/重启后**无条件**注入最新 checkpoint 摘要：水位之前的历史原文
+        # 从未被加载（init_history 只取覆盖边界之后的事件），只存在于摘要里。
+        # 绑在"本轮是否触发压缩"上会让重启后历史变小的那几轮丢掉这段历史。
+        checkpoint_message = self._latest_checkpoint_message()
         try:
             compiled = self.context_compiler.compile_history(
                 history,
                 model=model,
                 tool_definitions=tools,
+                checkpoint_message=checkpoint_message,
                 memory_pack_messages=memory_pack_messages,
             )
         except ContextOverflowError as exc:
@@ -609,9 +639,9 @@ class AgentOrchestrator:
                 covered_prefix = self._coverable_prefix_length(history)
             coverable = self._non_system_messages(history)[:covered_prefix]
             coverable_tokens = estimate_messages_tokens(coverable)
-            checkpoint_message = None
+            fresh_checkpoint_message = None
             if covered_prefix and coverable_tokens >= CONTEXT_COMPACTION_MIN_TOKENS:
-                checkpoint_message = self._compact_context_once(
+                fresh_checkpoint_message = self._compact_context_once(
                     history, covered_prefix
                 )
             else:
@@ -634,7 +664,10 @@ class AgentOrchestrator:
                     },
                 )
 
-            if checkpoint_message is not None:
+            if fresh_checkpoint_message is not None:
+                # 压缩成功：用新摘要替换默认注入的旧摘要，并且重编译时只保留
+                # checkpoint 覆盖区间之后的事件候选（避免摘要与原文重复）。
+                checkpoint_message = fresh_checkpoint_message
                 uncovered = self._history_after_covered(history, covered_prefix)
                 compiled = self.context_compiler.compile_history(
                     uncovered,
@@ -836,13 +869,30 @@ class AgentOrchestrator:
 
         previous = self.checkpoint_store.load_latest()
         covered_before = self._current_covered_rows()
-        covered_messages = self._non_system_messages(history)[:covered_prefix]
+        prefix_messages = self._non_system_messages(history)[:covered_prefix]
+        # 只压**尚未被上一版覆盖**的那一段。in-memory history 压缩后不会被截断
+        # （只有发送视图会被 _history_after_covered 裁剪），所以前缀里可能仍含
+        # 已被覆盖的消息：重新喂给模型既浪费 token，也会让声明的区间
+        # （从 rows-<covered_before> 起）与实际内容不符。
+        covered_messages: list[dict] = []
+        for message in prefix_messages:
+            row = self._row_of(message)
+            if row is None or row >= covered_before:
+                covered_messages.append(message)
         if not covered_messages:
-            return None
-        covered_rows = sum(
-            1 for message in covered_messages if self._row_of(message) is not None
-        )
-        covered_until = covered_before + covered_rows
+            # 前缀里没有新事件：沿用上一版，不产生新版本。
+            return previous.render_system_message() if previous is not None else None
+        # 水位必须由**实际行号**推出。旧实现是 ``covered_before + 条数``，在
+        # "同一会话内第二次压缩"时会把已覆盖的那部分重复计入 → 水位超出实际
+        # 行数 → 重启后 load_history_after(超界) 返回空，原文全部丢失。
+        rows = [
+            row
+            for row in (self._row_of(message) for message in covered_messages)
+            if row is not None
+        ]
+        covered_until = max(rows) + 1 if rows else covered_before
+        # 水位只前进、不后退。
+        covered_until = max(covered_until, covered_before)
         try:
             checkpoint = self.memory_compactor.compact(
                 covered_messages,
@@ -864,8 +914,15 @@ class AgentOrchestrator:
             print("Klonet Agent：上下文压缩失败，保留原始历史继续。")
             return None
 
-        if previous is not None and checkpoint.checkpoint_id == previous.checkpoint_id:
+        if previous is not None and checkpoint is previous:
             # 压缩失败回退到了旧 checkpoint：不产生新版本。
+            #
+            # 这里必须比**对象身份**而不是 `checkpoint_id`：MemoryCompactor 在
+            # 两次校验都失败时返回的是传入的 previous 对象本身；而 checkpoint_id
+            # 默认是秒精度时间戳（cp-<YYYYMMDDTHHMMSS>），同一秒内的两次压缩会
+            # 撞号。按 id 比较会在撞号时把一份**合法的新 checkpoint** 当成回退
+            # 丢掉，并让 covered_prefix 已推进、摘要却还是旧的——那段历史既没进
+            # 上下文也没进摘要。
             self._covered_rows = covered_before
             return previous.render_system_message()
 

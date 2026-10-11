@@ -347,3 +347,115 @@ def test_legacy_compression_gate_is_closed_by_default(tmp_path, monkeypatch):
 
     monkeypatch.setattr(orchestrator_module, "LEGACY_MEMORY_COMPRESSION_ENABLED", True)
     assert orchestrator._legacy_history_cap() == orchestrator_module.HISTORY_MAX_MESSAGES
+
+
+# --------------------------------------------------------------------------
+# 恢复的两条不变量（2026-10-11 修复）
+#   1. 水位之前的历史只存在于摘要里 → 摘要必须**每轮**注入，不能绑在"本轮是否压缩"上
+#   2. 水位必须由实际行号推出 → 同会话第二次压缩不得重复计数
+# --------------------------------------------------------------------------
+
+
+def _save_checkpoint_covering_all(orchestrator, store):
+    """让 checkpoint 覆盖当前全部已持久化事件。"""
+
+    return orchestrator.checkpoint_store.save(
+        orchestrator.memory_compactor.compact(
+            [{"role": "user", "content": "旧对话"}],
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            source_event_start="rows-0",
+            source_event_end=f"rows-{store.count_history_rows()}",
+        )
+    )
+
+
+def test_checkpoint_is_injected_even_when_compaction_not_required(
+    tmp_path, monkeypatch
+):
+    """压完就关再重启：首轮不触发压缩，但摘要必须仍然注入。
+
+    回归的是这样一条链路：``init_history()`` 只加载覆盖边界之后的原文，
+    边界之前的内容只存在于摘要里。若摘要只在"本轮触发压缩"时才注入，
+    重启后历史变小、压缩不再触发，这段历史就对模型完全不可见。
+    """
+
+    store = _memory_store(tmp_path)
+    fake_llm = FakeLLM(_valid_checkpoint_json())
+    orchestrator = _orchestrator(tmp_path, fake_llm, store, monkeypatch)
+
+    for index in range(3):
+        store.append_history({"role": "user", "content": f"旧消息{index}"})
+        store.append_history({"role": "assistant", "content": f"旧回答{index}"})
+    saved = _save_checkpoint_covering_all(orchestrator, store)
+    assert saved.source_event_end == "rows-6"
+
+    # 重启：水位之后没有事件 → 恢复出来的历史里没有任何非 system 消息。
+    history = orchestrator.init_history()
+    assert [m for m in history if m.get("role") != "system"] == []
+
+    # 用大窗口保证本轮**不会**触发压缩，从而单独验证"无条件注入"。
+    monkeypatch.setenv("KLONET_AGENT_CONTEXT_WINDOW", "1000000")
+    history.append({"role": "user", "content": "重启后的新问题"})
+    orchestrator.chat_with_llm(history)
+
+    sent = fake_llm.received[-1]
+    assert any("【任务检查点】" in str(m.get("content")) for m in sent)
+    assert any("部署 Klonet 平台" in str(m.get("content")) for m in sent)
+
+
+def test_checkpoint_covering_nothing_is_not_injected(tmp_path, monkeypatch):
+    """水位为 rows-0 的 checkpoint 不注入：它没有覆盖任何事件。"""
+
+    store = _memory_store(tmp_path)
+    fake_llm = FakeLLM(_valid_checkpoint_json())
+    orchestrator = _orchestrator(tmp_path, fake_llm, store, monkeypatch)
+
+    orchestrator.checkpoint_store.save(
+        orchestrator.memory_compactor.compact(
+            [{"role": "user", "content": "旧对话"}],
+            user_id="u1",
+            project_id="p1",
+            mode="mentor",
+            source_event_start="rows-0",
+            source_event_end="rows-0",
+        )
+    )
+    assert orchestrator._latest_checkpoint_message() is None
+
+
+def test_second_compaction_watermark_does_not_overshoot(tmp_path, monkeypatch):
+    """同一会话内压缩两次：水位必须落在实际行数之内。
+
+    旧实现是 ``covered_before + 条数``，而 in-memory history 压缩后不截断，
+    第二次压缩会把已覆盖部分重复计入（12 条消息得出 rows-18），
+    重启后 ``load_history_after(超界)`` 返回空 → 原文全部丢失。
+    """
+
+    store = _memory_store(tmp_path)
+    fake_llm = FakeLLM(_valid_checkpoint_json())
+    orchestrator = _orchestrator(tmp_path, fake_llm, store, monkeypatch)
+
+    history = orchestrator.init_history()
+    for index in range(6):
+        orchestrator._emit_turn_message(
+            history, {"role": "user", "content": f"用户{index}"}
+        )
+        orchestrator._emit_turn_message(
+            history, {"role": "assistant", "content": f"回答{index}"}
+        )
+    assert store.count_history_rows() == 12
+
+    assert orchestrator._compact_context_once(history, 6) is not None
+    assert orchestrator.checkpoint_store.load_latest().source_event_end == "rows-6"
+
+    # 第二次压缩：前缀仍是整段历史，但只有 rows-6..rows-11 是新增的。
+    assert orchestrator._compact_context_once(history, 12) is not None
+    second = orchestrator.checkpoint_store.load_latest()
+    assert second.source_event_end == "rows-12"
+    assert second.source_event_start == "rows-6"
+
+    # 水位不得超出实际行数，否则重启后原文会被整段裁掉。
+    covered = int(second.source_event_end.split("-")[1])
+    assert covered <= store.count_history_rows()
