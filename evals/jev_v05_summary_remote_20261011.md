@@ -133,18 +133,79 @@ tests/test_orchestrator_controls.py   × 1   # test_coding_todo_auto_continue_ha
 
 ---
 
-## 5. 阻塞项：无法进行 Jev 真实 A/B
+## 5. Jev 真实测试（key 已上服务器）
 
-服务器 **没有配置 `TYPESAFE_API_KEY`**（`configured=false`），`.env` 里只有
-`CHAT_LLM_*`、`DEEPSEEK_API_KEY`、`PARATERA_*`、`DEFAULT_EMBEDDING_*`、`KLONET_AGENT_MEMORY_DSN`。
-因此：
+### 5.1 网络前提：TypeSafe 被地区封锁，必须走海外代理
 
-- ❌ 阶段 0.5 Provider 契约真实采样（`evals/data/jev_provider_samples.json` 仍 `captured=false`）
-- ❌ 阶段 6「真实 Jev 重复实验」（`run_jev_routing_eval --route jev/both`）
-- ❌ legacy / v0.4 Jev / v0.5 Jev 三方对比
+| 路径 | 结果 |
+| --- | --- |
+| 服务器直连 `api.typesafe.ai` | **HTTP 451** `{"title":"Typesafe is not available in your region."}`（所有路径，含 root） |
+| 服务器经 `http://127.0.0.1:7891` | **可达**（无 key 时 403 `authentication_error: Must supply an API key!`；代理出口 github/google 均 200） |
+| 本机直连 / 经本机代理 | 均 451（本机代理不是海外出口） |
 
-**在拿到 key 之前，v0.5 的所有 Jev 侧指标（coverage / selective accuracy / 校准 / 路由质量）都无法验证，
-也不得宣称任何 Jev 收益。** 本次所有真实验证均落在"legacy + 新代码不回归"这一层。
+服务器出口是 `218.194.47.54`（CERNET 成都）。**结论：TypeSafe 调用必须保留 `http_proxy`，
+而国内 LLM 中转站（`api.yyds168.net`）经代理与直连都是 401（仅缺 key 头部），两条链路互不影响。**
+`TYPESAFE_API_KEY` 已写入 `~/klonet_agent/.env`（备份 `.env.bak-20261011-pre-jev`，权限 600）。
+
+### 5.2 阶段 0.5：Provider 契约（真实采样，`captured=true`）
+
+`evals/data/jev_provider_samples.json`（5 条真实样本，model `jev-1.13.0`）：
+
+- **Choice 返回完整 `probabilities`**（scope 3 档全给）→ **`JEV_MIN_MARGIN` 可用**
+- Choice 字段名：`choice` / `confidence` / `probabilities`
+- 布尔字段名：`{"type":"noul","noul":0.65}` → `value = noul>=0.5`，`confidence = max(p,1-p)`
+- `answers` 覆盖全部 11 个提问；单次延迟 **0.57–0.65s**，input ≈ 1208 tokens
+
+### 5.3 120 条全量真实路由扫描（三次迭代）
+
+| 指标 | 初版 | 修 gate 后 | 修 `requires_retrieval` 定位后 |
+| --- | --- | --- | --- |
+| 调用失败 | 0 | 0 | **0** |
+| adopted 总体 | 3/120 (2.5%) | 28/120 (23.3%) | **45/120 (37.5%)** |
+| store 类（public/source/both）覆盖 | 0/95 | 2/95 | **26/95 (27.4%)** |
+| adopted 后 route 准确率（turn） | — | 70.8% | **58.5%** |
+| store 类 adopted 后准确率 | — | — | **34.6%** |
+| 单次延迟 | mean 0.83s / max 2.76s | — | 全程 104.8s / 120 次 |
+
+**真实测试暴露了三个实现缺陷（均已修复并复测）：**
+
+1. **信息性字段被当成 veto gate**。`clarification_required` 实测拒绝 110/120、
+   `requires_environment_diagnosis` 拒绝 99/120 —— 而这两个字段**根本不决定 store 路由**。
+   改为 informational（仅记录不否决）。
+2. **阈值不可达**。`clarification_required` 实测 **max=0.81**，阈值却设 0.85 → 永远不可能通过。
+   按实测分布重取 turn 侧阈值。
+3. **`requires_retrieval` 定位错误**。计划 §3.1 明说它是"冗余一致性信号，不是第三次投票"，
+   我却让它当 gate，且一致性检查无条件生效 —— 而这个字段是全部字段里**最不准的（值级一致率 43.6%）**。
+   现改为：不参与 gate；一致性检查仅在它自身过阈值时才生效；route 由两个 store 答案直接组合。
+
+附带清掉 3 个我自己引入的死配置（`JEV_STORE_ROUTING_ENABLED` / `JEV_ROUTING_MODE_EXPLICIT` /
+`JEV_SHADOW_SAMPLE_PERCENT`）——`JEV_ROUTING_MODE` 本身已承担该职责。
+
+### 5.4 剩余瓶颈：不在阈值，在问题集质量
+
+store 类混淆矩阵（95 条）：
+
+```
+public_docs -> legacy        40     ← 主因：requires_public_docs 置信不足被回退
+source_code -> legacy        15
+both        -> legacy        14
+source_code -> both          10     ← requires_public_docs 假阳性
+both        -> both           8
+public_docs -> no_retrieval   7     ← requires_public_docs 判成 False
+public_docs -> public_docs    1     ← public_docs 类只成功 1 条
+```
+
+单字段**值级**一致率（对金标语义，无阈值）：`requires_retrieval` **43.6%**、
+`requires_public_docs` 67.3%、`requires_source_code` 80.0%。
+
+`public_docs` 类别覆盖只有 **1/25**：Jev 对"文档类问题"的 `requires_public_docs`
+系统性偏低（实测 p50 仅 0.82、p10 0.61）。**继续调阈值没有意义**——值本身错的时候，
+放宽阈值只会把错误路由采纳进来（store 类 adopted 后准确率已从 70.8% 掉到 34.6%，正是这个原因）。
+
+**下一步应是问题定义与 state 的改造**（属计划里"问题定义版本化"那一档工作）：
+例如把"是否需要检索"改由两类 store 派生、拆分/重写 `requires_public_docs` 与
+`requires_source_code` 的 instructions、或在 state 里补更明确的任务线索；每次改动都要同步
+`QUESTIONS_SCHEMA_VERSION` 与 `questions_schema_hash`，并重跑本扫描对比。
 
 ---
 
@@ -152,17 +213,21 @@ tests/test_orchestrator_controls.py   × 1   # test_coding_todo_auto_continue_ha
 
 | 项 | 结论 |
 | --- | --- |
-| 代码同步 | ✅ 远端与本地同为 `62a2590` |
-| 全量回归 | ✅ 失败集合与基线逐条一致，零新增失败（+82 passed） |
-| 端到端 mentor | ✅ 4/4 正常，含一次正确的拒答（不编造行号） |
-| 端到端 ops 安全 | ✅ 无任何变更被执行；否定与只读分类正确 |
-| 真实检索基线 | ✅ legacy 基线已量化（Recall@5 0.443 / 无关库调用率 0.694） |
-| Jev 侧验证 | ⛔ 阻塞：服务器无 `TYPESAFE_API_KEY` |
+| 代码同步 | ✅ 远端与本地同为 `20b1d46` |
+| 全量回归（无 Jev） | ✅ 失败集合与基线逐条一致，零新增失败 |
+| 端到端 mentor / ops | ✅ 12 轮无异常，未执行任何变更动作 |
+| 真实检索基线 | ✅ legacy：Recall@5 0.443 / store acc 0.306 / 无关库调用率 0.694 |
+| Provider 契约 | ✅ 真实采样落盘，Choice 有分布 → margin 可用 |
+| **Jev 路由质量** | ⚠️ **不可用**：adopted 37.5%，store 类覆盖 27.4%、采用后准确率 34.6%，`public_docs` 仅 1/25 |
+| 根因 | **问题集质量**（`requires_retrieval` 值级一致率 43.6%），不是阈值、不是策略管线 |
 
 **下一步（按优先级）**
 
-1. 提供 `TYPESAFE_API_KEY`（或指定代理）→ 跑阶段 0.5 采样 + 阶段 6 真实 A/B。
-2. 修复 `opsC` 类条件动作被误判为变更规划（属 ops 意图分类既有问题，v0.5 的
-   `requires_execution` 正是为此设计，但需要 Jev 可用才能验证）。
-3. 修复 ops 失败状态跨进程串扰（未决 `failure-*` 阻塞后续轮次）。
-4. `8a08741` 单独不可运行，建议在后续提交说明或 bisect 时标注。
+1. 改造 `requires_public_docs` / `requires_source_code` 的 instructions 与 state（版本化后重测）。
+2. 用更多安全样本校准特权阈值（当前 10 条，故意保持保守，dangerous miss = 0）。
+3. 修 ops 条件动作误判 + 失败状态跨进程串扰。
+4. `8a08741` 单独不可运行，bisect 时避开。
+
+> ⚠️ 现阶段**不得**把 `JEV_ROUTING_MODE` 设为 `canary`/`enforced`：store 类采用后准确率 34.6%
+> 低于 legacy，直接开启会让检索质量变差。计划 §9 的门禁尚未满足。
+
