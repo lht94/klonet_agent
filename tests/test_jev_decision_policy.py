@@ -121,6 +121,7 @@ def test_informational_fields_never_veto_the_store_route():
     """
 
     from klonet_agent.llm.decision_policy import (
+        CONSISTENCY_ONLY_FIELDS,
         INFORMATIONAL_FIELDS,
         ROUTE_GATING_FIELDS,
     )
@@ -138,10 +139,54 @@ def test_informational_fields_never_veto_the_store_route():
     }
     assert "clarification_required" not in ROUTE_GATING_FIELDS
     assert "requires_environment_diagnosis" not in ROUTE_GATING_FIELDS
-    non_gating = [
+    non_gating = {
         item.name for item in decision.field_decisions if item.gating is False
-    ]
-    assert set(non_gating) == set(INFORMATIONAL_FIELDS)
+    }
+    assert non_gating == set(INFORMATIONAL_FIELDS) | set(CONSISTENCY_ONLY_FIELDS)
+
+
+def test_requires_retrieval_is_a_consistency_signal_not_a_gate():
+    """Plan §3.1: it is "不是第三次投票". Real sweep: 43.6% agreement."""
+
+    from klonet_agent.llm.decision_policy import (
+        CONSISTENCY_ONLY_FIELDS,
+        ROUTE_GATING_FIELDS,
+    )
+
+    assert "requires_retrieval" not in ROUTE_GATING_FIELDS
+    assert CONSISTENCY_ONLY_FIELDS == ("requires_retrieval",)
+
+    # Store answers say "source code", requires_retrieval is unsure (0.55).
+    answers = _turn_answers(
+        requires_retrieval=False,
+        requires_public_docs=False,
+        requires_source_code=True,
+    )
+    confidences = _confident(answers)
+    confidences["requires_retrieval"] = 0.55
+    unsure = _decide(_result(answers, confidences=confidences))
+    assert unsure.disposition == "constrain"
+    assert unsure.knowledge_route == "source_code"
+
+    # Same contradiction, but requires_retrieval is confident → conflict.
+    confident = _confident(answers)
+    confident["requires_retrieval"] = 0.95
+    decided = _decide(_result(answers, confidences=confident))
+    assert decided.disposition == "fallback"
+    assert "retrieval_store_conflict" in decided.reason_codes
+
+
+def test_rejected_fields_are_not_handed_downstream_as_constraints():
+    answers = _turn_answers(requires_public_docs=True, requires_source_code=False)
+    confidences = _confident(answers)
+    confidences["requires_retrieval"] = 0.30
+    confidences["clarification_required"] = 0.20
+    decision = _decide(_result(answers, confidences=confidences))
+
+    assert decision.disposition == "constrain"
+    assert "requires_retrieval" not in decision.accepted_answers
+    assert "clarification_required" not in decision.accepted_answers
+    assert decision.accepted_answers["requires_public_docs"] is True
 
 
 def test_choice_margin_too_small_rejects_the_field():

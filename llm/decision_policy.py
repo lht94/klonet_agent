@@ -96,9 +96,14 @@ _SCOPE_OPTIONS = ("klonet", "general", "mixed")
 # *informational*: their low confidence must never block store routing — the
 # 2026-10-11 real sweep showed them rejecting 110/120 and 99/120 cases while
 # changing nothing about which store is right.
+#
+# ``requires_retrieval`` is deliberately **not** here either: plan §3.1 defines
+# it as a redundant consistency signal ("不是第三次投票"), not a third vote.
+# The real sweep confirmed this — it is the least accurate field (43.6% value
+# agreement) yet was gating everything.  It still triggers a conflict fallback,
+# but only when its own confidence clears its threshold.
 ROUTE_GATING_FIELDS = (
     "scope",
-    "requires_retrieval",
     "requires_public_docs",
     "requires_source_code",
 )
@@ -106,6 +111,7 @@ INFORMATIONAL_FIELDS = (
     "requires_environment_diagnosis",
     "clarification_required",
 )
+CONSISTENCY_ONLY_FIELDS = ("requires_retrieval",)
 
 # Deterministic overrides (plan §6.1 rules 7–8).  Kept deliberately narrow:
 # they can only *veto* a Jev answer, never create one.
@@ -267,14 +273,32 @@ def decide_knowledge_route(
             margin_available=margin_available,
         )
 
-    accepted = {name: answers[name] for name in required}
-    requires_retrieval = bool(accepted["requires_retrieval"])
-    public = bool(accepted["requires_public_docs"])
-    source = bool(accepted["requires_source_code"])
-    route = _compose_route(requires_retrieval, public, source)
+    answers_all = {name: answers[name] for name in required}
+    requires_retrieval = bool(answers_all["requires_retrieval"])
+    public = bool(answers_all["requires_public_docs"])
+    source = bool(answers_all["requires_source_code"])
+    # The store answers are authoritative for the route; ``requires_retrieval``
+    # is only a cross-check (plan §3.1).
+    route = _compose_route(public, source)
 
+    # Only fields that cleared their own threshold are handed downstream as
+    # constraints — a rejected field must not be injected into the LLM prompt.
+    trusted = {item.name: item.value for item in decisions if item.accepted}
+
+    # The redundant signal is only trusted when it clears its own threshold;
+    # otherwise an inaccurate ``requires_retrieval`` would veto good store
+    # answers via the consistency check (observed on 2026-10-11).
+    trust_retrieval = next(
+        (
+            item.accepted
+            for item in decisions
+            if item.name == "requires_retrieval"
+        ),
+        False,
+    )
     conflict = _consistency_conflict(
-        accepted["scope"], requires_retrieval, public, source,
+        answers_all["scope"], requires_retrieval, public, source,
+        trust_retrieval=trust_retrieval,
     )
     if conflict:
         return _fallback(
@@ -293,14 +317,14 @@ def decide_knowledge_route(
 
     reason_codes = (REASON_ACCEPTED,)
     disposition = "accept" if (
-        route == "no_retrieval" and accepted["scope"] == "general"
+        route == "no_retrieval" and answers_all["scope"] == "general"
     ) else "constrain"
     if mode == "shadow":
         reason_codes = reason_codes + (REASON_SHADOW_ONLY,)
     return JevRouteDecision(
         disposition=disposition,
         knowledge_route=route,
-        accepted_answers=accepted,
+        accepted_answers=trusted,
         field_decisions=tuple(decisions),
         reason_codes=reason_codes,
         margin_available=margin_available,
@@ -482,9 +506,9 @@ def choice_margin(result: Any, name: str) -> Optional[float]:
     return values[0] - values[1]
 
 
-def _compose_route(requires_retrieval: bool, public: bool, source: bool) -> str:
-    if not requires_retrieval:
-        return "no_retrieval"
+def _compose_route(public: bool, source: bool) -> str:
+    """Route from the two store answers alone (plan §3.1 combination table)."""
+
     if public and source:
         return "both"
     if public:
@@ -499,11 +523,14 @@ def _consistency_conflict(
     requires_retrieval: bool,
     public: bool,
     source: bool,
+    *,
+    trust_retrieval: bool = True,
 ) -> Optional[str]:
-    if not requires_retrieval and (public or source):
-        return REASON_RETRIEVAL_STORE_CONFLICT
-    if requires_retrieval and not (public or source):
-        return REASON_RETRIEVAL_STORE_CONFLICT
+    if trust_retrieval:
+        if not requires_retrieval and (public or source):
+            return REASON_RETRIEVAL_STORE_CONFLICT
+        if requires_retrieval and not (public or source):
+            return REASON_RETRIEVAL_STORE_CONFLICT
     if str(scope) == "general" and (public or source):
         return REASON_GENERAL_SCOPE_CONFLICT
     return None
