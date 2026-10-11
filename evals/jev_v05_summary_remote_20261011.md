@@ -207,6 +207,47 @@ public_docs -> public_docs    1     ← public_docs 类只成功 1 条
 `requires_source_code` 的 instructions、或在 state 里补更明确的任务线索；每次改动都要同步
 `QUESTIONS_SCHEMA_VERSION` 与 `questions_schema_hash`，并重跑本扫描对比。
 
+### 5.5 四臂对照实验：到底是"问题描述"还是"上下文背景"在起作用
+
+只看 **70 条标签可靠的 store 用例**（public 25 / source 25 / both 20），
+4 臂 × 70 = **280 次真实调用，231s**。各臂只改一个变量：
+
+| 臂 | 变量 | public 一致率 | source 一致率 | **route 命中率** |
+| --- | --- | ---: | ---: | ---: |
+| A | 现状（基线） | 68.6% | 75.7% | **45.7%** |
+| **B** | **只在 state 里补「两个 store 各是什么」的背景** | **92.9%** | 80.0% | **75.7%** |
+| C | 只重写问题描述（instructions） | 65.7% | 90.0% | 55.7% |
+| D | B + C 结合 | 81.4% | 87.1% | 71.4% |
+
+分路由命中率：
+
+| 臂 | public_docs | source_code | both |
+| --- | ---: | ---: | ---: |
+| A | 48% | **8%** | 90% |
+| B | 68% | **84%** | 75% |
+| C | **96%** | **4%** | 70% |
+| D | 100% | 48% | 65% |
+
+**结论（1 例 ≈ 1.4 个百分点，B 与 D 差 3 例，在噪声范围内）：**
+
+1. **上下文背景是压倒性的最大杠杆**：仅补一段"public_docs / source_code 各装什么"的说明，
+   route 命中率 **45.7% → 75.7%（+30 点）**。其中 `source_code` 从 **8% → 84%**。
+2. **只重写问题描述反而更差（55.7%）且引入偏差**：改写后的 public_docs 指令
+   （"...only when no Klonet documentation would be relevant"）让 public 过度触发，
+   `public_docs` 升到 96% 但 `source_code` 塌到 **4%** —— 把 source-only 问题一并答成 public。
+3. **两个杠杆会互相抵消**：D 结合后 71.4%，略低于 B 单独的 75.7%。
+4. **`both` 在基线下已经 90%**，加背景后反降到 75% —— 存在"过度拆分"的副作用。
+
+**根因判断**：`source_code` 在基线下只有 8%，不是因为问题写得差，而是
+**字段名与所指对象之间存在语义鸿沟**——模型不知道 "source_code" 指的是
+Klonet/VEMU 平台源码（`Function_layer/`、`mains/`、`webserver/`…），
+也不知道它**不是** agent 自己的代码、**不是**描述平台的文档。
+补上这段背景后立刻到 84%。所以这一步是**领域接地（grounding）**，不是文字润色。
+
+**建议的落地（尚未实施，待决策）**：采用 B —— 在 `build_turn_state()` 的 state 里
+增加 `knowledge_stores` 字段（描述两个库的实际内容与边界），
+`QUESTIONS_SCHEMA_VERSION` 递增，`questions_schema_hash` 记录到 trace，然后重跑本扫描。
+
 ---
 
 ## 6. 结论
@@ -220,10 +261,12 @@ public_docs -> public_docs    1     ← public_docs 类只成功 1 条
 | Provider 契约 | ✅ 真实采样落盘，Choice 有分布 → margin 可用 |
 | **Jev 路由质量** | ⚠️ **不可用**：adopted 37.5%，store 类覆盖 27.4%、采用后准确率 34.6%，`public_docs` 仅 1/25 |
 | 根因 | **问题集质量**（`requires_retrieval` 值级一致率 43.6%），不是阈值、不是策略管线 |
+| 可修复性 | ✅ **已验证**：只在 state 补 store 背景，route 命中率 45.7% → **75.7%**（§5.5） |
 
 **下一步（按优先级）**
 
-1. 改造 `requires_public_docs` / `requires_source_code` 的 instructions 与 state（版本化后重测）。
+1. **落地 §5.5 的 B 臂**（state 补 `knowledge_stores` 背景）→ 重跑扫描，预计 store 类命中率翻倍；
+   同步 `QUESTIONS_SCHEMA_VERSION` + `questions_schema_hash`。
 2. 用更多安全样本校准特权阈值（当前 10 条，故意保持保守，dangerous miss = 0）。
 3. 修 ops 条件动作误判 + 失败状态跨进程串扰。
 4. `8a08741` 单独不可运行，bisect 时避开。
