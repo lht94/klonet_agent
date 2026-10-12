@@ -1,86 +1,371 @@
 # Klonet Agent
-**Klonet 专用教学协作 Agent**
 
-开发或让 Coding Agent 修改本项目之前，请先阅读
-[`docs/DEVELOPMENT_GUIDELINES.md`](docs/DEVELOPMENT_GUIDELINES.md)。该文档是当前架构收敛、状态边界、证据合同、Shell 安全和测试验收的统一开发规范；带日期的历史设计稿不能覆盖它与当前代码/测试合同。
+> 面向 Klonet 教学、开发与运维场景的多角色智能协作 Agent。
 
-## 上下文管理（ContextCompiler）
+[项目简介](#项目简介) · [核心能力](#核心能力) · [系统架构](#系统架构) · [快速开始](#快速开始) · [测试与评估](#测试与评估) · [技术演进](#技术实现与演进)
 
-聊天模型调用前统一经过 `context/` 包的上下文编译器，取代
-"history 无限增长 + 超限后自然语言总结"的旧模式：
+Klonet Agent 不是一个换了提示词的通用聊天机器人。它围绕 Klonet 项目的知识学习、代码开发、运行维护和过程验收，提供 **Mentor、Coding、Ops** 三种职责明确的工作模式，并将 RAG、长期记忆、项目日志、上下文治理、安全工具和评测体系整合到同一套轻量 Agent Runtime 中。
+
+项目当前以交互式 CLI 运行，适合作为课程设计、Agent 工程实践和面向垂直领域的智能协作系统原型。
+
+## 项目简介
+
+通用 Coding Agent 能阅读和修改代码，但通常不了解 Klonet 的领域知识、开发规范、部署方式和课程验收要求。每次会话都从零理解项目，也很难持续记录不同用户的开发进度与历史问题。
+
+Klonet Agent 针对这些问题做了四层增强：
+
+- **领域化**：将 Klonet 架构、源码、操作手册和历史故障整理为可检索知识库。
+- **角色化**：不同 Profile 使用不同提示词、工具权限和默认工作流，避免答疑、开发和运维相互越权。
+- **过程化**：用项目日志、任务计划、测试结果和验收差异记录完整开发过程。
+- **工程化**：用上下文预算、结构化证据、运行治理、trace 和 eval 控制 Agent 的成本、风险与可验证性。
+
+### 三种工作模式
+
+| 模式 | 定位 | 典型任务 | 权限边界 |
+| --- | --- | --- | --- |
+| `mentor` | Klonet 数字导师 | 知识问答、源码解释、故障分析、项目进度理解 | 默认只读，不直接修改业务代码 |
+| `coding` | 编程协作助手 | 任务规划、代码修改、测试、diff、项目日志与轻量 review | 仅在受控 workspace 内读写和执行测试 |
+| `ops` | 运维诊断 Agent | 环境盘点、运行态检查、日志定位、变更计划与验收 | 只读证据优先；环境变更必须经过结构化计划、审批与验证 |
+
+三个模式共享会话、知识、记忆、工具和追踪基础设施，但通过 [`AgentProfile`](agents/profile.py) 隔离行为与能力。
+
+## 核心能力
+
+### 1. 多角色 Agent Runtime
+
+- 使用统一 Orchestrator 驱动模型、工具调用、任务状态和结果整理。
+- Prompt 按核心身份、安全规则、模式规则、代码风格和任务规则分层组合。
+- `user_id + project_id + mode` 构成会话边界，支持不同用户与项目独立运行。
+
+### 2. Klonet 混合 RAG
+
+- 检索对象覆盖领域文档、操作手册、源码索引、项目日志和历史经验。
+- 支持关键词、BM25 与向量召回，并通过 query planning、collection routing 和 rerank 组织多阶段检索。
+- 将公共领域知识与用户私有项目资料分层，减少跨项目信息混用。
+
+### 3. 上下文预算与任务恢复
+
+- 每次模型调用前由 `ContextCompiler` 按模型窗口、输出预留和安全余量编译上下文。
+- 以完整对话回合和工具交换为裁剪单位，避免孤立的 tool call / tool result。
+- 超过软阈值后生成结构化 `TaskCheckpoint`；超过硬阈值时在本地拒绝发送。
+- 编译结果记录各区域 token 占用，便于定位上下文膨胀。
+
+### 4. 长期记忆与项目日志
+
+- 支持 Markdown / JSONL 本地记忆，以及 PostgreSQL + pgvector 记忆仓库。
+- 记忆写入经过候选提取、写入策略、版本决策、幂等落库和审计链路。
+- 每个用户、每个项目拥有独立 Markdown 日志：`journals/{user_id}/{project_id}.md`。
+- 日志持续记录目标、计划、执行过程、问题、测试结果、验收差异和下一步。
+
+### 5. 安全工具与运行治理
+
+- 文件工具受 workspace 边界约束，并对危险命令和敏感路径进行拦截。
+- Ops 模式以运行态证据为事实来源，将 Discovery、Planning、Binding、Execution、Checking 和 Verification 分离。
+- 高风险操作不能只靠自然语言确认；审批与计划 ID、内容哈希和持久化状态绑定。
+- 允许注册 Action 和受控 Shell 兜底，但都必须经过统一合同、安全校验与审计边界。
+
+### 6. 可观测性与评估
+
+- trace 记录模型调用、token、耗时、工具执行状态和结果摘要。
+- `evals/` 提供 Mentor、Coding、错误处理、RAG、上下文管理、记忆和 Ops 能力评测。
+- 专项报告保留 case、预算、证据与回归结果，便于对比不同策略。
+
+## 系统架构
+
+```mermaid
+flowchart TD
+    U[用户输入] --> CLI[CLI / AgentSession]
+    CLI --> P{Agent Profile}
+    P -->|Mentor| M[Mentor 工作流]
+    P -->|Coding| C[Coding 工作流]
+    P -->|Ops| O[Ops 工作流]
+    M --> OR[Orchestrator]
+    C --> OR
+    O --> OR
+    OR --> CC[ContextCompiler]
+    OR --> RAG[Hybrid RAG]
+    OR --> MEM[Memory]
+    OR --> TOOL[Tool Registry]
+    OR --> JOURNAL[Project Journal]
+    OR --> GOV[Runtime Governance]
+    CC --> LLM[LLM Provider]
+    RAG --> CC
+    MEM --> CC
+    TOOL --> OR
+    JOURNAL --> CC
+    GOV --> TOOL
+    OR --> TRACE[Trace / Eval]
+    LLM --> OR
+```
+
+核心调用关系：
 
 ```text
-原始事件持续写入 history.jsonl（不可变）
-    → 每次调用前按模型预算编译（context/budget.py + compiler.py）
-    → 超过软阈值时生成结构化 TaskCheckpoint（memory/compactor.py）
-    → checkpoint + 预算内最近完整回合继续任务
-    → 超过硬阈值时本地拒绝发送，不再请求失败后补救
+用户输入
+  → 选择 Profile 与工具权限
+  → 检索领域知识 / 项目证据 / 长期记忆
+  → ContextCompiler 按预算组装上下文
+  → 模型判断、工具循环与结果验证
+  → 写入 history、journal、memory 与 trace
 ```
 
-- **动态预算**：按模型解析窗口/输出预留/安全余量（`ModelContextProfile`）。
-  已知模型包括 `gemini-3.7-flash`（1M）、`glm-5.2`/`glm-5.3`/`glm-5.3-flash`、
-  `deepseek-v4-flash`/`deepseek-v4.1-flash`/`deepseek-v4-pro`、`qwen3.8-flash`
-  （128K）；未知模型回退 65536 保守默认，可用 `KLONET_AGENT_CONTEXT_WINDOW`、
-  `KLONET_AGENT_MAX_OUTPUT_TOKENS`、`KLONET_AGENT_SAFETY_MARGIN_TOKENS`、
-  `KLONET_AGENT_SOFT_LIMIT_RATIO` 覆盖。
-- **完整消息组**：裁剪单位是语义完整的回合/工具交换，而不是"最近 20 条"，
-  tool call 与 tool result 整组保留或整组淘汰。
-- **结构化 TaskCheckpoint**：压缩结果为固定 schema（目标/约束/已完成/
-  失败尝试/下一步等），版本化原子写入 `memory/checkpoints/`，损坏自动
-  回退上一版本；重启后从 checkpoint 覆盖范围（`rows-N`）之后的事件恢复。
-- **可审计**：每次编译的估算 token、各区域占用（system/checkpoint/evidence/
-  recent_history/tools）、淘汰组数写入 `trace.jsonl`（event=`context_compile`）。
+## 快速开始
 
-常用配置：
+### 环境要求
+
+- Python 3.10+
+- 一个支持 OpenAI API 格式的聊天模型服务
+- 可选：PostgreSQL + pgvector，用于数据库记忆后端
+- 可选：Tesseract 与 Poppler，用于 OCR 和 PDF 页面处理
+
+### 1. 获取代码并创建环境
 
 ```bash
-KLONET_AGENT_DISABLE_CONTEXT_COMPILER=1   # 一键回退旧压缩路径
-KLONET_AGENT_CONTEXT_WINDOW=131072        # 覆盖窗口
-KLONET_AGENT_REASONING_EFFORT=off         # 不发送 reasoning_effort（部分中转站 Gemini 上游会 500）
-KLONET_DEBUG_DUMP_REQUEST=/tmp/req.json   # 导出最终请求体，便于离线重放定位供应商问题
+git clone https://github.com/lht94/klonet_agent.git
+cd klonet_agent
+python -m venv .venv
 ```
 
-完整设计、部署记录与验证数据见
-[`doc/16_context_management_upgrade.md`](doc/16_context_management_upgrade.md)。
+激活虚拟环境：
 
-## 聊天模型供应商
+```bash
+# Linux / macOS
+source .venv/bin/activate
 
-聊天模型统一通过 `llm.LLMClient` 调用。默认按北京时间选择供应商：
-
-- 每日 21:00（含）至次日 09:00（不含）：并行科技 `GLM-5.2`；
-- 其余时段：OpenAI 兼容接口 `https://api.yyds168.net/v1` 的 `gemini-3.7-flash`。
-
-生产部署（vemu25_test3）已把两个分支统一指向中转站，绕开官方额度限制：
-
-```dotenv
-CHAT_LLM_BASE_URL=https://api.yyds168.net/v1
-CHAT_LLM_MODEL=deepseek-v4-flash
-PARATERA_BASE_URL=https://api.yyds168.net/v1
-PARATERA_MODEL=deepseek-v4-flash
-PARATERA_API_KEY_1=<复用 CHAT_LLM_API_KEY>
-KLONET_AGENT_REASONING_EFFORT=off
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
 ```
 
-两个分支保持一致后，无论夜间窗口是否命中，`ProviderRouter.resolve()` 只会解析出
-一种 `(model, base_url)` 组合。中转站可用的国产模型实测（stream + tools 均兼容）：
-`deepseek-v4-flash`（约 5s，当前选用）、`glm-5.3-flash`（约 11s）、
-`qwen3.8-flash`（约 19s）。
+安装依赖：
 
-本地 `.env` 可配置：
+```bash
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+### 2. 配置模型
+
+在项目根目录创建 `.env`：
 
 ```dotenv
-CHAT_LLM_API_KEY=...
-CHAT_LLM_BASE_URL=https://api.yyds168.net/v1
-CHAT_LLM_MODEL=gemini-3.7-flash
+CHAT_LLM_API_KEY=<your-api-key>
+CHAT_LLM_BASE_URL=<your-openai-compatible-endpoint>
+CHAT_LLM_MODEL=<your-model-name>
+```
+
+更多供应商、超时、重试、上下文窗口与记忆配置见 [`config.py`](config.py)。不要提交真实密钥。
+
+### 3. 启动 Agent
+
+```bash
+# 知识问答与学习辅导
+python -m klonet_agent.agent --mode mentor --user-id demo --project-id klonet-demo
+
+# 代码开发与测试协作
+python -m klonet_agent.agent --mode coding --user-id demo --project-id klonet-demo
+
+# Klonet 环境诊断与受控运维
+python -m klonet_agent.agent --mode ops --user-id demo --project-id klonet-demo
+```
+
+查看完整参数：
+
+```bash
+python -m klonet_agent.agent --help
+```
+
+### 4. 运行测试
+
+```bash
+python -m pytest -q
+```
+
+Ops 相关测试和功能面向 Linux/Klonet 运行环境，建议在 Ubuntu 上进行完整验证。
+
+## 使用示例
+
+### Mentor：理解系统
+
+```text
+Klonet 的 master、worker 和 celery 分别负责什么？
+请结合知识库解释拓扑部署失败时的排查顺序，并标注证据来源。
+```
+
+### Coding：完成开发任务
+
+```text
+读取当前项目日志，为后端接口增加参数校验。
+先查找相似实现，再做最小修改、运行相关测试并展示 diff。
+```
+
+### Ops：诊断运行环境
+
+```text
+检查当前 Klonet 平台的进程、端口、Screen 会话和最近错误日志。
+先只读诊断，不要修改环境；给出证据、根因和下一步建议。
+```
+
+## 项目结构
+
+```text
+klonet_agent/
+├── agent.py              # CLI 入口
+├── orchestrator.py       # 主编排与工具循环
+├── session.py            # 用户、项目、模式与任务状态
+├── prompts.py            # 分层 Prompt
+├── agents/               # Mentor / Coding / Ops Profile
+├── context/              # token 预算、消息分组与上下文编译
+├── knowledge/            # 文档/源码索引与混合 RAG
+├── memory/               # checkpoint、长期记忆与 PostgreSQL 后端
+├── journal/              # 项目 Markdown 状态机
+├── workspace/            # 工作区管理与沙箱
+├── tools/                # 文件、源码、环境、终端与 Web 工具
+├── ops/                  # 运维证据、计划、审批和执行链
+├── runtime/              # Agent 运行治理
+├── tracing/              # trace 与 Jev 记录
+├── evals/                # 评测集和评测报告
+├── tests/                # 自动化测试
+└── docs/ / doc/          # 开发规范、设计与运维文档
+```
+
+## 技术栈
+
+| 领域 | 方案 |
+| --- | --- |
+| Agent Runtime | Python、自研轻量工具循环、Profile 隔离 |
+| 模型接入 | OpenAI-compatible API、多供应商路由 |
+| 检索 | JSONL 索引、jieba、BM25、向量召回、rerank |
+| 上下文 | 模型预算、完整消息组、结构化 checkpoint |
+| 记忆 | Markdown / JSONL、PostgreSQL、pgvector |
+| 文档处理 | python-docx、python-pptx、pdfplumber、pypdf、OCR |
+| 工程保障 | pytest、trace、专项 eval、Git diff |
+
+## 测试与评估
+
+项目同时使用单元测试、离线 case 和专项评测：
+
+- [`evals/summary.md`](evals/summary.md)：Mentor、Coding 与错误处理基础样例。
+- [`evals/context_management_summary.md`](evals/context_management_summary.md)：上下文预算、压缩、硬拒绝和重启恢复评测。
+- [`evals/memory_summary.md`](evals/memory_summary.md)：记忆写入、召回与生命周期评测。
+- [`evals/retrieval_summary.md`](evals/retrieval_summary.md)：知识检索效果汇总。
+- [`evals/agent_real_user_capability/README.md`](evals/agent_real_user_capability/README.md)：真实用户能力验证入口。
+
+上下文管理专项评测覆盖 8 个场景，包括长工具结果、多工具调用、中断工具链、长输入、Ops 对话、硬溢出和 checkpoint 重启恢复；完整数据以仓库中的评测报告为准。
+
+## 文档导航
+
+| 文档 | 内容 |
+| --- | --- |
+| [`docs/DEVELOPMENT_GUIDELINES.md`](docs/DEVELOPMENT_GUIDELINES.md) | 当前权威开发规范与架构边界 |
+| [`doc/00_project_overview.md`](doc/00_project_overview.md) | 项目背景、目标与差异化价值 |
+| [`doc/02_architecture_design.md`](doc/02_architecture_design.md) | 分层架构与 Profile 设计 |
+| [`doc/16_context_management_upgrade.md`](doc/16_context_management_upgrade.md) | ContextCompiler 设计与验证 |
+| [`doc/17_memory_lifecycle_operations.md`](doc/17_memory_lifecycle_operations.md) | 记忆生命周期运维说明 |
+| [`doc/18_runtime_governance_upgrade.md`](doc/18_runtime_governance_upgrade.md) | Agent 运行治理升级 |
+| [`docs/ops/klonet-agent-op-install.md`](docs/ops/klonet-agent-op-install.md) | Ubuntu 专用账户与 Ops 部署 |
+| [`knowledge/klonet/README.md`](knowledge/klonet/README.md) | Klonet 领域知识库入口 |
+
+开发或让 Coding Agent 修改本项目之前，请先阅读 [`docs/DEVELOPMENT_GUIDELINES.md`](docs/DEVELOPMENT_GUIDELINES.md)。当前代码、结构化合同和自动化测试的优先级高于带日期的历史设计稿。
+
+## 技术实现与演进
+
+以下内容保留项目从教学协作原型到完整 Agent 工程的主要演进路径。首次阅读可跳过。
+
+<details>
+<summary><strong>上下文管理：从无限 history 到 ContextCompiler</strong></summary>
+
+```text
+history.jsonl 持续记录不可变事件
+  → 按模型预算编译 system / checkpoint / evidence / history / tools
+  → 超过软阈值时生成结构化 TaskCheckpoint
+  → checkpoint 与预算内最近完整回合继续任务
+  → 必需区超过硬阈值时本地拒绝发送
+```
+
+当前实现以完整消息组为裁剪单位；checkpoint 支持版本化原子写入与损坏回退；`context_compile` trace 会记录分区 token 和预算决策。
+
+```dotenv
+KLONET_AGENT_DISABLE_CONTEXT_COMPILER=1
+KLONET_AGENT_CONTEXT_WINDOW=131072
+KLONET_AGENT_MAX_OUTPUT_TOKENS=8192
+KLONET_AGENT_SAFETY_MARGIN_TOKENS=4096
+KLONET_AGENT_SOFT_LIMIT_RATIO=0.7
+```
+
+详见 [`doc/16_context_management_upgrade.md`](doc/16_context_management_upgrade.md)。
+
+</details>
+
+<details>
+<summary><strong>知识检索：从本地 JSONL 到多阶段混合 RAG</strong></summary>
+
+```text
+检索必要性判断
+  → Query Planning / Expansion
+  → Collection Routing
+  → 关键词 + BM25 + 向量召回
+  → Rerank / 证据组织
+  → 按上下文预算注入
+```
+
+知识来源包括 Klonet 架构、开发规范、部署流程、常见故障、源码索引、项目日志和历史案例。`knowledge/klonet/` 保存公共领域知识，用户 workspace、journal 和 memory 保持独立边界。
+
+</details>
+
+<details>
+<summary><strong>记忆系统：从 Markdown 记录到版本化 PostgreSQL</strong></summary>
+
+本地模式仍可使用 `history.jsonl`、`USER.md`、每日记忆和 `MEMORY.md`。数据库模式将长期记忆拆成四层：
+
+| 层 | 主要模块 | 职责 |
+| --- | --- | --- |
+| 领域 | `memory/domain.py` | 定义合法记忆、类型、作用域和 subject |
+| 契约 | `memory/repository.py` | 定义仓库能力和 embedding 合同 |
+| 存储 | `memory/postgres.py`、`migrations/` | 连接池、租户事务、RLS 与不可变记录 |
+| 决策 | `memory/versioning.py` | ADD / UPDATE / SUPERSEDE / NOOP / REJECT |
+
+写入链路由候选提取、写入策略、版本决策和幂等 pipeline 组成；召回链路包含向量查询、rerank 回退、冲突标注和 token 预算构包。Embedding 通过 outbox worker 异步补算。
+
+详见 [`doc/15_memory_postgres_deployment.md`](doc/15_memory_postgres_deployment.md) 与 [`doc/17_memory_lifecycle_operations.md`](doc/17_memory_lifecycle_operations.md)。
+
+</details>
+
+<details>
+<summary><strong>Ops：从命令工具到证据驱动的运行治理</strong></summary>
+
+```text
+意图候选
+  → Coordinator 核对持久化状态
+  → Discovery 收集只读证据
+  → Evidence Synthesis
+  → Planner 描述语义变更
+  → Binder 绑定注册 Action / ShellArtifact
+  → 人工审批
+  → Executor 单次执行
+  → Checker 验证后置条件
+  → Verifier 判断目标是否达成
+```
+
+运行态证据高于历史对话、RAG 和静态文档。Planner 不负责选择命令，Executor 不负责判断目标完成，只有 Verifier 可以产生目标级结果。未注册的长尾能力仍须经过风险策略、冻结合同、人工确认与审计。
+
+</details>
+
+<details>
+<summary><strong>模型供应商与运行配置</strong></summary>
+
+聊天模型统一通过 `llm.LLMClient` 和 `ProviderRouter` 调用，支持 OpenAI-compatible endpoint、按时间路由、备用密钥、超时和限流退避。Embedding 与 rerank 使用独立配置。
+
+```dotenv
+CHAT_LLM_API_KEY=<your-primary-api-key>
+CHAT_LLM_BASE_URL=<your-primary-endpoint>
+CHAT_LLM_MODEL=<your-primary-model>
 CHAT_LLM_MIN_TIMEOUT_SECONDS=90
-PARATERA_API_KEY_1=...
-PARATERA_API_KEY_2=...
-PARATERA_BASE_URL=https://llmapi.paratera.com/v1
-PARATERA_MODEL=GLM-5.2
+
+PARATERA_API_KEY_1=<your-secondary-api-key>
+PARATERA_BASE_URL=<your-secondary-endpoint>
+PARATERA_MODEL=<your-secondary-model>
 PARATERA_MIN_TIMEOUT_SECONDS=120
-PARATERA_RATE_LIMIT_MAX_ATTEMPTS=14
-PARATERA_RATE_LIMIT_BACKOFF_SECONDS=1
-PARATERA_RATE_LIMIT_MAX_BACKOFF_SECONDS=8
+
 DEFAULT_LLM_TIMEOUT_SECONDS=60
 DEFAULT_LLM_MAX_RETRIES=0
 LLM_NIGHT_TIMEZONE=Asia/Shanghai
@@ -88,707 +373,26 @@ LLM_NIGHT_START_HOUR=21
 LLM_NIGHT_END_HOUR=9
 ```
 
-两个并行科技密钥只在认证、额度或限流错误时顺序切换；业务合同错误不会触发换钥重试。Embedding 与 Rerank 使用各自专用模型，不经过聊天模型路由。
+密钥轮换只用于认证、额度或限流类供应商错误，业务合同错误不会通过换钥掩盖。
 
-## 更新：Klonet 专用教学协作 Agent 第一版
-这一版开始从通用的 `agent_v7` 迁移成 `klonet_agent`，目标也从“个人对话 agent”变成“面向 Klonet 的教学协作 agent”。
+</details>
 
-核心思路是：**两个 agent 共用同一个底层框架，但是通过 profile 区分行为**。
+## 当前状态与限制
 
-- Mentor Agent：负责 Klonet 知识问答、源码解释、报错排查和项目进度理解
-- Coding Agent：负责 Klonet 项目开发、代码修改、测试验证、diff 检查和项目日志记录
+- 当前主要入口是交互式 CLI，尚未提供完整 Web UI 或公共在线 Demo。
+- 高权限 Ops 执行依赖 Ubuntu、专用系统账户、受控 helper 和明确的部署配置。
+- PostgreSQL 记忆、OCR、向量模型等高级能力需要额外服务或系统依赖。
+- 仓库包含持续演进的实验与评测文档；历史设计稿应以当前代码和开发规范为准。
 
-### 这一版主要做了什么
-1. 修复迁移问题
-   - 把代码里的 `agent_v7` 引用统一迁移成 `klonet_agent`
-   - 新增命令行参数，可以通过 `--mode mentor` 或 `--mode coding` 选择 agent 模式
-   - 增加最小导入测试，保证迁移后核心模块可以正常 import
+## 参与开发
 
-2. 新增 Agent Profile 机制
-   - 新增 `agents/profile.py`
-   - 用 `AgentProfile` 描述不同 agent 的行为差异
-   - Mentor 和 Coding 共用 `orchestrator`、`tools`、`memory`、`knowledge` 等底层模块
-   - 不同 profile 只开放不同工具，避免 Mentor 模式误改代码
+欢迎通过 Issue 或 Pull Request 讨论问题与改进方向。提交代码前请：
 
-3. 重构系统提示词
-   - 把原来单一的 `SYSTEM_PROMPT` 拆成多层 prompt
-   - 清理旧个人 Agent 口吻，统一为 Klonet 教学协作 Agent 表达
-   - 现在包含：
-     - `CORE_SYSTEM_PROMPT`：核心身份与通用规则
-     - `SAFETY_PROMPT`：安全与权限规则
-     - `MENTOR_PROMPT`：导师模式规则
-     - `CODING_PROMPT`：开发模式规则
-     - `STYLE_PROMPT`：代码与注释风格规则
-     - `TASK_PROMPT`：任务规划规则
-   - 这样后续改某一种规则时，不需要改一整坨系统提示词
+1. 阅读 [`docs/DEVELOPMENT_GUIDELINES.md`](docs/DEVELOPMENT_GUIDELINES.md)。
+2. 保持模块职责和现有调用链收敛，不为单一场景增加平行工作流。
+3. 为行为变更补充测试，并运行相关测试集。
+4. 不提交 `.env`、API Key、用户记忆、运行 trace 或真实项目数据。
 
-4. 完善会话隔离
-   - `AgentSession` 现在保存 `user_id`、`project_id`、`mode`、`todos`、`workspace_path`、`journal_path`
-   - 原来的全局 `TODOS` 已经迁移到 session 内部
-   - 后续多用户部署时，不同同学的项目进度不会混在一起
+## 许可证
 
-5. 实现项目 Markdown 状态机
-   - 新增 `journal/project_journal.py`
-   - 每个用户、每个项目对应一个 md 文件：
-     ```
-     journals/{user_id}/{project_id}.md
-     ```
-   - 固定记录以下内容：
-     - 项目目标
-     - 当前状态
-     - 需求与预期功能
-     - 开发计划
-     - 执行记录
-     - 遇到的问题
-     - 测试与验证
-     - 功能差异与验收建议
-     - 下一步
-   - 这就是后续做“项目管理、老师验收、进度对齐”的核心文件
-   - 支持生成项目日志摘要，避免每次把完整日志注入上下文
-
-6. 实现 Klonet 知识库第一版
-   - 新增 `knowledge/indexer.py`
-   - 新增 `knowledge/retriever.py`
-   - 新增 `knowledge/rag.py`
-   - 当前先使用本地 JSONL 索引，不上复杂向量数据库
-   - 检索对象包括 README、prompt、knowledge、journal、workspace、tools、memory 等文本资料
-   - 新增 `knowledge/task_templates.md`，沉淀 Mentor 问答、Coding 开发、报错排查、修复测试失败等常见任务模板
-   - 后续可以逐步替换成 BM25 + 向量检索的混合 RAG
-
-7. 新增代码风格指南
-   - 新增 `knowledge/style_guide.md`
-   - 用来约束 Coding Agent 生成代码和注释时尽量贴合当前项目风格
-   - 目前原则是：中文注释、模块职责清楚、实现直观、不为了抽象而抽象
-
-8. 初步实现 workspace 和安全工具
-   - 新增 `workspace/manager.py`
-   - 新增 `workspace/sandbox.py`
-   - 文件读写被限制在当前用户的 workspace 内
-   - 结构化工具包括：
-     - `list_files`
-     - `read_file`
-     - `write_file`
-     - `run_tests`
-     - `show_diff`
-   - 旧的 `run_command` 只保留兼容能力，并增加危险命令拦截
-   - `show_diff` 在无 Git 仓库时会降级返回文件摘要，在 Git 仓库中会显示未跟踪文件
-
-9. 新增评估集雏形
-   - 新增 `evals/mentor_cases.jsonl`
-   - 新增 `evals/coding_cases.jsonl`
-   - 新增 `evals/error_cases.jsonl`
-   - 新增 `evals/runner.py`，可以离线汇总 eval case，生成 `evals/summary.md`
-   - 后续可以用这些 case 做对比实验，例如：通用 Claude Code / 无 RAG 版本 / 有 RAG + 项目日志版本
-
-10. 新增 trace 与 token 统计
-    - 新增 `tracing/logger.py`
-    - 记录 LLM 调用 token、耗时
-    - 记录工具调用、执行状态、耗时和结果摘要
-    - trace 写入 `tracing/trace.jsonl`，作为后续评估和审计数据
-    - 工具结果过长时会统一截断，保护上下文窗口
-
-11. 增强本地 CLI 稳定性
-    - CLI 启动时把 stdout/stderr 配置为 UTF-8，避免 Windows GBK 输出特殊字符时崩溃
-    - 新增 `pytest.ini`，排除 `workspaces/`、`journals/`、`memory/` 等运行时目录，避免测试污染
-
-12. 新增测试
-    - 新增 `tests/test_imports.py`
-    - 新增 `tests/test_cli_entry.py`
-    - 新增 `tests/test_prompt_style.py`
-    - 新增 `tests/test_session.py`
-    - 新增 `tests/test_journal.py`
-    - 新增 `tests/test_knowledge.py`
-    - 新增 `tests/test_workspace_tools.py`
-    - 新增 `tests/test_tracing.py`
-    - 新增 `tests/test_eval_runner.py`
-    - 新增 `tests/test_pytest_config.py`
-    - 当前验证结果：
-      ```bash
-      python -m pytest -q
-      # 31 passed
-      ```
-
-### 现在的运行方式
-现在可以直接在项目根目录下运行：
-```bash
-cd C:\Users\LHT\OneDrive\课设\agent开发\klonet_agent
-python -m klonet_agent.agent --mode mentor --user-id default --project-id default
-python -m klonet_agent.agent --mode coding --user-id default --project-id demo
-```
-
-Ubuntu 服务器需要让 Ops Agent 以 `klonet-agent` 专用系统账户运行时，请使用
-[`docs/ops/klonet-agent-op-install.md`](docs/ops/klonet-agent-op-install.md) 中的
-幂等部署脚本和账户配置。当前入口仍是交互式 CLI；systemd 常驻运行需要后续接入
-Web/API 服务入口。
-
-部署脚本也支持 `--enable-ssh-login --set-password`。启用后可以先通过
-`ssh klonet-agent@SERVER_ADDRESS` 登录，再用同一个 `python -m klonet_agent.agent`
-入口启动 mentor、coding 或 ops 模式；密码由系统 `passwd` 交互设置，不保存在仓库中。
-
-也可以用脚本方式查看帮助或启动：
-```bash
-python agent.py --help
-```
-
-PowerShell 使用管道传入多行中文时，需要同时统一 PowerShell 和 Python 的编码：
-
-```powershell
-$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-@'
-不需要 Klonet，只做 Docker Compose 实验。
-这里可以继续输入多行需求。
-'@ | python -X utf8 -m klonet_agent.agent --mode mentor
-```
-
-CLI 会把非交互 stdin 的全部内容作为一个用户回合，并使用 UTF-8 严格解码。
-如果生产端已经把中文替换成 `?`，程序会得到损坏文本，无法在接收后恢复。
-
-### 这一版还没有做的事情
-- Klonet 当前运行实例的现场源码仍不属于 Mentor workspace；Mentor 使用随主仓库发布的脱敏源码快照，现场差异需在 Ops 模式核验
-- RAG 已使用 LLM Query Planner、BM25、精确匹配、向量召回、RRF 和可选 rerank；仍不依赖向量数据库
-- ReviewAgent 目前只是 prompt 层面的轻量 review，还没有独立子 agent
-- Web/API 服务还没有做，当前目标仍然是本地 CLI 可用
-- token/速度优化目前已有 trace 和 eval runner 基础，后续需要接入真实 Klonet 任务做对比实验
-
-### 知识向量自动构建
-
-配置 `EMBEDDING_API_KEY` 后，Mentor 第一次加载知识索引时会自动创建
-`knowledge/vectors.jsonl`。已有文件缺少 chunk 或 chunk 内容发生变化时，只补齐
-缺失、过期的向量；接口支持批量输入时默认每批 10 条。构建中途失败会保留已经
-完成的批次，检索继续以 BM25 降级运行，并在 RAG 结果中输出
-`retrieval_mode`、`vector_status` 和 `vector_status_detail`。
-
-可用以下环境变量调整行为：
-
-```bash
-KLONET_AGENT_AUTO_BUILD_VECTORS=1
-KLONET_AGENT_VECTOR_BATCH_SIZE=10
-```
-
-也可以手工预构建：
-
-```bash
-cd /home/klonet-agent/klonet_agent
-PYTHONPATH=/home/klonet-agent python -m scripts.build_knowledge_vectors
-```
-
-`knowledge/vectors.jsonl` 是由指定 embedding 模型生成的部署产物，默认不进入普通
-Git 历史。需要在多台机器间分发时，推荐使用 Git LFS、Release artifact 或对象
-存储，并随文件记录 embedding 模型和知识索引版本。
-
-### 多阶段 RAG
-
-Mentor 的 `search_knowledge` 默认使用 `multi_stage` 流程。每轮已有的前置
-理解调用使用全局聊天模型（当前默认 `gemini-3.7-flash`），并在同一次 JSON 响应中生成结构化
-`RetrievalPlan`，其中直接包含
-公共文档库和源码库的检索任务、BM25 查询、语义查询和精确词，不再先做一次
-意图分类再调用另一个模型改写 query。后续工具调用复用该计划，不进行第二次
-规划；直接调用 `KnowledgeBase` 且没有现成计划时才补一次 Planner。原始问题
-始终独立参与召回。
-
-每个任务在对应知识库内分别运行 BM25、dense vector 和精确匹配，候选使用
-weighted RRF 融合去重；融合 Top 20 可交给 DashScope `qwen3-rerank` 统一
-重排。Planner 失败时使用原问题同时搜索两个库，reranker 失败时退回 RRF，
-不会因为外部模型不可用而中断检索。
-
-同一轮的多个 dense query 会批量请求 embedding，并在公共文档索引和源码索引
-之间复用查询向量；chunk 向量从 JSONL 加载后使用内存 NumPy 矩阵计算余弦分数。
-向量完整性只在索引版本变化时检查一次，避免每个召回通道重复扫描向量文件。
-
-```bash
-RAG_PIPELINE_MODE=multi_stage
-RAG_QUERY_PLANNER_MODEL=gemini-3.7-flash
-RAG_QUERY_PLANNER_TIMEOUT_SECONDS=6
-RAG_RECALL_TOP_K=30
-RAG_FUSION_TOP_K=20
-RAG_RERANK_TOP_N=10
-RAG_RERANK_TIMEOUT_SECONDS=8
-RERANK_MODEL=qwen3-rerank
-RERANK_BASE_URL=https://WORKSPACE_ID.cn-beijing.maas.aliyuncs.com/compatible-api/v1
-RERANK_API_KEY=...
-```
-
-`RERANK_API_KEY` 未设置时会依次尝试 `DASHSCOPE_API_KEY` 和
-`EMBEDDING_API_KEY`；默认会把 embedding URL 的 `compatible-mode/v1`
-转换为 rerank 使用的 `compatible-api/v1`。需要临时回退到旧检索流程时设置
-`RAG_PIPELINE_MODE=legacy`。
-
-### 公共知识边界
-
-主 RAG 使用显式 allowlist，只索引以下正式知识：
-
-```text
-knowledge/klonet/**/*.md
-knowledge/klonet/**/*.txt
-knowledge/klonet_experience/**/*.md
-knowledge/klonet_experience/**/*.txt
-```
-
-上述目录中的 `README.md` 是集合导航和路由说明，也不会作为回答证据进入索引。
-`journals/`、`memory/`、`workspace/`、`workspaces/`、`tools/`、`doc/`、
-`docs/`、`prompts.py`、仓库 `README.md` 和 `knowledge/klonet_index/`
-不会进入公共索引或公共向量文件。项目日志通过当前用户和项目作用域内的
-`read_project_journal` 读取；源码事实通过 `search_code` 和
-`read_source_file` 按需核验；collection 的 `manifest.json` 只用于路由，
-不作为回答证据。
-
-### Klonet 源码检索层
-
-源码通过独立索引接入，不与公共文档 chunk 混在同一个向量文件中。主仓库跟踪
-一个位于 `knowledge/klonet_source/` 的精简、脱敏源码快照，因此新部署无需再
-单独拉取 `vemu_uestc`。也可通过 `KLONET_SOURCE_ROOT` 覆盖默认快照路径。
-快照会过滤 `.git`、`.history`、日志、测试、编译目录、`static_resources`、
-第三方前端依赖、二进制和压缩包等非业务源码。
-
-Python 源码按模块、类、方法和函数切分；JavaScript、TypeScript、C 和头文件
-优先按符号边界切分，其他允许的文本文件按带重叠的行窗口切分。每个 chunk
-保留相对路径、符号名和起止行号。密码、令牌、API Key 和带认证信息的 URL
-会在写入索引及调用 embedding 服务前脱敏。生成文件为：
-
-```text
-knowledge/code_index.jsonl
-knowledge/code_vectors.jsonl
-```
-
-两者均为本机部署产物，不进入普通 Git 历史。首次部署或需要手动重建时执行：
-
-```bash
-cd /home/klonet-agent/klonet_agent
-PYTHONPATH=/home/klonet-agent python -m scripts.build_code_vectors
-```
-
-`search_knowledge` 的 Planner 可以把开发、API、调用链和排障问题自动路由到
-源码索引；`search_code` 仍保留为显式源码下钻工具，优先执行精确字面量搜索，
-没有精确命中时才使用源码 BM25 和向量检索。返回候选路径和行号后应继续调用
-`read_source_file` 核验真实代码。
-
-源码快照由上游仓库的已提交 Git tree 确定性生成，不会复制上游工作区的本地
-修改、未跟踪文件或备份文件。`knowledge/klonet_source/manifest.json` 记录
-上游 remote、commit、文件数和脱敏文件数。更新快照时执行：
-
-```bash
-cd /home/klonet-agent/klonet_agent
-PYTHONPATH=/home/klonet-agent python -m scripts.sync_klonet_source
-```
-
-同步源默认是主项目同级的 `/home/klonet-agent/vemu_uestc`，可通过
-`KLONET_UPSTREAM_SOURCE_ROOT` 覆盖。同步完成后需要审查并提交
-`knowledge/klonet_source/`；生成的源码索引和向量仍保持 Git ignore。
-
-## 更新：项目架构
-把项目封装成了一个个类
-
-具体文件架构如下：
-```
-agent.py                         # CLI 启动入口，尽量很薄
-
-klonet_agent/
-├── __init__.py
-├── config.py                    # 配置：模型名、路径、token限制、开关
-├── prompts.py                   # 系统提示词、角色提示词、任务提示词
-│
-├── session.py                   # AgentSession：一次用户会话
-├── orchestrator.py              # AgentOrchestrator：主循环/编排器
-│
-├── llm/
-│   ├── __init__.py
-│   ├── client.py                # LLMClient：模型调用封装
-│   └── schemas.py               # 消息、工具调用、响应结构
-│
-├── tools/
-│   ├── __init__.py
-│   ├── registry.py              # ToolRegistry：工具注册表
-│   ├── executor.py              # ToolExecutor：工具执行入口
-│   ├── shell.py                 # ShellTool：命令执行
-│   ├── file_ops.py              # 文件读写工具
-│   └── web.py                   # web_fetch 等联网工具
-│
-├── memory/
-│   ├── __init__.py
-│   ├── store.py                 # MemoryStore：长期记忆、用户画像、history
-│   ├── compactor.py             # 记忆压缩
-│   └── models.py                # 记忆数据结构
-│
-├── journal/
-│   ├── __init__.py
-│   ├── project_journal.py       # ProjectJournal：项目 Markdown 状态机
-│   └── templates.py             # md 模板
-│
-├── knowledge/
-│   ├── __init__.py
-│   ├── skill_loader.py          # 你现在的 skills.py 可迁移到这里
-│   ├── rag.py                   # KnowledgeBase：Klonet RAG
-│   ├── indexer.py               # 索引 Klonet 源码/文档
-│   └── retriever.py             # 检索相关上下文
-│
-├── workspace/
-│   ├── __init__.py
-│   ├── manager.py               # WorkspaceManager：为用户创建隔离代码副本
-│   ├── git_ops.py               # clone/worktree/diff/patch
-│   └── sandbox.py               # 执行限制、路径限制
-│
-├── subagents/
-│   ├── __init__.py
-│   ├── manager.py               # SubAgentManager
-│   └── agents.py                # ResearchAgent / CodingAgent / ReviewAgent
-│
-├── tracing/
-│   ├── __init__.py
-│   └── logger.py                # TraceLogger：工具调用、失败原因、产物记录
-│
-└── app/
-    ├── cli.py                   # 命令行运行
-    └── service.py               # 以后部署成 Web/API 服务时用
-```
-没有完成的模块用占位符填充，其他模块的对应关系如下：
-```
-client.py -> llm/client.py
-history.py -> memory/store.py
-skills.py -> knowledge/skill_loader.py
-tools.py -> tools/*
-run.py ->
-```
-
-## 更新：任务规划模块的设计
-实际上很简单
-1. 在系统提示词中告诉它应该什么时候分步做任务，如何调用工具分步做任务
-2. 定义一个任务规划工具，让llm输出完整的计划列表
-3. 再定义一个工具函数，用来查看与更新任务执行状态
-4. 最后做一个检验，模型说完成任务之后再手动二次检验，避免llm出错而导致需要用户自己提醒
-
-## 运行治理层（Agent Runtime Governance）
-
-任务状态、失败、模型/工具调用现在共享一套**运行标识 + 事件账本 + 状态投影**
-（计划见 [`通用功能升级计划/03-Agent运行治理升级计划.md`](通用功能升级计划/03-Agent运行治理升级计划.md)，
-实施记录见 [`doc/18_runtime_governance_upgrade.md`](doc/18_runtime_governance_upgrade.md)）。
-
-- `runtime/governance/`：models / privacy / repository / postgres / service / exporters / bootstrap；
-- `migrations/0004_governance.sql`：`governance` schema 九张表，RLS 与记忆系统同一套租户变量；
-- 开关 `KLONET_AGENT_RUNTIME_GOVERNANCE=1`（默认关闭，与记忆库共用
-  `KLONET_AGENT_MEMORY_DSN`，没有 DSN 时自动降级）；
-- 降级规则：**任务状态改变与失败关闭 fail closed**（存储不可用时内存 todos
-  不会被修改），模型/工具调用的 telemetry 事件进缓冲按幂等键补投；
-- secret 级数据（API key、密码、私钥）被最小隐私网关拒绝持久化，事件降级为
-  不含原文的 tombstone；`tracing/governance.jsonl` 只是导出，不是权威。
-- 证据与主张分离（阶段 4）：工具成功结果自动登记为 `governance.evidence`
-  （内容寻址哈希，源变化 → stale）；同主体矛盾观察自动生成 `contradicted`
-  主张；记忆候选的最小证据门槛是 `claim_evidence_gate`（≥1 条 supports）。
-- 确定性路由（阶段 5，shadow-only）：`ModelCapabilityRegistry` + 硬约束过滤 +
-  可解释评分，每次调用把「策略选择 vs 实际模型」写进 `governance.route_decisions`，
-  不控制生产流量。
-
-## 记忆系统（PostgreSQL + pgvector）
-
-长期记忆已经从"几个 Markdown 文件 + 模型自由覆写"升级为**有 schema、有版本、
-有召回策略**的数据库子系统。设计与迁移计划见
-[`通用功能升级计划/02-记忆系统升级计划.md`](通用功能升级计划/02-记忆系统升级计划.md)，
-部署与运维见 [`doc/15_memory_postgres_deployment.md`](doc/15_memory_postgres_deployment.md)
-（安装）与 [`doc/17_memory_lifecycle_operations.md`](doc/17_memory_lifecycle_operations.md)
-（评测门槛、cutover、备份恢复、删除权）。
-
-**生命周期 Worker**（04 计划，阶段 0–7 已落地）：六个维护 Job
-（embedding 回填 / 过期归档 / 删除清理 / 整理提案 / 模型迁移回填 / 健康报告）
-由 `python -m klonet_agent.memory.maintenance run` 常驻驱动；生产入口与
-暂停/恢复/dry-run/回滚手册见
-[`doc/18_memory_lifecycle_worker_runbook.md`](doc/18_memory_lifecycle_worker_runbook.md)，
-systemd / compose 部署样例在 `deploy/`。健康指标唯一权威通道是
-`governance.runtime_events`（`record_run_metric`），健康门禁已接入
-`scripts/memory_cutover.py --check`。
-
-七条不变量，出问题先看这几条：
-
-1. **正文不可变**：版本表上的触发器冻结正文/哈希/时间/分词结果，只放行
-   `valid_to`、`embedding` 三列、`verified`（false→true），违反报 SQLSTATE `2F002`。
-   改一条事实只能"新增版本 + 替代旧记录"，历史一律保留。
-2. **模型不能自由决定覆盖**：候选只带"提议"，`memory/versioning.py` 的
-   `plan_consolidation`（13 条确定性规则）判 ADD/UPDATE/SUPERSEDE/NOOP/REJECT，
-   `apply_plan` 是唯一写入出口。
-3. **模型不能编造证据**：候选的来源 `source_id` 只能取本回合真实出现过的
-   `rows-<n>` 或工具调用 id；**白名单为空时一律拒绝**。
-4. **租户隔离是双层的**：应用层 SQL（`_record_scope()`）+ PostgreSQL RLS
-   （六表 `FORCE ROW LEVEL SECURITY`，连表 owner 也被约束）。
-5. **向量是异步补算的**：正文先提交，`memory_versions` 入 outbox，由
-   `memory/embedding_worker.py` 领取后写回；失败按异常上的 `permanent` 标记
-   分类（瞬时退避重试、永久放弃），崩溃靠租约自动回收。
-6. **召回是三通道 + 加权 RRF**：全文（jieba 分词）/ 向量 / 精确标识符，
-   `k=60`，与 `knowledge/multi_stage.py` 同口径；`42xxx` 类 SQLSTATE 直接抛
-   部署错误而不降级（静默少一路召回比报错更危险）。
-7. **注入有硬预算**：`memory/pack.py` 按类型（偏好 2 / 事实 4 / 经历 3）与
-   token 双重上限构包，淘汰顺序 episode → fact → preference；六项元数据
-   （id/类型/作用域/置信度/有效期/来源）永不截断，放不下就返回**空包**。
-
-### 开关与切换
-
-| 环境变量 | 默认 | 作用 |
-| :--- | :--- | :--- |
-| `KLONET_AGENT_MEMORY_AUTHORITY` | `cutover` | `legacy`/`shadow`/`compare`/`cutover` 四态。默认 `cutover`：**数据库优先**——配了 DSN 就走受控写入与按需召回，Markdown 退出常驻注入；**库不可用（未配 DSN / 连不上）时自动降级回 Markdown**（trace 记 `memory_pack_markdown_fallback`，只告警一次）。设成 `legacy` 可回到旧行为 |
-| `KLONET_AGENT_MEMORY_WRITE_PIPELINE` | `0` | 受控写入管线（候选提取 + 策略过滤 + consolidation） |
-| `KLONET_AGENT_MEMORY_PACK` | `0` | 不再常驻注入 `MEMORY.md`/`USER.md`，改为每轮按问题召回 |
-| `KLONET_AGENT_MEMORY_PACK_TOKEN_BUDGET` | `900` | 记忆包 token 硬上限 |
-| `KLONET_AGENT_MEMORY_DSN` | 空 | 业务侧记忆库连接串（`/etc/klonet-agent/klonet-agent.env`） |
-
-**默认值刻意保留旧行为**：记忆库是可选部署件，没有 DSN 的环境里默认打开新路径
-只会让每次对话多一次失败的连接尝试。所以"默认启用"落在一个部署变量上——
-切到 `cutover` 必须先通过冻结的验收阈值：
-
-```bash
-# 1) 跑记忆专项评测（会建/删临时库，用测试 DSN）
-KLONET_AGENT_TEST_PG_DSN=postgresql://... python -m evals.run_memory_eval
-# 2) 评测达标后切换（就地修改部署环境文件）
-KLONET_AGENT_TEST_PG_DSN=postgresql://... \
-    python scripts/memory_cutover.py --apply /etc/klonet-agent/klonet-agent.env
-# 3) 回滚：Markdown 重新成为权威
-python scripts/memory_cutover.py --rollback /etc/klonet-agent/klonet-agent.env
-```
-
-### 记忆专项评测
-
-| 路径 | recall@k | precision@k | 过期误召回率 | 跨租户泄漏 | 平均注入 token |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| Markdown 全量注入（baseline） | 1.00 | 0.60 | 0.30 | 0 | 26.1 |
-| 数据库（关键词） | 0.80 | 0.75 | 0 | 0 | 13.0 |
-| 数据库（混合检索） | 1.00 | 0.75 | 0 | 0 | 22.8 |
-
-用例见 `evals/memory_cases.jsonl`（单跳 / 精确标识符 / 时态 / 过期 / 冲突 /
-多跳 / 偏好 / 跨租户隔离 / 语义改写），阈值冻结在
-`evals/memory_eval_thresholds.json`，报告落在 `evals/memory_summary.md`。
-**混合检索的平均注入 token 只有 Markdown 全量的 0.87 倍，而过期误召回与跨租户
-泄漏都是 0** —— 这两条正是 cutover 的硬性完成标准。
-
-## 更新：记忆模块的设计
-
-> **以下是最早的 Markdown 方案，现为 legacy 路径**（`KLONET_AGENT_MEMORY_AUTHORITY=legacy`
-> 时才生效，且 `MEMORY.md`/`USER.md` 只作为迁移与导出来源）。当前生效的设计见上一节。
-
-现在简单的把history数组无线增长显示是不可以的，不仅会忘记之前的目标，还会导致记忆窗口经常溢出
-
-人的记忆分为三种：
-- 目前的记忆（工作记忆）：记着我们当前在做什么，记得十分清除
-- 之前一段时间的记忆（情景记忆）：记着我们前一段时间做了什么，但是记不太清具体细节，越往前追忆记忆越模糊
-- 一直以来的记忆（核心记忆）：记着我们的一些主线目标与人生规划，会记特别久
-
-所以我们agent的记忆系统设计也可以仿照着来：
-- 工作记忆：最近几轮的原文（即原本的history数组，但是只记录最近几轮对话）
-- 情景记忆：之前对话的简单记录，在压缩时触发写入，可以以时间为维度来进行记录，llm可以按需检索（即history过大时就把他整理成一个小记录，然后清空之前的）
-- 核心记忆：常驻任务提示，每轮都要输入进去。同时字数要有限制，以防膨胀（记录包括用户偏好，核心目标等等）
-
-**实际上也就是文本记录**，具体实现如下，用几个文件来分别实现几个记忆：
-| 文件 | 作用 |
-| :--- | :--- |
-| `history.jsonl` | 记录完整的对话 |
-| `YYYY-MM-DD.md` | 记录当天事件的摘要 |
-| `MEMORY.md` | 记录核心的目标 |
-| `USER.md` | 记录用户偏好 |
-| `tokens.jsonl` | 记录token用量 |
-
-### history数组
-上个版本的history数组，现在依旧保留，只不过当检测到溢出时，就会触发压缩机制，清空数组
-
-### history.jsonl
-上个版本的history是个单独定义的列表，代码一停，history就完全丢失了（即history存在内存里，没有实现永久性存储）。
-
-.jsonl 的好处是读写极快，文件再大也不需要像普通 .json 那样把整个文件加载到内存里解析。
-
-和上个版本相同，每生成一条消息，就追加一行到文件末尾，形成永久存储。开始对话之前，先读取这个文件，恢复之前的上下文。（不是全读，而是去寻找最后一个归档压缩标记，把这之后的对话加载到记忆里）
-
-### USER.md
-.md 的好处是，大模型处理非结构化的 Markdown 比处理严格的 JSON 键值对更自然，不容易出错
-
-注意USER.md是全覆盖更新，因为用户偏好可能会改变
-
-### YYYY-MM-DD.md
-新增一个工具，如果大模型在对话中遇到有价值的进展就追加到 YYYY-MM-DD.md 里
-
-### MEMORY.md
-新增一个工具，如果大模型积累了好几天的日志，或者某个模块彻底做完、或者你明确要求它做阶段性复盘时，它再去通读近期的日志，把提炼出来的核心状态和规则覆盖更新到 MEMORY.md
-
-### 记忆压缩
-判断当前的对话轮数是否超过了阈值（比如 10 轮），或者计算 Token 数是否过高。如果达标，用系统级 Prompt，让大模总结：“请总结上述对话中的关键技术结论或任务进度，并调用对应的工具更新到 MEMORY.md 中。”
-
-总结完毕后，手动打上标签
-
-## 旧版架构记录
-把项目拆成了三层
-1. 基础设施层：client，history，tools，skills
-2. 编排层：runner （即把各个模块拼接在一起）
-3. 入口层：main，agent （main提供拼装与导出，agent作为方便运行的启动脚本）
-
-具体文件架构如下：
-```
-agent.py                    项目入口
-agent_v5/
-    ├── __init__.py
-    ├── client.py           大模型客户端初始化
-    ├── prompts.py          系统提示词
-    ├── history.py          负责对话记忆
-    ├── tools.py            工具定义和工具执行
-    ├── skills.py           技能系统
-    ├── runner.py           真正的对话流程
-    ├── main.py             实例化各个模块
-```
-
-## 拆分实现的关键步骤
-1. 把原本的一段段代码封装成一个个函数
-2. 然后在主函数里import这个函数，再调用即可
-3. 目前以面向过程编程为原则，主要是比较简单。后续做大后，为了维护方便可以改成面向对象编程
-
-## 运行方法
-当前项目建议在仓库根目录运行：
-``` bash
-cd ~/klonet_agent
-source /.venv/bin/activate
-python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
-python agent.py --help
-```
-
-## Ubuntu Python 运行环境准备
-
-推荐在项目目录准备 `.venv`。
-
-```bash
-# 进入项目目录
-cd ~/klonet_agent
-
-# 创建虚拟环境（清华源）
-sudo -u klonet-agent /usr/local/python3/bin/python3.8 -m venv .venv --without-pip
-wget https://bootstrap.pypa.io/pip/3.8/get-pip.py -O /tmp/get-pip.py
-sudo -u klonet-agent .venv/bin/python /tmp/get-pip.py \
-  -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 安装依赖
-sudo -u klonet-agent .venv/bin/pip install -r requirements.txt \
-  -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-sudo -u klonet-agent .venv/bin/python --version
-sudo -u klonet-agent .venv/bin/pip --version
-
-# 激活虚拟环境
-source /.venv/bin/activate
-
-# 退出虚拟环境
-deactive
-```
-
-## Ubuntu 专用 SSH 账户部署
-
-使用agent前，需要运行部署脚本，创建 `klonet-agent` 账户
-
-把当前环境的 Python 解释器交给部署脚本；下面以使用项目内虚拟环境为例，但也可以换成其他已安装好依赖的 Python：
-（执行 which python 把输出替代 --python后的参数即可）
-
-```bash
-sudo ./scripts/install-klonet-agent-service.sh \
-  --project-root "$PWD" \
-  --python "$PWD/.venv/bin/python" \
-  --mode ops \
-  --user-id lht \
-  --project-id test \
-  --enable-ssh-login \
-  --set-password
-```
-
-之后用这个用户登录即可：
-
-```bash
-ssh klonet-agent@服务器地址
-```
-
-登录后，环境文件、虚拟环境和项目目录会自动加载，可以使用统一入口启动
-mentor、coding 或 ops 模式：
-
-```bash
-python -m klonet_agent.agent --mode mentor --user-id lht --project-id test
-python -m klonet_agent.agent --mode coding --user-id lht --project-id test
-python -m klonet_agent.agent --mode ops --user-id lht --project-id test
-```
-
-`ops` 是唯一的 Agentic 高权限运维模式，由 Supervisor 编排并以执行证据验证。语义 Planner 先结合 Klonet RAG
-Runbook 和统一服务器环境事实决定“做什么、为什么做、怎样算成功”，但看不到 Action
-名称，也不能输出命令。Execution Agent 再把每个语义步骤映射成注册 Action；确实没有
-对应能力时，才生成内容、工作目录、用户、环境、超时、哈希和有效期全部固定的一次性
-Shell Artifact。Verifier 根据执行证据、Checker 和必要的只读探测判断目标状态。
-
-修改计划使用内容哈希绑定的 `confirm-priv-plan <plan_id> <sha256>` 精确确认。
-计划 ID、内容、环境指纹或有效期发生变化都会使确认失效；解析器会拒绝命令替换、
-嵌套 Shell、网络外传、敏感凭据、修改 Agent 安全边界和无边界删除。执行始终使用
-`shell=False` 的固定 argv。`ops` 的所有环境修改都经过这条受控、可验证的执行链路。
-
-`ops` 的知识和执行能力分成四层：
-
-- RAG Runbook：部署、启停、重启、组件恢复、Nginx、环境部署、源码升级和回滚的
-  经验与检查思路，只提供 Planner 参考，不规定固定路径。
-- `ReadOnlyProbeRegistry`：项目结构、Python 导入、进程树、PID/端口、systemd、
-  screen、Docker、Nginx、Redis/MySQL/RabbitMQ、网络、防火墙、磁盘、内存、
-  Git、日志、TCP/HTTP 和权限探测；探测结果统一脱敏。
-- `OpsActionRegistry`：文件复制/移动/创建/删除、服务/进程/容器管理、系统包与
-  Python 包、权限、Git、带备份的唯一文本匹配替换，以及 Klonet 专用平台动作。
-  动作声明前置条件、影响、后置条件、风险和可用执行后端。
-- `ShellArtifactPolicy`：当注册 Action 无法覆盖时，对一次性原生 Shell 做 AST、
-  语法、敏感信息、环境、目标范围和不可变哈希校验，并强制逐步人工确认。
-
-高权限变更计划确认命令：
-
-```text
-confirm-priv-plan <plan_id> <sha256>
-```
-
-当前唯一的 Ops 工作流位于 `ops/privileged/workflow/`。计划、执行绑定、
-Shell Artifact、授权哈希、步骤状态、探测证据和检查结果保存在当前 user/project 的
-`memory/sessions/.../privileged_ops_plans/` 下。进程中断时，原来处于
-`running`/`verifying` 的步骤会变成 `execution_unknown`；恢复流程先验证当前状态，
-绝不自动重放结果未知的步骤。
-
-步骤失败后会立即停止后续变更，把真实执行绑定、输出、Checker、Verifier 反思、
-已发生变化、已完成和剩余步骤组成 Failure Packet，交回同一个 Planner 自主重新规划。
-新计划必须重新确认；相同失败证据不会无限循环。旧版本计划不进入当前存储目录，
-不能沿用原授权哈希，需要按当前环境重新生成。
-
-部署脚本会在 `/etc/klonet-agent/klonet-agent.env` 中默认写入
-`KLONET_AGENT_OPS_REAL_EXECUTION=1`，因此 Ops 模式会走受控真实执行链路。
-真实环境修改仍然必须经过 OperationPlan、计划确认、特权步骤确认和 sudoers
-白名单 helper。
-
-先用管理员账户确认 helper、sudoers 和专用账户权限：
-
-```bash
-ls -l /usr/local/bin/klonet-agent-op
-sudo visudo -cf /etc/sudoers.d/klonet-agent-op
-sudo -l -U klonet-agent
-grep -E '^(TMPDIR|KLONET_AGENT_OPS_REAL_EXECUTION)=' /etc/klonet-agent/klonet-agent.env
-```
-
-重新登录 `klonet-agent`，或在当前 shell 手动加载：
-
-```bash
-set -a
-source /etc/klonet-agent/klonet-agent.env
-set +a
-
-echo "$KLONET_AGENT_OPS_REAL_EXECUTION"
-echo "$TMPDIR"
-```
-
-确认 helper 的 dry-run 和真实执行链路都能跑：
-
-```bash
-/usr/local/bin/klonet-agent-op reload-nginx --dry-run
-sudo -n /usr/local/bin/klonet-agent-op reload-nginx --execute
-```
-
-`base_requ_setup.sh NORMAL` 这类耗时安装步骤会把脚本输出直接流到当前终端；
-如果看到 Docker 镜像解压、`docker load`、OVS/Docker 服务启动等日志，说明仍在执行，
-不是 Agent 已经卡死。
-
-最后用 `klonet-agent` 身份启动 Ops：
-
-```bash
-python -m klonet_agent.agent --mode ops --user-id lht --project-id test
-```
-
-如果之前已经生成过 dry-run 的部署计划，重新部署并启用默认真实执行后建议创建一个新计划，
-不要继续复用已把步骤标记为 completed 的旧计划。
-
-更新 helper/sudoers：
-cd /home/klonet-agent/klonet_agent
-sudo bash scripts/install-klonet-agent-service.sh --project-root "$PWD" --python "$PWD/.venv/bin/python"
-systemctl start klonet-agent.service
+本仓库目前尚未添加开源许可证。在许可证明确之前，代码默认受著作权保护，不代表允许复制、修改或再分发。若计划将仓库正式开放给外部贡献者，建议在发布前选择并添加合适的许可证。
